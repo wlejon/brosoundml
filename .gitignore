@@ -1,0 +1,19 @@
+build/
+build-*/
+build_*/
+out/
+.cache/
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+compile_commands.json
+*.safetensors
+*.ckpt
+*.bin
+*.wav
+
+# Downloaded model weights, voice packs, and config files.
+weights/
+voices/
