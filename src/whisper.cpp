@@ -1,6 +1,7 @@
 #include "brosoundml/whisper.h"
 
 #include "brosoundml/detail/json.h"
+#include "brosoundml/whisper_modules.h"
 
 #include <brotensor/safetensors.h>
 
@@ -72,6 +73,22 @@ struct Whisper::Impl {
     WhisperConfig     config;
     brotensor::Device device = brotensor::Device::CPU;
     bool              loaded = false;
+
+    // Stage 2: log-mel front-end. Built once at load() time.
+    LogMel            log_mel;
+    // Stage 3: encoder. Holds all encoder-side weights + per-layer modules.
+    WhisperEncoder    encoder;
+
+    // Encode an audio buffer to (max_source_positions, d_model) hidden states.
+    // Called from the future transcribe() path; exposed here so the test layer
+    // can lock the contract before the decoder lands. The result is the cross-
+    // attention key/value source the decoder consumes.
+    void encode_audio(const AudioBuffer& audio,
+                      brotensor::Tensor& hidden) const {
+        brotensor::Tensor mel;
+        log_mel.forward(audio, mel);
+        encoder.forward(mel, hidden);
+    }
 };
 
 Whisper::Whisper() : impl_(std::make_unique<Impl>()) {}
@@ -94,12 +111,23 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
     impl_->config = parse_config(config_path.string());
     impl_->device = device;
 
-    // Stage 1 only opens-and-closes the safetensors file to confirm it's a
-    // valid container. Per-submodule uploads land in later stages.
-    {
-        auto weights = brotensor::safetensors::File::open(weight_path.string());
-        (void)weights;
+    if (device != brotensor::Device::CPU) {
+        fail("Whisper::load", "stages 2-3 not yet ported off CPU");
     }
+
+    auto weights = brotensor::safetensors::File::open(weight_path.string());
+
+    // Stage 2: build the log-mel front-end (no learnable weights).
+    impl_->log_mel.build(impl_->config.num_mel_bins, device);
+
+    // Stage 3: load the encoder backbone from the safetensors file.
+    impl_->encoder.load_from(weights,
+                             impl_->config.num_mel_bins,
+                             impl_->config.d_model,
+                             impl_->config.max_source_positions,
+                             impl_->config.encoder_layers,
+                             impl_->config.encoder_ffn_dim,
+                             impl_->config.encoder_attention_heads);
 
     impl_->loaded = true;
 }
@@ -114,7 +142,7 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     (void)prompt_ids;
     (void)max_new_tokens;
     fail("Whisper::transcribe",
-         "not yet implemented — stage 2 (log-mel front-end + encoder) pending");
+         "not yet implemented — stage 4 (decoder + greedy decode) pending");
 }
 
 const WhisperConfig& Whisper::config() const { return impl_->config; }
