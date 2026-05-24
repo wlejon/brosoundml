@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace brosoundml {
@@ -48,17 +49,52 @@ namespace brosoundml {
 // the build-out plan in README.md. Until it lands, load() / synthesize() throw
 // a std::runtime_error that names the stage.
 
-// Model hyperparameters. Concrete values are read from the model's config.json
-// by Kokoro::load — the zero defaults here are placeholders, not real config.
+// iSTFTNet decoder hyperparameters — the Kokoro vocoder branch. Drives the
+// upsampling stack, the AdaIN residual blocks, and the iSTFT head.
+struct IStftNetConfig {
+    int                            upsample_initial_channel = 0;
+    std::vector<int>               upsample_kernel_sizes;       // per upsample stage
+    std::vector<int>               upsample_rates;              // per upsample stage
+    std::vector<int>               resblock_kernel_sizes;       // shared across stages
+    std::vector<std::vector<int>>  resblock_dilation_sizes;     // per resblock kernel
+    int                            gen_istft_n_fft  = 0;        // iSTFT head transform size
+    int                            gen_istft_hop_size = 0;      // iSTFT head hop
+};
+
+// plBERT — the phoneme-level BERT (ALBERT-style, weight-shared layers) that
+// runs over the phoneme sequence before the text encoder consumes it.
+struct PLBertConfig {
+    int hidden_size              = 0;
+    int num_attention_heads      = 0;
+    int intermediate_size        = 0;
+    int max_position_embeddings  = 0;
+    int num_hidden_layers        = 0;
+    int vocab_size               = 0;   // phoneme vocab (mirrors KokoroConfig::n_tokens)
+};
+
+// Model hyperparameters. Read from the model's `config.json` by Kokoro::load —
+// the zero defaults below are placeholders that get overwritten on a real
+// load. The fixed-rate `sample_rate` is the one true default: Kokoro outputs
+// 24 kHz unconditionally.
 struct KokoroConfig {
-    int sample_rate = 24000;   // Kokoro output rate (fixed)
-    int n_fft       = 0;       // iSTFT head transform size
-    int hop_length  = 0;       // iSTFT hop
-    int win_length  = 0;       // iSTFT window length
-    int hidden_dim  = 0;       // text encoder / predictor hidden width
-    int style_dim   = 0;       // half a voice embedding (a voice is 2*style_dim)
-    int n_tokens    = 0;       // phoneme vocabulary size
-    int max_context = 0;       // phoneme-count limit for one utterance
+    int sample_rate              = 24000;   // Kokoro output rate (fixed)
+    int n_tokens                 = 0;       // phoneme vocabulary size
+    int hidden_dim               = 0;       // text encoder / predictor hidden width
+    int style_dim                = 0;       // half a voice embedding (voice_dim = 2*style_dim)
+    int n_layer                  = 0;       // text encoder layer count
+    int n_mels                   = 0;       // mel spectrogram bands (training-side; not used at inference)
+    int dim_in                   = 0;       // text encoder input channel count
+    int max_dur                  = 0;       // duration predictor max frame count per phoneme
+    int max_conv_dim             = 0;       // decoder feature-stack channel cap
+    int text_encoder_kernel_size = 0;       // conv kernel in the text encoder CNN
+
+    IStftNetConfig decoder;
+    PLBertConfig   plbert;
+
+    // Phoneme string → token id. Optional convenience for callers without a
+    // separate G2P pipeline that returns ids directly — Kokoro itself only
+    // needs the inverse mapping at inference.
+    std::unordered_map<std::string, int> vocab;
 };
 
 // A Kokoro voice pack: the precomputed style embedding that conditions the
@@ -91,7 +127,15 @@ public:
     void load(const std::string& model_dir,
               brotensor::Device device = brotensor::Device::CPU);
 
-    // Load a single voice pack from a weights file.
+    // Load a single voice pack from a weights file. The file is a raw
+    // little-endian FP32 buffer of `rows * voice_dim` elements, row-major,
+    // where `voice_dim = 2 * style_dim` (from KokoroConfig) and `rows` is the
+    // maximum phoneme count supported by the pack (510 in the upstream Kokoro
+    // distribution). The row count is inferred from the file size:
+    // `file_size_bytes / (voice_dim * 4)` must divide evenly. PyTorch .pt
+    // voice packs from the upstream distribution should be converted to this
+    // raw format once, by the caller — brosoundml does not pull in a pickle
+    // reader. The returned Voice's `packs` tensor lives on Device::CPU.
     Voice load_voice(const std::string& voice_path) const;
 
     // Run the full pipeline: phoneme token ids (see the misaki G2P note above)

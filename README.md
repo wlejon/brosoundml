@@ -20,8 +20,9 @@ Early — the repo is **stood up**, not yet operational.
 |---|---|
 | Build system, sibling wiring (bromath + brotensor) | ✅ done |
 | `AudioBuffer` + 16-bit PCM WAV read/write | ✅ done, tested |
-| Kokoro public API (`Kokoro`, `KokoroConfig`, `Voice`) | ✅ designed |
-| Kokoro forward pass | 🚧 build-out — see the plan below |
+| Kokoro public API (`Kokoro`, `KokoroConfig`, `Voice`) | ✅ committed |
+| Stage 1 — `config.json` parser, `model.safetensors` open, voice-pack loader | ✅ done, tested |
+| Kokoro forward pass (stages 2–5) | 🚧 build-out — see the plan below |
 
 While the forward pass is in build-out, `Kokoro::load` / `synthesize` throw a
 `std::runtime_error` naming the stage; the API shape itself is committed and
@@ -109,9 +110,11 @@ shapes are known.
 
 Ordered so each stage is independently testable:
 
-1. **Weight loading** — parse `config.json` into `KokoroConfig`; load
+1. **Weight loading** ✅ — parse `config.json` into `KokoroConfig`; open
    `model.safetensors` (via `brotensor::safetensors`) and the voice packs into
-   tensors. `load` / `load_voice` / `Voice::pick_for` become real.
+   tensors. `load` / `load_voice` / `Voice::pick_for` are real. Voice packs are
+   loaded as raw little-endian FP32 of shape `(rows, 2*style_dim)`; convert
+   upstream Kokoro `.pt` voices to this format once on the host.
 2. **Module layer** — a small nn-module set over brotensor ops: `Linear`,
    `Conv1d`, `LSTM` (composed), `AdaINResBlock`, `LayerNorm`. Unit-tested with
    synthetic weights, independent of Kokoro.
