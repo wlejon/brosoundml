@@ -109,6 +109,13 @@ if(BROSOUNDML_INSTALL)
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
+# --- Tools ---
+option(BROSOUNDML_TOOLS "Build brosoundml CLI tools" ON)
+if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_executable(brosoundml_synth tools/synth.cpp)
+    target_link_libraries(brosoundml_synth PRIVATE brosoundml)
+endif()
+
 # --- Tests ---
 option(BROSOUNDML_TESTS "Build brosoundml tests" ON)
 if(BROSOUNDML_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
