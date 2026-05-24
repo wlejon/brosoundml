@@ -977,4 +977,127 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     N_proj.forward(N_x, /*N=*/1, /*L=*/N_L, out.N_pred);
 }
 
+// ─── DecoderBackbone ───────────────────────────────────────────────────────
+
+void DecoderBackbone::load_from(const stf::File& f) {
+    const std::string where = "DecoderBackbone::load_from";
+    const std::string p = "decoder.module.";
+
+    // F0_conv / N_conv: Conv1d(1, 1, k=3, s=2, p=1) — downsample 2x.
+    auto load_strided_conv = [&](const std::string& name, Conv1d& c) {
+        c.in_channels  = 1;
+        c.out_channels = 1;
+        c.kernel_size  = 3;
+        c.stride       = 2;
+        c.padding      = 1;
+        c.dilation     = 1;
+        c.groups       = 1;
+        upload(f, p + name + ".weight", 1, 1 * 3, c.W, where);
+        upload(f, p + name + ".bias",   1, 1,     c.b, where);
+    };
+    load_strided_conv("F0_conv", F0_conv);
+    load_strided_conv("N_conv",  N_conv);
+
+    // asr_res: Sequential(Conv1d(512, 64, k=1)) — wrapped in a Sequential so
+    // the state-dict key has a `.0.` infix.
+    asr_res.in_channels  = 512;
+    asr_res.out_channels = 64;
+    asr_res.kernel_size  = 1;
+    asr_res.padding      = 0;
+    asr_res.stride       = 1;
+    asr_res.dilation     = 1;
+    asr_res.groups       = 1;
+    upload(f, p + "asr_res.0.weight", 64, 512, asr_res.W, where);
+    upload(f, p + "asr_res.0.bias",   64, 1,   asr_res.b, where);
+
+    // encode: AdainResBlk1d(514, 1024, style=128, no upsample, learned_sc=True).
+    load_adain_resblk(f, p + "encode", /*dim_in=*/514, /*dim_out=*/1024,
+                      /*style_dim=*/128, /*upsample=*/false, encode, where);
+
+    // decode[0..3]: 1090 -> 1024 (no upsample) x3, then 1090 -> 512 (upsample).
+    decode.clear();
+    decode.resize(4);
+    load_adain_resblk(f, p + "decode.0", 1090, 1024, 128, false, decode[0], where);
+    load_adain_resblk(f, p + "decode.1", 1090, 1024, 128, false, decode[1], where);
+    load_adain_resblk(f, p + "decode.2", 1090, 1024, 128, false, decode[2], where);
+    load_adain_resblk(f, p + "decode.3", 1090, 512,  128, true,  decode[3], where);
+}
+
+namespace {
+
+// Concat NCL tensors along the channel axis. Each part is (1, C_i * L) with
+// the same L; out is (1, (sum C_i) * L) with channel blocks laid end-to-end.
+void cat_channels_ncl(const std::vector<const bt::Tensor*>& parts,
+                      int L, bt::Tensor& out) {
+    int C_total = 0;
+    for (const auto* p : parts) C_total += p->cols / L;
+    out.resize(1, C_total * L, bt::Dtype::FP32);
+    float* dst = out.host_f32_mut();
+    int c_off = 0;
+    for (const auto* p : parts) {
+        const int C = p->cols / L;
+        const float* src = p->host_f32();
+        for (int c = 0; c < C; ++c) {
+            std::memcpy(dst + (c_off + c) * L, src + c * L,
+                        static_cast<std::size_t>(L) * sizeof(float));
+        }
+        c_off += C;
+    }
+}
+
+}  // namespace
+
+void DecoderBackbone::forward(const bt::Tensor& asr,
+                              const bt::Tensor& F0_pred,
+                              const bt::Tensor& N_pred,
+                              const bt::Tensor& ref_s,
+                              int T,
+                              bt::Tensor& gen_in) const {
+    const int style_dim = 128;
+
+    bt::Tensor style = bt::Tensor::zeros_on(bt::Device::CPU, 1, style_dim, bt::Dtype::FP32);
+    std::memcpy(style.host_f32_mut(), ref_s.host_f32(),
+                static_cast<std::size_t>(style_dim) * sizeof(float));
+
+    // F0_pred / N_pred: (1, 2*T) -> unsqueeze to (1, 1*(2T)) NCL -> stride-2
+    // conv -> (1, 1*T).
+    bt::Tensor F0_dn, N_dn;
+    F0_conv.forward(F0_pred, /*N=*/1, /*L=*/2 * T, F0_dn);
+    N_conv .forward(N_pred,  /*N=*/1, /*L=*/2 * T, N_dn);
+
+    // Concat [asr, F0_dn, N_dn] along channel axis: (1, 514*T).
+    bt::Tensor dec_pre;
+    cat_channels_ncl({&asr, &F0_dn, &N_dn}, T, dec_pre);
+
+    // encode: AdainResBlk1d(514 -> 1024).
+    bt::Tensor enc_out;
+    int L_after = 0;
+    adain_resblk_1d_forward(encode, dec_pre, T, style, L_after, enc_out);
+
+    // asr_res = Conv1d(512 -> 64, k=1) over asr.
+    bt::Tensor asr_res_out;
+    asr_res.forward(asr, /*N=*/1, /*L=*/T, asr_res_out);
+
+    // decode loop.
+    bt::Tensor x = std::move(enc_out);
+    int L_now = L_after;
+    bool res = true;
+    for (size_t i = 0; i < decode.size(); ++i) {
+        if (res) {
+            // Concat x (1024 channels) with asr_res (64) + F0_dn (1) + N_dn (1)
+            // = 1090 channels at the same L_now=T.
+            bt::Tensor catted;
+            cat_channels_ncl({&x, &asr_res_out, &F0_dn, &N_dn}, L_now, catted);
+            x = std::move(catted);
+        }
+        bt::Tensor y;
+        int L_next = 0;
+        adain_resblk_1d_forward(decode[i], x, L_now, style, L_next, y);
+        x = std::move(y);
+        L_now = L_next;
+        if (decode[i].upsample) res = false;
+    }
+    gen_in = std::move(x);
+}
+
 }  // namespace brosoundml

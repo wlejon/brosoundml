@@ -186,6 +186,44 @@ int main() {
     compare(po.N_pred,  ref_f0n.get("N_pred"),
             2 * total, "predictor.N_pred",  5e-3f, 5e-4f);
 
+    // ─── DecoderBackbone ───────────────────────────────────────────────────
+    // asr = t_en @ pred_aln_trg : (1, 512*total). Compute it here so we don't
+    // depend on the reference for the upstream alignment matrix.
+    bt::Tensor asr_ncl = bt::Tensor::zeros_on(bt::Device::CPU,
+                                              1, cfg.hidden_dim * total,
+                                              bt::Dtype::FP32);
+    {
+        const float* te_d = t_en.host_f32();
+        float* asr_d = asr_ncl.host_f32_mut();
+        int t = 0;
+        for (int l = 0; l < L; ++l) {
+            const int reps = po.pred_dur[l];
+            for (int r = 0; r < reps; ++r) {
+                for (int c = 0; c < cfg.hidden_dim; ++c) {
+                    asr_d[c * total + t] = te_d[c * L + l];
+                }
+                ++t;
+            }
+        }
+    }
+
+    stf::File ref_dec_pre = stf::File::open((ref_dir / "08_decoder_pre.safetensors").string());
+    stf::File ref_dec_loop= stf::File::open((ref_dir / "09_decoder_decode.safetensors").string());
+
+    // Sanity check our hand-rolled `asr` matches the upstream `asr` reference.
+    stf::File ref_asr = stf::File::open((ref_dir / "07_asr.safetensors").string());
+    compare(asr_ncl, ref_asr.get("asr"),
+            cfg.hidden_dim * total, "asr (length-regulated)", 1e-3f, 1e-4f);
+
+    brosoundml::DecoderBackbone dec;
+    dec.load_from(weights);
+
+    bt::Tensor gen_in;
+    dec.forward(asr_ncl, po.F0_pred, po.N_pred, ref_s, total, gen_in);
+    const int L_gen = 2 * total;
+    compare(gen_in, ref_dec_loop.get("gen_in"),
+            512 * L_gen, "decoder.gen_in", 5e-3f, 5e-4f);
+
     if (failures == 0) {
         std::printf("test_kokoro_modules: all checks passed\n");
         return 0;

@@ -217,6 +217,30 @@ struct Predictor {
                  Output& out) const;
 };
 
+// ─── Decoder backbone (everything up to the Generator) ────────────────────
+//
+// Mirrors kokoro/istftnet.py::Decoder.forward, except the trailing
+// `self.generator(...)` call. Owns F0_conv, N_conv, asr_res, encode, and the
+// 4-block decode list. Output is the (1, 512*L_after_upsample) tensor the
+// Generator consumes — captured as `gen_in` in the reference dump.
+struct DecoderBackbone {
+    Conv1d F0_conv;     // (1, 1, 3) stride 2 padding 1
+    Conv1d N_conv;      // (1, 1, 3) stride 2 padding 1
+    Conv1d asr_res;     // (64, 512, 1) — 1x1 projection
+    AdainResBlk1dWeights              encode;
+    std::vector<AdainResBlk1dWeights> decode;    // 4 blocks; the last upsamples 2x
+
+    void load_from(const brotensor::safetensors::File& f);
+    // asr: (1, 512*T).  F0_pred / N_pred: (1, 2*T).  ref_s: (1, 256).
+    // gen_in is written as (1, 512 * (2*T)) NCL — input to the Generator.
+    void forward(const brotensor::Tensor& asr,
+                 const brotensor::Tensor& F0_pred,
+                 const brotensor::Tensor& N_pred,
+                 const brotensor::Tensor& ref_s,
+                 int T,
+                 brotensor::Tensor& gen_in) const;
+};
+
 // ─── Per-(N,L) channel-wise LayerNorm on NCL inputs ────────────────────────
 //
 // The StyleTTS2 / Kokoro CNN-stack LayerNorm: at every (n, l) position,

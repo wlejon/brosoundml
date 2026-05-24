@@ -155,9 +155,67 @@ def main() -> int:
         asr = t_en @ pred_aln_trg
         dump(out_dir, "07_asr", {"asr": asr})
 
-        # 7. Decoder + iSTFT head.
-        audio = model.decoder(asr, F0_pred, N_pred, ref_s_b[:, :128]).squeeze()
-        dump(out_dir, "08_audio", {"audio": audio})
+        # 7. Decoder + iSTFT head — capture every intermediate so each stage
+        #    of the C++ port can be validated independently.
+        dec = model.decoder
+        dec_style = ref_s_b[:, :128]
+
+        F0_dn = dec.F0_conv(F0_pred.unsqueeze(1))     # (1, 1, T)
+        N_dn  = dec.N_conv (N_pred.unsqueeze(1))      # (1, 1, T)
+        dec_pre_x = torch.cat([asr, F0_dn, N_dn], axis=1)  # (1, 514, T)
+        dec_enc_x = dec.encode(dec_pre_x, dec_style)        # (1, 1024, T)
+        asr_res   = dec.asr_res(asr)                        # (1, 64, T)
+        dump(out_dir, "08_decoder_pre", {
+            "F0_dn":      F0_dn,
+            "N_dn":       N_dn,
+            "dec_pre_x":  dec_pre_x,
+            "dec_enc_x":  dec_enc_x,
+            "asr_res":    asr_res,
+        })
+
+        # decode loop — record after each block.
+        x = dec_enc_x
+        res = True
+        cat_inputs = []
+        block_outs = []
+        for i, block in enumerate(dec.decode):
+            if res:
+                x = torch.cat([x, asr_res, F0_dn, N_dn], axis=1)
+                cat_inputs.append(x.detach())
+            x = block(x, dec_style)
+            block_outs.append(x.detach())
+            if block.upsample_type != "none":
+                res = False
+        dec_gen_in = x  # (1, 512, 2*T) after the upsample block
+        dec_tensors = {}
+        for i, t in enumerate(cat_inputs):
+            dec_tensors[f"cat_in_{i}"] = t
+        for i, t in enumerate(block_outs):
+            dec_tensors[f"block_out_{i}"] = t
+        dec_tensors["gen_in"] = dec_gen_in.clone()
+        dump(out_dir, "09_decoder_decode", dec_tensors)
+
+        # Generator: capture the source (random-driven) and the final audio.
+        torch.manual_seed(0)
+        gen = dec.generator
+        f0_for_src = F0_pred[:, None]
+        f0_up = gen.f0_upsamp(f0_for_src).transpose(1, 2)
+        har_source, noi_source, uv = gen.m_source(f0_up)
+        har_source = har_source.transpose(1, 2).squeeze(1)
+        har_spec, har_phase = gen.stft.transform(har_source)
+        har = torch.cat([har_spec, har_phase], dim=1)
+        dump(out_dir, "10_generator_src", {
+            "har_source": har_source,
+            "har_spec":   har_spec,
+            "har_phase":  har_phase,
+            "har":        har,
+        })
+
+        # Re-run the full audio with the same seed so the audio matches the
+        # captured har source (otherwise random reuse would diverge).
+        torch.manual_seed(0)
+        audio = dec(asr, F0_pred, N_pred, dec_style).squeeze()
+        dump(out_dir, "11_audio", {"audio": audio})
 
     print("\nDone.")
     return 0
