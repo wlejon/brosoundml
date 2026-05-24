@@ -78,6 +78,11 @@ struct Whisper::Impl {
     LogMel            log_mel;
     // Stage 3: encoder. Holds all encoder-side weights + per-layer modules.
     WhisperEncoder    encoder;
+    // Stage 4: decoder + KV cache. The cache is owned by Impl so consecutive
+    // transcriptions reuse the same per-layer slabs (allocation-free decode
+    // loop, once the loop lands in stage 5).
+    WhisperDecoder    decoder;
+    mutable WhisperKVCache cache;
 
     // Encode an audio buffer to (max_source_positions, d_model) hidden states.
     // Called from the future transcribe() path; exposed here so the test layer
@@ -88,6 +93,29 @@ struct Whisper::Impl {
         brotensor::Tensor mel;
         log_mel.forward(audio, mel);
         encoder.forward(mel, hidden);
+    }
+
+    // Decoder prefill: T = prompt_ids.size(). Resets the cache, primes its
+    // cross-attn slot from encoder_hidden, runs the decoder once over the
+    // whole prompt, and writes the (T, vocab_size) logits to `logits`. After
+    // the call `cache.size() == T`. The caller's greedy loop reads
+    // logits.row(T-1) to pick the first generated token.
+    void decode_prefill(const std::int32_t* prompt_ids, int T,
+                        const brotensor::Tensor& encoder_hidden,
+                        brotensor::Tensor& logits) const {
+        cache.reset();
+        decoder.prime_cross(encoder_hidden, cache);
+        decoder.forward(prompt_ids, T, /*pos_offset=*/0, cache, logits);
+    }
+
+    // Single-step decode: run the decoder over one token at the current
+    // cache length, writing (1, vocab_size) logits. The cache grows by one
+    // row. The caller is responsible for `decode_prefill` having been called
+    // first (cross-attn cache must already be primed).
+    void decode_step(std::int32_t token_id,
+                     brotensor::Tensor& logits) const {
+        const int pos_offset = cache.size();
+        decoder.forward(&token_id, /*T=*/1, pos_offset, cache, logits);
     }
 };
 
@@ -112,7 +140,7 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
     impl_->device = device;
 
     if (device != brotensor::Device::CPU) {
-        fail("Whisper::load", "stages 2-3 not yet ported off CPU");
+        fail("Whisper::load", "stages 2-4 not yet ported off CPU");
     }
 
     auto weights = brotensor::safetensors::File::open(weight_path.string());
@@ -129,6 +157,22 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
                              impl_->config.encoder_ffn_dim,
                              impl_->config.encoder_attention_heads);
 
+    // Stage 4: load the decoder + pre-allocate the per-layer KV cache. Cache
+    // storage outlives every transcribe() call so the eventual greedy loop
+    // never reallocates.
+    impl_->decoder.load_from(weights,
+                             impl_->config.d_model,
+                             impl_->config.decoder_layers,
+                             impl_->config.decoder_ffn_dim,
+                             impl_->config.decoder_attention_heads,
+                             impl_->config.vocab_size,
+                             impl_->config.max_target_positions,
+                             impl_->config.max_source_positions);
+    impl_->cache.allocate(impl_->config.decoder_layers,
+                          impl_->config.d_model,
+                          impl_->config.max_target_positions,
+                          impl_->config.max_source_positions);
+
     impl_->loaded = true;
 }
 
@@ -142,7 +186,7 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     (void)prompt_ids;
     (void)max_new_tokens;
     fail("Whisper::transcribe",
-         "not yet implemented — stage 4 (decoder + greedy decode) pending");
+         "not yet implemented — stage 5 (greedy decode loop + tokenizer integration) pending");
 }
 
 const WhisperConfig& Whisper::config() const { return impl_->config; }

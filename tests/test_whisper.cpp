@@ -132,8 +132,9 @@ static int run() {
               "transcribe() after a failed load still throws");
     }
 
-    // Stage 4 stub: once the encoder is wired in (test_whisper_modules covers
-    // that with synthetic weights), transcribe() throws the stage-4 message.
+    // Stage 5 stub: once the encoder + decoder are wired in (test_whisper_modules
+    // and test_whisper_decoder cover those with synthetic weights), transcribe()
+    // throws the stage-5 message naming the missing greedy-decode loop.
     // We exercise this contract via the staged error string from the loader
     // path above; the parsed-config sanity also runs there. Field-by-field
     // config asserts stay below to lock the parse contract.

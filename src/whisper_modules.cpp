@@ -478,4 +478,491 @@ void WhisperEncoder::forward(const bt::Tensor& mel, bt::Tensor& hidden) const {
     layer_norm.forward(x, hidden);
 }
 
+// ─── WhisperKVCache ────────────────────────────────────────────────────────
+
+void WhisperKVCache::allocate(int decoder_layers, int d_model,
+                              int max_target_positions, int max_source_positions) {
+    const std::string where = "WhisperKVCache::allocate";
+    if (decoder_layers <= 0) fail(where, "decoder_layers must be positive");
+    if (d_model <= 0)        fail(where, "d_model must be positive");
+    if (max_target_positions <= 0) fail(where, "max_target_positions must be positive");
+    if (max_source_positions <= 0) fail(where, "max_source_positions must be positive");
+
+    layers.clear();
+    layers.resize(static_cast<std::size_t>(decoder_layers));
+    for (auto& l : layers) {
+        l.self_k = bt::Tensor::zeros_on(bt::Device::CPU, max_target_positions,
+                                        d_model, bt::Dtype::FP32);
+        l.self_v = bt::Tensor::zeros_on(bt::Device::CPU, max_target_positions,
+                                        d_model, bt::Dtype::FP32);
+        l.cross_k = bt::Tensor::zeros_on(bt::Device::CPU, max_source_positions,
+                                         d_model, bt::Dtype::FP32);
+        l.cross_v = bt::Tensor::zeros_on(bt::Device::CPU, max_source_positions,
+                                         d_model, bt::Dtype::FP32);
+        l.self_len = 0;
+        l.cross_primed = false;
+    }
+}
+
+void WhisperKVCache::reset() {
+    for (auto& l : layers) {
+        l.self_len = 0;
+        l.cross_primed = false;
+    }
+}
+
+// ─── mha_causal_cached_fp32 ────────────────────────────────────────────────
+
+void mha_causal_cached_fp32(const bt::Tensor& X,
+                            const bt::Tensor& Wq, const bt::Tensor& bq,
+                            const bt::Tensor& Wk, const bt::Tensor& bk,
+                            const bt::Tensor& Wv, const bt::Tensor& bv,
+                            const bt::Tensor& Wo, const bt::Tensor& bo,
+                            int num_heads,
+                            WhisperLayerCache& cache,
+                            bt::Tensor& out) {
+    const std::string where = "mha_causal_cached_fp32";
+    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
+        fail(where, "currently CPU FP32 only");
+    }
+    const int T = X.rows;
+    const int D = X.cols;
+    if (D <= 0 || T <= 0) fail(where, "X must be non-empty");
+    if (D % num_heads != 0) {
+        fail(where, "embed_dim " + std::to_string(D) +
+             " not divisible by num_heads " + std::to_string(num_heads));
+    }
+    if (cache.self_k.rows == 0 || cache.self_k.cols != D ||
+        cache.self_v.rows == 0 || cache.self_v.cols != D) {
+        fail(where, "cache.self_k/self_v not pre-allocated to (>=T, D)");
+    }
+    if (cache.self_len + T > cache.self_k.rows) {
+        fail(where, "cache overflow: self_len=" + std::to_string(cache.self_len) +
+             " + T=" + std::to_string(T) + " > " +
+             std::to_string(cache.self_k.rows));
+    }
+
+    // Project Q, K, V for the current T input rows.
+    bt::Tensor Q, Knew, Vnew;
+    bt::linear_forward_batched(Wq, bq, X, Q);     // (T, D)
+    bt::linear_forward_batched(Wk, bk, X, Knew);  // (T, D)
+    bt::linear_forward_batched(Wv, bv, X, Vnew);  // (T, D)
+
+    // Append Knew, Vnew into the cache at rows [self_len, self_len + T).
+    {
+        const std::size_t row_bytes = static_cast<std::size_t>(D) * sizeof(float);
+        float*       kdst = cache.self_k.host_f32_mut()
+                          + static_cast<std::size_t>(cache.self_len) * D;
+        float*       vdst = cache.self_v.host_f32_mut()
+                          + static_cast<std::size_t>(cache.self_len) * D;
+        std::memcpy(kdst, Knew.host_f32(), static_cast<std::size_t>(T) * row_bytes);
+        std::memcpy(vdst, Vnew.host_f32(), static_cast<std::size_t>(T) * row_bytes);
+    }
+
+    const int head_dim = D / num_heads;
+    const float scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const int Lk_total = cache.self_len + T;
+
+    const float* Qd = Q.host_f32();
+    const float* Kd = cache.self_k.host_f32();
+    const float* Vd = cache.self_v.host_f32();
+
+    bt::Tensor ctx = bt::Tensor::zeros_on(bt::Device::CPU, T, D, bt::Dtype::FP32);
+    float* ctx_d = ctx.host_f32_mut();
+
+    std::vector<float> scores(static_cast<std::size_t>(Lk_total), 0.0f);
+
+    // Query row q (0..T-1) corresponds to absolute position self_len + q;
+    // it may attend to keys [0, self_len + q].
+    for (int h = 0; h < num_heads; ++h) {
+        for (int q = 0; q < T; ++q) {
+            const int abs_q  = cache.self_len + q;
+            const int kv_end = abs_q + 1;                 // exclusive
+            const float* q_vec = Qd + static_cast<std::size_t>(q) * D + h * head_dim;
+
+            float max_score = -INFINITY;
+            for (int k = 0; k < kv_end; ++k) {
+                const float* k_vec = Kd + static_cast<std::size_t>(k) * D + h * head_dim;
+                float s = 0.0f;
+                for (int j = 0; j < head_dim; ++j) s += q_vec[j] * k_vec[j];
+                s *= scale;
+                scores[static_cast<std::size_t>(k)] = s;
+                if (s > max_score) max_score = s;
+            }
+            float sum = 0.0f;
+            for (int k = 0; k < kv_end; ++k) {
+                scores[static_cast<std::size_t>(k)] =
+                    std::exp(scores[static_cast<std::size_t>(k)] - max_score);
+                sum += scores[static_cast<std::size_t>(k)];
+            }
+            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+            for (int k = 0; k < kv_end; ++k) {
+                scores[static_cast<std::size_t>(k)] *= inv;
+            }
+
+            float* ctx_row = ctx_d + static_cast<std::size_t>(q) * D + h * head_dim;
+            for (int k = 0; k < kv_end; ++k) {
+                const float w = scores[static_cast<std::size_t>(k)];
+                const float* v_vec = Vd + static_cast<std::size_t>(k) * D + h * head_dim;
+                for (int j = 0; j < head_dim; ++j) ctx_row[j] += w * v_vec[j];
+            }
+        }
+    }
+
+    bt::linear_forward_batched(Wo, bo, ctx, out);
+
+    cache.self_len += T;
+}
+
+// ─── cross_attn_cached_fp32 ────────────────────────────────────────────────
+
+void cross_attn_cached_fp32(const bt::Tensor& X,
+                            const bt::Tensor& Wq, const bt::Tensor& bq,
+                            const bt::Tensor& Wo, const bt::Tensor& bo,
+                            int num_heads,
+                            const WhisperLayerCache& cache,
+                            bt::Tensor& out) {
+    const std::string where = "cross_attn_cached_fp32";
+    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
+        fail(where, "currently CPU FP32 only");
+    }
+    if (!cache.cross_primed) {
+        fail(where, "cross-attn cache not primed — call prime_cross first");
+    }
+    const int T  = X.rows;
+    const int D  = X.cols;
+    const int Lk = cache.cross_k.rows;
+    if (D <= 0 || T <= 0) fail(where, "X must be non-empty");
+    if (D % num_heads != 0) {
+        fail(where, "embed_dim " + std::to_string(D) +
+             " not divisible by num_heads " + std::to_string(num_heads));
+    }
+    if (cache.cross_k.cols != D || cache.cross_v.cols != D ||
+        cache.cross_v.rows != Lk) {
+        fail(where, "cross_k/cross_v shape mismatch");
+    }
+
+    bt::Tensor Q;
+    bt::linear_forward_batched(Wq, bq, X, Q);  // (T, D)
+
+    const int head_dim = D / num_heads;
+    const float scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const float* Qd = Q.host_f32();
+    const float* Kd = cache.cross_k.host_f32();
+    const float* Vd = cache.cross_v.host_f32();
+
+    bt::Tensor ctx = bt::Tensor::zeros_on(bt::Device::CPU, T, D, bt::Dtype::FP32);
+    float* ctx_d = ctx.host_f32_mut();
+
+    std::vector<float> scores(static_cast<std::size_t>(Lk), 0.0f);
+
+    for (int h = 0; h < num_heads; ++h) {
+        for (int q = 0; q < T; ++q) {
+            const float* q_vec = Qd + static_cast<std::size_t>(q) * D + h * head_dim;
+
+            float max_score = -INFINITY;
+            for (int k = 0; k < Lk; ++k) {
+                const float* k_vec = Kd + static_cast<std::size_t>(k) * D + h * head_dim;
+                float s = 0.0f;
+                for (int j = 0; j < head_dim; ++j) s += q_vec[j] * k_vec[j];
+                s *= scale;
+                scores[static_cast<std::size_t>(k)] = s;
+                if (s > max_score) max_score = s;
+            }
+            float sum = 0.0f;
+            for (int k = 0; k < Lk; ++k) {
+                scores[static_cast<std::size_t>(k)] =
+                    std::exp(scores[static_cast<std::size_t>(k)] - max_score);
+                sum += scores[static_cast<std::size_t>(k)];
+            }
+            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+            for (int k = 0; k < Lk; ++k) {
+                scores[static_cast<std::size_t>(k)] *= inv;
+            }
+
+            float* ctx_row = ctx_d + static_cast<std::size_t>(q) * D + h * head_dim;
+            for (int k = 0; k < Lk; ++k) {
+                const float w = scores[static_cast<std::size_t>(k)];
+                const float* v_vec = Vd + static_cast<std::size_t>(k) * D + h * head_dim;
+                for (int j = 0; j < head_dim; ++j) ctx_row[j] += w * v_vec[j];
+            }
+        }
+    }
+
+    bt::linear_forward_batched(Wo, bo, ctx, out);
+}
+
+// ─── prime_cross_cache_fp32 ────────────────────────────────────────────────
+
+void prime_cross_cache_fp32(const bt::Tensor& encoder_hidden,
+                            const bt::Tensor& Wk, const bt::Tensor& bk,
+                            const bt::Tensor& Wv, const bt::Tensor& bv,
+                            WhisperLayerCache& cache) {
+    const std::string where = "prime_cross_cache_fp32";
+    if (encoder_hidden.device != bt::Device::CPU ||
+        encoder_hidden.dtype  != bt::Dtype::FP32) {
+        fail(where, "currently CPU FP32 only");
+    }
+    const int L = encoder_hidden.rows;
+    const int D = encoder_hidden.cols;
+    if (cache.cross_k.rows != L || cache.cross_k.cols != D ||
+        cache.cross_v.rows != L || cache.cross_v.cols != D) {
+        fail(where, "cross_k/cross_v cache shape (" +
+             std::to_string(cache.cross_k.rows) + "," +
+             std::to_string(cache.cross_k.cols) + ") != encoder hidden (" +
+             std::to_string(L) + "," + std::to_string(D) +
+             ") — call WhisperKVCache::allocate with the matching dims first");
+    }
+
+    bt::Tensor Kproj, Vproj;
+    bt::linear_forward_batched(Wk, bk, encoder_hidden, Kproj);
+    bt::linear_forward_batched(Wv, bv, encoder_hidden, Vproj);
+
+    const std::size_t bytes = static_cast<std::size_t>(L) * D * sizeof(float);
+    std::memcpy(cache.cross_k.host_f32_mut(), Kproj.host_f32(), bytes);
+    std::memcpy(cache.cross_v.host_f32_mut(), Vproj.host_f32(), bytes);
+    cache.cross_primed = true;
+}
+
+// ─── WhisperDecoderLayer ───────────────────────────────────────────────────
+
+void WhisperDecoderLayer::load_from(const stf::File& f,
+                                    const std::string& prefix,
+                                    int dm, int ffn, int nh) {
+    const std::string where = "WhisperDecoderLayer::load_from";
+    d_model   = dm;
+    ffn_dim   = ffn;
+    num_heads = nh;
+
+    // Self-attention LN.
+    load_layernorm(f, prefix + "self_attn_layer_norm", dm, 1e-5f,
+                   self_attn_layer_norm, where);
+
+    // Self-attention projections. K has NO bias on disk; we zero-fill bk.
+    upload(f, prefix + "self_attn.q_proj.weight",   dm, dm, self_Wq, where);
+    upload(f, prefix + "self_attn.q_proj.bias",     dm, 1,  self_bq, where);
+    upload(f, prefix + "self_attn.k_proj.weight",   dm, dm, self_Wk, where);
+    self_bk = bt::Tensor::zeros_on(bt::Device::CPU, dm, 1, bt::Dtype::FP32);
+    upload(f, prefix + "self_attn.v_proj.weight",   dm, dm, self_Wv, where);
+    upload(f, prefix + "self_attn.v_proj.bias",     dm, 1,  self_bv, where);
+    upload(f, prefix + "self_attn.out_proj.weight", dm, dm, self_Wo, where);
+    upload(f, prefix + "self_attn.out_proj.bias",   dm, 1,  self_bo, where);
+
+    // Cross-attention LN.
+    load_layernorm(f, prefix + "encoder_attn_layer_norm", dm, 1e-5f,
+                   encoder_attn_layer_norm, where);
+
+    // Cross-attention projections. K has NO bias on disk; we zero-fill bk.
+    upload(f, prefix + "encoder_attn.q_proj.weight",   dm, dm, cross_Wq, where);
+    upload(f, prefix + "encoder_attn.q_proj.bias",     dm, 1,  cross_bq, where);
+    upload(f, prefix + "encoder_attn.k_proj.weight",   dm, dm, cross_Wk, where);
+    cross_bk = bt::Tensor::zeros_on(bt::Device::CPU, dm, 1, bt::Dtype::FP32);
+    upload(f, prefix + "encoder_attn.v_proj.weight",   dm, dm, cross_Wv, where);
+    upload(f, prefix + "encoder_attn.v_proj.bias",     dm, 1,  cross_bv, where);
+    upload(f, prefix + "encoder_attn.out_proj.weight", dm, dm, cross_Wo, where);
+    upload(f, prefix + "encoder_attn.out_proj.bias",   dm, 1,  cross_bo, where);
+
+    // FFN.
+    load_layernorm(f, prefix + "final_layer_norm", dm, 1e-5f,
+                   final_layer_norm, where);
+    load_linear(f, prefix + "fc1", ffn, dm, fc1, where);
+    load_linear(f, prefix + "fc2", dm, ffn, fc2, where);
+}
+
+void WhisperDecoderLayer::prime_cross(const bt::Tensor& encoder_hidden,
+                                      WhisperLayerCache& cache) const {
+    prime_cross_cache_fp32(encoder_hidden,
+                           cross_Wk, cross_bk, cross_Wv, cross_bv,
+                           cache);
+}
+
+void WhisperDecoderLayer::forward(const bt::Tensor& X,
+                                  WhisperLayerCache& cache,
+                                  bt::Tensor& Y) const {
+    const std::string where = "WhisperDecoderLayer::forward";
+    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
+        fail(where, "stage 4 not yet ported off CPU");
+    }
+    if (X.cols != d_model) {
+        fail(where, "X cols=" + std::to_string(X.cols) +
+                    " != d_model=" + std::to_string(d_model));
+    }
+
+    // ─── Causal self-attention residual ────────────────────────────────────
+    bt::Tensor x_ln;
+    self_attn_layer_norm.forward(X, x_ln);                  // (T, D)
+    bt::Tensor self_out;
+    mha_causal_cached_fp32(x_ln,
+                           self_Wq, self_bq,
+                           self_Wk, self_bk,
+                           self_Wv, self_bv,
+                           self_Wo, self_bo,
+                           num_heads, cache, self_out);     // (T, D)
+    bt::add_inplace(self_out, X);                            // residual
+
+    // ─── Cross-attention residual ──────────────────────────────────────────
+    bt::Tensor x_ca_ln;
+    encoder_attn_layer_norm.forward(self_out, x_ca_ln);
+    bt::Tensor cross_out;
+    cross_attn_cached_fp32(x_ca_ln,
+                           cross_Wq, cross_bq,
+                           cross_Wo, cross_bo,
+                           num_heads, cache, cross_out);    // (T, D)
+    bt::add_inplace(cross_out, self_out);                    // residual
+
+    // ─── FFN residual ──────────────────────────────────────────────────────
+    bt::Tensor ffn_ln;
+    final_layer_norm.forward(cross_out, ffn_ln);
+    bt::Tensor h1;
+    fc1.forward_batched(ffn_ln, h1);
+    bt::Tensor h1_act;
+    bt::gelu_forward(h1, h1_act);
+    bt::Tensor h2;
+    fc2.forward_batched(h1_act, h2);
+    bt::add_inplace(h2, cross_out);                          // residual
+
+    Y = std::move(h2);
+}
+
+// ─── WhisperDecoder ────────────────────────────────────────────────────────
+
+void WhisperDecoder::load_from(const stf::File& f,
+                               int dm, int n_layer, int ffn, int n_head,
+                               int vocab, int max_tgt, int max_src) {
+    const std::string where = "WhisperDecoder::load_from";
+    d_model                  = dm;
+    decoder_layers           = n_layer;
+    decoder_ffn_dim          = ffn;
+    decoder_attention_heads  = n_head;
+    vocab_size               = vocab;
+    max_target_positions     = max_tgt;
+    max_source_positions     = max_src;
+
+    const std::string p = "model.decoder.";
+
+    upload(f, p + "embed_tokens.weight",    vocab,   dm, embed_tokens,    where);
+    upload(f, p + "embed_positions.weight", max_tgt, dm, embed_positions, where);
+
+    layers.clear();
+    layers.resize(static_cast<std::size_t>(n_layer));
+    for (int i = 0; i < n_layer; ++i) {
+        const std::string lp = p + "layers." + std::to_string(i) + ".";
+        layers[static_cast<std::size_t>(i)].load_from(f, lp, dm, ffn, n_head);
+    }
+
+    load_layernorm(f, p + "layer_norm", dm, 1e-5f, layer_norm, where);
+
+    // Tied LM head: `proj_out.weight` is usually absent (tied to
+    // embed_tokens). If present, prefer it.
+    proj_out_explicit = false;
+    if (const stf::TensorView* v = f.find("proj_out.weight")) {
+        (void)v;
+        upload(f, "proj_out.weight", vocab, dm, proj_out_weight, where);
+        proj_out_explicit = true;
+    } else {
+        proj_out_weight = bt::Tensor{};  // empty signals tied mode
+    }
+}
+
+void WhisperDecoder::prime_cross(const bt::Tensor& encoder_hidden,
+                                 WhisperKVCache& cache) const {
+    const std::string where = "WhisperDecoder::prime_cross";
+    if (static_cast<int>(cache.layers.size()) != decoder_layers) {
+        fail(where, "cache layer count " +
+             std::to_string(cache.layers.size()) + " != decoder_layers=" +
+             std::to_string(decoder_layers));
+    }
+    if (encoder_hidden.rows != max_source_positions ||
+        encoder_hidden.cols != d_model) {
+        fail(where, "encoder_hidden shape (" +
+             std::to_string(encoder_hidden.rows) + "," +
+             std::to_string(encoder_hidden.cols) + ") != (" +
+             std::to_string(max_source_positions) + "," +
+             std::to_string(d_model) + ")");
+    }
+    for (int i = 0; i < decoder_layers; ++i) {
+        layers[static_cast<std::size_t>(i)].prime_cross(
+            encoder_hidden, cache.layers[static_cast<std::size_t>(i)]);
+    }
+}
+
+void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
+                             int pos_offset,
+                             WhisperKVCache& cache,
+                             bt::Tensor& logits) const {
+    const std::string where = "WhisperDecoder::forward";
+    if (T <= 0)               fail(where, "T must be positive");
+    if (pos_offset < 0)       fail(where, "pos_offset must be non-negative");
+    if (pos_offset + T > max_target_positions) {
+        fail(where, "pos_offset+T=" + std::to_string(pos_offset + T) +
+             " exceeds max_target_positions=" + std::to_string(max_target_positions));
+    }
+    if (static_cast<int>(cache.layers.size()) != decoder_layers) {
+        fail(where, "cache layer count " +
+             std::to_string(cache.layers.size()) +
+             " != decoder_layers=" + std::to_string(decoder_layers));
+    }
+    for (int i = 0; i < decoder_layers; ++i) {
+        const auto& l = cache.layers[static_cast<std::size_t>(i)];
+        if (!l.cross_primed) {
+            fail(where, "cache layer " + std::to_string(i) +
+                 " cross-attn not primed; call prime_cross first");
+        }
+        if (l.self_len != pos_offset) {
+            fail(where, "cache layer " + std::to_string(i) +
+                 " self_len=" + std::to_string(l.self_len) +
+                 " != pos_offset=" + std::to_string(pos_offset));
+        }
+    }
+
+    // ─── Embed tokens ──────────────────────────────────────────────────────
+    bt::Tensor x;
+    bt::embedding_lookup_forward(embed_tokens, token_ids, T, x);  // (T, d_model)
+
+    // ─── Add learned positional embedding (rows [pos_offset, pos_offset+T)) ─
+    {
+        const float* pe_all = embed_positions.host_f32();
+        float* xd = x.host_f32_mut();
+        for (int t = 0; t < T; ++t) {
+            const float* pe_row = pe_all +
+                static_cast<std::size_t>(pos_offset + t) * d_model;
+            float* x_row = xd + static_cast<std::size_t>(t) * d_model;
+            for (int c = 0; c < d_model; ++c) x_row[c] += pe_row[c];
+        }
+    }
+
+    // ─── Pre-LN Transformer stack ──────────────────────────────────────────
+    bt::Tensor y;
+    for (int i = 0; i < decoder_layers; ++i) {
+        layers[static_cast<std::size_t>(i)].forward(
+            x, cache.layers[static_cast<std::size_t>(i)], y);
+        x = std::move(y);
+    }
+
+    // ─── Final decoder LayerNorm ───────────────────────────────────────────
+    bt::Tensor hidden;
+    layer_norm.forward(x, hidden);          // (T, d_model)
+
+    // ─── LM head: tied (default) or explicit proj_out ──────────────────────
+    // For both paths the math is the same: logits = hidden (T, D) @ W^T,
+    // where W is (vocab, D). brotensor::matmul has no transpose flag, so we
+    // build a (D, vocab) view by transposing the embedding table at call
+    // time. The transpose is one allocation and one tight loop per
+    // forward() — acceptable for stage 4; can be cached / fused later.
+    const bt::Tensor& W = proj_out_explicit ? proj_out_weight : embed_tokens;
+    bt::Tensor W_T = bt::Tensor::zeros_on(bt::Device::CPU, d_model, vocab_size,
+                                          bt::Dtype::FP32);
+    {
+        const float* src = W.host_f32();
+        float* dst = W_T.host_f32_mut();
+        for (int v = 0; v < vocab_size; ++v) {
+            for (int c = 0; c < d_model; ++c) {
+                dst[c * vocab_size + v] = src[v * d_model + c];
+            }
+        }
+    }
+    bt::matmul(hidden, W_T, logits);        // (T, vocab_size)
+}
+
 }  // namespace brosoundml
