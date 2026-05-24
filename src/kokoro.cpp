@@ -6,8 +6,10 @@
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <numeric>
@@ -23,6 +25,51 @@ namespace fs = std::filesystem;
 namespace j  = detail::json;
 
 namespace {
+
+// Print min/mean/max/std of a tensor's host FP32 data to stderr, prefixed by
+// `tag`. Triggered only when `BROSOUNDML_DEBUG_STAGES=1`. Lets us spot the
+// first stage whose stats diverge from the Python reference.
+void debug_stats(const char* tag, const brotensor::Tensor& t) {
+    static const bool on = []() {
+        const char* v = std::getenv("BROSOUNDML_DEBUG_STAGES");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (!on) return;
+    if (t.dtype != brotensor::Dtype::FP32) {
+        std::fprintf(stderr, "[stage] %-24s dtype != FP32\n", tag);
+        return;
+    }
+    const float* d = t.host_f32();
+    const std::size_t n = t.size();
+    if (n == 0) { std::fprintf(stderr, "[stage] %-24s empty\n", tag); return; }
+    float mn = d[0], mx = d[0];
+    double sum = 0, sumsq = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        float v = d[i];
+        if (v < mn) mn = v; if (v > mx) mx = v;
+        sum += v; sumsq += static_cast<double>(v) * v;
+    }
+    const double mean = sum / static_cast<double>(n);
+    const double var  = sumsq / static_cast<double>(n) - mean * mean;
+    const double std  = var > 0 ? std::sqrt(var) : 0.0;
+    std::fprintf(stderr,
+        "[stage] %-24s rows=%d cols=%d  min=%+.4f  max=%+.4f  mean=%+.4f  std=%.4f\n",
+        tag, t.rows, t.cols, mn, mx, mean, std);
+}
+
+void debug_vec(const char* tag, const std::vector<int>& v) {
+    static const bool on = []() {
+        const char* x = std::getenv("BROSOUNDML_DEBUG_STAGES");
+        return x && x[0] && x[0] != '0';
+    }();
+    if (!on) return;
+    int sum = 0, mn = (v.empty() ? 0 : v[0]), mx = mn;
+    for (int x : v) { sum += x; if (x < mn) mn = x; if (x > mx) mx = x; }
+    std::fprintf(stderr,
+        "[stage] %-24s n=%zu  sum=%d  min=%d  max=%d\n",
+        tag, v.size(), sum, mn, mx);
+}
+
 
 [[noreturn]] void fail(const std::string& where, const std::string& msg) {
     throw std::runtime_error("brosoundml: " + where + ": " + msg);
@@ -239,18 +286,24 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     // 1. plBERT.
     brotensor::Tensor bert_dur;
     impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
+    debug_stats("01_bert_dur", bert_dur);
 
     // 2. bert_encoder.
     brotensor::Tensor d_en;
     impl_->bert_encoder.forward(bert_dur, d_en);
+    debug_stats("02_d_en", d_en);
 
     // 3. text_encoder (StyleTTS2 phoneme CNN+BiLSTM).
     brotensor::Tensor t_en;
     impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
+    debug_stats("06_t_en", t_en);
 
     // 4. Predictor: duration + F0 + N.
     Predictor::Output po;
     impl_->predictor.forward(d_en, ref_s, L, speed, po);
+    debug_stats("05_F0_pred", po.F0_pred);
+    debug_stats("05_N_pred",  po.N_pred);
+    debug_vec  ("03_pred_dur", po.pred_dur);
 
     // 5. Length-regulate t_en into asr.
     const int total = std::accumulate(po.pred_dur.begin(), po.pred_dur.end(), 0);
@@ -272,10 +325,13 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
         }
     }
 
+    debug_stats("07_asr", asr);
+
     // 6. Decoder backbone -> generator input.
     brotensor::Tensor gen_in;
     impl_->decoder.forward(asr, po.F0_pred, po.N_pred, ref_s, total, gen_in);
     const int L_gen = 2 * total;
+    debug_stats("09_gen_in", gen_in);
 
     // 7. Generator. SineGen is not yet implemented — feed a zero har stack so
     //    the harmonic-source branch contributes nothing. Audio will lack the
@@ -311,7 +367,10 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     std::memcpy(style_dec.host_f32_mut(), ref_s.host_f32(),
                 static_cast<std::size_t>(impl_->config.style_dim) * sizeof(float));
 
+    debug_stats("10_har_stub", har_stub);
+
     brotensor::Tensor audio_t;    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
+    debug_stats("11_audio", audio_t);
 
     // 8. Wrap as AudioBuffer.
     AudioBuffer out;

@@ -356,18 +356,26 @@ void layernorm_1d_ncl(const bt::Tensor& X,
     for (int n = 0; n < N; ++n) {
         for (int l = 0; l < L; ++l) {
             // Length-C vector at (n, :, l): elements at flat index (n*C + c)*L + l.
-            float mean = 0.0f, sumsq = 0.0f;
+            // Two-pass variance — sumsq/C - mean² loses all precision under
+            // catastrophic cancellation when mean²≈sumsq/C, producing NaN via
+            // sqrt of a negative var. The accumulators are double so even very
+            // long sequences don't drift.
+            double mean = 0.0;
             for (int c = 0; c < C; ++c) {
-                const float v = xd[(static_cast<std::size_t>(n) * C + c) * L + l];
-                mean += v;
-                sumsq += v * v;
+                mean += xd[(static_cast<std::size_t>(n) * C + c) * L + l];
             }
             mean /= C;
-            const float var  = sumsq / C - mean * mean;
+            double sumsq_dev = 0.0;
+            for (int c = 0; c < C; ++c) {
+                const double d = xd[(static_cast<std::size_t>(n) * C + c) * L + l] - mean;
+                sumsq_dev += d * d;
+            }
+            const float var  = static_cast<float>(sumsq_dev / C);
             const float rstd = 1.0f / std::sqrt(var + eps);
+            const float fmean = static_cast<float>(mean);
             for (int c = 0; c < C; ++c) {
                 const std::size_t idx = (static_cast<std::size_t>(n) * C + c) * L + l;
-                const float xhat = (xd[idx] - mean) * rstd;
+                const float xhat = (xd[idx] - fmean) * rstd;
                 yd[idx] = xhat * gd[c] + bd[c];
             }
         }
@@ -557,14 +565,22 @@ void ada_layernorm(const AdaLayerNormWeights& w, int L,
     float* yd       = y_lc.host_f32_mut();
     for (int l = 0; l < L; ++l) {
         const float* row = xd + static_cast<std::size_t>(l) * C;
-        float mean = 0.0f, sumsq = 0.0f;
-        for (int c = 0; c < C; ++c) { mean += row[c]; sumsq += row[c] * row[c]; }
+        // Two-pass variance to avoid catastrophic cancellation; see
+        // layernorm_1d_ncl for the same rationale.
+        double mean = 0.0;
+        for (int c = 0; c < C; ++c) mean += row[c];
         mean /= C;
-        const float var  = sumsq / C - mean * mean;
+        double sumsq_dev = 0.0;
+        for (int c = 0; c < C; ++c) {
+            const double d = row[c] - mean;
+            sumsq_dev += d * d;
+        }
+        const float var  = static_cast<float>(sumsq_dev / C);
         const float rstd = 1.0f / std::sqrt(var + w.eps);
+        const float fmean = static_cast<float>(mean);
         float* y_row = yd + static_cast<std::size_t>(l) * C;
         for (int c = 0; c < C; ++c) {
-            const float xhat = (row[c] - mean) * rstd;
+            const float xhat = (row[c] - fmean) * rstd;
             y_row[c] = (1.0f + gamma[c]) * xhat + beta[c];
         }
     }
@@ -586,13 +602,22 @@ void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const std::size_t base = (static_cast<std::size_t>(n) * C + c) * L;
-            float mean = 0.0f, sumsq = 0.0f;
-            for (int l = 0; l < L; ++l) { mean += xd[base + l]; sumsq += xd[base + l] * xd[base + l]; }
+            // Two-pass variance to avoid catastrophic cancellation; see
+            // layernorm_1d_ncl. The single-pass formula NaNs on long L when
+            // sumsq/L ≈ mean², which is what happens deep in the Generator.
+            double mean = 0.0;
+            for (int l = 0; l < L; ++l) mean += xd[base + l];
             mean /= L;
-            const float var  = sumsq / L - mean * mean;
-            const float rstd = 1.0f / std::sqrt(var + w.eps);
+            double sumsq_dev = 0.0;
             for (int l = 0; l < L; ++l) {
-                const float xhat = (xd[base + l] - mean) * rstd;
+                const double d = xd[base + l] - mean;
+                sumsq_dev += d * d;
+            }
+            const float var  = static_cast<float>(sumsq_dev / L);
+            const float rstd = 1.0f / std::sqrt(var + w.eps);
+            const float fmean = static_cast<float>(mean);
+            for (int l = 0; l < L; ++l) {
+                const float xhat = (xd[base + l] - fmean) * rstd;
                 yd[base + l] = (1.0f + gamma[c]) * xhat + beta[c];
             }
         }
@@ -1322,6 +1347,31 @@ bt::Tensor hann_window_periodic(int N) {
 
 }  // namespace
 
+static void gdbg(const char* tag, const bt::Tensor& t) {
+    static const bool on = []() {
+        const char* v = std::getenv("BROSOUNDML_DEBUG_STAGES");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (!on || t.dtype != bt::Dtype::FP32) return;
+    const float* d = t.host_f32();
+    const std::size_t n = t.size();
+    if (n == 0) { std::fprintf(stderr, "[gen]   %-32s empty\n", tag); return; }
+    float mn = d[0], mx = d[0];
+    int n_nan = 0, n_inf = 0;
+    double sum = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        float v = d[i];
+        if (std::isnan(v)) { ++n_nan; continue; }
+        if (std::isinf(v)) { ++n_inf; continue; }
+        if (v < mn) mn = v; if (v > mx) mx = v;
+        sum += v;
+    }
+    const double mean = sum / static_cast<double>(n);
+    std::fprintf(stderr,
+        "[gen]   %-32s n=%zu  min=%+.3e  max=%+.3e  mean=%+.3e  nan=%d  inf=%d\n",
+        tag, n, mn, mx, mean, n_nan, n_inf);
+}
+
 void Generator::forward(const bt::Tensor& gen_in, int L_in,
                         const bt::Tensor& har, int frames,
                         const bt::Tensor& style,
@@ -1330,6 +1380,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     int L = L_in;
     int C = ups_C_in[0];     // init_C
 
+    gdbg("gen_in", x);
     for (int i = 0; i < num_upsamples; ++i) {
         // x <- leaky_relu(x, 0.1)
         {
@@ -1337,14 +1388,17 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
             bt::leaky_relu_forward(x, 0.1f, tmp);
             x = std::move(tmp);
         }
+        { char b[32]; std::snprintf(b, sizeof(b), "ups%d_after_lrelu", i); gdbg(b, x); }
 
         // x_source = noise_convs[i](har) (1, C_cur*L_after_noise_conv)
         bt::Tensor x_source;
         noise_convs[i].forward(har, /*N=*/1, /*L=*/frames, x_source);
         const int L_src = x_source.cols / ups_C_out[i];
+        { char b[32]; std::snprintf(b, sizeof(b), "ups%d_noise_conv", i); gdbg(b, x_source); }
 
         // x_source = noise_res[i](x_source, s)
         adain_resblock1_forward(noise_res[i], x_source, ups_C_out[i], L_src, style);
+        { char b[32]; std::snprintf(b, sizeof(b), "ups%d_noise_res", i); gdbg(b, x_source); }
 
         // x = ups[i](x). Compute output length: L_up = (L-1)*stride - 2*pad + (kL-1) + 1
         const int kL = ups_k[i];
@@ -1379,6 +1433,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
                  " at stage " + std::to_string(i));
         }
         bt::add_inplace(x, x_source);
+        { char b[32]; std::snprintf(b, sizeof(b), "ups%d_after_add", i); gdbg(b, x); }
 
         // resblocks i*num_kernels..(i+1)*num_kernels -> averaged residual sum.
         bt::Tensor xs;
@@ -1386,6 +1441,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
             bt::Tensor xj = x;
             adain_resblock1_forward(resblocks[i * num_kernels + j], xj,
                                     ups_C_out[i], L_x, style);
+            { char b[32]; std::snprintf(b, sizeof(b), "ups%d_resblock%d", i, j); gdbg(b, xj); }
             if (j == 0) {
                 xs = std::move(xj);
             } else {
@@ -1396,6 +1452,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         x = std::move(xs);
         L = L_x;
         C = ups_C_out[i];
+        { char b[32]; std::snprintf(b, sizeof(b), "ups%d_out", i); gdbg(b, x); }
     }
 
     // x = leaky_relu(x); x = conv_post(x); split into spec / phase; iSTFT.
@@ -1406,6 +1463,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     }
     bt::Tensor post;
     conv_post.forward(x, /*N=*/1, /*L=*/L, post);
+    gdbg("conv_post", post);
 
     // post is (1, (n_fft+2)*L). The first (n_fft/2+1) channels are log-magnitude;
     // the next (n_fft/2+1) channels are pre-sin phase.
