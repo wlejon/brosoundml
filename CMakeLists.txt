@@ -106,6 +106,7 @@ target_sources(brosoundml PRIVATE
     src/modules.cpp
     src/kokoro_modules.cpp
     src/kokoro.cpp
+    src/whisper.cpp
 )
 
 # --- Install ---
