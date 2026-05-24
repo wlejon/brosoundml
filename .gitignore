@@ -17,3 +17,4 @@ compile_commands.json
 # Downloaded model weights, voice packs, and config files.
 weights/
 voices/
+.claude/

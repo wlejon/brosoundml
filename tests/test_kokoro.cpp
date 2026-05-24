@@ -237,6 +237,38 @@ int main() {
 
     fs::remove_all(root);
 
+    // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
+    //
+    // Runs only if the converted upstream Kokoro-82M artifacts are present
+    // under <repo>/weights/kokoro/. Skipped silently otherwise so CI / fresh
+    // clones still pass this test. Produce the artifacts with:
+    //   scripts/download-kokoro.sh && python scripts/convert-kokoro.py
+    const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "kokoro";
+    const fs::path real_model = real_root / "model.safetensors";
+    if (fs::exists(real_model)) {
+        Kokoro real;
+        real.load(real_root.string());
+        const auto& rcfg = real.config();
+        // Kokoro-82M's published config: 178-token phoneme vocab, hidden=512,
+        // style=128, plBERT 768/12/12. If the loader silently dropped fields,
+        // these checks fire.
+        CHECK(rcfg.n_tokens    == 178, "real Kokoro: n_tokens == 178");
+        CHECK(rcfg.hidden_dim  == 512, "real Kokoro: hidden_dim == 512");
+        CHECK(rcfg.style_dim   == 128, "real Kokoro: style_dim == 128");
+        CHECK(rcfg.plbert.hidden_size         == 768, "real Kokoro: plbert.hidden_size");
+        CHECK(rcfg.plbert.num_attention_heads == 12,  "real Kokoro: plbert.heads");
+        CHECK(rcfg.plbert.num_hidden_layers   == 12,  "real Kokoro: plbert.layers");
+        CHECK(rcfg.vocab.size() > 100,
+              "real Kokoro: vocab map populated");
+
+        const fs::path real_voice = real_root / "voices" / "af_heart.bin";
+        if (fs::exists(real_voice)) {
+            Voice v = real.load_voice(real_voice.string());
+            CHECK(v.packs.rows == 510 && v.packs.cols == 256,
+                  "real Kokoro voice af_heart: shape (510, 256)");
+        }
+    }
+
     if (failures == 0) {
         std::printf("test_kokoro: all checks passed\n");
         return 0;

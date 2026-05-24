@@ -90,7 +90,12 @@ KokoroConfig parse_config(const std::string& path) {
     c.dim_in       = root.get_int("dim_in",       0);
     c.max_conv_dim = root.get_int("max_conv_dim", 0);
 
-    parse_decoder(root.at("decoder"), c.decoder, where);
+    // Upstream Kokoro names the iSTFTNet sub-config `istftnet`; some forks
+    // and our synthetic test fixture use `decoder`. Accept either.
+    const j::Value* decoder_obj = root.find("istftnet");
+    if (!decoder_obj) decoder_obj = root.find("decoder");
+    if (!decoder_obj) fail(where, "config.json missing 'istftnet' (or 'decoder')");
+    parse_decoder(*decoder_obj, c.decoder, where);
     parse_plbert (root.at("plbert"),  c.plbert,  where);
     if (c.plbert.vocab_size == 0) c.plbert.vocab_size = c.n_tokens;
 
