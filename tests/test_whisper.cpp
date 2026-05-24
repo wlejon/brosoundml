@@ -1,10 +1,15 @@
 // Whisper stage-1 loader contract: config.json + model.safetensors parsing.
 // The forward pass is still in build-out, so transcribe() must throw a staged
 // std::runtime_error naming the stage.
+#include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
+
+#include <brolm/whisper_tokenizer.h>
 
 #include <brotensor/safetensors.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -132,12 +137,9 @@ static int run() {
               "transcribe() after a failed load still throws");
     }
 
-    // Stage 5 stub: once the encoder + decoder are wired in (test_whisper_modules
-    // and test_whisper_decoder cover those with synthetic weights), transcribe()
-    // throws the stage-5 message naming the missing greedy-decode loop.
-    // We exercise this contract via the staged error string from the loader
-    // path above; the parsed-config sanity also runs there. Field-by-field
-    // config asserts stay below to lock the parse contract.
+    // Stages 5-6 are live: transcribe() runs the full pipeline. The greedy
+    // loop is exercised end-to-end by test_whisper_e2e (synthetic weights);
+    // here we just keep the parse-contract checks for config.json.
     {
         // Even though load() throws while populating the encoder, parse_config
         // runs to completion before the safetensors uploads begin — so the
@@ -206,6 +208,81 @@ static int run() {
     }
 
     fs::remove_all(root);
+
+    // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
+    //
+    // Runs only if a converted Whisper checkpoint is present under
+    // <repo>/weights/whisper/ (config.json + model.safetensors + vocab.json +
+    // merges.txt). Skipped silently otherwise so CI / fresh clones still pass.
+    //
+    // If `weights/whisper/test_audio_en.wav` exists, the test transcribes it
+    // and prints the result. When the filename contains a known target
+    // (e.g. `test_audio_en_hello.wav` -> "hello") we assert a case-
+    // insensitive substring match; otherwise we just print for the user
+    // to eyeball.
+    {
+        const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "whisper";
+        const fs::path real_model = real_root / "model.safetensors";
+        const fs::path vocab_path = real_root / "vocab.json";
+        const fs::path merges_path = real_root / "merges.txt";
+        const fs::path test_wav   = real_root / "test_audio_en.wav";
+        if (fs::exists(real_model) && fs::exists(vocab_path) &&
+            fs::exists(merges_path)) {
+            Whisper real;
+            real.load(real_root.string());
+            CHECK(real.loaded(), "real Whisper: loaded()");
+
+            auto tok = brolm::whisper::Tokenizer::load(vocab_path.string(),
+                                                       merges_path.string());
+            if (fs::exists(test_wav)) {
+                AudioBuffer audio = brosoundml::read_wav(test_wav.string());
+                CHECK(audio.sample_rate == 16000,
+                      "real Whisper: test_audio_en.wav is 16 kHz");
+
+                std::vector<int32_t> prompt =
+                    tok.build_prompt("en", "transcribe",
+                                     /*with_timestamps=*/false);
+                auto result = real.transcribe(audio, prompt);
+                CHECK(result.token_ids.size() > prompt.size(),
+                      "real Whisper: transcribe generated at least one token");
+
+                std::vector<int32_t> generated(
+                    result.token_ids.begin() + prompt.size(),
+                    result.token_ids.end());
+                std::string transcript =
+                    tok.decode(generated, /*skip_special=*/true);
+                CHECK(!transcript.empty(),
+                      "real Whisper: decoded transcript is non-empty");
+                std::printf("    real Whisper transcript: %s\n",
+                            transcript.c_str());
+
+                // Filename-driven optional substring assertion.
+                const std::string stem = test_wav.stem().string();
+                const std::string marker = "test_audio_en_";
+                if (stem.size() > marker.size() &&
+                    stem.compare(0, marker.size(), marker) == 0) {
+                    std::string target = stem.substr(marker.size());
+                    auto lower = [](std::string s) {
+                        for (auto& c : s) {
+                            c = static_cast<char>(std::tolower(
+                                static_cast<unsigned char>(c)));
+                        }
+                        return s;
+                    };
+                    if (lower(transcript).find(lower(target)) == std::string::npos) {
+                        std::fprintf(stderr,
+                                     "FAIL: real Whisper transcript does not"
+                                     " contain expected substring '%s'\n",
+                                     target.c_str());
+                        ++failures;
+                    } else {
+                        std::printf("    matched filename target '%s'\n",
+                                    target.c_str());
+                    }
+                }
+            }
+        }
+    }
 
     if (failures) {
         std::fprintf(stderr, "test_whisper: %d failure(s)\n", failures);

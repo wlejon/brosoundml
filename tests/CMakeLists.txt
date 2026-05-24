@@ -17,8 +17,11 @@ brosoundml_add_test(brosoundml_test_kokoro_modules test_kokoro_modules.cpp)
 brosoundml_add_test(brosoundml_test_whisper  test_whisper.cpp)
 brosoundml_add_test(brosoundml_test_whisper_modules test_whisper_modules.cpp)
 brosoundml_add_test(brosoundml_test_whisper_decoder test_whisper_decoder.cpp)
+brosoundml_add_test(brosoundml_test_whisper_e2e test_whisper_e2e.cpp)
 # Surface the repo root to the tests' optional real-weights smoke paths.
 target_compile_definitions(brosoundml_test_kokoro PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(brosoundml_test_whisper PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")

@@ -134,6 +134,9 @@ option(BROSOUNDML_TOOLS "Build brosoundml CLI tools" ON)
 if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_synth tools/synth.cpp)
     target_link_libraries(brosoundml_synth PRIVATE brosoundml)
+
+    add_executable(brosoundml_transcribe tools/transcribe.cpp)
+    target_link_libraries(brosoundml_transcribe PRIVATE brosoundml)
 endif()
 
 # --- Tests ---

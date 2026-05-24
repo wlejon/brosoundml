@@ -95,15 +95,14 @@ struct Whisper::Impl {
         encoder.forward(mel, hidden);
     }
 
-    // Decoder prefill: T = prompt_ids.size(). Resets the cache, primes its
-    // cross-attn slot from encoder_hidden, runs the decoder once over the
-    // whole prompt, and writes the (T, vocab_size) logits to `logits`. After
-    // the call `cache.size() == T`. The caller's greedy loop reads
-    // logits.row(T-1) to pick the first generated token.
+    // Decoder prefill: T = prompt_ids.size(). Primes the cross-attn slot from
+    // encoder_hidden, runs the decoder once over the whole prompt, and writes
+    // the (T, vocab_size) logits to `logits`. After the call
+    // `cache.size() == T`. The caller's greedy loop reads logits.row(T-1) to
+    // pick the first generated token. NOTE: caller must `cache.reset()` first.
     void decode_prefill(const std::int32_t* prompt_ids, int T,
                         const brotensor::Tensor& encoder_hidden,
                         brotensor::Tensor& logits) const {
-        cache.reset();
         decoder.prime_cross(encoder_hidden, cache);
         decoder.forward(prompt_ids, T, /*pos_offset=*/0, cache, logits);
     }
@@ -176,17 +175,87 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
     impl_->loaded = true;
 }
 
+namespace {
+
+// Greedy argmax over the last row of a (T, V) logits tensor. Scalar loop —
+// cheaper than building a (1, V) view + calling brotensor::argmax_rows for a
+// single row.
+int32_t argmax_last_row(const brotensor::Tensor& logits) {
+    const int T = logits.rows;
+    const int V = logits.cols;
+    const float* p = logits.host_f32() + static_cast<std::size_t>(T - 1) * V;
+    int   best_i = 0;
+    float best_v = p[0];
+    for (int v = 1; v < V; ++v) {
+        if (p[v] > best_v) { best_v = p[v]; best_i = v; }
+    }
+    return static_cast<int32_t>(best_i);
+}
+
+}  // namespace
+
 Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
                                            const std::vector<int32_t>& prompt_ids,
                                            int max_new_tokens) const {
     if (!impl_->loaded) {
         fail("Whisper::transcribe", "no model loaded; call Whisper::load() first");
     }
-    (void)audio;
-    (void)prompt_ids;
-    (void)max_new_tokens;
-    fail("Whisper::transcribe",
-         "not yet implemented — stage 5 (greedy decode loop + tokenizer integration) pending");
+    if (audio.samples.empty()) {
+        fail("Whisper::transcribe", "audio buffer is empty");
+    }
+    if (audio.sample_rate != impl_->config.sample_rate) {
+        fail("Whisper::transcribe",
+             "audio.sample_rate must be 16000 Hz (Whisper-fixed); "
+             "resampling is the caller's responsibility");
+    }
+    if (prompt_ids.empty()) {
+        fail("Whisper::transcribe",
+             "prompt_ids must be non-empty "
+             "(typically tokenizer.build_prompt(lang, task, with_timestamps))");
+    }
+
+    const int prompt_len = static_cast<int>(prompt_ids.size());
+    if (prompt_len >= impl_->config.max_target_positions) {
+        fail("Whisper::transcribe",
+             "prompt_ids length >= max_target_positions; nothing to generate");
+    }
+    int budget = max_new_tokens;
+    if (budget <= 0) {
+        budget = impl_->config.max_target_positions - prompt_len;
+    } else {
+        const int hard_cap = impl_->config.max_target_positions - prompt_len;
+        if (budget > hard_cap) budget = hard_cap;
+    }
+
+    // 1. Encode the audio once.
+    brotensor::Tensor hidden;
+    impl_->encode_audio(audio, hidden);
+
+    // 2. Reset cache for this transcription, then prefill the prompt.
+    impl_->cache.reset();
+    brotensor::Tensor logits;
+    impl_->decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
+
+    // 3. Greedy loop. `logits` is mutated in-place by decode_step (no fresh
+    // tensor per step, per project memory: Tensor copy ctor is deep).
+    std::vector<int32_t> generated;
+    generated.reserve(static_cast<std::size_t>(budget));
+    for (int step = 0; step < budget; ++step) {
+        const int32_t next_id = argmax_last_row(logits);
+        if (next_id == impl_->config.eos_token_id) break;
+        generated.push_back(next_id);
+        if (static_cast<int>(prompt_len + generated.size())
+            >= impl_->config.max_target_positions) {
+            break;
+        }
+        impl_->decode_step(next_id, logits);
+    }
+
+    Transcription out;
+    out.token_ids = prompt_ids;
+    out.token_ids.insert(out.token_ids.end(),
+                         generated.begin(), generated.end());
+    return out;
 }
 
 const WhisperConfig& Whisper::config() const { return impl_->config; }
