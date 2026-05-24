@@ -22,7 +22,8 @@ Early — the repo is **stood up**, not yet operational.
 | `AudioBuffer` + 16-bit PCM WAV read/write | ✅ done, tested |
 | Kokoro public API (`Kokoro`, `KokoroConfig`, `Voice`) | ✅ committed |
 | Stage 1 — `config.json` parser, `model.safetensors` open, voice-pack loader | ✅ done, tested |
-| Kokoro forward pass (stages 2–5) | 🚧 build-out — see the plan below |
+| Stage 2 — module layer (`Linear`, `LayerNorm`, `Conv1d`, `LSTM`, `BiLSTM`, `ada_in_1d`) | ✅ done, tested |
+| Kokoro forward pass (stages 3–5) | 🚧 build-out — see the plan below |
 
 While the forward pass is in build-out, `Kokoro::load` / `synthesize` throw a
 `std::runtime_error` naming the stage; the API shape itself is committed and
@@ -115,9 +116,14 @@ Ordered so each stage is independently testable:
    tensors. `load` / `load_voice` / `Voice::pick_for` are real. Voice packs are
    loaded as raw little-endian FP32 of shape `(rows, 2*style_dim)`; convert
    upstream Kokoro `.pt` voices to this format once on the host.
-2. **Module layer** — a small nn-module set over brotensor ops: `Linear`,
-   `Conv1d`, `LSTM` (composed), `AdaINResBlock`, `LayerNorm`. Unit-tested with
-   synthetic weights, independent of Kokoro.
+2. **Module layer** ✅ — a small nn-module set over brotensor ops: `Linear`
+   (single-vec + batched), `LayerNorm`, `Conv1d`, `LSTM` + `BiLSTM` (composed
+   from `matmul` + `sigmoid` + `tanh` per timestep), and the `ada_in_1d` affine
+   primitive. Inference-only. Unit-tested in `test_modules` with hand-rolled
+   synthetic weights against a from-scratch LSTM-cell reference. The
+   `AdaINResBlock` decoder block from iSTFTNet is deferred to stage 5 — its
+   topology is decoder-specific, easier to compose once the surrounding
+   decoder is in place.
 3. **plBERT + text encoder** — phonemes → per-phoneme features; checked against
    a reference activation dump.
 4. **Predictor** — duration → length regulation → F0 / energy.

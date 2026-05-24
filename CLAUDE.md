@@ -13,17 +13,24 @@ stood up but not yet operational — see the build-out plan below.
 
 ```
 include/brosoundml/
-  version.h     library version constants + version_string()
-  audio.h       AudioBuffer (mono FP32 PCM) + WAV read/write
-  kokoro.h      Kokoro-82M: KokoroConfig, Voice, the Kokoro pipeline class
+  version.h        library version constants + version_string()
+  audio.h          AudioBuffer (mono FP32 PCM) + WAV read/write
+  modules.h        inference-only nn-modules over brotensor ops:
+                   Linear, LayerNorm, Conv1d, LSTM, BiLSTM, ada_in_1d
+  kokoro.h         Kokoro-82M: KokoroConfig, Voice, the Kokoro pipeline class
+  detail/json.h    vendored JSON parser (kept in sync with brolm's)
 src/
   version.cpp
-  audio.cpp     AudioBuffer math + 16-bit PCM WAV I/O  (real, tested)
-  kokoro.cpp    Kokoro pipeline — pImpl; forward pass in build-out
+  audio.cpp        AudioBuffer math + 16-bit PCM WAV I/O  (real, tested)
+  modules.cpp      module-layer implementations (CPU FP32 path proven; GPU
+                   paths follow once brotensor ops land for them)
+  kokoro.cpp       Kokoro pipeline — pImpl; stage-1 loader real, forward pass
+                   in build-out
 tests/
-  test_smoke.cpp   links + versions + reaches brotensor
-  test_audio.cpp   AudioBuffer math + WAV round trip
-  test_kokoro.cpp  Kokoro API surface + the staged not-implemented contract
+  test_smoke.cpp    links + versions + reaches brotensor
+  test_audio.cpp    AudioBuffer math + WAV round trip
+  test_modules.cpp  module layer vs. a from-scratch LSTM-cell reference
+  test_kokoro.cpp   Kokoro stage-1 loader contract + staged forward-pass stub
 ```
 
 ## Build
@@ -85,10 +92,19 @@ head → 24 kHz waveform. Full detail and the brotensor op mapping are in
 
 **Known op gap: no recurrent (LSTM) primitive in brotensor.** The text encoder
 and predictors are bidirectional-LSTM-based. brosoundml composes the LSTM cell
-from `matmul` + `sigmoid` + `tanh` per timestep — correct and sufficient to get
-Kokoro running. A fused `brotensor` `lstm` op is a deferred optimisation; do not
-add it speculatively — specify it once the real cell shapes are pinned down by
-a working model (north-star vs. task).
+from `matmul` + `sigmoid` + `tanh` per timestep (see `brosoundml::LSTM` /
+`BiLSTM` in `modules.h`) — correct and sufficient to get Kokoro running. A
+fused `brotensor` `lstm` op is a deferred optimisation; do not add it
+speculatively — specify it once the real cell shapes are pinned down by a
+working model (north-star vs. task).
+
+**Known op gap: no per-channel affine on NCL in brotensor.** The AdaIN affine
+step (used by every iSTFTNet AdaIN1d resblock) is a per-channel scale + shift
+broadcast across `(n, l)`. brosoundml's `ada_in_1d` does `group_norm_forward`
+(with `num_groups == C`) followed by a hand-rolled CPU loop for the affine —
+fine to get Kokoro running on CPU, but the affine should move to a brotensor
+op (`per_channel_affine_1d`, NCL, FP32, all three backends) before stage 5
+matters on GPU.
 
 ## Build-out plan
 
