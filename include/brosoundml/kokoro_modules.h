@@ -21,6 +21,7 @@
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -239,6 +240,68 @@ struct DecoderBackbone {
                  const brotensor::Tensor& ref_s,
                  int T,
                  brotensor::Tensor& gen_in) const;
+};
+
+// ─── AdaINResBlock1 (Generator residual block, with Snake1D) ──────────────
+//
+// Distinct from `AdainResBlk1dWeights`. The Generator uses 3 dilated/plain
+// conv pairs with a learnable Snake1D activation between them:
+//
+//   for i in 0..2:
+//     xt = adain1[i](x, s)
+//     xt = xt + (1/alpha1[i]) * sin(alpha1[i]*xt)^2     # Snake1D
+//     xt = convs1[i](xt)                                # dilation = dilations[i]
+//     xt = adain2[i](xt, s)
+//     xt = xt + (1/alpha2[i]) * sin(alpha2[i]*xt)^2
+//     xt = convs2[i](xt)                                # dilation = 1
+//     x  = xt + x
+struct AdaINResBlock1Weights {
+    int channels    = 0;
+    int kernel_size = 0;
+    std::vector<int>             dilations;  // length 3
+    std::array<Conv1d, 3>        convs1;     // dilated convs
+    std::array<Conv1d, 3>        convs2;     // dilation=1 convs
+    std::array<AdaIN1dWeights, 3> adain1;
+    std::array<AdaIN1dWeights, 3> adain2;
+    std::array<brotensor::Tensor, 3> alpha1;  // (channels, 1)
+    std::array<brotensor::Tensor, 3> alpha2;
+};
+
+// ─── Generator (iSTFTNet vocoder backbone) ─────────────────────────────────
+//
+// Accepts the decoder backbone output `x` (1, 512*L), the harmonic-source
+// stack `har` (1, (n_fft+2)*frames), and the style vector. Returns the
+// 24 kHz mono waveform as a flat (1, signal_len) tensor.
+//
+// SineGen / SourceModuleHnNSF are NOT implemented yet — `har` is fed in
+// directly so the deterministic backbone (ups, noise_convs, noise_res,
+// resblocks, conv_post, iSTFT) can be validated against the upstream
+// reference without re-implementing torch's RNG.
+struct Generator {
+    int n_fft     = 0;
+    int hop_size  = 0;
+    int win_size  = 0;
+    int num_upsamples = 0;
+    int num_kernels   = 0;
+
+    // ups[i] is a ConvTranspose1d; we store the raw weight + bias rather than
+    // wrapping in a Conv1dTranspose struct since they're only used here.
+    std::vector<brotensor::Tensor> ups_W;       // each (C_in, C_out*kL)
+    std::vector<brotensor::Tensor> ups_b;       // each (C_out, 1)
+    std::vector<int>               ups_C_in, ups_C_out, ups_k, ups_stride, ups_pad;
+
+    std::vector<Conv1d>                 noise_convs;
+    std::vector<AdaINResBlock1Weights>  noise_res;     // size = num_upsamples
+    std::vector<AdaINResBlock1Weights>  resblocks;     // size = num_upsamples * num_kernels
+    Conv1d                              conv_post;
+
+    void load_from(const brotensor::safetensors::File& f, const KokoroConfig& cfg);
+    // gen_in: (1, 512*L_in). har: (1, (n_fft+2)*frames). style: (1, style_dim).
+    // audio: (1, signal_len) where signal_len = (frames-1) * hop_size for center-true istft.
+    void forward(const brotensor::Tensor& gen_in, int L_in,
+                 const brotensor::Tensor& har, int frames,
+                 const brotensor::Tensor& style,
+                 brotensor::Tensor& audio) const;
 };
 
 // ─── Per-(N,L) channel-wise LayerNorm on NCL inputs ────────────────────────

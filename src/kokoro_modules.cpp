@@ -1100,4 +1100,360 @@ void DecoderBackbone::forward(const bt::Tensor& asr,
     gen_in = std::move(x);
 }
 
+// ─── AdaINResBlock1 (Generator residual block) ─────────────────────────────
+
+namespace {
+
+void load_adain_resblock1(const stf::File& f, const std::string& prefix,
+                          int channels, int kernel,
+                          const std::vector<int>& dilations,
+                          AdaINResBlock1Weights& w, const std::string& where) {
+    w.channels    = channels;
+    w.kernel_size = kernel;
+    w.dilations   = dilations;
+    for (int i = 0; i < 3; ++i) {
+        // convs1[i]: dilation = dilations[i], padding = get_padding(k, dil) = ((k*dil - dil) / 2)
+        const int dil1 = dilations[i];
+        const int pad1 = (kernel * dil1 - dil1) / 2;
+        w.convs1[i].in_channels  = channels;
+        w.convs1[i].out_channels = channels;
+        w.convs1[i].kernel_size  = kernel;
+        w.convs1[i].padding      = pad1;
+        w.convs1[i].dilation     = dil1;
+        w.convs1[i].stride       = 1;
+        w.convs1[i].groups       = 1;
+        upload(f, prefix + ".convs1." + std::to_string(i) + ".weight",
+               channels, channels * kernel, w.convs1[i].W, where);
+        upload(f, prefix + ".convs1." + std::to_string(i) + ".bias",
+               channels, 1, w.convs1[i].b, where);
+
+        // convs2[i]: dilation = 1.
+        const int pad2 = (kernel - 1) / 2;
+        w.convs2[i].in_channels  = channels;
+        w.convs2[i].out_channels = channels;
+        w.convs2[i].kernel_size  = kernel;
+        w.convs2[i].padding      = pad2;
+        w.convs2[i].dilation     = 1;
+        w.convs2[i].stride       = 1;
+        w.convs2[i].groups       = 1;
+        upload(f, prefix + ".convs2." + std::to_string(i) + ".weight",
+               channels, channels * kernel, w.convs2[i].W, where);
+        upload(f, prefix + ".convs2." + std::to_string(i) + ".bias",
+               channels, 1, w.convs2[i].b, where);
+
+        load_ada_in_1d(f, prefix + ".adain1." + std::to_string(i),
+                       channels, /*style_dim=*/128, w.adain1[i], where);
+        load_ada_in_1d(f, prefix + ".adain2." + std::to_string(i),
+                       channels, /*style_dim=*/128, w.adain2[i], where);
+
+        // alpha shape on disk is (1, channels, 1); we want (channels, 1).
+        upload(f, prefix + ".alpha1." + std::to_string(i),
+               channels, 1, w.alpha1[i], where);
+        upload(f, prefix + ".alpha2." + std::to_string(i),
+               channels, 1, w.alpha2[i], where);
+    }
+}
+
+void adain_resblock1_forward(const AdaINResBlock1Weights& w,
+                             bt::Tensor& x, int C, int L,
+                             const bt::Tensor& style) {
+    for (int i = 0; i < 3; ++i) {
+        bt::Tensor xt;
+        // n1(x, s)
+        ada_in_1d_styled(w.adain1[i], 1, C, L, x, style, xt);
+        // Snake1D: xt += (1/alpha) * sin(alpha*x)^2
+        {
+            bt::Tensor snake_out;
+            bt::snake_forward(xt, w.alpha1[i], /*beta=*/nullptr, 1, C, L, snake_out);
+            xt = std::move(snake_out);
+        }
+        // c1 (dilated conv)
+        bt::Tensor c1_out;
+        w.convs1[i].forward(xt, /*N=*/1, /*L=*/L, c1_out);
+
+        // n2
+        ada_in_1d_styled(w.adain2[i], 1, C, L, c1_out, style, xt);
+        // Snake1D
+        {
+            bt::Tensor snake_out;
+            bt::snake_forward(xt, w.alpha2[i], /*beta=*/nullptr, 1, C, L, snake_out);
+            xt = std::move(snake_out);
+        }
+        // c2
+        bt::Tensor c2_out;
+        w.convs2[i].forward(xt, /*N=*/1, /*L=*/L, c2_out);
+
+        // x = xt + x  (residual)
+        bt::add_inplace(c2_out, x);
+        x = std::move(c2_out);
+    }
+}
+
+}  // namespace
+
+// ─── Generator ─────────────────────────────────────────────────────────────
+
+void Generator::load_from(const stf::File& f, const KokoroConfig& cfg) {
+    const std::string where = "Generator::load_from";
+    const std::string p = "decoder.module.generator.";
+
+    n_fft         = cfg.decoder.gen_istft_n_fft;
+    hop_size      = cfg.decoder.gen_istft_hop_size;
+    win_size      = n_fft;
+    num_upsamples = static_cast<int>(cfg.decoder.upsample_rates.size());
+    num_kernels   = static_cast<int>(cfg.decoder.resblock_kernel_sizes.size());
+
+    const int init_C = cfg.decoder.upsample_initial_channel;
+
+    // ─── ups (ConvTranspose1d) ────────────────────────────────────────────
+    ups_W.resize(num_upsamples);
+    ups_b.resize(num_upsamples);
+    ups_C_in.resize(num_upsamples);
+    ups_C_out.resize(num_upsamples);
+    ups_k.resize(num_upsamples);
+    ups_stride.resize(num_upsamples);
+    ups_pad.resize(num_upsamples);
+    for (int i = 0; i < num_upsamples; ++i) {
+        const int C_in  = init_C / (1 << i);
+        const int C_out = init_C / (1 << (i + 1));
+        const int kL    = cfg.decoder.upsample_kernel_sizes[i];
+        const int s     = cfg.decoder.upsample_rates[i];
+        ups_C_in[i]  = C_in;
+        ups_C_out[i] = C_out;
+        ups_k[i]     = kL;
+        ups_stride[i]= s;
+        ups_pad[i]   = (kL - s) / 2;
+        // Weight on disk: (C_in, C_out, kL). brotensor wants (C_in, C_out*kL).
+        upload(f, p + "ups." + std::to_string(i) + ".weight",
+               C_in, C_out * kL, ups_W[i], where);
+        upload(f, p + "ups." + std::to_string(i) + ".bias",
+               C_out, 1, ups_b[i], where);
+    }
+
+    // ─── noise_convs ──────────────────────────────────────────────────────
+    noise_convs.assign(num_upsamples, Conv1d{});
+    {
+        const int upsample_prod = [&] {
+            int u = 1; for (int r : cfg.decoder.upsample_rates) u *= r; return u;
+        }();
+        (void)upsample_prod;
+        for (int i = 0; i < num_upsamples; ++i) {
+            const int C_cur = init_C / (1 << (i + 1));
+            Conv1d& c = noise_convs[i];
+            c.in_channels  = n_fft + 2;
+            c.out_channels = C_cur;
+            if (i + 1 < num_upsamples) {
+                int stride_f0 = 1;
+                for (int j = i + 1; j < num_upsamples; ++j) {
+                    stride_f0 *= cfg.decoder.upsample_rates[j];
+                }
+                c.kernel_size = stride_f0 * 2;
+                c.stride      = stride_f0;
+                c.padding     = (stride_f0 + 1) / 2;
+            } else {
+                c.kernel_size = 1;
+                c.stride      = 1;
+                c.padding     = 0;
+            }
+            c.dilation = 1;
+            c.groups   = 1;
+            upload(f, p + "noise_convs." + std::to_string(i) + ".weight",
+                   C_cur, (n_fft + 2) * c.kernel_size, c.W, where);
+            upload(f, p + "noise_convs." + std::to_string(i) + ".bias",
+                   C_cur, 1, c.b, where);
+        }
+    }
+
+    // ─── noise_res ────────────────────────────────────────────────────────
+    noise_res.resize(num_upsamples);
+    for (int i = 0; i < num_upsamples; ++i) {
+        const int C_cur = init_C / (1 << (i + 1));
+        // From the upstream: kernels are 7 for the non-last, 11 for the last.
+        const int kr = (i + 1 < num_upsamples) ? 7 : 11;
+        load_adain_resblock1(f, p + "noise_res." + std::to_string(i),
+                             C_cur, kr, /*dilations=*/{1, 3, 5}, noise_res[i], where);
+    }
+
+    // ─── resblocks ────────────────────────────────────────────────────────
+    resblocks.resize(num_upsamples * num_kernels);
+    for (int i = 0; i < num_upsamples; ++i) {
+        const int C_cur = init_C / (1 << (i + 1));
+        for (int j = 0; j < num_kernels; ++j) {
+            const int idx = i * num_kernels + j;
+            load_adain_resblock1(f, p + "resblocks." + std::to_string(idx),
+                                 C_cur,
+                                 cfg.decoder.resblock_kernel_sizes[j],
+                                 cfg.decoder.resblock_dilation_sizes[j],
+                                 resblocks[idx], where);
+        }
+    }
+
+    // ─── conv_post ────────────────────────────────────────────────────────
+    {
+        const int last_C = init_C / (1 << num_upsamples);
+        conv_post.in_channels  = last_C;
+        conv_post.out_channels = n_fft + 2;
+        conv_post.kernel_size  = 7;
+        conv_post.padding      = 3;
+        conv_post.dilation     = 1;
+        conv_post.stride       = 1;
+        conv_post.groups       = 1;
+        upload(f, p + "conv_post.weight",
+               n_fft + 2, last_C * 7, conv_post.W, where);
+        upload(f, p + "conv_post.bias",
+               n_fft + 2, 1, conv_post.b, where);
+    }
+}
+
+namespace {
+
+// Build a periodic Hann window of length N — matches scipy.signal.get_window
+// with fftbins=True (which torch.hann_window also produces with periodic=True).
+bt::Tensor hann_window_periodic(int N) {
+    bt::Tensor w = bt::Tensor::zeros_on(bt::Device::CPU, 1, N, bt::Dtype::FP32);
+    float* d = w.host_f32_mut();
+    for (int n = 0; n < N; ++n) {
+        constexpr float kTwoPi = 6.28318530717958647692f;
+        d[n] = 0.5f - 0.5f * std::cos(kTwoPi * static_cast<float>(n) /
+                                              static_cast<float>(N));
+    }
+    return w;
+}
+
+}  // namespace
+
+void Generator::forward(const bt::Tensor& gen_in, int L_in,
+                        const bt::Tensor& har, int frames,
+                        const bt::Tensor& style,
+                        bt::Tensor& audio) const {
+    bt::Tensor x = gen_in;   // (1, init_C * L_in) NCL
+    int L = L_in;
+    int C = ups_C_in[0];     // init_C
+
+    for (int i = 0; i < num_upsamples; ++i) {
+        // x <- leaky_relu(x, 0.1)
+        {
+            bt::Tensor tmp;
+            bt::leaky_relu_forward(x, 0.1f, tmp);
+            x = std::move(tmp);
+        }
+
+        // x_source = noise_convs[i](har) (1, C_cur*L_after_noise_conv)
+        bt::Tensor x_source;
+        noise_convs[i].forward(har, /*N=*/1, /*L=*/frames, x_source);
+        const int L_src = x_source.cols / ups_C_out[i];
+
+        // x_source = noise_res[i](x_source, s)
+        adain_resblock1_forward(noise_res[i], x_source, ups_C_out[i], L_src, style);
+
+        // x = ups[i](x). Compute output length: L_up = (L-1)*stride - 2*pad + (kL-1) + 1
+        const int kL = ups_k[i];
+        const int s  = ups_stride[i];
+        const int p  = ups_pad[i];
+        const int L_up = (L - 1) * s - 2 * p + (kL - 1) + 1;
+        bt::Tensor up_out;
+        bt::conv_transpose1d_forward(x, ups_W[i], &ups_b[i],
+                                     /*N=*/1, /*C_in=*/ups_C_in[i], /*L=*/L,
+                                     /*C_out=*/ups_C_out[i], /*kL=*/kL,
+                                     /*stride=*/s, /*padding=*/p,
+                                     /*output_padding=*/0, /*dilation=*/1,
+                                     up_out);
+        x = std::move(up_out);
+        int L_x = L_up;
+        // Final upsample stage applies a left-pad-by-1 reflection.
+        if (i == num_upsamples - 1) {
+            bt::Tensor padded;
+            bt::pad1d_forward(x, 1, ups_C_out[i], L_x,
+                              /*pad_left=*/1, /*pad_right=*/0, /*mode=*/1,
+                              padded);
+            x = std::move(padded);
+            L_x += 1;
+        }
+
+        // x = x + x_source  (broadcast at the channel level — same C, same L expected)
+        // Length should match L_src == L_x by Kokoro's design.
+        if (L_src != L_x) {
+            fail("Generator::forward",
+                 "noise source length " + std::to_string(L_src) +
+                 " != upsampled length " + std::to_string(L_x) +
+                 " at stage " + std::to_string(i));
+        }
+        bt::add_inplace(x, x_source);
+
+        // resblocks i*num_kernels..(i+1)*num_kernels -> averaged residual sum.
+        bt::Tensor xs;
+        for (int j = 0; j < num_kernels; ++j) {
+            bt::Tensor xj = x;
+            adain_resblock1_forward(resblocks[i * num_kernels + j], xj,
+                                    ups_C_out[i], L_x, style);
+            if (j == 0) {
+                xs = std::move(xj);
+            } else {
+                bt::add_inplace(xs, xj);
+            }
+        }
+        bt::scale_inplace(xs, 1.0f / static_cast<float>(num_kernels));
+        x = std::move(xs);
+        L = L_x;
+        C = ups_C_out[i];
+    }
+
+    // x = leaky_relu(x); x = conv_post(x); split into spec / phase; iSTFT.
+    {
+        bt::Tensor tmp;
+        bt::leaky_relu_forward(x, 0.01f, tmp);  // PyTorch leaky_relu default slope.
+        x = std::move(tmp);
+    }
+    bt::Tensor post;
+    conv_post.forward(x, /*N=*/1, /*L=*/L, post);
+
+    // post is (1, (n_fft+2)*L). The first (n_fft/2+1) channels are log-magnitude;
+    // the next (n_fft/2+1) channels are pre-sin phase.
+    const int n_freq = n_fft / 2 + 1;
+    bt::Tensor mag = bt::Tensor::zeros_on(bt::Device::CPU, 1, n_freq * L, bt::Dtype::FP32);
+    bt::Tensor pha = bt::Tensor::zeros_on(bt::Device::CPU, 1, n_freq * L, bt::Dtype::FP32);
+    {
+        const float* pd = post.host_f32();
+        float* md = mag.host_f32_mut();
+        float* phd = pha.host_f32_mut();
+        for (int c = 0; c < n_freq; ++c) {
+            for (int l = 0; l < L; ++l) {
+                md[c * L + l] = std::exp(pd[c * L + l]);
+            }
+        }
+        for (int c = 0; c < n_freq; ++c) {
+            for (int l = 0; l < L; ++l) {
+                phd[c * L + l] = std::sin(pd[(n_freq + c) * L + l]);
+            }
+        }
+    }
+
+    // Build complex spectrogram from polar form. brotensor stores complex in
+    // an interleaved (N*frames, 2*n_freq) layout — we have to transpose from
+    // NCL (channel-major over frames) to NFL (frame-major over channels).
+    bt::Tensor mag_frames = bt::Tensor::zeros_on(bt::Device::CPU, L, n_freq, bt::Dtype::FP32);
+    bt::Tensor pha_frames = bt::Tensor::zeros_on(bt::Device::CPU, L, n_freq, bt::Dtype::FP32);
+    {
+        const float* md = mag.host_f32();
+        const float* phd = pha.host_f32();
+        float* mfd = mag_frames.host_f32_mut();
+        float* pfd = pha_frames.host_f32_mut();
+        for (int c = 0; c < n_freq; ++c) {
+            for (int l = 0; l < L; ++l) {
+                mfd[l * n_freq + c] = md[c * L + l];
+                pfd[l * n_freq + c] = phd[c * L + l];
+            }
+        }
+    }
+    bt::Tensor spec_complex;  // (frames, 2*n_freq) interleaved
+    bt::complex_from_polar(mag_frames, pha_frames, spec_complex);
+
+    // iSTFT: signal_len = (frames - 1) * hop for center-true mode.
+    const int signal_len = (L - 1) * hop_size;
+    bt::Tensor window = hann_window_periodic(win_size);
+    bt::istft(spec_complex, window,
+              /*N=*/1, signal_len, n_fft, hop_size, win_size,
+              /*center=*/true, /*normalized=*/false, audio);
+}
+
 }  // namespace brosoundml

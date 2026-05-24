@@ -224,6 +224,38 @@ int main() {
     compare(gen_in, ref_dec_loop.get("gen_in"),
             512 * L_gen, "decoder.gen_in", 5e-3f, 5e-4f);
 
+    // ─── Generator (deterministic backbone) ────────────────────────────────
+    // Loads har from the reference (skips SineGen / SourceModuleHnNSF, which
+    // depend on torch's RNG). The Generator's audio output should then match
+    // the upstream's audio dump up to STFT/iSTFT numerical noise.
+    stf::File ref_gen_src = stf::File::open((ref_dir / "10_generator_src.safetensors").string());
+    stf::File ref_audio   = stf::File::open((ref_dir / "11_audio.safetensors").string());
+
+    const stf::TensorView& har_v = ref_gen_src.get("har");
+    bt::Tensor har = bt::Tensor::from_host_on(
+        bt::Device::CPU, reinterpret_cast<const float*>(har_v.data),
+        1, static_cast<int>(har_v.numel()));
+    const int gen_frames = static_cast<int>(har_v.shape[2]);  // (1, 22, frames)
+
+    bt::Tensor style_pred_decoder = bt::Tensor::from_host_on(
+        bt::Device::CPU, ref_s.host_f32(), 1, cfg.style_dim);
+
+    brosoundml::Generator gen;
+    gen.load_from(weights, cfg);
+
+    bt::Tensor audio;
+    gen.forward(gen_in, /*L_in=*/L_gen,
+                har, /*frames=*/gen_frames,
+                style_pred_decoder, audio);
+
+    const stf::TensorView& audio_ref = ref_audio.get("audio");
+    // Generator's iSTFT path through floats accumulates significant noise via
+    // the 6 resblocks + 2 ConvTranspose ups; loosen the tolerance for audio
+    // samples accordingly. Mean-abs is still tight.
+    compare(audio, audio_ref,
+            static_cast<int>(audio_ref.numel()),
+            "generator.audio", 5e-2f, 5e-3f);
+
     if (failures == 0) {
         std::printf("test_kokoro_modules: all checks passed\n");
         return 0;
