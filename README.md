@@ -23,7 +23,12 @@ Early — the repo is **stood up**, not yet operational.
 | Kokoro public API (`Kokoro`, `KokoroConfig`, `Voice`) | ✅ committed |
 | Stage 1 — `config.json` parser, `model.safetensors` open, voice-pack loader | ✅ done, tested |
 | Stage 2 — module layer (`Linear`, `LayerNorm`, `Conv1d`, `LSTM`, `BiLSTM`, `ada_in_1d`) | ✅ done, tested |
-| Kokoro forward pass (stages 3–5) | 🚧 build-out — see the plan below |
+| Stage 3 — plBERT + bert_encoder + TextEncoder | ✅ validated to upstream (max-abs 1e-5) |
+| Stage 4 — ProsodyPredictor (duration + F0 + N) | ✅ validated to upstream (max-abs 5e-4) |
+| Stage 5a — Decoder backbone (encode + decode loop) | ✅ validated to upstream (max-abs 1e-4) |
+| Stage 5b — Generator (ups + resblocks + iSTFT) | ✅ validated to upstream (max-abs 7e-5) |
+| `Kokoro::synthesize` end-to-end | ✅ runs; SineGen / harmonic source stubbed |
+| SineGen / SourceModuleHnNSF | ❌ not implemented — har_source replaced by deterministic placeholder; audio lacks natural breath excitation |
 
 While the forward pass is in build-out, `Kokoro::load` / `synthesize` throw a
 `std::runtime_error` naming the stage; the API shape itself is committed and
@@ -120,17 +125,29 @@ Ordered so each stage is independently testable:
    (single-vec + batched), `LayerNorm`, `Conv1d`, `LSTM` + `BiLSTM` (composed
    from `matmul` + `sigmoid` + `tanh` per timestep), and the `ada_in_1d` affine
    primitive. Inference-only. Unit-tested in `test_modules` with hand-rolled
-   synthetic weights against a from-scratch LSTM-cell reference. The
-   `AdaINResBlock` decoder block from iSTFTNet is deferred to stage 5 — its
-   topology is decoder-specific, easier to compose once the surrounding
-   decoder is in place.
-3. **plBERT + text encoder** — phonemes → per-phoneme features; checked against
-   a reference activation dump.
-4. **Predictor** — duration → length regulation → F0 / energy.
-5. **Decoder + iSTFT head** — frame features → waveform; `synthesize` becomes
-   real, end to end.
-6. **bro integration** — surface brosoundml as `bro.sound` (or similar) JS
-   bindings and wire it into `bro/third_party/CMakeLists.txt`.
+   synthetic weights against a from-scratch LSTM-cell reference.
+3. **plBERT + text encoder** ✅ — `brosoundml::PLBert` (HuggingFace
+   `AlbertModel` topology with 12 shared layers + hand-rolled MHA with biases),
+   `brosoundml::BertEncoder` (768 → 512 Linear), and `brosoundml::TextEncoder`
+   (embedding + 3 × (Conv1d + per-channel NCL LayerNorm + LeakyReLU) +
+   bidirectional LSTM). Validated row-by-row against a reference activation
+   dump from the upstream `kokoro` Python package (max-abs 1e-5).
+4. **Predictor** ✅ — `brosoundml::Predictor` covers `DurationEncoder` (3
+   alternating BiLSTM + AdaLayerNorm blocks), the duration LSTM, the
+   `LinearNorm` projection, the length regulator, the shared LSTM, and the
+   AdaINResBlk1d-based F0 / N stacks. Reference-validated (max-abs 5e-4).
+5. **Decoder + iSTFT head** ✅ (with one caveat) — `brosoundml::DecoderBackbone`
+   covers the encode + decode loop (`F0_conv`, `N_conv`, `asr_res`, encode,
+   4 decode blocks including the upsample). `brosoundml::Generator` covers
+   the deterministic iSTFTNet backbone (2 ConvTranspose ups, 2 noise convs,
+   2 noise_res AdaINResBlock1 blocks, 6 resblocks, conv_post, iSTFT) and
+   matches the upstream audio bit-for-bit given the same harmonic source
+   (max-abs 7e-5). **SineGen / SourceModuleHnNSF is not implemented** — the
+   end-to-end `Kokoro::synthesize` feeds a deterministic noise placeholder
+   into the noise branch, so the synthesised audio lacks the natural breath
+   excitation. Implementing a torch-compatible RNG (or a deterministic sine
+   generator) is the remaining work to reach upstream audio quality.
+6. **bro integration** — deferred until after SineGen.
 
 ## License
 

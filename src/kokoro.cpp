@@ -1,6 +1,7 @@
 #include "brosoundml/kokoro.h"
 
 #include "brosoundml/detail/json.h"
+#include "brosoundml/kokoro_modules.h"
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <numeric>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -120,7 +122,15 @@ struct Kokoro::Impl {
     KokoroConfig                config;
     brotensor::Device           device = brotensor::Device::CPU;
     bool                        loaded = false;
-    brotensor::safetensors::File weights;
+    // Submodules are populated by Kokoro::load. The safetensors file is only
+    // alive for the duration of load(); the per-submodule upload calls copy
+    // the weights out, so we don't keep the mmap around afterwards.
+    PLBert                      bert;
+    BertEncoder                 bert_encoder;
+    TextEncoder                 text_encoder;
+    Predictor                   predictor;
+    DecoderBackbone             decoder;
+    Generator                   generator;
 };
 
 Kokoro::Kokoro() : impl_(std::make_unique<Impl>()) {}
@@ -140,10 +150,24 @@ void Kokoro::load(const std::string& model_dir, brotensor::Device device) {
         fail("Kokoro::load", "no model.safetensors under '" + model_dir + "'");
     }
 
-    impl_->config  = parse_config(config_path.string());
-    impl_->device  = device;
-    impl_->weights = brotensor::safetensors::File::open(weight_path.string());
-    impl_->loaded  = true;
+    impl_->config = parse_config(config_path.string());
+    impl_->device = device;
+
+    // Open the safetensors file just long enough to upload every submodule's
+    // weights — release the mmap as soon as we leave this scope so callers can
+    // delete the source file without first destructing the Kokoro instance.
+    {
+        auto weights = brotensor::safetensors::File::open(weight_path.string());
+        impl_->bert.load_from         (weights, impl_->config.plbert);
+        impl_->bert_encoder.load_from (weights, impl_->config.plbert.hidden_size,
+                                                impl_->config.hidden_dim);
+        impl_->text_encoder.load_from (weights, impl_->config);
+        impl_->predictor.load_from    (weights, impl_->config);
+        impl_->decoder.load_from      (weights);
+        impl_->generator.load_from    (weights, impl_->config);
+    }
+
+    impl_->loaded = true;
 }
 
 Voice Kokoro::load_voice(const std::string& voice_path) const {
@@ -186,15 +210,114 @@ Voice Kokoro::load_voice(const std::string& voice_path) const {
     return voice;
 }
 
-AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& /*phoneme_ids*/,
-                               const Voice& /*voice*/,
-                               float /*speed*/) const {
+AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
+                               const Voice& voice,
+                               float speed) const {
     if (!impl_->loaded) {
         fail("Kokoro::synthesize", "no model loaded; call Kokoro::load() first");
     }
-    fail("Kokoro::synthesize",
-         "the Kokoro forward pass is not yet implemented — "
-         "stages 2–5 of the README build-out plan");
+    if (phoneme_ids.empty()) {
+        fail("Kokoro::synthesize", "phoneme_ids is empty");
+    }
+    if (voice.packs.rows <= 0 || voice.packs.cols != 2 * impl_->config.style_dim) {
+        fail("Kokoro::synthesize", "voice pack shape does not match 2*style_dim");
+    }
+
+    // Wrap phoneme ids with the upstream BOS/EOS convention: [0, ...ids, 0].
+    std::vector<int32_t> ids;
+    ids.reserve(phoneme_ids.size() + 2);
+    ids.push_back(0);
+    ids.insert(ids.end(), phoneme_ids.begin(), phoneme_ids.end());
+    ids.push_back(0);
+    const int L = static_cast<int>(ids.size());
+
+    // Style row: upstream picks ref_s = voice[len(input_ids) - 1].
+    brotensor::Tensor ref_s = voice.pick_for(L);
+
+    // 1. plBERT.
+    brotensor::Tensor bert_dur;
+    impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
+
+    // 2. bert_encoder.
+    brotensor::Tensor d_en;
+    impl_->bert_encoder.forward(bert_dur, d_en);
+
+    // 3. text_encoder (StyleTTS2 phoneme CNN+BiLSTM).
+    brotensor::Tensor t_en;
+    impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
+
+    // 4. Predictor: duration + F0 + N.
+    Predictor::Output po;
+    impl_->predictor.forward(d_en, ref_s, L, speed, po);
+
+    // 5. Length-regulate t_en into asr.
+    const int total = std::accumulate(po.pred_dur.begin(), po.pred_dur.end(), 0);
+    brotensor::Tensor asr = brotensor::Tensor::zeros_on(
+        brotensor::Device::CPU, 1, impl_->config.hidden_dim * total,
+        brotensor::Dtype::FP32);
+    {
+        const float* te = t_en.host_f32();
+        float* ad = asr.host_f32_mut();
+        int t = 0;
+        for (int l = 0; l < L; ++l) {
+            const int reps = po.pred_dur[l];
+            for (int r = 0; r < reps; ++r) {
+                for (int c = 0; c < impl_->config.hidden_dim; ++c) {
+                    ad[c * total + t] = te[c * L + l];
+                }
+                ++t;
+            }
+        }
+    }
+
+    // 6. Decoder backbone -> generator input.
+    brotensor::Tensor gen_in;
+    impl_->decoder.forward(asr, po.F0_pred, po.N_pred, ref_s, total, gen_in);
+    const int L_gen = 2 * total;
+
+    // 7. Generator. SineGen is not yet implemented — feed a zero har stack so
+    //    the harmonic-source branch contributes nothing. Audio will lack the
+    //    natural breath noise but the phonemic content is intact.
+    // har_frames matches the time axis at the Generator's iSTFT input. After
+    // L_gen -> ups[0] (×10) -> ups[1] (×6) -> reflection_pad (+1) we hit
+    // L_gen * 60 + 1 frames. noise_convs see the same har stack and produce
+    // outputs that align with the ups stack length at every stage.
+    int upsample_prod = 1;
+    for (int r : impl_->config.decoder.upsample_rates) upsample_prod *= r;
+    const int har_frames = L_gen * upsample_prod + 1;
+    const int har_channels = impl_->config.decoder.gen_istft_n_fft + 2;
+    // SineGen / SourceModuleHnNSF are not yet implemented (they need a torch-
+    // compatible RNG to reproduce the upstream initial-phase + additive noise).
+    // Until they land, fill har with a tiny deterministic ramp so the
+    // noise_res InstanceNorm sees non-zero variance — the synthesised audio
+    // will therefore omit the natural breath/harmonic excitation, but the
+    // phonemic content from the deterministic backbone comes through.
+    brotensor::Tensor har_stub = brotensor::Tensor::zeros_on(
+        brotensor::Device::CPU, 1, har_channels * har_frames,
+        brotensor::Dtype::FP32);
+    {
+        float* d = har_stub.host_f32_mut();
+        const std::size_t N = static_cast<std::size_t>(har_channels) * har_frames;
+        for (std::size_t i = 0; i < N; ++i) {
+            // Cheap deterministic noise in [-1e-3, 1e-3].
+            const float t = static_cast<float>((i * 2654435761u) & 0xFFFF) / 65535.0f;
+            d[i] = (t - 0.5f) * 2e-3f;
+        }
+    }
+
+    // The decoder style (ref_s[:, :style_dim]) is what Generator wants.
+    brotensor::Tensor style_dec = brotensor::Tensor::zeros_on(
+        brotensor::Device::CPU, 1, impl_->config.style_dim, brotensor::Dtype::FP32);
+    std::memcpy(style_dec.host_f32_mut(), ref_s.host_f32(),
+                static_cast<std::size_t>(impl_->config.style_dim) * sizeof(float));
+
+    brotensor::Tensor audio_t;    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
+
+    // 8. Wrap as AudioBuffer.
+    AudioBuffer out;
+    out.sample_rate = impl_->config.sample_rate;
+    out.samples.assign(audio_t.host_f32(), audio_t.host_f32() + audio_t.size());
+    return out;
 }
 
 const KokoroConfig& Kokoro::config() const { return impl_->config; }
