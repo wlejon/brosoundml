@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -141,6 +142,49 @@ int main() {
           "TextEncoder output element count (hidden_dim * L)");
     compare(t_en, ref_te.get("t_en"),
             cfg.hidden_dim * L, "t_en", 1e-3f, 1e-4f);
+
+    // ─── Predictor ─────────────────────────────────────────────────────────
+    stf::File ref_pre = stf::File::open((ref_dir / "03_predictor_pre.safetensors").string());
+    stf::File ref_lr  = stf::File::open((ref_dir / "04_length_reg.safetensors").string());
+    stf::File ref_f0n = stf::File::open((ref_dir / "05_f0_energy.safetensors").string());
+
+    // Reconstruct ref_s = a (1, 2*style_dim) row vector from the inputs dump.
+    const stf::TensorView& ref_s_view = ref_in.get("ref_s");
+    bt::Tensor ref_s = bt::Tensor::from_host_on(
+        bt::Device::CPU,
+        reinterpret_cast<const float*>(ref_s_view.data),
+        1, static_cast<int>(ref_s_view.numel()));
+
+    brosoundml::Predictor pred;
+    pred.load_from(weights, cfg);
+    brosoundml::Predictor::Output po;
+    pred.forward(d_en, ref_s, L, /*speed=*/1.0f, po);
+
+    compare(po.d,        ref_pre.get("d"),
+            L * (cfg.hidden_dim + cfg.style_dim), "predictor.d",      1e-3f, 1e-4f);
+    compare(po.lstm_x,   ref_pre.get("lstm_x"),
+            L * cfg.hidden_dim,                   "predictor.lstm_x", 1e-3f, 1e-4f);
+    compare(po.duration, ref_pre.get("duration"),
+            L * cfg.max_dur,                      "predictor.duration", 1e-3f, 1e-4f);
+
+    // pred_dur is integer-valued — compare exact (after casting the FP32-saved
+    // reference to int). A mismatch here means the duration LSTM drifted enough
+    // to cross a rounding boundary somewhere.
+    const stf::TensorView& pdv = ref_pre.get("pred_dur");
+    const float* pdv_f = reinterpret_cast<const float*>(pdv.data);
+    bool pdur_ok = (pdv.numel() == L);
+    for (int l = 0; l < L && pdur_ok; ++l) {
+        if (po.pred_dur[l] != static_cast<int32_t>(pdv_f[l])) pdur_ok = false;
+    }
+    CHECK(pdur_ok, "predictor.pred_dur matches reference exactly");
+
+    const int total = std::accumulate(po.pred_dur.begin(), po.pred_dur.end(), 0);
+    compare(po.en,      ref_lr.get("en"),
+            (cfg.hidden_dim + cfg.style_dim) * total, "predictor.en", 1e-3f, 1e-4f);
+    compare(po.F0_pred, ref_f0n.get("F0_pred"),
+            2 * total, "predictor.F0_pred", 5e-3f, 5e-4f);
+    compare(po.N_pred,  ref_f0n.get("N_pred"),
+            2 * total, "predictor.N_pred",  5e-3f, 5e-4f);
 
     if (failures == 0) {
         std::printf("test_kokoro_modules: all checks passed\n");

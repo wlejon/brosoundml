@@ -104,6 +104,119 @@ struct TextEncoder {
                  brotensor::Tensor& t_en) const;
 };
 
+// ─── Style-conditioned norms (StyleTTS2 / Kokoro predictor) ────────────────
+//
+// AdaLayerNorm:
+//   y = (1 + gamma(s)) * LayerNorm(x) + beta(s)
+//   x: (L, C). gamma, beta: derived from style by `fc: C*2 <- style_dim`,
+//   chunked into two (1, C) vectors broadcast across L.
+//
+// AdaIN1d:
+//   y = (1 + gamma(s)) * InstanceNorm1d(x) + beta(s)
+//   x: (1, C*L) NCL with N=1. Same style-conditioned (gamma, beta) shape,
+//   broadcast across L within each channel.
+struct AdaLayerNormWeights {
+    int    channels  = 0;
+    int    style_dim = 0;
+    float  eps       = 1e-5f;
+    Linear fc;   // (channels * 2, style_dim)
+};
+
+struct AdaIN1dWeights {
+    int    channels  = 0;
+    int    style_dim = 0;
+    float  eps       = 1e-5f;
+    Linear fc;   // (channels * 2, style_dim)
+};
+
+// ─── AdainResBlk1d (iSTFTNet decoder / predictor F0+N blocks) ──────────────
+//
+// The StyleTTS2 AdaIN residual block from kokoro/istftnet.py:
+//   residual = conv2(actv(norm2(conv1(pool(actv(norm1(x, s)))), s)))
+//   shortcut = (upsample ? nearest_2x : x)
+//              -> conv1x1 if dim_in != dim_out
+//   out = (residual + shortcut) / sqrt(2)
+// pool is identity for the non-upsampling blocks, or a depthwise (groups=dim_in)
+// ConvTranspose1d(k=3, stride=2, pad=1, out_pad=1) for the upsampling blocks
+// in the predictor's F0 / N stacks.
+struct AdainResBlk1dWeights {
+    int                channels_in  = 0;
+    int                channels_out = 0;
+    bool               upsample     = false;
+    bool               learned_sc   = false;  // dim_in != dim_out
+    AdaIN1dWeights     norm1;        // channels_in
+    AdaIN1dWeights     norm2;        // channels_out
+    Conv1d             conv1;        // (channels_out, channels_in, 3)
+    Conv1d             conv2;        // (channels_out, channels_out, 3)
+    Conv1d             conv1x1;      // (channels_out, channels_in, 1) when learned_sc
+    // Depthwise ConvTranspose1d weight for the upsampling pool: stored as
+    // (channels_in, 1, 3) since groups == channels_in (== channels_out / dim_in).
+    brotensor::Tensor  pool_W;       // (channels_in, 3)  flattened
+    brotensor::Tensor  pool_b;       // (channels_in, 1)
+};
+
+// ─── DurationEncoder ───────────────────────────────────────────────────────
+//
+// Alternating BiLSTM + AdaLayerNorm blocks; between layers the style vector
+// is concatenated back onto the feature axis so each LSTM sees
+// (channels + style_dim) input. Loaded from
+// `predictor.module.text_encoder.lstms.*`.
+struct DurationEncoder {
+    int channels  = 0;   // d_model = KokoroConfig::hidden_dim (512)
+    int style_dim = 0;   // 128
+    int nlayers   = 0;   // KokoroConfig::n_layer (3) — pairs of (BiLSTM, AdaLayerNorm)
+    struct Block {
+        BiLSTM             bilstm;
+        AdaLayerNormWeights aln;
+    };
+    std::vector<Block> blocks;
+
+    // d_en: (1, channels*L) NCL.  style: (1, style_dim).
+    // d: (L, channels + style_dim) — the format ProsodyPredictor.lstm consumes.
+    void forward(const brotensor::Tensor& d_en,
+                 const brotensor::Tensor& style,
+                 int L,
+                 brotensor::Tensor& d) const;
+};
+
+// ─── Predictor (the full ProsodyPredictor) ─────────────────────────────────
+//
+// Owns duration encoder + duration LSTM + duration projection + shared LSTM +
+// F0 / N AdaIN res blocks + final 1x1 conv projections. The forward pass
+// returns every intermediate the test layer compares against — keep them in
+// a struct so the test doesn't need a separate hand-rolled mirror.
+struct Predictor {
+    KokoroConfig                       cfg;
+    DurationEncoder                    text_encoder;
+    BiLSTM                             lstm;                // 640 -> 512
+    Linear                             duration_proj;       // 512 -> max_dur (50)
+    BiLSTM                             shared;              // 640 -> 512
+    std::vector<AdainResBlk1dWeights>  F0_blocks;           // 3 blocks
+    std::vector<AdainResBlk1dWeights>  N_blocks;            // 3 blocks
+    Conv1d                             F0_proj;             // (1, channels/2, 1)
+    Conv1d                             N_proj;              // (1, channels/2, 1)
+
+    struct Output {
+        brotensor::Tensor    d;            // (L, channels + style_dim)
+        brotensor::Tensor    lstm_x;       // (L, channels)
+        brotensor::Tensor    duration;     // (L, max_dur)
+        std::vector<int32_t> pred_dur;     // (L,)
+        brotensor::Tensor    en;           // (1, (channels+style_dim) * total_frames)
+        brotensor::Tensor    F0_pred;      // (1, 2 * total_frames)
+        brotensor::Tensor    N_pred;       // (1, 2 * total_frames)
+    };
+
+    void load_from(const brotensor::safetensors::File& f, const KokoroConfig& cfg);
+    // d_en: BertEncoder output, (1, hidden_dim*L) NCL.
+    // ref_s: full voice row (1, 2*style_dim). The predictor reads ref_s[:, style_dim:].
+    // speed: predicted durations are divided by `speed` before rounding.
+    void forward(const brotensor::Tensor& d_en,
+                 const brotensor::Tensor& ref_s,
+                 int L,
+                 float speed,
+                 Output& out) const;
+};
+
 // ─── Per-(N,L) channel-wise LayerNorm on NCL inputs ────────────────────────
 //
 // The StyleTTS2 / Kokoro CNN-stack LayerNorm: at every (n, l) position,

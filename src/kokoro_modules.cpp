@@ -526,4 +526,455 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
     }
 }
 
+// ─── Style-conditioned norms ───────────────────────────────────────────────
+
+namespace {
+
+// Compute (gamma, beta) = chunk(fc(style)) for an AdaLayerNorm / AdaIN1d.
+// Returns two length-C views over a freshly-allocated (1, 2*C) buffer. The
+// caller keeps `scratch` alive until the views go out of scope.
+void compute_style_affine(const Linear& fc, int C,
+                          const bt::Tensor& style, bt::Tensor& scratch,
+                          const float*& gamma_out, const float*& beta_out) {
+    bt::linear_forward_batched(fc.W, fc.b, style, scratch);  // (1, 2*C)
+    const float* h = scratch.host_f32();
+    gamma_out = h;
+    beta_out  = h + C;
+}
+
+// AdaLayerNorm forward on (L, C):
+//   y = (1 + gamma) * LayerNorm_no_affine(x_row, C) + beta
+void ada_layernorm(const AdaLayerNormWeights& w, int L,
+                   const bt::Tensor& x_lc, const bt::Tensor& style,
+                   bt::Tensor& y_lc) {
+    bt::Tensor scratch;
+    const float* gamma = nullptr;
+    const float* beta  = nullptr;
+    compute_style_affine(w.fc, w.channels, style, scratch, gamma, beta);
+    const int C = w.channels;
+    y_lc.resize(L, C, bt::Dtype::FP32);
+    const float* xd = x_lc.host_f32();
+    float* yd       = y_lc.host_f32_mut();
+    for (int l = 0; l < L; ++l) {
+        const float* row = xd + static_cast<std::size_t>(l) * C;
+        float mean = 0.0f, sumsq = 0.0f;
+        for (int c = 0; c < C; ++c) { mean += row[c]; sumsq += row[c] * row[c]; }
+        mean /= C;
+        const float var  = sumsq / C - mean * mean;
+        const float rstd = 1.0f / std::sqrt(var + w.eps);
+        float* y_row = yd + static_cast<std::size_t>(l) * C;
+        for (int c = 0; c < C; ++c) {
+            const float xhat = (row[c] - mean) * rstd;
+            y_row[c] = (1.0f + gamma[c]) * xhat + beta[c];
+        }
+    }
+}
+
+// AdaIN1d forward on (1, C*L) NCL:
+//   per channel c: y[n,c,l] = (1 + gamma[c]) * (x[n,c,l] - mean_c)/std_c + beta[c]
+//   where mean_c / std_c are taken over the L axis (instance norm).
+void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
+                      const bt::Tensor& x_ncl, const bt::Tensor& style,
+                      bt::Tensor& y_ncl) {
+    bt::Tensor scratch;
+    const float* gamma = nullptr;
+    const float* beta  = nullptr;
+    compute_style_affine(w.fc, w.channels, style, scratch, gamma, beta);
+    y_ncl.resize(N, C * L, bt::Dtype::FP32);
+    const float* xd = x_ncl.host_f32();
+    float* yd       = y_ncl.host_f32_mut();
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < C; ++c) {
+            const std::size_t base = (static_cast<std::size_t>(n) * C + c) * L;
+            float mean = 0.0f, sumsq = 0.0f;
+            for (int l = 0; l < L; ++l) { mean += xd[base + l]; sumsq += xd[base + l] * xd[base + l]; }
+            mean /= L;
+            const float var  = sumsq / L - mean * mean;
+            const float rstd = 1.0f / std::sqrt(var + w.eps);
+            for (int l = 0; l < L; ++l) {
+                const float xhat = (xd[base + l] - mean) * rstd;
+                yd[base + l] = (1.0f + gamma[c]) * xhat + beta[c];
+            }
+        }
+    }
+}
+
+// Per-(L) leaky_relu on NCL.
+void leaky_relu_ncl(bt::Tensor& y, float slope) {
+    bt::Tensor tmp;
+    bt::leaky_relu_forward(y, slope, tmp);
+    y = std::move(tmp);
+}
+
+// Nearest-neighbour 2x upsample along L: (1, C*L_in) NCL -> (1, C*(2*L_in)) NCL.
+void upsample_nearest_2x_ncl(const bt::Tensor& x, int N, int C, int L_in,
+                             bt::Tensor& y) {
+    const int L_out = 2 * L_in;
+    y.resize(N, C * L_out, bt::Dtype::FP32);
+    const float* xd = x.host_f32();
+    float* yd       = y.host_f32_mut();
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < C; ++c) {
+            const std::size_t bx = (static_cast<std::size_t>(n) * C + c) * L_in;
+            const std::size_t by = (static_cast<std::size_t>(n) * C + c) * L_out;
+            for (int l = 0; l < L_in; ++l) {
+                const float v = xd[bx + l];
+                yd[by + 2 * l + 0] = v;
+                yd[by + 2 * l + 1] = v;
+            }
+        }
+    }
+}
+
+// AdainResBlk1d forward: residual + shortcut, both / sqrt(2). x in NCL with
+// N=1; L_out = upsample ? 2*L_in : L_in. dropout is no-op at inference.
+void adain_resblk_1d_forward(const AdainResBlk1dWeights& w,
+                             const bt::Tensor& x, int L_in,
+                             const bt::Tensor& style,
+                             int& L_out, bt::Tensor& y) {
+    const int C_in  = w.channels_in;
+    const int C_out = w.channels_out;
+    L_out = w.upsample ? 2 * L_in : L_in;
+
+    // ─── residual path ────────────────────────────────────────────────────
+    bt::Tensor r;
+    ada_in_1d_styled(w.norm1, 1, C_in, L_in, x, style, r);
+    leaky_relu_ncl(r, 0.2f);
+
+    bt::Tensor pooled;
+    if (w.upsample) {
+        // Depthwise ConvTranspose1d: groups = C_in = C_out (when depthwise on dim_in).
+        // Weight layout (C_in, (C_out_per_group=1) * kL=3) = (C_in, 3).
+        bt::conv_transpose1d_forward(r, w.pool_W, &w.pool_b,
+                                     /*N=*/1, /*C_in=*/C_in, /*L=*/L_in,
+                                     /*C_out=*/C_in, /*kL=*/3,
+                                     /*stride=*/2, /*padding=*/1,
+                                     /*output_padding=*/1, /*dilation=*/1,
+                                     /*groups=*/C_in, pooled);
+    } else {
+        pooled = std::move(r);
+    }
+
+    bt::Tensor conv1_out;
+    w.conv1.forward(pooled, /*N=*/1, /*L=*/L_out, conv1_out);
+
+    bt::Tensor n2;
+    ada_in_1d_styled(w.norm2, 1, C_out, L_out, conv1_out, style, n2);
+    leaky_relu_ncl(n2, 0.2f);
+
+    bt::Tensor conv2_out;
+    w.conv2.forward(n2, /*N=*/1, /*L=*/L_out, conv2_out);
+
+    // ─── shortcut path ────────────────────────────────────────────────────
+    bt::Tensor short_x;
+    if (w.upsample) {
+        upsample_nearest_2x_ncl(x, 1, C_in, L_in, short_x);
+    } else {
+        short_x = x;
+    }
+    if (w.learned_sc) {
+        bt::Tensor sc;
+        w.conv1x1.forward(short_x, /*N=*/1, /*L=*/L_out, sc);
+        short_x = std::move(sc);
+    }
+
+    // ─── combine: y = (residual + shortcut) / sqrt(2) ─────────────────────
+    bt::add_inplace(conv2_out, short_x);
+    bt::scale_inplace(conv2_out, 1.0f / std::sqrt(2.0f));
+    y = std::move(conv2_out);
+}
+
+// Load an AdaIN1d weight set from `<prefix>.fc.{weight,bias}`.
+void load_ada_in_1d(const stf::File& f, const std::string& prefix,
+                    int channels, int style_dim, AdaIN1dWeights& w,
+                    const std::string& where) {
+    w.channels  = channels;
+    w.style_dim = style_dim;
+    w.fc.in_features  = style_dim;
+    w.fc.out_features = 2 * channels;
+    upload(f, prefix + ".fc.weight", 2 * channels, style_dim, w.fc.W, where);
+    upload(f, prefix + ".fc.bias",   2 * channels, 1,         w.fc.b, where);
+}
+
+void load_ada_layernorm(const stf::File& f, const std::string& prefix,
+                        int channels, int style_dim, AdaLayerNormWeights& w,
+                        const std::string& where) {
+    w.channels  = channels;
+    w.style_dim = style_dim;
+    w.fc.in_features  = style_dim;
+    w.fc.out_features = 2 * channels;
+    upload(f, prefix + ".fc.weight", 2 * channels, style_dim, w.fc.W, where);
+    upload(f, prefix + ".fc.bias",   2 * channels, 1,         w.fc.b, where);
+}
+
+void load_conv1d(const stf::File& f, const std::string& prefix,
+                 int C_out, int C_in, int kL, bool has_bias,
+                 Conv1d& c, const std::string& where) {
+    c.in_channels  = C_in;
+    c.out_channels = C_out;
+    c.kernel_size  = kL;
+    c.padding      = (kL == 3) ? 1 : 0;   // matches AdainResBlk1d's hardcoded paddings
+    c.stride       = 1;
+    c.dilation     = 1;
+    c.groups       = 1;
+    upload(f, prefix + ".weight", C_out, C_in * kL, c.W, where);
+    if (has_bias) {
+        upload(f, prefix + ".bias", C_out, 1, c.b, where);
+    }
+}
+
+void load_adain_resblk(const stf::File& f, const std::string& prefix,
+                       int dim_in, int dim_out, int style_dim, bool upsample,
+                       AdainResBlk1dWeights& w, const std::string& where) {
+    w.channels_in  = dim_in;
+    w.channels_out = dim_out;
+    w.upsample     = upsample;
+    w.learned_sc   = (dim_in != dim_out);
+
+    load_ada_in_1d(f, prefix + ".norm1", dim_in,  style_dim, w.norm1, where);
+    load_ada_in_1d(f, prefix + ".norm2", dim_out, style_dim, w.norm2, where);
+    load_conv1d   (f, prefix + ".conv1", dim_out, dim_in,  3, true, w.conv1, where);
+    load_conv1d   (f, prefix + ".conv2", dim_out, dim_out, 3, true, w.conv2, where);
+    if (w.learned_sc) {
+        load_conv1d(f, prefix + ".conv1x1", dim_out, dim_in, 1, false, w.conv1x1, where);
+    }
+    if (upsample) {
+        // Depthwise ConvTranspose1d: weight shape (C_in, 1, 3) -> flatten to (C_in, 3).
+        upload(f, prefix + ".pool.weight", dim_in, 3,  w.pool_W, where);
+        upload(f, prefix + ".pool.bias",   dim_in, 1,  w.pool_b, where);
+    }
+}
+
+// Transpose (1, C*L) NCL <-> (L, C) NLC.
+void ncl_to_lc(const bt::Tensor& x_ncl, int C, int L, bt::Tensor& x_lc) {
+    x_lc.resize(L, C, bt::Dtype::FP32);
+    const float* src = x_ncl.host_f32();
+    float* dst       = x_lc.host_f32_mut();
+    for (int c = 0; c < C; ++c) {
+        for (int l = 0; l < L; ++l) {
+            dst[l * C + c] = src[c * L + l];
+        }
+    }
+}
+void lc_to_ncl(const bt::Tensor& x_lc, int L, int C, bt::Tensor& x_ncl) {
+    x_ncl.resize(1, C * L, bt::Dtype::FP32);
+    const float* src = x_lc.host_f32();
+    float* dst       = x_ncl.host_f32_mut();
+    for (int l = 0; l < L; ++l) {
+        for (int c = 0; c < C; ++c) {
+            dst[c * L + l] = src[l * C + c];
+        }
+    }
+}
+
+}  // namespace
+
+// ─── DurationEncoder ───────────────────────────────────────────────────────
+
+void DurationEncoder::forward(const bt::Tensor& d_en, const bt::Tensor& style,
+                              int L, bt::Tensor& d) const {
+    const int C = channels;
+    const int S = style_dim;
+
+    // (1, C*L) NCL -> (L, C) NLC.
+    bt::Tensor x;
+    ncl_to_lc(d_en, C, L, x);
+
+    // Concat style across L: (L, C) -> (L, C + S).
+    auto cat_with_style = [&](const bt::Tensor& xs, bt::Tensor& out) {
+        out.resize(L, C + S, bt::Dtype::FP32);
+        const float* xd = xs.host_f32();
+        const float* sd = style.host_f32();
+        float* od = out.host_f32_mut();
+        for (int l = 0; l < L; ++l) {
+            float* row = od + static_cast<std::size_t>(l) * (C + S);
+            std::memcpy(row, xd + static_cast<std::size_t>(l) * C,
+                        static_cast<std::size_t>(C) * sizeof(float));
+            std::memcpy(row + C, sd, static_cast<std::size_t>(S) * sizeof(float));
+        }
+    };
+
+    bt::Tensor cat;
+    cat_with_style(x, cat);
+
+    for (const auto& blk : blocks) {
+        // BiLSTM step: (L, C+S) -> (L, C).
+        bt::Tensor lstm_out;
+        blk.bilstm.forward(cat, lstm_out);
+
+        // AdaLayerNorm step: (L, C) -> (L, C).
+        bt::Tensor aln_out;
+        ada_layernorm(blk.aln, L, lstm_out, style, aln_out);
+
+        // Concat style back: (L, C) + style -> (L, C+S).
+        cat_with_style(aln_out, cat);
+    }
+
+    d = std::move(cat);  // (L, C + S)
+}
+
+// ─── Predictor ─────────────────────────────────────────────────────────────
+
+void Predictor::load_from(const stf::File& f, const KokoroConfig& c) {
+    cfg = c;
+    const std::string where = "Predictor::load_from";
+    const std::string p = "predictor.module.";
+    const int C = c.hidden_dim;       // 512
+    const int S = c.style_dim;        // 128
+    const int H = C / 2;              // BiLSTM hidden = 256
+
+    // ─── DurationEncoder ──────────────────────────────────────────────────
+    text_encoder.channels  = C;
+    text_encoder.style_dim = S;
+    text_encoder.nlayers   = c.n_layer;
+    text_encoder.blocks.clear();
+    text_encoder.blocks.reserve(c.n_layer);
+    for (int i = 0; i < c.n_layer; ++i) {
+        DurationEncoder::Block blk;
+        // lstms.{2*i}: BiLSTM input=C+S, hidden=H.
+        blk.bilstm.input_size  = C + S;
+        blk.bilstm.hidden_size = H;
+        const std::string lp = p + "text_encoder.lstms." + std::to_string(2 * i) + ".";
+        load_lstm_cell(f, lp, C + S, H, false, blk.bilstm.forward_cell, where);
+        load_lstm_cell(f, lp, C + S, H, true,  blk.bilstm.reverse_cell, where);
+
+        const std::string ap = p + "text_encoder.lstms." + std::to_string(2 * i + 1);
+        load_ada_layernorm(f, ap, C, S, blk.aln, where);
+        text_encoder.blocks.push_back(std::move(blk));
+    }
+
+    // ─── Duration LSTM + proj ─────────────────────────────────────────────
+    lstm.input_size  = C + S;
+    lstm.hidden_size = H;
+    load_lstm_cell(f, p + "lstm.", C + S, H, false, lstm.forward_cell, where);
+    load_lstm_cell(f, p + "lstm.", C + S, H, true,  lstm.reverse_cell, where);
+
+    duration_proj.in_features  = C;
+    duration_proj.out_features = c.max_dur;
+    upload(f, p + "duration_proj.linear_layer.weight",
+           c.max_dur, C, duration_proj.W, where);
+    upload(f, p + "duration_proj.linear_layer.bias",
+           c.max_dur, 1, duration_proj.b, where);
+
+    // ─── Shared BiLSTM ────────────────────────────────────────────────────
+    shared.input_size  = C + S;
+    shared.hidden_size = H;
+    load_lstm_cell(f, p + "shared.", C + S, H, false, shared.forward_cell, where);
+    load_lstm_cell(f, p + "shared.", C + S, H, true,  shared.reverse_cell, where);
+
+    // ─── F0 / N blocks (3 each, with the middle one upsampling) ───────────
+    auto load_f0n = [&](const std::string& prefix,
+                        std::vector<AdainResBlk1dWeights>& blocks) {
+        blocks.clear();
+        blocks.resize(3);
+        load_adain_resblk(f, prefix + ".0", C,     C,     S, /*upsample=*/false, blocks[0], where);
+        load_adain_resblk(f, prefix + ".1", C,     C / 2, S, /*upsample=*/true,  blocks[1], where);
+        load_adain_resblk(f, prefix + ".2", C / 2, C / 2, S, /*upsample=*/false, blocks[2], where);
+    };
+    load_f0n(p + "F0", F0_blocks);
+    load_f0n(p + "N",  N_blocks);
+
+    // ─── Final 1x1 conv projections (C/2 -> 1) ────────────────────────────
+    load_conv1d(f, p + "F0_proj", /*C_out=*/1, /*C_in=*/C / 2, /*kL=*/1, true,
+                F0_proj, where);
+    load_conv1d(f, p + "N_proj",  /*C_out=*/1, /*C_in=*/C / 2, /*kL=*/1, true,
+                N_proj, where);
+    F0_proj.padding = 0;
+    N_proj.padding  = 0;
+}
+
+void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
+                        int L, float speed, Output& out) const {
+    const int C = cfg.hidden_dim;
+    const int S = cfg.style_dim;
+
+    // Style for predictor = ref_s[:, style_dim:].
+    bt::Tensor style = bt::Tensor::zeros_on(bt::Device::CPU, 1, S, bt::Dtype::FP32);
+    {
+        const float* rs = ref_s.host_f32();
+        std::memcpy(style.host_f32_mut(), rs + S,
+                    static_cast<std::size_t>(S) * sizeof(float));
+    }
+
+    // ─── DurationEncoder ──────────────────────────────────────────────────
+    text_encoder.forward(d_en, style, L, out.d);  // (L, C + S)
+
+    // ─── Duration LSTM + projection ──────────────────────────────────────
+    lstm.forward(out.d, out.lstm_x);              // (L, C)
+    duration_proj.forward_batched(out.lstm_x, out.duration);  // (L, max_dur)
+
+    // sigmoid + sum over the max_dur axis, / speed, round, clamp to >= 1.
+    out.pred_dur.assign(L, 0);
+    const float* dur = out.duration.host_f32();
+    int total = 0;
+    for (int l = 0; l < L; ++l) {
+        float s = 0.0f;
+        for (int k = 0; k < cfg.max_dur; ++k) {
+            const float v = dur[l * cfg.max_dur + k];
+            s += 1.0f / (1.0f + std::exp(-v));
+        }
+        s /= speed;
+        int rounded = static_cast<int>(std::round(s));
+        if (rounded < 1) rounded = 1;
+        out.pred_dur[l] = rounded;
+        total += rounded;
+    }
+
+    // ─── Length regulator ────────────────────────────────────────────────
+    // en = d.T @ alignment, where alignment is (L, total) one-hot expansion.
+    // Equivalently: en[c, t] = d[phoneme(t), c] (with `phoneme(t)` mapping
+    // each frame t back to the source phoneme).
+    out.en.resize(1, (C + S) * total, bt::Dtype::FP32);
+    {
+        const float* dd = out.d.host_f32();
+        float* en_d = out.en.host_f32_mut();
+        int t = 0;
+        for (int l = 0; l < L; ++l) {
+            const int reps = out.pred_dur[l];
+            for (int r = 0; r < reps; ++r) {
+                for (int c = 0; c < C + S; ++c) {
+                    en_d[c * total + t] = dd[l * (C + S) + c];
+                }
+                ++t;
+            }
+        }
+    }
+
+    // ─── F0Ntrain ────────────────────────────────────────────────────────
+    // shared LSTM input = en.T  -> (total, C+S) -> (total, C). Then split into
+    // F0 path and N path, each a stack of 3 AdaINResBlk1d (one upsamples).
+    bt::Tensor en_lc;
+    ncl_to_lc(out.en, C + S, total, en_lc);  // (total, C+S)
+
+    bt::Tensor shared_out;
+    shared.forward(en_lc, shared_out);        // (total, C)
+
+    bt::Tensor shared_ncl;
+    lc_to_ncl(shared_out, total, C, shared_ncl);  // (1, C*total) NCL
+
+    // F0 stack.
+    bt::Tensor F0_x = shared_ncl;
+    int F0_L = total;
+    int next_L;
+    for (const auto& blk : F0_blocks) {
+        bt::Tensor y;
+        adain_resblk_1d_forward(blk, F0_x, F0_L, style, next_L, y);
+        F0_x = std::move(y);
+        F0_L = next_L;
+    }
+    // F0_proj: Conv1d(C/2 -> 1, k=1). Output (1, 1*F0_L).
+    F0_proj.forward(F0_x, /*N=*/1, /*L=*/F0_L, out.F0_pred);
+
+    // N stack.
+    bt::Tensor N_x = shared_ncl;
+    int N_L = total;
+    for (const auto& blk : N_blocks) {
+        bt::Tensor y;
+        adain_resblk_1d_forward(blk, N_x, N_L, style, next_L, y);
+        N_x = std::move(y);
+        N_L = next_L;
+    }
+    N_proj.forward(N_x, /*N=*/1, /*L=*/N_L, out.N_pred);
+}
+
 }  // namespace brosoundml
