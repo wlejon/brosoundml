@@ -267,6 +267,37 @@ struct AdaINResBlock1Weights {
     std::array<brotensor::Tensor, 3> alpha2;
 };
 
+// ─── HarmonicSource (deterministic SineGen approximation) ──────────────────
+//
+// Generates the harmonic-source `har` stack the Generator's noise branch
+// consumes. Mirrors kokoro/istftnet.py::Generator's m_source path with one
+// simplification: torch's RNG-driven initial-phase noise and additive
+// gaussian noise are dropped. The result is a clean sinusoidal source —
+// not bit-equal to the upstream audio, but deterministic and audibly
+// TTS-shaped.
+//
+// Layout of weights on disk (under decoder.module.generator.m_source.l_linear.*):
+//   l_linear.weight  (1, harmonic_num + 1) — merges the 9 harmonic channels
+//   l_linear.bias    (1,)                  — added to the merged source
+struct HarmonicSource {
+    int sample_rate    = 24000;
+    int harmonic_num   = 8;
+    int upsample_scale = 0;   // sample_rate / F0_frame_rate; = prod(upsample_rates) * gen_istft_hop_size
+    int n_fft          = 0;
+    int hop_size       = 0;
+    int win_size       = 0;
+    float sine_amp     = 0.1f;
+    Linear l_linear;          // (1, harmonic_num + 1)
+
+    void load_from(const brotensor::safetensors::File& f, const KokoroConfig& cfg);
+    // F0_pred: (1, frame_count) per-frame fundamental frequency in Hz.
+    // har: (1, (n_fft+2) * stft_frames) — magnitude + phase channels concatenated.
+    // signal_len: filled with the upsampled audio length (frame_count * upsample_scale).
+    void forward(const brotensor::Tensor& F0_pred, int frame_count,
+                 int& signal_len, int& stft_frames,
+                 brotensor::Tensor& har) const;
+};
+
 // ─── Generator (iSTFTNet vocoder backbone) ─────────────────────────────────
 //
 // Accepts the decoder backbone output `x` (1, 512*L), the harmonic-source

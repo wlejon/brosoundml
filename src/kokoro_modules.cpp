@@ -1456,4 +1456,113 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
               /*center=*/true, /*normalized=*/false, audio);
 }
 
+// ─── HarmonicSource ────────────────────────────────────────────────────────
+
+void HarmonicSource::load_from(const stf::File& f, const KokoroConfig& cfg) {
+    const std::string where = "HarmonicSource::load_from";
+    const std::string p = "decoder.module.generator.m_source.";
+    sample_rate    = cfg.sample_rate;
+    harmonic_num   = 8;
+    n_fft          = cfg.decoder.gen_istft_n_fft;
+    hop_size       = cfg.decoder.gen_istft_hop_size;
+    win_size       = n_fft;
+    int upr = 1;
+    for (int r : cfg.decoder.upsample_rates) upr *= r;
+    upsample_scale = upr * hop_size;
+    sine_amp       = 0.1f;
+    l_linear.in_features  = harmonic_num + 1;
+    l_linear.out_features = 1;
+    upload(f, p + "l_linear.weight", 1, harmonic_num + 1, l_linear.W, where);
+    upload(f, p + "l_linear.bias",   1, 1,                l_linear.b, where);
+}
+
+void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
+                             int& signal_len, int& stft_frames,
+                             bt::Tensor& har) const {
+    signal_len = frame_count * upsample_scale;
+    const float sr_f = static_cast<float>(sample_rate);
+
+    // 1. Upsample F0 to sample rate (nearest neighbour) and compute the
+    //    instantaneous phase per harmonic. We deliberately skip torch's
+    //    rand_ini and the additive noise step — this is the deterministic
+    //    placeholder until a proper SineGen lands.
+    const float* f0_d = F0_pred.host_f32();
+    const int dim = harmonic_num + 1;
+
+    // sine_waves[t, h] = sin(phase[t][h]) * sine_amp * uv[t]
+    // We compute one length-`dim` mixed source per sample via l_linear, so we
+    // can stream and avoid a (signal_len, dim) intermediate. But the upstream
+    // multiplies a linear projection over the dim axis — for clarity we
+    // materialise a (signal_len, dim) buffer first.
+    std::vector<float> phases(dim, 0.0f);
+    std::vector<float> sine_waves(static_cast<std::size_t>(signal_len) * dim, 0.0f);
+
+    for (int t = 0; t < signal_len; ++t) {
+        const int frame = t / upsample_scale;
+        const float f0  = f0_d[std::min(frame, frame_count - 1)];
+        const float uv  = (f0 > 0.0f) ? 1.0f : 0.0f;
+        for (int h = 0; h < dim; ++h) {
+            const float omega = 6.28318530717958647692f *
+                                static_cast<float>(h + 1) * f0 / sr_f;
+            phases[h] += omega;
+            // Reduce modulo 2*pi to keep float precision.
+            if (phases[h] > 6.28318530717958647692f) {
+                phases[h] -= 6.28318530717958647692f;
+            }
+            sine_waves[static_cast<std::size_t>(t) * dim + h] =
+                std::sin(phases[h]) * sine_amp * uv;
+        }
+    }
+
+    // 2. l_linear: (signal_len, dim) -> (signal_len, 1).
+    bt::Tensor sine_t = bt::Tensor::from_host_on(bt::Device::CPU,
+                                                  sine_waves.data(),
+                                                  signal_len, dim);
+    bt::Tensor merged;  // (signal_len, 1)
+    bt::linear_forward_batched(l_linear.W, l_linear.b, sine_t, merged);
+    // 3. tanh.
+    bt::Tensor tanh_out;
+    bt::tanh_forward(merged, tanh_out);
+
+    // 4. STFT on har_source (1, signal_len).
+    bt::Tensor har_source = bt::Tensor::zeros_on(bt::Device::CPU,
+                                                  1, signal_len, bt::Dtype::FP32);
+    {
+        const float* t_d = tanh_out.host_f32();
+        float* h_d = har_source.host_f32_mut();
+        for (int t = 0; t < signal_len; ++t) h_d[t] = t_d[t];
+    }
+    bt::Tensor window = hann_window_periodic(win_size);
+    bt::Tensor spec;
+    bt::stft(har_source, window, /*N=*/1, n_fft, hop_size, win_size,
+             /*center=*/true, /*normalized=*/false, spec);
+
+    // spec layout: (frames, 2 * n_freq) interleaved. Compute magnitude/phase
+    // then transpose into (n_freq + n_freq) channels × frames for the har stack.
+    const int n_freq = n_fft / 2 + 1;
+    stft_frames = spec.rows;  // == signal_len / hop + 1 with center=true
+
+    bt::Tensor mag_frames, pha_frames;
+    bt::complex_abs(spec, mag_frames);    // (frames, n_freq)
+    bt::complex_angle(spec, pha_frames);  // (frames, n_freq)
+
+    // Transpose frames-major -> channel-major NCL: (1, 2*n_freq * frames).
+    har.resize(1, (2 * n_freq) * stft_frames, bt::Dtype::FP32);
+    float* hd = har.host_f32_mut();
+    {
+        const float* md = mag_frames.host_f32();
+        for (int c = 0; c < n_freq; ++c) {
+            for (int f = 0; f < stft_frames; ++f) {
+                hd[c * stft_frames + f] = md[f * n_freq + c];
+            }
+        }
+        const float* pd = pha_frames.host_f32();
+        for (int c = 0; c < n_freq; ++c) {
+            for (int f = 0; f < stft_frames; ++f) {
+                hd[(n_freq + c) * stft_frames + f] = pd[f * n_freq + c];
+            }
+        }
+    }
+}
+
 }  // namespace brosoundml

@@ -215,6 +215,13 @@ static int run() {
             CHECK(max_abs < 10.0f,  "synthesize: output is bounded");
             std::printf("    synthesize: %zu samples, peak |x| = %.4f\n",
                         audio.samples.size(), max_abs);
+
+            // Save the synthesized audio so the user can listen and judge
+            // quality. Path is reused on subsequent runs — overwrite-on-write
+            // by AudioBuffer::write_wav is fine for our purposes.
+            const fs::path out_wav = real_root / "synth_hello.wav";
+            audio.write_wav(out_wav.string());
+            std::printf("    synthesize: wrote %s\n", out_wav.string().c_str());
         }
     }
 

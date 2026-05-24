@@ -130,6 +130,7 @@ struct Kokoro::Impl {
     TextEncoder                 text_encoder;
     Predictor                   predictor;
     DecoderBackbone             decoder;
+    HarmonicSource              hsource;
     Generator                   generator;
 };
 
@@ -164,6 +165,7 @@ void Kokoro::load(const std::string& model_dir, brotensor::Device device) {
         impl_->text_encoder.load_from (weights, impl_->config);
         impl_->predictor.load_from    (weights, impl_->config);
         impl_->decoder.load_from      (weights);
+        impl_->hsource.load_from      (weights, impl_->config);
         impl_->generator.load_from    (weights, impl_->config);
     }
 
@@ -286,24 +288,22 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     for (int r : impl_->config.decoder.upsample_rates) upsample_prod *= r;
     const int har_frames = L_gen * upsample_prod + 1;
     const int har_channels = impl_->config.decoder.gen_istft_n_fft + 2;
-    // SineGen / SourceModuleHnNSF are not yet implemented (they need a torch-
-    // compatible RNG to reproduce the upstream initial-phase + additive noise).
-    // Until they land, fill har with a tiny deterministic ramp so the
-    // noise_res InstanceNorm sees non-zero variance — the synthesised audio
-    // will therefore omit the natural breath/harmonic excitation, but the
-    // phonemic content from the deterministic backbone comes through.
-    brotensor::Tensor har_stub = brotensor::Tensor::zeros_on(
-        brotensor::Device::CPU, 1, har_channels * har_frames,
-        brotensor::Dtype::FP32);
-    {
-        float* d = har_stub.host_f32_mut();
-        const std::size_t N = static_cast<std::size_t>(har_channels) * har_frames;
-        for (std::size_t i = 0; i < N; ++i) {
-            // Cheap deterministic noise in [-1e-3, 1e-3].
-            const float t = static_cast<float>((i * 2654435761u) & 0xFFFF) / 65535.0f;
-            d[i] = (t - 0.5f) * 2e-3f;
-        }
+    // HarmonicSource builds the (n_fft+2) × stft_frames `har` stack the
+    // Generator's noise branch consumes. It's a deterministic approximation
+    // of the upstream SineGen / SourceModuleHnNSF path — the random initial
+    // phase + additive gaussian noise are dropped, so the audio won't match
+    // upstream sample-for-sample, but it carries the F0-driven harmonic
+    // content the network was trained to consume.
+    brotensor::Tensor har_stub;
+    int sig_len = 0, hframes = 0;
+    impl_->hsource.forward(po.F0_pred, /*frame_count=*/2 * total,
+                           sig_len, hframes, har_stub);
+    if (hframes != har_frames) {
+        fail("Kokoro::synthesize",
+             "har_frames mismatch: hsource=" + std::to_string(hframes) +
+             " vs expected=" + std::to_string(har_frames));
     }
+    (void)har_channels;
 
     // The decoder style (ref_s[:, :style_dim]) is what Generator wants.
     brotensor::Tensor style_dec = brotensor::Tensor::zeros_on(

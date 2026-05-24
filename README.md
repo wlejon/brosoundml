@@ -27,8 +27,8 @@ Early — the repo is **stood up**, not yet operational.
 | Stage 4 — ProsodyPredictor (duration + F0 + N) | ✅ validated to upstream (max-abs 5e-4) |
 | Stage 5a — Decoder backbone (encode + decode loop) | ✅ validated to upstream (max-abs 1e-4) |
 | Stage 5b — Generator (ups + resblocks + iSTFT) | ✅ validated to upstream (max-abs 7e-5) |
-| `Kokoro::synthesize` end-to-end | ✅ runs; SineGen / harmonic source stubbed |
-| SineGen / SourceModuleHnNSF | ❌ not implemented — har_source replaced by deterministic placeholder; audio lacks natural breath excitation |
+| `Kokoro::synthesize` end-to-end | ✅ runs; outputs a 24 kHz WAV |
+| SineGen / SourceModuleHnNSF | ⚠️ deterministic approximation — drops torch's random initial phases + additive noise. Audio is intelligible but not bit-equal to upstream. |
 
 While the forward pass is in build-out, `Kokoro::load` / `synthesize` throw a
 `std::runtime_error` naming the stage; the API shape itself is committed and
