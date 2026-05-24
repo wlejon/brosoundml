@@ -86,6 +86,7 @@ target_sources(brosoundml PRIVATE
     src/version.cpp
     src/audio.cpp
     src/modules.cpp
+    src/kokoro_modules.cpp
     src/kokoro.cpp
 )
 
