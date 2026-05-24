@@ -2,10 +2,12 @@
 
 #include <brotensor/ops.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brosoundml {
 
@@ -264,6 +266,126 @@ void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
         std::memcpy(dst, src_fwd, row_bytes);
         std::memcpy(dst + row_bytes, src_rev, row_bytes);
     }
+}
+
+// ─── Multi-head attention (CPU FP32, with Q/K/V/O biases) ─────────────────
+//
+// The core attention kernel: pre-projected Q (Lq, D), K (Lk, D), V (Lk, D),
+// scaled dot-product softmax per head, context concat, then a biased linear
+// projection through Wo. Used by both MHA::forward (self-attention) and
+// CrossAttention::forward (cross-attention) — they differ only in how Q vs.
+// K/V are projected at the boundary.
+
+void mha_attention_fp32(const bt::Tensor& Q,
+                        const bt::Tensor& K,
+                        const bt::Tensor& V,
+                        int num_heads,
+                        const bt::Tensor& Wo,
+                        const bt::Tensor& bo,
+                        const float* d_mask,
+                        bt::Tensor& out) {
+    const int Lq = Q.rows;
+    const int D  = Q.cols;
+    const int Lk = K.rows;
+    if (V.rows != Lk || V.cols != D || K.cols != D) {
+        fail("mha_attn", "Q/K/V shape mismatch");
+    }
+    if (D % num_heads != 0) {
+        fail("mha_attn", "embed_dim " + std::to_string(D) +
+             " not divisible by num_heads " + std::to_string(num_heads));
+    }
+    const int head_dim = D / num_heads;
+    const float scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const float* Qd = Q.host_f32();
+    const float* Kd = K.host_f32();
+    const float* Vd = V.host_f32();
+
+    bt::Tensor ctx = bt::Tensor::zeros_on(bt::Device::CPU, Lq, D, bt::Dtype::FP32);
+    float* ctx_d = ctx.host_f32_mut();
+
+    std::vector<float> scores(static_cast<std::size_t>(Lk), 0.0f);
+
+    for (int h = 0; h < num_heads; ++h) {
+        for (int q = 0; q < Lq; ++q) {
+            const float* q_vec = Qd + static_cast<std::size_t>(q) * D + h * head_dim;
+
+            float max_score = -INFINITY;
+            for (int k = 0; k < Lk; ++k) {
+                const float* k_vec = Kd + static_cast<std::size_t>(k) * D + h * head_dim;
+                float s = 0.0f;
+                for (int j = 0; j < head_dim; ++j) s += q_vec[j] * k_vec[j];
+                s *= scale;
+                if (d_mask && d_mask[k] < 0.5f) s = -1e30f;
+                scores[static_cast<std::size_t>(k)] = s;
+                if (s > max_score) max_score = s;
+            }
+            float sum = 0.0f;
+            for (int k = 0; k < Lk; ++k) {
+                scores[static_cast<std::size_t>(k)] =
+                    std::exp(scores[static_cast<std::size_t>(k)] - max_score);
+                sum += scores[static_cast<std::size_t>(k)];
+            }
+            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+            for (int k = 0; k < Lk; ++k) {
+                scores[static_cast<std::size_t>(k)] *= inv;
+            }
+
+            float* ctx_row = ctx_d + static_cast<std::size_t>(q) * D + h * head_dim;
+            for (int k = 0; k < Lk; ++k) {
+                const float w = scores[static_cast<std::size_t>(k)];
+                const float* v_vec = Vd + static_cast<std::size_t>(k) * D + h * head_dim;
+                for (int j = 0; j < head_dim; ++j) ctx_row[j] += w * v_vec[j];
+            }
+        }
+    }
+
+    bt::linear_forward_batched(Wo, bo, ctx, out);
+}
+
+namespace {
+
+void check_attn_inputs(const std::string& where,
+                       const bt::Tensor& X, int expected_dim) {
+    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
+        fail(where, "currently CPU FP32 only");
+    }
+    if (X.cols != expected_dim) {
+        fail(where, "input cols=" + std::to_string(X.cols) +
+             " != expected dim=" + std::to_string(expected_dim));
+    }
+}
+
+}  // namespace
+
+void MHA::forward(const bt::Tensor& X,
+                  const float* d_mask,
+                  bt::Tensor& out) const {
+    const std::string where = "MHA::forward";
+    check_attn_inputs(where, X, embed_dim);
+
+    bt::Tensor Q, K, V;
+    bt::linear_forward_batched(Wq, bq, X, Q);
+    bt::linear_forward_batched(Wk, bk, X, K);
+    bt::linear_forward_batched(Wv, bv, X, V);
+
+    mha_attention_fp32(Q, K, V, num_heads, Wo, bo, d_mask, out);
+}
+
+void CrossAttention::forward(const bt::Tensor& X,
+                             const bt::Tensor& Ctx,
+                             const float* d_mask,
+                             bt::Tensor& out) const {
+    const std::string where = "CrossAttention::forward";
+    check_attn_inputs(where, X, embed_dim);
+    check_attn_inputs(where, Ctx, ctx_dim);
+
+    bt::Tensor Q, K, V;
+    bt::linear_forward_batched(Wq, bq, X,   Q);
+    bt::linear_forward_batched(Wk, bk, Ctx, K);
+    bt::linear_forward_batched(Wv, bv, Ctx, V);
+
+    mha_attention_fp32(Q, K, V, num_heads, Wo, bo, d_mask, out);
 }
 
 // ─── AdaIN1D ───────────────────────────────────────────────────────────────

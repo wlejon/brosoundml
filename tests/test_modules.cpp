@@ -347,6 +347,120 @@ static void test_ada_in_1d() {
     }
 }
 
+// ─── MHA / CrossAttention smoke ─────────────────────────────────────────────
+//
+// Synthetic-weights sanity check. With identity Q/K/V/O weights and zero
+// biases, single-head self-attention on rows that are one-hot vectors
+// concentrates almost all softmax mass on the matching row (Q.K^T peaks
+// where q_i == k_i), so the output of each query row is close to its own
+// V row. The non-trivial check is that the *plumbing* — Q/K/V projection,
+// per-head reshape, softmax/context, Wo projection — composes correctly,
+// not the math (which test_kokoro_modules already validates end-to-end).
+
+static void test_mha_self() {
+    const int D = 4;
+    const int L = 3;
+    const int H = 1;
+    const float ID[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    };
+    const float ZERO[4] = {0, 0, 0, 0};
+
+    brosoundml::MHA mha;
+    mha.num_heads = H;
+    mha.embed_dim = D;
+    mha.Wq = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
+    mha.Wk = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
+    mha.Wv = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
+    mha.Wo = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
+    mha.bq = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
+    mha.bk = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
+    mha.bv = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
+    mha.bo = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
+
+    // Three sharply-distinct rows; very large magnitude so the softmax over
+    // queries argmax-snaps onto the matching key row.
+    const float X[12] = {
+        10, 0, 0, 0,
+         0, 10, 0, 0,
+         0, 0, 10, 0,
+    };
+    bt::Tensor X_t  = bt::Tensor::from_host_on(bt::Device::CPU, X, L, D);
+    bt::Tensor out;
+    mha.forward(X_t, /*d_mask=*/nullptr, out);
+    CHECK(out.rows == L && out.cols == D, "MHA output shape (L, D)");
+    const float* od = out.host_f32();
+    // Each row should be near its corresponding V row (which equals the input
+    // row given identity weights).
+    for (int r = 0; r < L; ++r) {
+        for (int c = 0; c < D; ++c) {
+            CHECK(approx(od[r * D + c], X[r * D + c], 1e-2f),
+                  "MHA self-attention concentrates on matching key");
+        }
+    }
+}
+
+static void test_cross_attention() {
+    // Q from X has D=4 dims; K/V from Ctx have D_ctx=2 dims, so Wk/Wv are
+    // rectangular (D=4, D_ctx=2). Single query, two context rows; biases zero;
+    // an identity-ish projection lets us verify the cross-projection shape
+    // glue without rerunning attention math.
+    const int D     = 4;
+    const int D_ctx = 2;
+    const int Lq    = 1;
+    const int Lk    = 2;
+
+    // Wq: (D, D) identity.
+    const float Wq_d[16] = {
+        1, 0, 0, 0,  0, 1, 0, 0,
+        0, 0, 1, 0,  0, 0, 0, 1,
+    };
+    // Wk = Wv: (D, D_ctx). Project Ctx to D by writing it into the first 2
+    // channels and zeroing the rest.
+    const float Wkv_d[8] = {
+        1, 0,  0, 1,
+        0, 0,  0, 0,
+    };
+    // Wo: (D, D) identity.
+    const float Wo_d[16] = {
+        1, 0, 0, 0,  0, 1, 0, 0,
+        0, 0, 1, 0,  0, 0, 0, 1,
+    };
+    const float ZERO_D[4] = {0, 0, 0, 0};
+
+    brosoundml::CrossAttention xa;
+    xa.num_heads = 1;
+    xa.embed_dim = D;
+    xa.ctx_dim   = D_ctx;
+    xa.Wq = bt::Tensor::from_host_on(bt::Device::CPU, Wq_d,  D, D);
+    xa.Wk = bt::Tensor::from_host_on(bt::Device::CPU, Wkv_d, D, D_ctx);
+    xa.Wv = bt::Tensor::from_host_on(bt::Device::CPU, Wkv_d, D, D_ctx);
+    xa.Wo = bt::Tensor::from_host_on(bt::Device::CPU, Wo_d,  D, D);
+    xa.bq = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
+    xa.bk = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
+    xa.bv = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
+    xa.bo = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
+
+    // Query strongly aligned with the first context row's projection.
+    const float X_d[4]   = {10, 0, 0, 0};
+    const float Ctx_d[4] = {1, 0,  0, 1};   // Lk=2 rows of D_ctx=2
+    bt::Tensor X_t   = bt::Tensor::from_host_on(bt::Device::CPU, X_d,   Lq, D);
+    bt::Tensor Ctx_t = bt::Tensor::from_host_on(bt::Device::CPU, Ctx_d, Lk, D_ctx);
+
+    bt::Tensor out;
+    xa.forward(X_t, Ctx_t, /*d_mask=*/nullptr, out);
+    CHECK(out.rows == Lq && out.cols == D, "CrossAttention output shape (Lq, D)");
+    // V_0 = Wkv [1, 0] = (1, 0, 0, 0); V_1 = Wkv [0, 1] = (0, 1, 0, 0).
+    // Query projects to (10, 0, 0, 0); attends heavily to V_0 -> first
+    // channel ≈ 1, second ≈ 0. Output projection (Wo = I) preserves that.
+    const float* od = out.host_f32();
+    CHECK(approx(od[0], 1.0f, 1e-2f), "CrossAttention attends to matching ctx row");
+    CHECK(approx(od[1], 0.0f, 1e-2f), "CrossAttention non-attended ctx row near zero");
+}
+
 int main() {
     test_linear();
     test_layernorm();
@@ -354,6 +468,8 @@ int main() {
     test_lstm();
     test_bilstm();
     test_ada_in_1d();
+    test_mha_self();
+    test_cross_attention();
 
     if (failures == 0) {
         std::printf("test_modules: all checks passed\n");

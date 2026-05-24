@@ -123,6 +123,88 @@ struct BiLSTM {
     void forward(const brotensor::Tensor& X, brotensor::Tensor& Y) const;
 };
 
+// ─── Multi-head self-attention (with Q/K/V/O biases) ──────────────────────
+//
+// PyTorch / Hugging Face MultiHeadAttention with separate weights + biases on
+// every projection. The plBERT branch of Kokoro needs this layout; so does
+// every transformer-encoder block in Whisper.
+//
+// brotensor's FP16 path (flash_attention_qkvo_forward) accepts separate
+// Q/K/V/O weights and biases, but no FP32 attention op does — so the FP32
+// CPU implementation projects Q/K/V via linear_forward_batched (which has
+// bias) and then runs an open-coded scalar softmax + context kernel. This
+// is the same loop kokoro_modules.cpp previously open-coded inline; lifting
+// it into a module so Whisper can reuse it.
+//
+// Dispatch (today): FP32 CPU only. The FP16 / GPU path will arrive when
+// Whisper-on-GPU performance becomes the bottleneck; until then a runtime
+// check rejects non-FP32 / non-CPU inputs rather than silently falling back.
+struct MHA {
+    int               num_heads = 0;
+    int               embed_dim = 0;   // D — must be divisible by num_heads
+    brotensor::Tensor Wq;              // (D, D)
+    brotensor::Tensor bq;              // (D, 1) — empty when bias disabled
+    brotensor::Tensor Wk;              // (D, D)
+    brotensor::Tensor bk;              // (D, 1)
+    brotensor::Tensor Wv;              // (D, D)
+    brotensor::Tensor bv;              // (D, 1)
+    brotensor::Tensor Wo;              // (D, D)
+    brotensor::Tensor bo;              // (D, 1)
+
+    // Self-attention. X: (L, embed_dim). `d_mask` is an optional length-L
+    // host pointer (1 valid / 0 invalid); pass nullptr when every key is
+    // valid. out: (L, embed_dim), resized.
+    void forward(const brotensor::Tensor& X,
+                 const float* d_mask,
+                 brotensor::Tensor& out) const;
+};
+
+// ─── Multi-head cross-attention (with Q/K/V/O biases) ─────────────────────
+//
+// Like MHA, but K and V are projected from a separate context tensor — so
+// Wk and Wv are rectangular (D, ctx_dim). This is the layout the Whisper
+// decoder's cross-attention layer needs, and the same shape SD1.5's
+// cross-attention uses (different ctx_dim for the encoder hidden state).
+//
+// Same dispatch rules as MHA — FP32 CPU only for now.
+struct CrossAttention {
+    int               num_heads = 0;
+    int               embed_dim = 0;   // D (query/output dim)
+    int               ctx_dim   = 0;   // context (K/V) input dim
+    brotensor::Tensor Wq;              // (D, D)
+    brotensor::Tensor bq;              // (D, 1)
+    brotensor::Tensor Wk;              // (D, ctx_dim)
+    brotensor::Tensor bk;              // (D, 1)
+    brotensor::Tensor Wv;              // (D, ctx_dim)
+    brotensor::Tensor bv;              // (D, 1)
+    brotensor::Tensor Wo;              // (D, D)
+    brotensor::Tensor bo;              // (D, 1)
+
+    // X:   (Lq, embed_dim) — query source.
+    // Ctx: (Lk, ctx_dim)   — key/value source.
+    // d_mask: optional length-Lk host pointer (1 valid / 0 invalid).
+    // out: (Lq, embed_dim), resized.
+    void forward(const brotensor::Tensor& X,
+                 const brotensor::Tensor& Ctx,
+                 const float* d_mask,
+                 brotensor::Tensor& out) const;
+};
+
+// Low-level multi-head attention kernel: takes pre-projected Q (Lq, D),
+// K (Lk, D), V (Lk, D); runs per-head scaled-dot-product softmax and a final
+// Wo + bo projection. Both MHA::forward and CrossAttention::forward delegate
+// to this — and call sites that already hold the projected Q/K/V can skip
+// the module wrappers and call this directly (PLBert's ALBERT layer does).
+// CPU FP32 only for now.
+void mha_attention_fp32(const brotensor::Tensor& Q,
+                        const brotensor::Tensor& K,
+                        const brotensor::Tensor& V,
+                        int num_heads,
+                        const brotensor::Tensor& Wo,
+                        const brotensor::Tensor& bo,
+                        const float* d_mask,
+                        brotensor::Tensor& out);
+
 // ─── AdaIN1D (instance norm + per-channel affine) ──────────────────────────
 //
 // The "AdaIN" affine step common to StyleTTS2 / iSTFTNet decoders: normalise

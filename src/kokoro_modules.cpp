@@ -76,80 +76,6 @@ void add_bias_rows(bt::Tensor& out, const bt::Tensor& b, int rows, int cols) {
     }
 }
 
-// Standard multi-head scaled-dot-product attention with biases on every
-// projection (Q, K, V, dense) — the ALBERT layout. Implemented from primitives
-// because brotensor's mha_forward has no Q/K/V bias slot.
-//
-// hidden: (L, D). num_heads divides D. head_dim = D/num_heads. mask is null
-// for our test input (all positions valid); a non-null length-L mask gates
-// keys by adding -inf to the masked scores before softmax.
-void mha_with_bias(const bt::Tensor& hidden, int L, int D, int num_heads,
-                   const bt::Tensor& Wq, const bt::Tensor& bq,
-                   const bt::Tensor& Wk, const bt::Tensor& bk,
-                   const bt::Tensor& Wv, const bt::Tensor& bv,
-                   const bt::Tensor& Wo, const bt::Tensor& bo,
-                   const float* d_mask,
-                   bt::Tensor& out) {
-    const int head_dim = D / num_heads;
-    const float scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-    // Q, K, V projections — each (L, D).
-    bt::Tensor Q, K, V;
-    bt::linear_forward_batched(Wq, bq, hidden, Q);
-    bt::linear_forward_batched(Wk, bk, hidden, K);
-    bt::linear_forward_batched(Wv, bv, hidden, V);
-
-    const float* Qd = Q.host_f32();
-    const float* Kd = K.host_f32();
-    const float* Vd = V.host_f32();
-
-    // Per-head attention context: ctx is (L, D), filled by stacking heads
-    // along the feature axis at offsets `h*head_dim`.
-    bt::Tensor ctx = bt::Tensor::zeros_on(bt::Device::CPU, L, D, bt::Dtype::FP32);
-    float* ctx_d = ctx.host_f32_mut();
-
-    // Reused row buffer for softmax-per-query.
-    std::vector<float> scores(L, 0.0f);
-
-    for (int h = 0; h < num_heads; ++h) {
-        // Pointers into the head's slice of Q, K, V.
-        // Q[L, D] -> Q_h slice: q[r, h*head_dim + j] for r in [0,L), j in [0,head_dim).
-        for (int q = 0; q < L; ++q) {
-            const float* q_vec = Qd + static_cast<std::size_t>(q) * D + h * head_dim;
-            // scores[k] = (q . K_h[k]) * scale; mask out invalid keys.
-            float max_score = -INFINITY;
-            for (int k = 0; k < L; ++k) {
-                const float* k_vec = Kd + static_cast<std::size_t>(k) * D + h * head_dim;
-                float s = 0.0f;
-                for (int j = 0; j < head_dim; ++j) s += q_vec[j] * k_vec[j];
-                s *= scale;
-                if (d_mask && d_mask[k] < 0.5f) s = -1e30f;
-                scores[k] = s;
-                if (s > max_score) max_score = s;
-            }
-            // Softmax (numerically stable).
-            float sum = 0.0f;
-            for (int k = 0; k < L; ++k) {
-                scores[k] = std::exp(scores[k] - max_score);
-                sum += scores[k];
-            }
-            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-            for (int k = 0; k < L; ++k) scores[k] *= inv;
-
-            // ctx_h[q] = sum_k scores[k] * V_h[k]; write into ctx[q, h*head_dim+j].
-            float* ctx_row = ctx_d + static_cast<std::size_t>(q) * D + h * head_dim;
-            for (int k = 0; k < L; ++k) {
-                const float w = scores[k];
-                const float* v_vec = Vd + static_cast<std::size_t>(k) * D + h * head_dim;
-                for (int j = 0; j < head_dim; ++j) ctx_row[j] += w * v_vec[j];
-            }
-        }
-    }
-
-    // Output projection: out = ctx @ Wo^T + bo.
-    bt::linear_forward_batched(Wo, bo, ctx, out);
-}
-
 }  // namespace
 
 // ─── PLBert ────────────────────────────────────────────────────────────────
@@ -277,13 +203,15 @@ void PLBert::forward(const std::vector<int32_t>& input_ids,
     bt::linear_forward_batched(emb_to_hidden.W, emb_to_hidden.b, emb, hidden);
 
     // ─── Shared ALBERT layer × num_hidden_layers ───────────────────────────
+    bt::Tensor Q_proj, K_proj, V_proj;
     bt::Tensor attn_out, ffn_in, ffn_act, ffn_out_t, hidden_next;
     for (int layer = 0; layer < cfg.num_hidden_layers; ++layer) {
         // attn_out = MHA(hidden) -- with biases on Q, K, V, dense.
-        mha_with_bias(hidden, L, H, cfg.num_attention_heads,
-                      attn_q.W, attn_q.b, attn_k.W, attn_k.b,
-                      attn_v.W, attn_v.b, attn_dense.W, attn_dense.b,
-                      d_mask, attn_out);
+        bt::linear_forward_batched(attn_q.W, attn_q.b, hidden, Q_proj);
+        bt::linear_forward_batched(attn_k.W, attn_k.b, hidden, K_proj);
+        bt::linear_forward_batched(attn_v.W, attn_v.b, hidden, V_proj);
+        mha_attention_fp32(Q_proj, K_proj, V_proj, cfg.num_attention_heads,
+                           attn_dense.W, attn_dense.b, d_mask, attn_out);
         // Residual + attention LayerNorm.
         bt::add_inplace(attn_out, hidden);
         bt::Tensor attn_normed;

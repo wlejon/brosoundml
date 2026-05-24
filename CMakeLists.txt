@@ -59,6 +59,23 @@ if(NOT TARGET brotensor)
     endif()
 endif()
 
+# brolm — sibling text/model library. brosoundml consumes brolm for tokenizers
+# (the upcoming Whisper target uses brolm::whisper::Tokenizer); brolm's own
+# tests + tools are skipped because we add it with EXCLUDE_FROM_ALL.
+set(BROLM_DIR "${CMAKE_SOURCE_DIR}/../brolm" CACHE PATH
+    "Path to standalone brolm repo (set to a missing path to force submodule fallback)")
+if(NOT TARGET brolm)
+    if(EXISTS "${BROLM_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROLM_DIR}" "${CMAKE_BINARY_DIR}/brolm" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brolm/CMakeLists.txt")
+        add_subdirectory(third_party/brolm EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "brolm not found at ${BROLM_DIR} or third_party/brolm. "
+            "Clone the brolm repo next to this repo, or override with -DBROLM_DIR=...")
+    endif()
+endif()
+
 # --- brosoundml library ---
 
 add_library(brosoundml STATIC)
@@ -72,6 +89,7 @@ target_compile_features(brosoundml PUBLIC cxx_std_20)
 target_link_libraries(brosoundml PUBLIC
     bromath::bromath
     brotensor::brotensor
+    brolm::brolm
 )
 
 if(MSVC)
