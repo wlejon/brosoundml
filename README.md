@@ -10,42 +10,26 @@ It is to audio what [`brodiffusion`](../brodiffusion) is to images and
 [`brolm`](../brolm) is to text: a sibling library that turns a tensor op
 surface into a model.
 
-The first operational target is **Kokoro-82M** text-to-speech.
+Models implemented:
 
-## Status
+- **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz output).
+- **Whisper** — speech-to-text (HF transformers checkpoints, tiny → large-v3).
 
-Early — the repo is **stood up**, not yet operational.
-
-| Area | State |
-|---|---|
-| Build system, sibling wiring (bromath + brotensor) | ✅ done |
-| `AudioBuffer` + 16-bit PCM WAV read/write | ✅ done, tested |
-| Kokoro public API (`Kokoro`, `KokoroConfig`, `Voice`) | ✅ committed |
-| Stage 1 — `config.json` parser, `model.safetensors` open, voice-pack loader | ✅ done, tested |
-| Stage 2 — module layer (`Linear`, `LayerNorm`, `Conv1d`, `LSTM`, `BiLSTM`, `ada_in_1d`) | ✅ done, tested |
-| Stage 3 — plBERT + bert_encoder + TextEncoder | ✅ validated to upstream (max-abs 1e-5) |
-| Stage 4 — ProsodyPredictor (duration + F0 + N) | ✅ validated to upstream (max-abs 5e-4) |
-| Stage 5a — Decoder backbone (encode + decode loop) | ✅ validated to upstream (max-abs 1e-4) |
-| Stage 5b — Generator (ups + resblocks + iSTFT) | ✅ validated to upstream (max-abs 7e-5) |
-| `Kokoro::synthesize` end-to-end | ✅ runs; outputs a 24 kHz WAV |
-| SineGen / SourceModuleHnNSF | ⚠️ deterministic approximation — drops torch's random initial phases + additive noise. Audio is intelligible but not bit-equal to upstream. |
-
-While the forward pass is in build-out, `Kokoro::load` / `synthesize` throw a
-`std::runtime_error` naming the stage; the API shape itself is committed and
-covered by `test_kokoro`.
+CLI tools `brosoundml_synth` and `brosoundml_transcribe` drive each end-to-end.
 
 ## Dependencies
 
-brosoundml is a standalone sibling repo. It links two siblings and ships no
+brosoundml is a standalone sibling repo. It links three siblings and ships no
 GPU kernels of its own — GPU work happens inside `brotensor`.
 
 | Library | Role |
 |---|---|
 | [`bromath`](../bromath) | header-only math (Vec/Quat/Mat, easing) |
-| [`brotensor`](../brotensor) | the unified `Tensor` + the device-neutral op surface, including the audio op family |
+| [`brotensor`](../brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) |
+| [`brolm`](../brolm) | tokenizers used by the speech models (e.g. `brolm::whisper::Tokenizer`) |
 
-CMake auto-detects standalone repos at `../bromath` and `../brotensor`, falling
-back to `third_party/` submodules — the pattern in
+CMake auto-detects standalone repos at `../<name>`, falling back to
+`third_party/` submodules — the pattern in
 [`bro/docs/multi-repo-workflow.md`](../bro/docs/multi-repo-workflow.md).
 
 ## Build
@@ -61,7 +45,7 @@ cmake -B build -DBROTENSOR_WITH_CUDA=ON
 cmake --build build --config Release
 ```
 
-## The Kokoro target
+## Kokoro
 
 Kokoro-82M is an 82M-parameter TTS model derived from **StyleTTS 2**. Unlike
 StyleTTS 2 it does not sample a style with a diffusion model — the "voice" is a
@@ -105,49 +89,43 @@ Most of Kokoro maps straight onto the existing op surface:
 | iSTFT head | `istft` (and `stft` / `complex_*` for the magnitude/phase pair) |
 | Resampling | `resample1d` |
 
-**The one gap is a recurrent (LSTM) op.** The text encoder and both predictors
-use bidirectional LSTMs, and `brotensor` has no recurrent primitive. brosoundml
-will compose the LSTM cell from `matmul` + `sigmoid` + `tanh` per timestep —
-correct first, and enough to get Kokoro operational. A fused `brotensor` LSTM
-op is a later performance optimisation, to be specified once the real cell
-shapes are known.
+The text encoder and both predictors use bidirectional LSTMs and `brotensor`
+has no recurrent primitive, so brosoundml composes the LSTM cell from `matmul`
++ `sigmoid` + `tanh` per timestep. A fused `brotensor` LSTM op is a later
+performance optimisation.
 
-## Build-out plan
+### Caveat
 
-Ordered so each stage is independently testable:
+The harmonic-source branch (SineGen / SourceModuleHnNSF in upstream Kokoro)
+uses a deterministic approximation that drops torch's random initial phases
+and additive noise. Output is intelligible but not bit-equal to upstream.
 
-1. **Weight loading** ✅ — parse `config.json` into `KokoroConfig`; open
-   `model.safetensors` (via `brotensor::safetensors`) and the voice packs into
-   tensors. `load` / `load_voice` / `Voice::pick_for` are real. Voice packs are
-   loaded as raw little-endian FP32 of shape `(rows, 2*style_dim)`; convert
-   upstream Kokoro `.pt` voices to this format once on the host.
-2. **Module layer** ✅ — a small nn-module set over brotensor ops: `Linear`
-   (single-vec + batched), `LayerNorm`, `Conv1d`, `LSTM` + `BiLSTM` (composed
-   from `matmul` + `sigmoid` + `tanh` per timestep), and the `ada_in_1d` affine
-   primitive. Inference-only. Unit-tested in `test_modules` with hand-rolled
-   synthetic weights against a from-scratch LSTM-cell reference.
-3. **plBERT + text encoder** ✅ — `brosoundml::PLBert` (HuggingFace
-   `AlbertModel` topology with 12 shared layers + hand-rolled MHA with biases),
-   `brosoundml::BertEncoder` (768 → 512 Linear), and `brosoundml::TextEncoder`
-   (embedding + 3 × (Conv1d + per-channel NCL LayerNorm + LeakyReLU) +
-   bidirectional LSTM). Validated row-by-row against a reference activation
-   dump from the upstream `kokoro` Python package (max-abs 1e-5).
-4. **Predictor** ✅ — `brosoundml::Predictor` covers `DurationEncoder` (3
-   alternating BiLSTM + AdaLayerNorm blocks), the duration LSTM, the
-   `LinearNorm` projection, the length regulator, the shared LSTM, and the
-   AdaINResBlk1d-based F0 / N stacks. Reference-validated (max-abs 5e-4).
-5. **Decoder + iSTFT head** ✅ (with one caveat) — `brosoundml::DecoderBackbone`
-   covers the encode + decode loop (`F0_conv`, `N_conv`, `asr_res`, encode,
-   4 decode blocks including the upsample). `brosoundml::Generator` covers
-   the deterministic iSTFTNet backbone (2 ConvTranspose ups, 2 noise convs,
-   2 noise_res AdaINResBlock1 blocks, 6 resblocks, conv_post, iSTFT) and
-   matches the upstream audio bit-for-bit given the same harmonic source
-   (max-abs 7e-5). **SineGen / SourceModuleHnNSF is not implemented** — the
-   end-to-end `Kokoro::synthesize` feeds a deterministic noise placeholder
-   into the noise branch, so the synthesised audio lacks the natural breath
-   excitation. Implementing a torch-compatible RNG (or a deterministic sine
-   generator) is the remaining work to reach upstream audio quality.
-6. **bro integration** — deferred until after SineGen.
+## Whisper
+
+OpenAI's encoder-decoder speech-to-text model. brosoundml targets the HF
+transformers checkpoints (`whisper-tiny` / `-base` / `-small` / `-medium` /
+`-large-v3`) — `config.json` + `model.safetensors` in a model directory.
+Tokenization is delegated to `brolm::whisper::Tokenizer`; brosoundml itself
+takes already-tokenized prompts and emits token ids.
+
+### Pipeline
+
+```
+   1. Log-mel front-end  16 kHz mono PCM ─▶ log-mel spectrogram
+                         (num_mel_bins × 3000 frames, 30 s padded/truncated).
+                         stft + mel-filterbank matmul + log.
+   2. Encoder            two strided conv1d stems + sinusoidal positional
+                         embeddings + a pre-LN Transformer stack.
+   3. Decoder            cross-attention Transformer with a KV cache,
+                         autoregressive greedy decode.
+   4. Tokenizer          brolm::whisper::Tokenizer (external) maps id ─▶ text.
+```
+
+### brotensor op coverage
+
+`stft` + `complex_abs` + `matmul` (mel front-end), `conv1d`, `gelu`,
+`layer_norm`, MHA (composed via brosoundml's FP32 MHA / CrossAttention
+modules — see `modules.h`), `embedding_lookup`, `sample_logits` / `argmax`.
 
 ## License
 
