@@ -494,6 +494,7 @@ static void run_all(bt::Device dev, const char* dev_name) {
 }
 
 int main() {
+    bt::init();
     run_all(bt::Device::CPU, "CPU");
     if (bt::is_available(bt::Device::CUDA)) {
         run_all(bt::Device::CUDA, "CUDA");

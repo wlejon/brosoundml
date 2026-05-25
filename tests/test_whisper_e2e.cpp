@@ -343,6 +343,7 @@ static int run() {
 }
 
 int main() {
+    brotensor::init();
     try {
         const int f = run();
         if (f) {

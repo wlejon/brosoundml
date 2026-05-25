@@ -2,6 +2,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/safetensors.h>
+#include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,40 @@ namespace brosoundml {
 namespace bt  = brotensor;
 namespace stf = brotensor::safetensors;
 
+// Target device for the file-local `upload` helper. The Kokoro `load_from`
+// chain doesn't thread a `device` argument through (the public header takes
+// only `(File, KokoroConfig)`), so kokoro.cpp calls `set_kokoro_load_device`
+// here before invoking the chain. safetensors::upload lands tensors on CPU;
+// without this migration step they stay on CPU even when the rest of the
+// model runs on CUDA, and brotensor's dispatcher then refuses the mixed call.
+// This is the upload-time half of the systemic CUDA-port bug.
+bt::Device g_kokoro_load_device = bt::Device::CPU;
+
+void set_kokoro_load_device(bt::Device d) { g_kokoro_load_device = d; }
+
+namespace {
+
+// Upload a host int32 index buffer to a (n, 1) INT32 tensor on `dev`.
+// brotensor lacks `Tensor::from_host_int32_on`, so we reach through the
+// public memcpy_h2d hook on the backend's vtable. CUDA's
+// `embedding_lookup_forward` reads `d_idx` as a DEVICE pointer, so calls that
+// previously passed `host_vector.data()` straight through crashed CUDA with
+// an illegal memory access.
+bt::Tensor upload_int32_idx(bt::Device dev, const std::int32_t* host_idx, int n) {
+    bt::Tensor t = bt::Tensor::empty_on(dev, n, 1, bt::Dtype::INT32);
+    if (n == 0) return t;
+    if (dev == bt::Device::CPU) {
+        std::memcpy(t.data, host_idx, static_cast<std::size_t>(n) * sizeof(std::int32_t));
+    } else {
+        bt::detail::alloc_for(dev).memcpy_h2d(
+            t.data, host_idx,
+            static_cast<std::size_t>(n) * sizeof(std::int32_t));
+    }
+    return t;
+}
+
+}  // namespace
+
 namespace {
 
 [[noreturn]] void fail(const std::string& where, const std::string& msg) {
@@ -25,7 +60,9 @@ namespace {
 
 // Upload a tensor named `key` from `f` into `dst` reshaped to (rows, cols).
 // rows*cols must equal the safetensors tensor's element count; the source
-// dtype must be F32 (Kokoro's converted checkpoint).
+// dtype must be F32 (Kokoro's converted checkpoint). After the host-side
+// safetensors upload, migrate `dst` to `g_kokoro_load_device` so the rest of
+// the module sees device-matched weights.
 void upload(const stf::File& f, const std::string& key,
             int rows, int cols, bt::Tensor& dst,
             const std::string& where) {
@@ -42,6 +79,13 @@ void upload(const stf::File& f, const std::string& key,
                     std::to_string(static_cast<int64_t>(rows) * cols));
     }
     stf::upload(*view, rows, cols, dst);
+    // safetensors::upload uses Tensor::from_host which lands on
+    // brotensor::default_device() — that's CUDA once init() registers it, not
+    // CPU. Migrate unconditionally to g_kokoro_load_device so the model's
+    // weights end up exactly where forward() expects them.
+    if (dst.device != g_kokoro_load_device) {
+        dst = dst.to(g_kokoro_load_device);
+    }
 }
 
 // Per-row LayerNorm over a (N, D) batch of features. Wraps the device-aware
@@ -50,6 +94,12 @@ void upload(const stf::File& f, const std::string& key,
 void layernorm_rows(int N, int D,
                     const bt::Tensor& gamma, const bt::Tensor& beta,
                     float eps, const bt::Tensor& X, bt::Tensor& Y) {
+    // Tensor::resize preserves the existing device field; a caller that
+    // default-constructed Y would leave it on CPU and crash CUDA dispatch.
+    // Migrate Y to X.device before the resize so the realloc lands correctly.
+    if (Y.device != X.device) {
+        Y = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
+    }
     Y.resize(N, D, bt::Dtype::FP32);
     bt::layernorm_forward_inference_batched(X, gamma, beta, Y, eps);
 }
@@ -155,34 +205,74 @@ void PLBert::forward(const std::vector<int32_t>& input_ids,
     }
 
     // ─── Embedding lookup + LayerNorm ──────────────────────────────────────
-    bt::Tensor word_emb;
-    bt::embedding_lookup_forward(word_embeddings, input_ids.data(), L, word_emb);
+    // Pre-allocate every op-out tensor on the model's device (taken from the
+    // embedding tables — they share the device every other weight was loaded
+    // onto). Default-constructed Tensors live on CPU and brotensor's CUDA
+    // dispatch refuses mixed-device calls; Tensor::resize preserves device,
+    // so a (0, 0) seed is enough for ops that re-size their out param.
+    const bt::Device dev = word_embeddings.device;
+
+    bt::Tensor word_emb = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    // CUDA `embedding_lookup_forward` reads `d_idx` as a DEVICE pointer, so on
+    // CUDA we stage indices through `upload_int32_idx`. On CPU we keep the
+    // host pointer to avoid a needless allocation.
+    bt::Tensor word_idx;
+    const std::int32_t* word_idx_ptr;
+    if (dev == bt::Device::CPU) {
+        word_idx_ptr = input_ids.data();
+    } else {
+        word_idx = upload_int32_idx(dev, input_ids.data(), L);
+        word_idx_ptr = static_cast<const std::int32_t*>(word_idx.data);
+    }
+    bt::embedding_lookup_forward(word_embeddings, word_idx_ptr, L, word_emb);
 
     std::vector<int32_t> pos_ids(L);
     std::iota(pos_ids.begin(), pos_ids.end(), 0);
-    bt::Tensor pos_emb;
-    bt::embedding_lookup_forward(position_embeddings, pos_ids.data(), L, pos_emb);
+    bt::Tensor pos_emb = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor pos_idx;
+    const std::int32_t* pos_idx_ptr;
+    if (dev == bt::Device::CPU) {
+        pos_idx_ptr = pos_ids.data();
+    } else {
+        pos_idx = upload_int32_idx(dev, pos_ids.data(), L);
+        pos_idx_ptr = static_cast<const std::int32_t*>(pos_idx.data);
+    }
+    bt::embedding_lookup_forward(position_embeddings, pos_idx_ptr, L, pos_emb);
 
     std::vector<int32_t> tt_ids(L, 0);
-    bt::Tensor tt_emb;
-    bt::embedding_lookup_forward(token_type_embeddings, tt_ids.data(), L, tt_emb);
+    bt::Tensor tt_emb = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor tt_idx;
+    const std::int32_t* tt_idx_ptr;
+    if (dev == bt::Device::CPU) {
+        tt_idx_ptr = tt_ids.data();
+    } else {
+        tt_idx = upload_int32_idx(dev, tt_ids.data(), L);
+        tt_idx_ptr = static_cast<const std::int32_t*>(tt_idx.data);
+    }
+    bt::embedding_lookup_forward(token_type_embeddings, tt_idx_ptr, L, tt_emb);
 
     // emb_sum = word + pos + tt.
     bt::Tensor emb_sum = word_emb;        // owns its own buffer (copy-ctor)
     bt::add_inplace(emb_sum, pos_emb);
     bt::add_inplace(emb_sum, tt_emb);
 
-    bt::Tensor emb;                       // (L, E)
+    bt::Tensor emb = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);  // (L, E)
     layernorm_rows(L, E, emb_layernorm.gamma, emb_layernorm.beta,
                    emb_layernorm.eps, emb_sum, emb);
 
     // Project to hidden_size.
-    bt::Tensor hidden;                    // (L, H)
+    bt::Tensor hidden = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);  // (L, H)
     bt::linear_forward_batched(emb_to_hidden.W, emb_to_hidden.b, emb, hidden);
 
     // ─── Shared ALBERT layer × num_hidden_layers ───────────────────────────
-    bt::Tensor Q_proj, K_proj, V_proj;
-    bt::Tensor attn_out, ffn_in, ffn_act, ffn_out_t, hidden_next;
+    bt::Tensor Q_proj    = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor K_proj    = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor V_proj    = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor attn_out  = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor ffn_in    = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor ffn_act   = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor ffn_out_t = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor hidden_next = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     for (int layer = 0; layer < cfg.num_hidden_layers; ++layer) {
         // attn_out = MHA(hidden) -- with biases on Q, K, V, dense.
         bt::linear_forward_batched(attn_q.W, attn_q.b, hidden, Q_proj);
@@ -192,7 +282,7 @@ void PLBert::forward(const std::vector<int32_t>& input_ids,
                            attn_dense.W, attn_dense.b, d_mask, attn_out);
         // Residual + attention LayerNorm.
         bt::add_inplace(attn_out, hidden);
-        bt::Tensor attn_normed;
+        bt::Tensor attn_normed = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         layernorm_rows(L, H, attn_layernorm.gamma, attn_layernorm.beta,
                        attn_layernorm.eps, attn_out, attn_normed);
 
@@ -207,6 +297,7 @@ void PLBert::forward(const std::vector<int32_t>& input_ids,
                        full_layernorm.eps, ffn_out_t, hidden_next);
         // Swap for next layer.
         hidden = std::move(hidden_next);
+        hidden_next = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
 
     bert_dur = std::move(hidden);
@@ -225,12 +316,17 @@ void BertEncoder::load_from(const stf::File& f, int bert_hidden, int out_hidden)
 
 void BertEncoder::forward(const bt::Tensor& bert_dur, bt::Tensor& d_en) const {
     // bert_dur: (L, bert_hidden) -> (L, out_hidden), then transpose to NCL.
-    bt::Tensor projected;
+    // Pre-allocate every op-out on bert_dur.device so brotensor's dispatch
+    // sees matched devices (Tensor::resize preserves device).
+    bt::Tensor projected = bt::Tensor::empty_on(bert_dur.device, 0, 0, bt::Dtype::FP32);
     bt::linear_forward_batched(projection.W, projection.b, bert_dur, projected);
     const int L  = projected.rows;
     const int Co = projected.cols;
     // Transpose (L, C) -> (1, C*L) NCL via sequence_to_nchw (the inverse of
     // nchw_to_sequence): NLC (L, C) maps to NCHW with N=1, H=1, W=L.
+    if (d_en.device != bert_dur.device) {
+        d_en = bt::Tensor::empty_on(bert_dur.device, 0, 0, bt::Dtype::FP32);
+    }
     bt::sequence_to_nchw(projected, /*N=*/1, /*C=*/Co, /*H=*/1, /*W=*/L, d_en);
 }
 
@@ -249,11 +345,15 @@ void layernorm_1d_ncl(const bt::Tensor& X,
     // Compose: NCL -> (N*L, C) via nchw_to_sequence (H=1, W=L); per-row
     // LayerNorm over the C axis with the existing batched op; then back to
     // NCL via sequence_to_nchw. All three ops dispatch on X.device.
-    bt::Tensor X_seq;
+    bt::Tensor X_seq = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     bt::nchw_to_sequence(X, N, C, /*H=*/1, /*W=*/L, X_seq);
-    bt::Tensor Y_seq;
-    Y_seq.resize(N * L, C, bt::Dtype::FP32);
+    // Pre-allocate Y_seq on X.device. Tensor::resize preserves device; a
+    // default-constructed (CPU) Y_seq would crash CUDA dispatch.
+    bt::Tensor Y_seq = bt::Tensor::empty_on(X.device, N * L, C, bt::Dtype::FP32);
     bt::layernorm_forward_inference_batched(X_seq, gamma, beta, Y_seq, eps);
+    if (Y.device != X.device) {
+        Y = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
+    }
     bt::sequence_to_nchw(Y_seq, N, C, /*H=*/1, /*W=*/L, Y);
 }
 
@@ -334,12 +434,23 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
     const int C = channels;
 
     // Embedding lookup -> (L, C) NLC. The lookup runs on `embedding`'s device.
-    bt::Tensor x_nlc;
-    bt::embedding_lookup_forward(embedding, input_ids.data(), L, x_nlc);
-    const bt::Device dev = x_nlc.device;
+    // Pre-allocate on embedding.device so the dispatch sees a matched out
+    // tensor (Tensor::resize preserves device).
+    const bt::Device dev = embedding.device;
+    bt::Tensor x_nlc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    // CUDA `embedding_lookup_forward` reads `d_idx` as a DEVICE pointer.
+    bt::Tensor idx_dev;
+    const std::int32_t* idx_ptr;
+    if (dev == bt::Device::CPU) {
+        idx_ptr = input_ids.data();
+    } else {
+        idx_dev = upload_int32_idx(dev, input_ids.data(), L);
+        idx_ptr = static_cast<const std::int32_t*>(idx_dev.data);
+    }
+    bt::embedding_lookup_forward(embedding, idx_ptr, L, x_nlc);
 
     // Transpose to NCL: (1, C*L). NLC (L, C) -> NCHW with N=1, H=1, W=L.
-    bt::Tensor x;
+    bt::Tensor x = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::sequence_to_nchw(x_nlc, /*N=*/1, /*C=*/C, /*H=*/1, /*W=*/L, x);
 
     // Apply mask: positions where text_mask == 1 (a *pad* mask) zero out the
@@ -356,7 +467,7 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
         for (int l = 0; l < Ly && l < static_cast<int>(text_mask.size()); ++l) {
             if (text_mask[l] != 0) keep_host[l] = 0.0f;
         }
-        bt::Tensor y_seq;
+        bt::Tensor y_seq = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         bt::nchw_to_sequence(y, /*N=*/1, Cy, /*H=*/1, /*W=*/Ly, y_seq);  // (Ly, Cy)
         bt::Tensor keep_col = bt::Tensor::from_host_on(dev, keep_host.data(), Ly, 1);
         // Multiply each row of y_seq by keep_col[l]: do it manually as
@@ -378,26 +489,32 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
 
     // depth × (Conv1d + LayerNorm1dNCL + LeakyReLU + mask).
     for (int i = 0; i < depth; ++i) {
-        bt::Tensor x_conv;
+        bt::Tensor x_conv = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         cnn[i].forward(x, /*N=*/1, /*L=*/L, x_conv);  // (1, C*L)
-        bt::Tensor x_ln;
+        bt::Tensor x_ln = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         layernorm_1d_ncl(x_conv, ln_gamma[i], ln_beta[i],
                          /*N=*/1, C, L, 1e-5f, x_ln);
-        bt::Tensor x_act;
+        bt::Tensor x_act = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         bt::leaky_relu_forward(x_ln, 0.2f, x_act);
         apply_mask(x_act, C, L);
         x = std::move(x_act);
     }
 
     // Transpose to (L, C) for the LSTM via nchw_to_sequence (H=1, W=L).
-    bt::Tensor x_lc;
+    bt::Tensor x_lc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::nchw_to_sequence(x, /*N=*/1, C, /*H=*/1, /*W=*/L, x_lc);
 
     // BiLSTM: (L, C) -> (L, C). (hidden_size = C/2 per direction; concat = C.)
-    bt::Tensor lstm_out;
+    // LSTM::forward in modules.cpp already pre-allocates Y on X.device, so the
+    // default-CPU `lstm_out` is safe here — but seeding it consistently keeps
+    // the pattern uniform across the file.
+    bt::Tensor lstm_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     lstm.forward(x_lc, lstm_out);
 
     // Transpose back to (1, C*L) NCL via sequence_to_nchw.
+    if (t_en.device != dev) {
+        t_en = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    }
     bt::sequence_to_nchw(lstm_out, /*N=*/1, C, /*H=*/1, /*W=*/L, t_en);
 }
 
@@ -413,7 +530,7 @@ namespace {
 void compute_style_affine(const Linear& fc, int C,
                           const bt::Tensor& style,
                           bt::Tensor& gamma, bt::Tensor& beta) {
-    bt::Tensor scratch;
+    bt::Tensor scratch = bt::Tensor::empty_on(style.device, 0, 0, bt::Dtype::FP32);
     bt::linear_forward_batched(fc.W, fc.b, style, scratch);  // (1, 2*C) on style.device
     gamma = bt::Tensor::zeros_on(scratch.device, C, 1, bt::Dtype::FP32);
     beta  = bt::Tensor::zeros_on(scratch.device, C, 1, bt::Dtype::FP32);
@@ -442,12 +559,14 @@ void ada_layernorm(const AdaLayerNormWeights& w, int L,
     bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
                                                     C, 1);
     bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
-    bt::Tensor x_norm;
-    x_norm.resize(L, C, bt::Dtype::FP32);
+    bt::Tensor x_norm = bt::Tensor::empty_on(dev, L, C, bt::Dtype::FP32);
     bt::layernorm_forward_inference_batched(x_lc, unit_gamma, zero_beta,
                                             x_norm, w.eps);
     // modulate is AdaLN-style (Y = X*(1+scale)+shift); upstream Kokoro
     // multiplies by (1 + gamma) which matches exactly — no -1 fix-up needed.
+    if (y_lc.device != dev) {
+        y_lc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    }
     bt::modulate(x_norm, gamma, beta, y_lc);
 }
 
@@ -471,8 +590,7 @@ void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
     bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
                                                     C, 1);
     bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
-    bt::Tensor x_norm;
-    x_norm.resize(N, C * L, bt::Dtype::FP32);
+    bt::Tensor x_norm = bt::Tensor::empty_on(dev, N, C * L, bt::Dtype::FP32);
     bt::group_norm_forward(x_ncl, unit_gamma, zero_beta,
                            N, C, /*H=*/1, /*W=*/L,
                            /*num_groups=*/C, w.eps, x_norm);
@@ -480,16 +598,19 @@ void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
     // Per-channel affine y = x_norm * (1 + gamma) + beta. modulate's AdaLN
     // contract (Y = X*(1+scale)+shift) is exactly this — pass gamma directly.
     // Composed on the (N*L, C) sequence layout.
-    bt::Tensor x_seq;
+    bt::Tensor x_seq = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::nchw_to_sequence(x_norm, N, C, /*H=*/1, /*W=*/L, x_seq);
-    bt::Tensor y_seq;
+    bt::Tensor y_seq = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::modulate(x_seq, gamma, beta, y_seq);
+    if (y_ncl.device != dev) {
+        y_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    }
     bt::sequence_to_nchw(y_seq, N, C, /*H=*/1, /*W=*/L, y_ncl);
 }
 
 // Per-(L) leaky_relu on NCL.
 void leaky_relu_ncl(bt::Tensor& y, float slope) {
-    bt::Tensor tmp;
+    bt::Tensor tmp = bt::Tensor::empty_on(y.device, 0, 0, bt::Dtype::FP32);
     bt::leaky_relu_forward(y, slope, tmp);
     y = std::move(tmp);
 }
@@ -536,11 +657,12 @@ void adain_resblk_1d_forward(const AdainResBlk1dWeights& w,
     L_out = w.upsample ? 2 * L_in : L_in;
 
     // ─── residual path ────────────────────────────────────────────────────
-    bt::Tensor r;
+    const bt::Device dev = x.device;
+    bt::Tensor r = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     ada_in_1d_styled(w.norm1, 1, C_in, L_in, x, style, r);
     leaky_relu_ncl(r, 0.2f);
 
-    bt::Tensor pooled;
+    bt::Tensor pooled = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     if (w.upsample) {
         // Depthwise ConvTranspose1d: groups = C_in = C_out (when depthwise on dim_in).
         // Weight layout (C_in, (C_out_per_group=1) * kL=3) = (C_in, 3).
@@ -554,25 +676,25 @@ void adain_resblk_1d_forward(const AdainResBlk1dWeights& w,
         pooled = std::move(r);
     }
 
-    bt::Tensor conv1_out;
+    bt::Tensor conv1_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     w.conv1.forward(pooled, /*N=*/1, /*L=*/L_out, conv1_out);
 
-    bt::Tensor n2;
+    bt::Tensor n2 = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     ada_in_1d_styled(w.norm2, 1, C_out, L_out, conv1_out, style, n2);
     leaky_relu_ncl(n2, 0.2f);
 
-    bt::Tensor conv2_out;
+    bt::Tensor conv2_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     w.conv2.forward(n2, /*N=*/1, /*L=*/L_out, conv2_out);
 
     // ─── shortcut path ────────────────────────────────────────────────────
-    bt::Tensor short_x;
+    bt::Tensor short_x = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     if (w.upsample) {
         upsample_nearest_2x_ncl(x, 1, C_in, L_in, short_x);
     } else {
         short_x = x;
     }
     if (w.learned_sc) {
-        bt::Tensor sc;
+        bt::Tensor sc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         w.conv1x1.forward(short_x, /*N=*/1, /*L=*/L_out, sc);
         short_x = std::move(sc);
     }
@@ -663,13 +785,19 @@ void DurationEncoder::forward(const bt::Tensor& d_en, const bt::Tensor& style,
     const int S = style_dim;
 
     // (1, C*L) NCL -> (L, C) NLC.
-    bt::Tensor x;
+    const bt::Device dev = d_en.device;
+    bt::Tensor x = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     ncl_to_lc(d_en, C, L, x);
 
     // Concat style across L: (L, C) -> (L, C + S). Each row's first C columns
     // are copied from xs[l]; the next S columns are the (broadcast) style.
     // Performed via copy_d2d per row — device-to-device, no host roundtrip.
     auto cat_with_style = [&](const bt::Tensor& xs, bt::Tensor& out) {
+        // out may have been default-constructed on first call; migrate to dev
+        // before resize since Tensor::resize preserves device.
+        if (out.device != dev) {
+            out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+        }
         out.resize(L, C + S, bt::Dtype::FP32);
         for (int l = 0; l < L; ++l) {
             bt::copy_d2d(xs,    l * C,         out, l * (C + S),     C);
@@ -677,16 +805,16 @@ void DurationEncoder::forward(const bt::Tensor& d_en, const bt::Tensor& style,
         }
     };
 
-    bt::Tensor cat;
+    bt::Tensor cat = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     cat_with_style(x, cat);
 
     for (const auto& blk : blocks) {
         // BiLSTM step: (L, C+S) -> (L, C).
-        bt::Tensor lstm_out;
+        bt::Tensor lstm_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         blk.bilstm.forward(cat, lstm_out);
 
         // AdaLayerNorm step: (L, C) -> (L, C).
-        bt::Tensor aln_out;
+        bt::Tensor aln_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         ada_layernorm(blk.aln, L, lstm_out, style, aln_out);
 
         // Concat style back: (L, C) + style -> (L, C+S).
@@ -777,6 +905,13 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     bt::copy_d2d(ref_s, S, style, 0, S);
 
     // ─── DurationEncoder ──────────────────────────────────────────────────
+    // Pre-allocate every Predictor::Output tensor on ref_s.device so callers
+    // that default-construct the Output struct don't drag CPU-resident out
+    // params through brotensor's device dispatch.
+    const bt::Device dev = ref_s.device;
+    if (out.d.device      != dev) out.d        = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    if (out.lstm_x.device != dev) out.lstm_x   = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    if (out.duration.device != dev) out.duration = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     text_encoder.forward(d_en, style, L, out.d);  // (L, C + S)
 
     // ─── Duration LSTM + projection ──────────────────────────────────────
@@ -807,8 +942,7 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     // Equivalently: en[c, t] = d[phoneme(t), c] (with `phoneme(t)` mapping
     // each frame t back to the source phoneme). The repeat-counts come from
     // pred_dur (host control flow), so the gather runs on host once and the
-    // result is uploaded to ref_s.device.
-    const bt::Device dev = ref_s.device;
+    // result is uploaded to ref_s.device (== dev).
     {
         const std::vector<float> d_host = out.d.to_host_vector();
         std::vector<float> en_host(static_cast<std::size_t>(C + S) * total);
@@ -830,13 +964,13 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     // ─── F0Ntrain ────────────────────────────────────────────────────────
     // shared LSTM input = en.T  -> (total, C+S) -> (total, C). Then split into
     // F0 path and N path, each a stack of 3 AdaINResBlk1d (one upsamples).
-    bt::Tensor en_lc;
+    bt::Tensor en_lc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     ncl_to_lc(out.en, C + S, total, en_lc);  // (total, C+S)
 
-    bt::Tensor shared_out;
+    bt::Tensor shared_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     shared.forward(en_lc, shared_out);        // (total, C)
 
-    bt::Tensor shared_ncl;
+    bt::Tensor shared_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     lc_to_ncl(shared_out, total, C, shared_ncl);  // (1, C*total) NCL
 
     // F0 stack.
@@ -844,22 +978,28 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     int F0_L = total;
     int next_L;
     for (const auto& blk : F0_blocks) {
-        bt::Tensor y;
+        bt::Tensor y = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         adain_resblk_1d_forward(blk, F0_x, F0_L, style, next_L, y);
         F0_x = std::move(y);
         F0_L = next_L;
     }
     // F0_proj: Conv1d(C/2 -> 1, k=1). Output (1, 1*F0_L).
+    if (out.F0_pred.device != dev) {
+        out.F0_pred = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    }
     F0_proj.forward(F0_x, /*N=*/1, /*L=*/F0_L, out.F0_pred);
 
     // N stack.
     bt::Tensor N_x = shared_ncl;
     int N_L = total;
     for (const auto& blk : N_blocks) {
-        bt::Tensor y;
+        bt::Tensor y = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         adain_resblk_1d_forward(blk, N_x, N_L, style, next_L, y);
         N_x = std::move(y);
         N_L = next_L;
+    }
+    if (out.N_pred.device != dev) {
+        out.N_pred = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
     N_proj.forward(N_x, /*N=*/1, /*L=*/N_L, out.N_pred);
 }
@@ -940,26 +1080,30 @@ void DecoderBackbone::forward(const bt::Tensor& asr,
                               bt::Tensor& gen_in) const {
     const int style_dim = 128;
 
+    const bt::Device dev = asr.device;
     bt::Tensor style = bt::Tensor::zeros_on(ref_s.device, 1, style_dim, bt::Dtype::FP32);
     bt::copy_d2d(ref_s, 0, style, 0, style_dim);
 
     // F0_pred / N_pred: (1, 2*T) -> unsqueeze to (1, 1*(2T)) NCL -> stride-2
-    // conv -> (1, 1*T).
-    bt::Tensor F0_dn, N_dn;
+    // conv -> (1, 1*T). Pre-allocate every op-out on dev (Tensor::resize
+    // preserves device; default-constructed Tensors are CPU and would crash
+    // brotensor's CUDA dispatch).
+    bt::Tensor F0_dn = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor N_dn  = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     F0_conv.forward(F0_pred, /*N=*/1, /*L=*/2 * T, F0_dn);
     N_conv .forward(N_pred,  /*N=*/1, /*L=*/2 * T, N_dn);
 
     // Concat [asr, F0_dn, N_dn] along channel axis: (1, 514*T).
-    bt::Tensor dec_pre;
+    bt::Tensor dec_pre = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     cat_channels_ncl({&asr, &F0_dn, &N_dn}, T, dec_pre);
 
     // encode: AdainResBlk1d(514 -> 1024).
-    bt::Tensor enc_out;
+    bt::Tensor enc_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     int L_after = 0;
     adain_resblk_1d_forward(encode, dec_pre, T, style, L_after, enc_out);
 
     // asr_res = Conv1d(512 -> 64, k=1) over asr.
-    bt::Tensor asr_res_out;
+    bt::Tensor asr_res_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     asr_res.forward(asr, /*N=*/1, /*L=*/T, asr_res_out);
 
     // decode loop.
@@ -970,11 +1114,11 @@ void DecoderBackbone::forward(const bt::Tensor& asr,
         if (res) {
             // Concat x (1024 channels) with asr_res (64) + F0_dn (1) + N_dn (1)
             // = 1090 channels at the same L_now=T.
-            bt::Tensor catted;
+            bt::Tensor catted = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
             cat_channels_ncl({&x, &asr_res_out, &F0_dn, &N_dn}, L_now, catted);
             x = std::move(catted);
         }
-        bt::Tensor y;
+        bt::Tensor y = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         int L_next = 0;
         adain_resblk_1d_forward(decode[i], x, L_now, style, L_next, y);
         x = std::move(y);
@@ -1041,30 +1185,31 @@ void load_adain_resblock1(const stf::File& f, const std::string& prefix,
 void adain_resblock1_forward(const AdaINResBlock1Weights& w,
                              bt::Tensor& x, int C, int L,
                              const bt::Tensor& style) {
+    const bt::Device dev = x.device;
     for (int i = 0; i < 3; ++i) {
-        bt::Tensor xt;
+        bt::Tensor xt = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         // n1(x, s)
         ada_in_1d_styled(w.adain1[i], 1, C, L, x, style, xt);
         // Snake1D: xt += (1/alpha) * sin(alpha*x)^2
         {
-            bt::Tensor snake_out;
+            bt::Tensor snake_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
             bt::snake_forward(xt, w.alpha1[i], /*beta=*/nullptr, 1, C, L, snake_out);
             xt = std::move(snake_out);
         }
         // c1 (dilated conv)
-        bt::Tensor c1_out;
+        bt::Tensor c1_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         w.convs1[i].forward(xt, /*N=*/1, /*L=*/L, c1_out);
 
         // n2
         ada_in_1d_styled(w.adain2[i], 1, C, L, c1_out, style, xt);
         // Snake1D
         {
-            bt::Tensor snake_out;
+            bt::Tensor snake_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
             bt::snake_forward(xt, w.alpha2[i], /*beta=*/nullptr, 1, C, L, snake_out);
             xt = std::move(snake_out);
         }
         // c2
-        bt::Tensor c2_out;
+        bt::Tensor c2_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         w.convs2[i].forward(xt, /*N=*/1, /*L=*/L, c2_out);
 
         // x = xt + x  (residual)
@@ -1247,19 +1392,23 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     bt::Tensor x = gen_in;   // (1, init_C * L_in) NCL
     int L = L_in;
     int C = ups_C_in[0];     // init_C
+    // Device for every op-out below. gen_in's device drives the whole stack;
+    // default-constructed Tensors land on CPU and brotensor's CUDA dispatch
+    // refuses mixed-device calls (Tensor::resize preserves device).
+    const bt::Device dev = gen_in.device;
 
     gdbg("gen_in", x);
     for (int i = 0; i < num_upsamples; ++i) {
         // x <- leaky_relu(x, 0.1)
         {
-            bt::Tensor tmp;
+            bt::Tensor tmp = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
             bt::leaky_relu_forward(x, 0.1f, tmp);
             x = std::move(tmp);
         }
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_after_lrelu", i); gdbg(b, x); }
 
         // x_source = noise_convs[i](har) (1, C_cur*L_after_noise_conv)
-        bt::Tensor x_source;
+        bt::Tensor x_source = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         noise_convs[i].forward(har, /*N=*/1, /*L=*/frames, x_source);
         const int L_src = x_source.cols / ups_C_out[i];
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_noise_conv", i); gdbg(b, x_source); }
@@ -1273,7 +1422,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         const int s  = ups_stride[i];
         const int p  = ups_pad[i];
         const int L_up = (L - 1) * s - 2 * p + (kL - 1) + 1;
-        bt::Tensor up_out;
+        bt::Tensor up_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         bt::conv_transpose1d_forward(x, ups_W[i], &ups_b[i],
                                      /*N=*/1, /*C_in=*/ups_C_in[i], /*L=*/L,
                                      /*C_out=*/ups_C_out[i], /*kL=*/kL,
@@ -1284,7 +1433,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         int L_x = L_up;
         // Final upsample stage applies a left-pad-by-1 reflection.
         if (i == num_upsamples - 1) {
-            bt::Tensor padded;
+            bt::Tensor padded = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
             bt::pad1d_forward(x, 1, ups_C_out[i], L_x,
                               /*pad_left=*/1, /*pad_right=*/0, /*mode=*/1,
                               padded);
@@ -1304,7 +1453,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_after_add", i); gdbg(b, x); }
 
         // resblocks i*num_kernels..(i+1)*num_kernels -> averaged residual sum.
-        bt::Tensor xs;
+        bt::Tensor xs = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         for (int j = 0; j < num_kernels; ++j) {
             bt::Tensor xj = x;
             adain_resblock1_forward(resblocks[i * num_kernels + j], xj,
@@ -1325,11 +1474,11 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
 
     // x = leaky_relu(x); x = conv_post(x); split into spec / phase; iSTFT.
     {
-        bt::Tensor tmp;
+        bt::Tensor tmp = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         bt::leaky_relu_forward(x, 0.01f, tmp);  // PyTorch leaky_relu default slope.
         x = std::move(tmp);
     }
-    bt::Tensor post;
+    bt::Tensor post = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     conv_post.forward(x, /*N=*/1, /*L=*/L, post);
     gdbg("conv_post", post);
 
@@ -1344,7 +1493,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     // The buffers are small (a few hundred kB at most); the heavy lifting is
     // the device-side complex_from_polar + istft that follow.
     const int n_freq = n_fft / 2 + 1;
-    const bt::Device dev = x.device;
+    // `dev` already declared at the top of Generator::forward — reuse it.
     bt::Tensor mag_frames;
     bt::Tensor pha_frames;
     {
@@ -1362,7 +1511,7 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     }
 
     // Build complex spectrogram on `dev`; istft consumes the same layout.
-    bt::Tensor spec_complex;  // (frames, 2*n_freq) interleaved
+    bt::Tensor spec_complex = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);  // (frames, 2*n_freq) interleaved
     bt::complex_from_polar(mag_frames, pha_frames, spec_complex);
 
     // iSTFT: signal_len = (frames - 1) * hop for center-true mode. The window
@@ -1371,6 +1520,9 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     const int signal_len = (L - 1) * hop_size;
     bt::Tensor window_host = hann_window_periodic(win_size);
     bt::Tensor window = window_host.to(dev);
+    if (audio.device != dev) {
+        audio = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    }
     bt::istft(spec_complex, window,
               /*N=*/1, signal_len, n_fft, hop_size, win_size,
               /*center=*/true, /*normalized=*/false, audio);
@@ -1445,10 +1597,10 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
     //    the model's device; the linear, tanh, and stft below run there.
     bt::Tensor sine_t = bt::Tensor::from_host_on(dev, sine_waves.data(),
                                                  signal_len, dim);
-    bt::Tensor merged;  // (signal_len, 1)
+    bt::Tensor merged = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);  // (signal_len, 1)
     bt::linear_forward_batched(l_linear.W, l_linear.b, sine_t, merged);
     // 3. tanh.
-    bt::Tensor tanh_out;
+    bt::Tensor tanh_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::tanh_forward(merged, tanh_out);
 
     // 4. STFT on har_source (1, signal_len). merged / tanh_out are (signal_len, 1);
@@ -1459,7 +1611,7 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
 
     bt::Tensor window_host = hann_window_periodic(win_size);
     bt::Tensor window = window_host.to(dev);
-    bt::Tensor spec;
+    bt::Tensor spec = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::stft(har_source, window, /*N=*/1, n_fft, hop_size, win_size,
              /*center=*/true, /*normalized=*/false, spec);
 
@@ -1468,7 +1620,8 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
     const int n_freq = n_fft / 2 + 1;
     stft_frames = spec.rows;  // == signal_len / hop + 1 with center=true
 
-    bt::Tensor mag_frames, pha_frames;
+    bt::Tensor mag_frames = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor pha_frames = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::complex_abs(spec, mag_frames);    // (frames, n_freq) on `dev`
     bt::complex_angle(spec, pha_frames);  // (frames, n_freq) on `dev`
 
@@ -1477,7 +1630,8 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
     // gives the (1, n_freq * frames) NCL block we want for the first half of
     // har. The same for pha_frames at the second-half offset. We materialise
     // both halves into a single (1, 2*n_freq*frames) tensor via copy_d2d.
-    bt::Tensor mag_ncl, pha_ncl;
+    bt::Tensor mag_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor pha_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     bt::sequence_to_nchw(mag_frames, /*N=*/1, /*C=*/n_freq,
                          /*H=*/1, /*W=*/stft_frames, mag_ncl);
     bt::sequence_to_nchw(pha_frames, /*N=*/1, /*C=*/n_freq,

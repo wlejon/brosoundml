@@ -22,6 +22,13 @@
 
 namespace brosoundml {
 
+// Forward decl — implemented in kokoro_modules.cpp. The Kokoro `load_from`
+// chain doesn't take a `device` parameter (the public submodule headers are
+// `load_from(File, ...)` only), so this is how kokoro.cpp tells the upload
+// helper which device to migrate every weight onto. Called once before the
+// load block and reset to CPU after it.
+void set_kokoro_load_device(brotensor::Device d);
+
 namespace fs = std::filesystem;
 namespace j  = detail::json;
 
@@ -197,6 +204,11 @@ Kokoro::Kokoro(Kokoro&&) noexcept = default;
 Kokoro& Kokoro::operator=(Kokoro&&) noexcept = default;
 
 void Kokoro::load(const std::string& model_dir, brotensor::Device device) {
+    // Ensure brotensor has probed all available backends; required before any
+    // non-CPU device is reachable. Idempotent — safe to call from every entry
+    // point.
+    brotensor::init();
+
     const fs::path dir         = model_dir;
     const fs::path config_path = dir / "config.json";
     const fs::path weight_path = dir / "model.safetensors";
@@ -216,6 +228,13 @@ void Kokoro::load(const std::string& model_dir, brotensor::Device device) {
     // delete the source file without first destructing the Kokoro instance.
     {
         auto weights = brotensor::safetensors::File::open(weight_path.string());
+        // Tell the file-local upload helper in kokoro_modules.cpp to migrate
+        // every weight to `device`. Reset on exit so other Kokoro instances
+        // (or a later CPU-only load) start from a clean CPU default.
+        set_kokoro_load_device(device);
+        struct DevReset {
+            ~DevReset() { set_kokoro_load_device(brotensor::Device::CPU); }
+        } _reset;
         impl_->bert.load_from         (weights, impl_->config.plbert);
         impl_->bert_encoder.load_from (weights, impl_->config.plbert.hidden_size,
                                                 impl_->config.hidden_dim);
@@ -296,18 +315,21 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     brotensor::Tensor ref_s_host = voice.pick_for(L);
     brotensor::Tensor ref_s = ref_s_host.to(impl_->device);
 
-    // 1. plBERT.
-    brotensor::Tensor bert_dur;
+    // 1. plBERT. Pre-allocate every out-tensor on the model's device — a
+    // default-constructed brotensor::Tensor lives on CPU and brotensor's CUDA
+    // dispatch refuses mixed-device calls (Tensor::resize preserves device).
+    const brotensor::Device dev = impl_->device;
+    brotensor::Tensor bert_dur = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
     debug_stats("01_bert_dur", bert_dur);
 
     // 2. bert_encoder.
-    brotensor::Tensor d_en;
+    brotensor::Tensor d_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert_encoder.forward(bert_dur, d_en);
     debug_stats("02_d_en", d_en);
 
     // 3. text_encoder (StyleTTS2 phoneme CNN+BiLSTM).
-    brotensor::Tensor t_en;
+    brotensor::Tensor t_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
     debug_stats("06_t_en", t_en);
 
@@ -346,7 +368,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     debug_stats("07_asr", asr);
 
     // 6. Decoder backbone -> generator input.
-    brotensor::Tensor gen_in;
+    brotensor::Tensor gen_in = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->decoder.forward(asr, po.F0_pred, po.N_pred, ref_s, total, gen_in);
     const int L_gen = 2 * total;
     debug_stats("09_gen_in", gen_in);
@@ -368,7 +390,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     // phase + additive gaussian noise are dropped, so the audio won't match
     // upstream sample-for-sample, but it carries the F0-driven harmonic
     // content the network was trained to consume.
-    brotensor::Tensor har_stub;
+    brotensor::Tensor har_stub = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     int sig_len = 0, hframes = 0;
     impl_->hsource.forward(po.F0_pred, /*frame_count=*/2 * total,
                            sig_len, hframes, har_stub);
@@ -387,7 +409,8 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
 
     debug_stats("10_har_stub", har_stub);
 
-    brotensor::Tensor audio_t;    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
+    brotensor::Tensor audio_t = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
     debug_stats("11_audio", audio_t);
 
     // 8. Wrap as AudioBuffer. audio_t lives on impl_->device; round-trip to

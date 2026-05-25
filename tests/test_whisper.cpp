@@ -77,6 +77,7 @@ static void write_stub_weights(const fs::path& p) {
 
 static int run();
 int main() {
+    brotensor::init();
     try { return run(); }
     catch (const std::exception& e) {
         std::fprintf(stderr, "test_whisper: uncaught exception: %s\n", e.what());

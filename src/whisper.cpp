@@ -3,6 +3,7 @@
 #include "brosoundml/detail/json.h"
 #include "brosoundml/whisper_modules.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
 #include <algorithm>
@@ -92,8 +93,16 @@ struct Whisper::Impl {
     // attention key/value source the decoder consumes.
     void encode_audio(const AudioBuffer& audio,
                       brotensor::Tensor& hidden) const {
-        brotensor::Tensor mel;
+        // LogMel uploads its (num_mel_bins, n_frames) output to `device` at
+        // the end of its host-side pipeline, so seed `mel` on CPU (where
+        // LogMel does the host work). The encoder's hidden out is pre-set on
+        // `device` so brotensor's dispatch sees device-matched operands.
+        brotensor::Tensor mel = brotensor::Tensor::empty_on(
+            brotensor::Device::CPU, 0, 0, brotensor::Dtype::FP32);
         log_mel.forward(audio, mel);
+        if (hidden.device != device) {
+            hidden = brotensor::Tensor::empty_on(device, 0, 0, brotensor::Dtype::FP32);
+        }
         encoder.forward(mel, hidden);
     }
 
@@ -126,6 +135,11 @@ Whisper::Whisper(Whisper&&) noexcept = default;
 Whisper& Whisper::operator=(Whisper&&) noexcept = default;
 
 void Whisper::load(const std::string& model_dir, brotensor::Device device) {
+    // Ensure brotensor has probed all available backends; required before any
+    // non-CPU device is reachable. Idempotent — safe to call from every entry
+    // point.
+    brotensor::init();
+
     const fs::path dir         = model_dir;
     const fs::path config_path = dir / "config.json";
     const fs::path weight_path = dir / "model.safetensors";
@@ -249,13 +263,17 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
         if (budget > hard_cap) budget = hard_cap;
     }
 
-    // 1. Encode the audio once.
-    brotensor::Tensor hidden;
+    // 1. Encode the audio once. Pre-allocate on the model device — Tensor::resize
+    // preserves the device field, so a default-constructed (CPU) Tensor would
+    // crash brotensor's CUDA dispatch.
+    brotensor::Tensor hidden = brotensor::Tensor::empty_on(
+        impl_->device, 0, 0, brotensor::Dtype::FP32);
     impl_->encode_audio(audio, hidden);
 
     // 2. Reset cache for this transcription, then prefill the prompt.
     impl_->cache.reset();
-    brotensor::Tensor logits;
+    brotensor::Tensor logits = brotensor::Tensor::empty_on(
+        impl_->device, 0, 0, brotensor::Dtype::FP32);
     impl_->decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
 
     // 3. Greedy loop. `logits` is mutated in-place by decode_step (no fresh

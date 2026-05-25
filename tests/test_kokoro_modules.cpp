@@ -75,6 +75,7 @@ static void compare(const bt::Tensor& got, const stf::TensorView& want,
 }
 
 int main() {
+    brotensor::init();
     const fs::path root = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "kokoro";
     const fs::path model_path = root / "model.safetensors";
     const fs::path ref_dir    = root / "reference";

@@ -88,22 +88,10 @@ void LayerNorm::forward(const bt::Tensor& X, bt::Tensor& Y) const {
              "gamma/beta must be (" + std::to_string(features) + ",1)");
     }
 
-    const int N = X.rows;
-    const int D = X.cols;
-    Y.resize(N, D, X.dtype);
-
-    // Per-row LayerNorm: brotensor::layernorm_forward operates on a single
-    // (D, 1) vector at a time. We loop, view each row as a (D, 1) buffer, and
-    // discard the xhat / mean / rstd caches the op writes — those are only
-    // useful for backward, and brosoundml is inference-only.
-    bt::Tensor xhat;  // resized to (D, 1) on each call
-    float mean_out = 0.0f, rstd_out = 0.0f;
-    for (int r = 0; r < N; ++r) {
-        bt::Tensor x_row = element_view(X, static_cast<std::size_t>(r) * D, D, 1);
-        bt::Tensor y_row = element_view(Y, static_cast<std::size_t>(r) * D, D, 1);
-        bt::layernorm_forward(x_row, gamma, beta, y_row, xhat,
-                              mean_out, rstd_out, eps);
-    }
+    // brotensor::layernorm_forward_inference_batched normalises every row
+    // independently in one device-dispatched op — no per-row dispatch, no
+    // backward caches (xhat / mean / rstd) to allocate on the right device.
+    bt::layernorm_forward_inference_batched(X, gamma, beta, Y, eps);
 }
 
 // ─── Conv1d ────────────────────────────────────────────────────────────────
@@ -216,7 +204,10 @@ void LSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     }
     check_lstm_weights(cell, input_size, hidden_size, "LSTM::forward");
     const int L = X.rows;
-    Y.resize(L, hidden_size, X.dtype);
+    // Allocate Y on X's device — a default-constructed out-param tensor lives
+    // on CPU, and Tensor::resize preserves device, so a CPU Y would land in
+    // a mixed-device copy_d2d below and crash on CUDA.
+    Y = bt::Tensor::empty_on(X.device, L, hidden_size, X.dtype);
 
     LSTMScratch s;
     s.init(hidden_size, X.device, X.dtype);
@@ -233,7 +224,8 @@ void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     check_lstm_weights(reverse_cell, input_size, hidden_size, "BiLSTM::forward(rev)");
     const int L = X.rows;
     const int H = hidden_size;
-    Y.resize(L, 2 * H, X.dtype);
+    // Allocate Y on X's device (same reasoning as LSTM::forward above).
+    Y = bt::Tensor::empty_on(X.device, L, 2 * H, X.dtype);
 
     bt::Tensor H_fwd = bt::Tensor::empty_on(X.device, L, H, X.dtype);
     bt::Tensor H_rev = bt::Tensor::empty_on(X.device, L, H, X.dtype);
@@ -278,11 +270,33 @@ void mha_attention_fp32(const bt::Tensor& Q,
     }
 
     // brotensor::flash_attention_forward does the per-head scaled-dot-product
-    // softmax + V-mix in one device-dispatched op (CPU/CUDA/Metal). d_mask is
-    // an optional length-Lk mask (1 valid / 0 invalid) on Q's device.
-    bt::Tensor ctx;
-    bt::flash_attention_forward(Q, K, V, d_mask, num_heads,
-                                /*causal=*/false, ctx);
+    // softmax + V-mix in one device-dispatched op. The CPU backend is FP32;
+    // the CUDA backend requires FP16 (or BF16) Q/K/V/O. Mirror that split:
+    // pass FP32 straight through on CPU, cast to FP16 for the flash core on
+    // any non-CPU device, then cast the (Lq, D) output back to FP32 before
+    // the Wo + bo projection. d_mask is FP32 either way.
+    bt::Tensor ctx = bt::Tensor::empty_on(Q.device, Q.rows, D, Q.dtype);
+    if (Q.device == bt::Device::CPU) {
+        bt::flash_attention_forward(Q, K, V, d_mask, num_heads,
+                                    /*causal=*/false, ctx);
+    } else {
+        bt::Tensor Qh = bt::Tensor::empty_on(Q.device, Q.rows, D, bt::Dtype::FP16);
+        bt::Tensor Kh = bt::Tensor::empty_on(K.device, K.rows, D, bt::Dtype::FP16);
+        bt::Tensor Vh = bt::Tensor::empty_on(V.device, V.rows, D, bt::Dtype::FP16);
+        bt::cast(Q, Qh, bt::Dtype::FP16);
+        bt::cast(K, Kh, bt::Dtype::FP16);
+        bt::cast(V, Vh, bt::Dtype::FP16);
+        bt::Tensor ctx_h = bt::Tensor::empty_on(Q.device, Q.rows, D, bt::Dtype::FP16);
+        bt::flash_attention_forward(Qh, Kh, Vh, d_mask, num_heads,
+                                    /*causal=*/false, ctx_h);
+        bt::cast(ctx_h, ctx, bt::Dtype::FP32);
+    }
+    // Pre-allocate `out` on Q.device — default-constructed Tensor lives on
+    // CPU and the CUDA linear_forward_batched does not migrate it.
+    if (out.device != Q.device || out.rows != Q.rows || out.cols != D ||
+        out.dtype != Q.dtype) {
+        out = bt::Tensor::empty_on(Q.device, Q.rows, D, Q.dtype);
+    }
     bt::linear_forward_batched(Wo, bo, ctx, out);
 }
 
@@ -307,7 +321,11 @@ void MHA::forward(const bt::Tensor& X,
     const std::string where = "MHA::forward";
     check_attn_inputs(where, X, embed_dim);
 
-    bt::Tensor Q, K, V;
+    // Allocate projection outputs on X's device — see ada_in_1d / LSTM for
+    // the same default-CPU pitfall.
+    bt::Tensor Q = bt::Tensor::empty_on(X.device, X.rows, embed_dim, X.dtype);
+    bt::Tensor K = bt::Tensor::empty_on(X.device, X.rows, embed_dim, X.dtype);
+    bt::Tensor V = bt::Tensor::empty_on(X.device, X.rows, embed_dim, X.dtype);
     bt::linear_forward_batched(Wq, bq, X, Q);
     bt::linear_forward_batched(Wk, bk, X, K);
     bt::linear_forward_batched(Wv, bv, X, V);
@@ -323,7 +341,9 @@ void CrossAttention::forward(const bt::Tensor& X,
     check_attn_inputs(where, X, embed_dim);
     check_attn_inputs(where, Ctx, ctx_dim);
 
-    bt::Tensor Q, K, V;
+    bt::Tensor Q = bt::Tensor::empty_on(X.device,   X.rows,   embed_dim, X.dtype);
+    bt::Tensor K = bt::Tensor::empty_on(Ctx.device, Ctx.rows, embed_dim, Ctx.dtype);
+    bt::Tensor V = bt::Tensor::empty_on(Ctx.device, Ctx.rows, embed_dim, Ctx.dtype);
     bt::linear_forward_batched(Wq, bq, X,   Q);
     bt::linear_forward_batched(Wk, bk, Ctx, K);
     bt::linear_forward_batched(Wv, bv, Ctx, V);
@@ -359,8 +379,7 @@ void ada_in_1d(const bt::Tensor& X,
                                                     C, 1);
     bt::Tensor zero_beta  = bt::Tensor::zeros_on(X.device, C, 1, bt::Dtype::FP32);
 
-    bt::Tensor X_norm;
-    X_norm.resize(N, C * L, bt::Dtype::FP32);
+    bt::Tensor X_norm = bt::Tensor::empty_on(X.device, N, C * L, bt::Dtype::FP32);
     bt::group_norm_forward(X, unit_gamma, zero_beta,
                            N, C, /*H=*/1, /*W=*/L,
                            /*num_groups=*/C, /*eps=*/1e-5f, X_norm);

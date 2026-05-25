@@ -2,6 +2,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/safetensors.h>
+#include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
 #include <cmath>
@@ -21,8 +22,38 @@ namespace {
     throw std::runtime_error("brosoundml: " + where + ": " + msg);
 }
 
+// Upload a host int32 index buffer to a (n, 1) INT32 tensor on `dev`.
+// brotensor lacks `Tensor::from_host_int32_on`, so we allocate the device
+// tensor and reach through `detail::alloc_for(dev).memcpy_h2d` to populate it
+// — the public memcpy_h2d hook on the backend vtable. CUDA's
+// `embedding_lookup_forward` reads `d_idx` as a DEVICE pointer, so calls that
+// previously passed `host_vector.data()` straight through crashed CUDA with
+// an illegal memory access.
+bt::Tensor upload_int32_idx(bt::Device dev, const std::int32_t* host_idx, int n) {
+    bt::Tensor t = bt::Tensor::empty_on(dev, n, 1, bt::Dtype::INT32);
+    if (n == 0) return t;
+    if (dev == bt::Device::CPU) {
+        std::memcpy(t.data, host_idx, static_cast<std::size_t>(n) * sizeof(std::int32_t));
+    } else {
+        bt::detail::alloc_for(dev).memcpy_h2d(
+            t.data, host_idx,
+            static_cast<std::size_t>(n) * sizeof(std::int32_t));
+    }
+    return t;
+}
+
+// Thread-local target device for the upload helper. Each public `load_from`
+// in this file sets this from its own `device` parameter and the upload helper
+// migrates every uploaded tensor to it. safetensors::upload lands the tensor
+// on CPU; without this migration step, weights stay on CPU even when the rest
+// of the module runs on CUDA, and brotensor's dispatcher refuses the mixed
+// call. (This is the upload-time half of the systemic CUDA-port bug.)
+thread_local bt::Device g_load_device = bt::Device::CPU;
+
 // Upload a tensor named `key` from `f` into `dst` reshaped to (rows, cols).
-// Mirrors the helper in kokoro_modules.cpp.
+// Mirrors the helper in kokoro_modules.cpp; on top of the safetensors upload
+// (CPU-resident), this migrates the destination to `g_load_device` so the
+// rest of the module sees device-matched weights.
 void upload(const stf::File& f, const std::string& key,
             int rows, int cols, bt::Tensor& dst,
             const std::string& where) {
@@ -39,6 +70,13 @@ void upload(const stf::File& f, const std::string& key,
                     std::to_string(static_cast<std::int64_t>(rows) * cols));
     }
     stf::upload(*view, rows, cols, dst);
+    // safetensors::upload uses Tensor::from_host which lands on
+    // brotensor::default_device() — that's CUDA once init() registers it, not
+    // CPU. Migrate unconditionally to g_load_device so weights end up exactly
+    // where this layer's forward expects them.
+    if (dst.device != g_load_device) {
+        dst = dst.to(g_load_device);
+    }
 }
 
 // ─── Mel-scale conversions (Slaney) ────────────────────────────────────────
@@ -311,6 +349,12 @@ void WhisperEncoderLayer::load_from(const stf::File& f,
                                     int dm, int ffn, int nh,
                                     bt::Device device) {
     const std::string where = "WhisperEncoderLayer::load_from";
+    // Route every `upload(...)` below through `device` (host-side load lands
+    // on CPU; we want every weight on the model's device).
+    const bt::Device prev_dev = g_load_device;
+    g_load_device = device;
+    struct DevGuard { bt::Device& slot; bt::Device prev;
+        ~DevGuard() { slot = prev; } } _guard{g_load_device, prev_dev};
     d_model   = dm;
     ffn_dim   = ffn;
     num_heads = nh;
@@ -352,20 +396,25 @@ void WhisperEncoderLayer::forward(const bt::Tensor& X, bt::Tensor& Y) const {
                     " != d_model=" + std::to_string(d_model));
     }
     // ─── Self-attention residual ───────────────────────────────────────────
-    bt::Tensor x_ln;
+    // Pre-allocate every op-out tensor on X.device; default-constructed
+    // bt::Tensor lives on CPU and brotensor's CUDA dispatch refuses mixed-
+    // device calls. Tensor::resize preserves the device field, so a (0, 0)
+    // pre-alloc with the right device is enough for ops that re-size their
+    // out param.
+    bt::Tensor x_ln = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     self_attn_layer_norm.forward(X, x_ln);                 // (L, D)
-    bt::Tensor attn_out;
+    bt::Tensor attn_out = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     self_attn.forward(x_ln, /*d_mask=*/nullptr, attn_out); // (L, D)
     bt::add_inplace(attn_out, X);                           // residual
 
     // ─── FFN residual ──────────────────────────────────────────────────────
-    bt::Tensor ffn_ln;
+    bt::Tensor ffn_ln = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     final_layer_norm.forward(attn_out, ffn_ln);            // (L, D)
-    bt::Tensor h1;
+    bt::Tensor h1 = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     fc1.forward_batched(ffn_ln, h1);                       // (L, ffn_dim)
-    bt::Tensor h1_act;
+    bt::Tensor h1_act = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     bt::gelu_forward(h1, h1_act);
-    bt::Tensor h2;
+    bt::Tensor h2 = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     fc2.forward_batched(h1_act, h2);                       // (L, D)
     bt::add_inplace(h2, attn_out);                          // residual
 
@@ -379,6 +428,10 @@ void WhisperEncoder::load_from(const stf::File& f,
                                int n_layer, int ffn, int n_head,
                                bt::Device device) {
     const std::string where = "WhisperEncoder::load_from";
+    const bt::Device prev_dev = g_load_device;
+    g_load_device = device;
+    struct DevGuard { bt::Device& slot; bt::Device prev;
+        ~DevGuard() { slot = prev; } } _guard{g_load_device, prev_dev};
     num_mel_bins             = n_mel;
     d_model                  = dm;
     max_source_positions     = max_src;
@@ -452,15 +505,18 @@ void WhisperEncoder::forward(const bt::Tensor& mel, bt::Tensor& hidden) const {
     }
 
     // ─── conv1 + GELU ──────────────────────────────────────────────────────
-    bt::Tensor x1;
+    // Pre-allocate every op-out tensor on mel.device; default-constructed
+    // bt::Tensor lives on CPU, brotensor's CUDA dispatch refuses mixed-device
+    // calls, and Tensor::resize preserves the device field.
+    bt::Tensor x1 = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     conv1.forward(mel_ncl, /*N=*/1, /*L=*/n_frames, x1);    // (1, d_model*n_frames)
-    bt::Tensor x1g;
+    bt::Tensor x1g = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     bt::gelu_forward(x1, x1g);
 
     // ─── conv2 (stride=2) + GELU ───────────────────────────────────────────
-    bt::Tensor x2;
+    bt::Tensor x2 = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     conv2.forward(x1g, /*N=*/1, /*L=*/n_frames, x2);
-    bt::Tensor x2g;
+    bt::Tensor x2g = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     bt::gelu_forward(x2, x2g);
     // Output length after stride-2 conv with padding=1, kernel=3:
     //   L_out = (L + 2*1 - 1*(3-1) - 1)/2 + 1 = L/2.
@@ -474,7 +530,7 @@ void WhisperEncoder::forward(const bt::Tensor& mel, bt::Tensor& hidden) const {
     // brotensor::nchw_to_sequence with N=1, C=d_model, H=1, W=L maps NCL ->
     // (N*H*W, C) = (L, d_model) — exactly the transpose we want, device-
     // dispatched on x2g's device.
-    bt::Tensor x;
+    bt::Tensor x = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     bt::nchw_to_sequence(x2g, /*N=*/1, /*C=*/d_model, /*H=*/1, /*W=*/L, x);
 
     // ─── Add positional embedding ──────────────────────────────────────────
@@ -482,7 +538,7 @@ void WhisperEncoder::forward(const bt::Tensor& mel, bt::Tensor& hidden) const {
     bt::add_inplace(x, embed_positions);
 
     // ─── Pre-LN Transformer stack ──────────────────────────────────────────
-    bt::Tensor y;
+    bt::Tensor y = bt::Tensor::empty_on(mel.device, 0, 0, bt::Dtype::FP32);
     for (const auto& layer : layers) {
         layer.forward(x, y);
         x = std::move(y);
@@ -567,8 +623,12 @@ void mha_causal_cached_fp32(const bt::Tensor& X,
              ", T=" + std::to_string(T) + ")");
     }
 
-    // Project Q, K, V for the current T input rows.
-    bt::Tensor Q, Knew, Vnew;
+    // Project Q, K, V for the current T input rows. Pre-allocate on X.device
+    // so brotensor's dispatch sees matched devices (the dispatcher refuses
+    // mixed-device calls; Tensor::resize preserves the device field).
+    bt::Tensor Q    = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
+    bt::Tensor Knew = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
+    bt::Tensor Vnew = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     bt::linear_forward_batched(Wq, bq, X, Q);     // (T, D)
     bt::linear_forward_batched(Wk, bk, X, Knew);  // (T, D)
     bt::linear_forward_batched(Wv, bv, X, Vnew);  // (T, D)
@@ -595,10 +655,32 @@ void mha_causal_cached_fp32(const bt::Tensor& X,
     //  - single-step (T==1): one query attends to every key in the cache; no
     //    mask needed, causal=false.
     const bool causal = (cache.self_len == 0);
-    bt::Tensor ctx;
-    bt::flash_attention_forward(Q, K_live, V_live,
-                                /*d_mask=*/nullptr, num_heads, causal, ctx);
+    // CUDA flash_attention_forward requires FP16/BF16; on non-CPU devices,
+    // cast Q/K/V to FP16, run the flash core, then cast the (T, D) output back
+    // to FP32 before the Wo + bo projection. Mirrors mha_attention_fp32 in
+    // modules.cpp.
+    bt::Tensor ctx = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
+    if (X.device == bt::Device::CPU) {
+        bt::flash_attention_forward(Q, K_live, V_live,
+                                    /*d_mask=*/nullptr, num_heads, causal, ctx);
+    } else {
+        bt::Tensor Qh = bt::Tensor::empty_on(X.device, T,        D, bt::Dtype::FP16);
+        bt::Tensor Kh = bt::Tensor::empty_on(X.device, Lk_total, D, bt::Dtype::FP16);
+        bt::Tensor Vh = bt::Tensor::empty_on(X.device, Lk_total, D, bt::Dtype::FP16);
+        bt::cast(Q,      Qh, bt::Dtype::FP16);
+        bt::cast(K_live, Kh, bt::Dtype::FP16);
+        bt::cast(V_live, Vh, bt::Dtype::FP16);
+        bt::Tensor ctx_h = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP16);
+        bt::flash_attention_forward(Qh, Kh, Vh, /*d_mask=*/nullptr,
+                                    num_heads, causal, ctx_h);
+        bt::cast(ctx_h, ctx, bt::Dtype::FP32);
+    }
 
+    // Pre-allocate `out` on X.device too — same reasoning.
+    if (out.device != X.device || out.rows != T || out.cols != D ||
+        out.dtype != bt::Dtype::FP32) {
+        out = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
+    }
     bt::linear_forward_batched(Wo, bo, ctx, out);
 
     cache.self_len += T;
@@ -632,18 +714,38 @@ void cross_attn_cached_fp32(const bt::Tensor& X,
         fail(where, "cross_k/cross_v shape mismatch");
     }
 
-    bt::Tensor Q;
+    bt::Tensor Q = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     bt::linear_forward_batched(Wq, bq, X, Q);  // (T, D)
 
     // Cross-attention: full attention over all Lk encoder positions, no mask,
     // not causal. K/V already live in the cache (pre-projected by
     // prime_cross_cache_fp32). flash_attention_forward handles per-head
     // scaled-dot-product softmax + V-mix in one device-dispatched op.
-    bt::Tensor ctx;
-    bt::flash_attention_forward(Q, cache.cross_k, cache.cross_v,
-                                /*d_mask=*/nullptr, num_heads,
-                                /*causal=*/false, ctx);
+    // CUDA flash_attention_forward requires FP16/BF16; on non-CPU devices,
+    // cast Q + cached K/V to FP16, run the flash core, then cast the (T, D)
+    // output back to FP32 before the Wo + bo projection.
+    bt::Tensor ctx = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
+    if (X.device == bt::Device::CPU) {
+        bt::flash_attention_forward(Q, cache.cross_k, cache.cross_v,
+                                    /*d_mask=*/nullptr, num_heads,
+                                    /*causal=*/false, ctx);
+    } else {
+        bt::Tensor Qh = bt::Tensor::empty_on(X.device, T,  D, bt::Dtype::FP16);
+        bt::Tensor Kh = bt::Tensor::empty_on(X.device, Lk, D, bt::Dtype::FP16);
+        bt::Tensor Vh = bt::Tensor::empty_on(X.device, Lk, D, bt::Dtype::FP16);
+        bt::cast(Q,             Qh, bt::Dtype::FP16);
+        bt::cast(cache.cross_k, Kh, bt::Dtype::FP16);
+        bt::cast(cache.cross_v, Vh, bt::Dtype::FP16);
+        bt::Tensor ctx_h = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP16);
+        bt::flash_attention_forward(Qh, Kh, Vh, /*d_mask=*/nullptr,
+                                    num_heads, /*causal=*/false, ctx_h);
+        bt::cast(ctx_h, ctx, bt::Dtype::FP32);
+    }
 
+    if (out.device != X.device || out.rows != T || out.cols != D ||
+        out.dtype != bt::Dtype::FP32) {
+        out = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
+    }
     bt::linear_forward_batched(Wo, bo, ctx, out);
 }
 
@@ -668,7 +770,8 @@ void prime_cross_cache_fp32(const bt::Tensor& encoder_hidden,
              ") — call WhisperKVCache::allocate with the matching dims first");
     }
 
-    bt::Tensor Kproj, Vproj;
+    bt::Tensor Kproj = bt::Tensor::empty_on(encoder_hidden.device, 0, 0, bt::Dtype::FP32);
+    bt::Tensor Vproj = bt::Tensor::empty_on(encoder_hidden.device, 0, 0, bt::Dtype::FP32);
     bt::linear_forward_batched(Wk, bk, encoder_hidden, Kproj);
     bt::linear_forward_batched(Wv, bv, encoder_hidden, Vproj);
 
@@ -684,6 +787,10 @@ void WhisperDecoderLayer::load_from(const stf::File& f,
                                     int dm, int ffn, int nh,
                                     bt::Device device) {
     const std::string where = "WhisperDecoderLayer::load_from";
+    const bt::Device prev_dev = g_load_device;
+    g_load_device = device;
+    struct DevGuard { bt::Device& slot; bt::Device prev;
+        ~DevGuard() { slot = prev; } } _guard{g_load_device, prev_dev};
     d_model   = dm;
     ffn_dim   = ffn;
     num_heads = nh;
@@ -743,9 +850,11 @@ void WhisperDecoderLayer::forward(const bt::Tensor& X,
     }
 
     // ─── Causal self-attention residual ────────────────────────────────────
-    bt::Tensor x_ln;
+    // Pre-allocate every op-out tensor on X.device (Tensor::resize preserves
+    // device; default-constructed Tensors are CPU and would crash CUDA dispatch).
+    bt::Tensor x_ln = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     self_attn_layer_norm.forward(X, x_ln);                  // (T, D)
-    bt::Tensor self_out;
+    bt::Tensor self_out = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     mha_causal_cached_fp32(x_ln,
                            self_Wq, self_bq,
                            self_Wk, self_bk,
@@ -755,9 +864,9 @@ void WhisperDecoderLayer::forward(const bt::Tensor& X,
     bt::add_inplace(self_out, X);                            // residual
 
     // ─── Cross-attention residual ──────────────────────────────────────────
-    bt::Tensor x_ca_ln;
+    bt::Tensor x_ca_ln = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     encoder_attn_layer_norm.forward(self_out, x_ca_ln);
-    bt::Tensor cross_out;
+    bt::Tensor cross_out = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     cross_attn_cached_fp32(x_ca_ln,
                            cross_Wq, cross_bq,
                            cross_Wo, cross_bo,
@@ -765,13 +874,13 @@ void WhisperDecoderLayer::forward(const bt::Tensor& X,
     bt::add_inplace(cross_out, self_out);                    // residual
 
     // ─── FFN residual ──────────────────────────────────────────────────────
-    bt::Tensor ffn_ln;
+    bt::Tensor ffn_ln = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     final_layer_norm.forward(cross_out, ffn_ln);
-    bt::Tensor h1;
+    bt::Tensor h1 = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     fc1.forward_batched(ffn_ln, h1);
-    bt::Tensor h1_act;
+    bt::Tensor h1_act = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     bt::gelu_forward(h1, h1_act);
-    bt::Tensor h2;
+    bt::Tensor h2 = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
     fc2.forward_batched(h1_act, h2);
     bt::add_inplace(h2, cross_out);                          // residual
 
@@ -785,6 +894,10 @@ void WhisperDecoder::load_from(const stf::File& f,
                                int vocab, int max_tgt, int max_src,
                                bt::Device device) {
     const std::string where = "WhisperDecoder::load_from";
+    const bt::Device prev_dev = g_load_device;
+    g_load_device = device;
+    struct DevGuard { bt::Device& slot; bt::Device prev;
+        ~DevGuard() { slot = prev; } } _guard{g_load_device, prev_dev};
     d_model                  = dm;
     decoder_layers           = n_layer;
     decoder_ffn_dim          = ffn;
@@ -871,8 +984,20 @@ void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
     }
 
     // ─── Embed tokens ──────────────────────────────────────────────────────
-    bt::Tensor x;
-    bt::embedding_lookup_forward(embed_tokens, token_ids, T, x);  // (T, d_model)
+    // embedding_lookup_forward resizes+dtype-sets `x` to match the table; we
+    // still pre-set the device so the resize lands on embed_tokens.device.
+    // CUDA `embedding_lookup_forward` reads `d_idx` as a DEVICE pointer (the
+    // backend kernel indexes through it), so when the table lives on CUDA we
+    // must upload the host-side token_ids to a device buffer first.
+    bt::Tensor x = bt::Tensor::empty_on(embed_tokens.device, 0, 0, bt::Dtype::FP32);
+    if (embed_tokens.device == bt::Device::CPU) {
+        bt::embedding_lookup_forward(embed_tokens, token_ids, T, x);  // (T, d_model)
+    } else {
+        bt::Tensor idx_dev = upload_int32_idx(embed_tokens.device, token_ids, T);
+        bt::embedding_lookup_forward(embed_tokens,
+                                     static_cast<const std::int32_t*>(idx_dev.data),
+                                     T, x);
+    }
 
     // ─── Add learned positional embedding (rows [pos_offset, pos_offset+T)) ─
     // embed_positions is (max_target_positions, d_model), row-major on the
@@ -888,15 +1013,18 @@ void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
     }
 
     // ─── Pre-LN Transformer stack ──────────────────────────────────────────
-    bt::Tensor y;
+    bt::Tensor y = bt::Tensor::empty_on(x.device, 0, 0, bt::Dtype::FP32);
     for (int i = 0; i < decoder_layers; ++i) {
         layers[static_cast<std::size_t>(i)].forward(
             x, cache.layers[static_cast<std::size_t>(i)], y);
         x = std::move(y);
+        // After move, `y` is moved-from; re-seed for the next iter so the
+        // dispatcher continues to see an x.device-resident out tensor.
+        y = bt::Tensor::empty_on(x.device, 0, 0, bt::Dtype::FP32);
     }
 
     // ─── Final decoder LayerNorm ───────────────────────────────────────────
-    bt::Tensor hidden;
+    bt::Tensor hidden = bt::Tensor::empty_on(x.device, 0, 0, bt::Dtype::FP32);
     layer_norm.forward(x, hidden);          // (T, d_model)
 
     // ─── LM head: tied (default) or explicit proj_out ──────────────────────
@@ -908,8 +1036,14 @@ void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
     // device-dispatched. Allocation per forward() is acceptable for stage 4;
     // can be cached / fused later.
     const bt::Tensor& W = proj_out_explicit ? proj_out_weight : embed_tokens;
-    bt::Tensor W_T;
+    bt::Tensor W_T = bt::Tensor::empty_on(W.device, 0, 0, bt::Dtype::FP32);
     bt::nchw_to_sequence(W, /*N=*/1, /*C=*/vocab_size, /*H=*/1, /*W=*/d_model, W_T);
+    // Pre-allocate logits on the same device too; the caller's logits tensor
+    // is default-constructed (CPU) and matmul resizes but preserves device.
+    if (logits.device != hidden.device || logits.rows != T ||
+        logits.cols != vocab_size || logits.dtype != bt::Dtype::FP32) {
+        logits = bt::Tensor::empty_on(hidden.device, T, vocab_size, bt::Dtype::FP32);
+    }
     bt::matmul(hidden, W_T, logits);        // (T, vocab_size)
 }
 
