@@ -129,16 +129,14 @@ struct BiLSTM {
 // every projection. The plBERT branch of Kokoro needs this layout; so does
 // every transformer-encoder block in Whisper.
 //
-// brotensor's FP16 path (flash_attention_qkvo_forward) accepts separate
-// Q/K/V/O weights and biases, but no FP32 attention op does — so the FP32
-// CPU implementation projects Q/K/V via linear_forward_batched (which has
-// bias) and then runs an open-coded scalar softmax + context kernel. This
-// is the same loop kokoro_modules.cpp previously open-coded inline; lifting
-// it into a module so Whisper can reuse it.
+// Q/K/V are projected via linear_forward_batched (which carries the bias),
+// then the per-head scaled-dot-product attention and V-mix run through
+// brotensor::flash_attention_forward — device-dispatched on CPU/CUDA/Metal.
+// Wo + bo is a final linear_forward_batched on the (Lq, D) context.
 //
-// Dispatch (today): FP32 CPU only. The FP16 / GPU path will arrive when
-// Whisper-on-GPU performance becomes the bottleneck; until then a runtime
-// check rejects non-FP32 / non-CPU inputs rather than silently falling back.
+// Dispatch: FP32 today on whichever device the input tensor lives on. A
+// runtime check rejects non-FP32 inputs (the loaded weights are FP32); the
+// FP16 path can flip on once a quantised model lands.
 struct MHA {
     int               num_heads = 0;
     int               embed_dim = 0;   // D — must be divisible by num_heads
@@ -166,7 +164,7 @@ struct MHA {
 // decoder's cross-attention layer needs, and the same shape SD1.5's
 // cross-attention uses (different ctx_dim for the encoder hidden state).
 //
-// Same dispatch rules as MHA — FP32 CPU only for now.
+// Same dispatch rules as MHA — FP32 on whichever device the inputs live on.
 struct CrossAttention {
     int               num_heads = 0;
     int               embed_dim = 0;   // D (query/output dim)
@@ -195,7 +193,7 @@ struct CrossAttention {
 // Wo + bo projection. Both MHA::forward and CrossAttention::forward delegate
 // to this — and call sites that already hold the projected Q/K/V can skip
 // the module wrappers and call this directly (PLBert's ALBERT layer does).
-// CPU FP32 only for now.
+// FP32 today; dispatched on the input tensors' device.
 void mha_attention_fp32(const brotensor::Tensor& Q,
                         const brotensor::Tensor& K,
                         const brotensor::Tensor& V,

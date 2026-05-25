@@ -2,9 +2,7 @@
 
 #include <brotensor/ops.h>
 
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -186,14 +184,9 @@ void lstm_run(const LSTMCellWeights& w,
         bt::mul_inplace(s.o_t, s.tanh_c);  // o_t <- h
 
         // Persist c_prev <- c_new, h_prev <- h, and copy h into Y[t,:].
-        const std::size_t elem_bytes =
-            static_cast<std::size_t>(bt::dtype_size_bytes(s.f_t.dtype));
-        const std::size_t row_bytes = static_cast<std::size_t>(H) * elem_bytes;
-        std::memcpy(s.c_prev.data, s.f_t.data, row_bytes);
-        std::memcpy(s.h_prev.data, s.o_t.data, row_bytes);
-        void* y_row = static_cast<std::uint8_t*>(Y.data)
-                    + static_cast<std::size_t>(t) * row_bytes;
-        std::memcpy(y_row, s.o_t.data, row_bytes);
+        bt::copy_d2d(s.f_t, 0, s.c_prev, 0, H);
+        bt::copy_d2d(s.o_t, 0, s.h_prev, 0, H);
+        bt::copy_d2d(s.o_t, 0, Y,        t * H, H);
     }
 }
 
@@ -253,18 +246,9 @@ void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     lstm_run(reverse_cell, X, L, input_size, H, H_rev, s_rev, /*reverse=*/true);
 
     // Concat per-row: Y[t, :H] = H_fwd[t,:], Y[t, H:] = H_rev[t,:].
-    const std::size_t elem_bytes =
-        static_cast<std::size_t>(bt::dtype_size_bytes(X.dtype));
-    const std::size_t row_bytes = static_cast<std::size_t>(H) * elem_bytes;
     for (int t = 0; t < L; ++t) {
-        std::uint8_t* dst = static_cast<std::uint8_t*>(Y.data)
-                          + static_cast<std::size_t>(t) * (2 * H) * elem_bytes;
-        const std::uint8_t* src_fwd = static_cast<const std::uint8_t*>(H_fwd.data)
-                                    + static_cast<std::size_t>(t) * row_bytes;
-        const std::uint8_t* src_rev = static_cast<const std::uint8_t*>(H_rev.data)
-                                    + static_cast<std::size_t>(t) * row_bytes;
-        std::memcpy(dst, src_fwd, row_bytes);
-        std::memcpy(dst + row_bytes, src_rev, row_bytes);
+        bt::copy_d2d(H_fwd, t * H, Y, t * 2 * H,     H);
+        bt::copy_d2d(H_rev, t * H, Y, t * 2 * H + H, H);
     }
 }
 
@@ -284,62 +268,21 @@ void mha_attention_fp32(const bt::Tensor& Q,
                         const bt::Tensor& bo,
                         const float* d_mask,
                         bt::Tensor& out) {
-    const int Lq = Q.rows;
-    const int D  = Q.cols;
-    const int Lk = K.rows;
-    if (V.rows != Lk || V.cols != D || K.cols != D) {
+    const int D = Q.cols;
+    if (V.rows != K.rows || V.cols != D || K.cols != D) {
         fail("mha_attn", "Q/K/V shape mismatch");
     }
     if (D % num_heads != 0) {
         fail("mha_attn", "embed_dim " + std::to_string(D) +
              " not divisible by num_heads " + std::to_string(num_heads));
     }
-    const int head_dim = D / num_heads;
-    const float scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    const float* Qd = Q.host_f32();
-    const float* Kd = K.host_f32();
-    const float* Vd = V.host_f32();
-
-    bt::Tensor ctx = bt::Tensor::zeros_on(bt::Device::CPU, Lq, D, bt::Dtype::FP32);
-    float* ctx_d = ctx.host_f32_mut();
-
-    std::vector<float> scores(static_cast<std::size_t>(Lk), 0.0f);
-
-    for (int h = 0; h < num_heads; ++h) {
-        for (int q = 0; q < Lq; ++q) {
-            const float* q_vec = Qd + static_cast<std::size_t>(q) * D + h * head_dim;
-
-            float max_score = -INFINITY;
-            for (int k = 0; k < Lk; ++k) {
-                const float* k_vec = Kd + static_cast<std::size_t>(k) * D + h * head_dim;
-                float s = 0.0f;
-                for (int j = 0; j < head_dim; ++j) s += q_vec[j] * k_vec[j];
-                s *= scale;
-                if (d_mask && d_mask[k] < 0.5f) s = -1e30f;
-                scores[static_cast<std::size_t>(k)] = s;
-                if (s > max_score) max_score = s;
-            }
-            float sum = 0.0f;
-            for (int k = 0; k < Lk; ++k) {
-                scores[static_cast<std::size_t>(k)] =
-                    std::exp(scores[static_cast<std::size_t>(k)] - max_score);
-                sum += scores[static_cast<std::size_t>(k)];
-            }
-            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-            for (int k = 0; k < Lk; ++k) {
-                scores[static_cast<std::size_t>(k)] *= inv;
-            }
-
-            float* ctx_row = ctx_d + static_cast<std::size_t>(q) * D + h * head_dim;
-            for (int k = 0; k < Lk; ++k) {
-                const float w = scores[static_cast<std::size_t>(k)];
-                const float* v_vec = Vd + static_cast<std::size_t>(k) * D + h * head_dim;
-                for (int j = 0; j < head_dim; ++j) ctx_row[j] += w * v_vec[j];
-            }
-        }
-    }
-
+    // brotensor::flash_attention_forward does the per-head scaled-dot-product
+    // softmax + V-mix in one device-dispatched op (CPU/CUDA/Metal). d_mask is
+    // an optional length-Lk mask (1 valid / 0 invalid) on Q's device.
+    bt::Tensor ctx;
+    bt::flash_attention_forward(Q, K, V, d_mask, num_heads,
+                                /*causal=*/false, ctx);
     bt::linear_forward_batched(Wo, bo, ctx, out);
 }
 
@@ -347,8 +290,8 @@ namespace {
 
 void check_attn_inputs(const std::string& where,
                        const bt::Tensor& X, int expected_dim) {
-    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
-        fail(where, "currently CPU FP32 only");
+    if (X.dtype != bt::Dtype::FP32) {
+        fail(where, "currently FP32 only");
     }
     if (X.cols != expected_dim) {
         fail(where, "input cols=" + std::to_string(X.cols) +
@@ -401,11 +344,8 @@ void ada_in_1d(const bt::Tensor& X,
              std::to_string(X.cols) + ") != (" + std::to_string(N) + "," +
              std::to_string(C * L) + ")");
     }
-    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
-        // brotensor has no per-channel affine on NCL on GPU yet — adding one
-        // belongs in brotensor (across CPU/CUDA/Metal), not here. Until then
-        // brosoundml composes ada_in_1d on CPU FP32 only.
-        fail("ada_in_1d", "currently CPU FP32 only — see TODO in modules.cpp");
+    if (X.dtype != bt::Dtype::FP32) {
+        fail("ada_in_1d", "currently FP32 only");
     }
     if ((scale.rows * scale.cols) != C || (shift.rows * shift.cols) != C) {
         fail("ada_in_1d", "scale/shift must hold C=" + std::to_string(C) +
@@ -413,31 +353,36 @@ void ada_in_1d(const bt::Tensor& X,
     }
 
     // Instance norm = GroupNorm with num_groups == C. Pass unit gamma / zero
-    // beta so the affine step is left for the modulate-like loop below.
-    bt::Tensor unit_gamma = bt::Tensor::zeros_on(bt::Device::CPU, C, 1, bt::Dtype::FP32);
-    bt::Tensor zero_beta  = bt::Tensor::zeros_on(bt::Device::CPU, C, 1, bt::Dtype::FP32);
-    for (int c = 0; c < C; ++c) unit_gamma.host_f32_mut()[c] = 1.0f;
+    // beta so the affine step is left for the per-channel modulate below.
+    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
+    bt::Tensor unit_gamma = bt::Tensor::from_host_on(X.device, unit_host.data(),
+                                                    C, 1);
+    bt::Tensor zero_beta  = bt::Tensor::zeros_on(X.device, C, 1, bt::Dtype::FP32);
 
-    Y.resize(N, C * L, bt::Dtype::FP32);
+    bt::Tensor X_norm;
+    X_norm.resize(N, C * L, bt::Dtype::FP32);
     bt::group_norm_forward(X, unit_gamma, zero_beta,
                            N, C, /*H=*/1, /*W=*/L,
-                           /*num_groups=*/C, /*eps=*/1e-5f, Y);
+                           /*num_groups=*/C, /*eps=*/1e-5f, X_norm);
 
-    // Per-channel affine Y[n,c,l] = Y[n,c,l] * scale[c] + shift[c].
-    // The (1,C)/(C,1) ambiguity is resolved by flat-indexing into host_f32().
-    const float* s_data = scale.host_f32();
-    const float* sh_data = shift.host_f32();
-    float* y_data = Y.host_f32_mut();
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const float sc = s_data[c];
-            const float sh = sh_data[c];
-            float* row = y_data + (static_cast<std::size_t>(n) * C + c) * L;
-            for (int l = 0; l < L; ++l) {
-                row[l] = row[l] * sc + sh;
-            }
-        }
-    }
+    // Per-channel affine Y[n,c,l] = X_norm[n,c,l] * scale[c] + shift[c],
+    // composed via NCL -> (N*L, C) -> modulate -> NCL. nchw_to_sequence with
+    // H=1 and W=L gives exactly the (N*L, C) layout modulate consumes.
+    //
+    // brotensor::modulate is AdaLN-style — it computes Y = X*(1+scale)+shift,
+    // baking a "+1" into the scale to centre learned deltas around identity.
+    // ada_in_1d's contract is the plain Y = X*scale + shift, so pre-subtract 1
+    // from a clone of `scale` (kept on the input device) before the call.
+    bt::Tensor scale_shifted = scale.clone();
+    bt::add_scalar_inplace(scale_shifted, -1.0f);
+
+    bt::Tensor X_seq;
+    bt::nchw_to_sequence(X_norm, N, C, /*H=*/1, /*W=*/L, X_seq);
+
+    bt::Tensor Y_seq;
+    bt::modulate(X_seq, scale_shifted, shift, Y_seq);
+
+    bt::sequence_to_nchw(Y_seq, N, C, /*H=*/1, /*W=*/L, Y);
 }
 
 }  // namespace brosoundml
