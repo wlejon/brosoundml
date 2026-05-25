@@ -44,36 +44,14 @@ void upload(const stf::File& f, const std::string& key,
     stf::upload(*view, rows, cols, dst);
 }
 
-// Per-row LayerNorm over a (N, D) batch of features. Wraps the existing
-// brosoundml::LayerNorm but skips its sanity checks — used inside the inner
-// loops where shapes are known to match.
+// Per-row LayerNorm over a (N, D) batch of features. Wraps the device-aware
+// brotensor::layernorm_forward_inference_batched — one launch instead of N
+// scalar-row calls. Y is resized to (N, D); X.device drives dispatch.
 void layernorm_rows(int N, int D,
                     const bt::Tensor& gamma, const bt::Tensor& beta,
                     float eps, const bt::Tensor& X, bt::Tensor& Y) {
     Y.resize(N, D, bt::Dtype::FP32);
-    bt::Tensor xhat;
-    float mean_out = 0.0f, rstd_out = 0.0f;
-    for (int r = 0; r < N; ++r) {
-        const auto offset_bytes = static_cast<std::size_t>(r) * D * sizeof(float);
-        bt::Tensor x_row = bt::Tensor::view(bt::Device::CPU,
-                                            static_cast<std::uint8_t*>(X.data) + offset_bytes,
-                                            D, 1, bt::Dtype::FP32);
-        bt::Tensor y_row = bt::Tensor::view(bt::Device::CPU,
-                                            static_cast<std::uint8_t*>(Y.data) + offset_bytes,
-                                            D, 1, bt::Dtype::FP32);
-        bt::layernorm_forward(x_row, gamma, beta, y_row, xhat,
-                              mean_out, rstd_out, eps);
-    }
-}
-
-// Add `b` broadcast across all rows: `out[r, c] += b[c]`. b is (D, 1) or (1, D).
-void add_bias_rows(bt::Tensor& out, const bt::Tensor& b, int rows, int cols) {
-    float* o = out.host_f32_mut();
-    const float* bd = b.host_f32();
-    for (int r = 0; r < rows; ++r) {
-        float* row = o + static_cast<std::size_t>(r) * cols;
-        for (int c = 0; c < cols; ++c) row[c] += bd[c];
-    }
+    bt::layernorm_forward_inference_batched(X, gamma, beta, Y, eps);
 }
 
 }  // namespace
@@ -251,15 +229,9 @@ void BertEncoder::forward(const bt::Tensor& bert_dur, bt::Tensor& d_en) const {
     bt::linear_forward_batched(projection.W, projection.b, bert_dur, projected);
     const int L  = projected.rows;
     const int Co = projected.cols;
-    // Transpose (L, C) -> (1, C, L) flattened as (1, C*L) row-major.
-    d_en.resize(1, Co * L, bt::Dtype::FP32);
-    const float* src = projected.host_f32();
-    float* dst = d_en.host_f32_mut();
-    for (int c = 0; c < Co; ++c) {
-        for (int l = 0; l < L; ++l) {
-            dst[c * L + l] = src[l * Co + c];
-        }
-    }
+    // Transpose (L, C) -> (1, C*L) NCL via sequence_to_nchw (the inverse of
+    // nchw_to_sequence): NLC (L, C) maps to NCHW with N=1, H=1, W=L.
+    bt::sequence_to_nchw(projected, /*N=*/1, /*C=*/Co, /*H=*/1, /*W=*/L, d_en);
 }
 
 // ─── layernorm_1d_ncl ──────────────────────────────────────────────────────
@@ -269,45 +241,20 @@ void layernorm_1d_ncl(const bt::Tensor& X,
                       int N, int C, int L, float eps,
                       bt::Tensor& Y) {
     const std::string where = "layernorm_1d_ncl";
-    if (X.device != bt::Device::CPU || X.dtype != bt::Dtype::FP32) {
-        fail(where, "CPU FP32 only");
-    }
+    if (X.dtype != bt::Dtype::FP32) fail(where, "FP32 only");
     if (X.rows != N || X.cols != C * L) fail(where, "X shape mismatch");
     if (gamma.rows * gamma.cols != C || beta.rows * beta.cols != C) {
         fail(where, "gamma/beta must hold C elements");
     }
-    Y.resize(N, C * L, bt::Dtype::FP32);
-    const float* xd = X.host_f32();
-    float* yd = Y.host_f32_mut();
-    const float* gd = gamma.host_f32();
-    const float* bd = beta.host_f32();
-    for (int n = 0; n < N; ++n) {
-        for (int l = 0; l < L; ++l) {
-            // Length-C vector at (n, :, l): elements at flat index (n*C + c)*L + l.
-            // Two-pass variance — sumsq/C - mean² loses all precision under
-            // catastrophic cancellation when mean²≈sumsq/C, producing NaN via
-            // sqrt of a negative var. The accumulators are double so even very
-            // long sequences don't drift.
-            double mean = 0.0;
-            for (int c = 0; c < C; ++c) {
-                mean += xd[(static_cast<std::size_t>(n) * C + c) * L + l];
-            }
-            mean /= C;
-            double sumsq_dev = 0.0;
-            for (int c = 0; c < C; ++c) {
-                const double d = xd[(static_cast<std::size_t>(n) * C + c) * L + l] - mean;
-                sumsq_dev += d * d;
-            }
-            const float var  = static_cast<float>(sumsq_dev / C);
-            const float rstd = 1.0f / std::sqrt(var + eps);
-            const float fmean = static_cast<float>(mean);
-            for (int c = 0; c < C; ++c) {
-                const std::size_t idx = (static_cast<std::size_t>(n) * C + c) * L + l;
-                const float xhat = (xd[idx] - fmean) * rstd;
-                yd[idx] = xhat * gd[c] + bd[c];
-            }
-        }
-    }
+    // Compose: NCL -> (N*L, C) via nchw_to_sequence (H=1, W=L); per-row
+    // LayerNorm over the C axis with the existing batched op; then back to
+    // NCL via sequence_to_nchw. All three ops dispatch on X.device.
+    bt::Tensor X_seq;
+    bt::nchw_to_sequence(X, N, C, /*H=*/1, /*W=*/L, X_seq);
+    bt::Tensor Y_seq;
+    Y_seq.resize(N * L, C, bt::Dtype::FP32);
+    bt::layernorm_forward_inference_batched(X_seq, gamma, beta, Y_seq, eps);
+    bt::sequence_to_nchw(Y_seq, N, C, /*H=*/1, /*W=*/L, Y);
 }
 
 // ─── TextEncoder ───────────────────────────────────────────────────────────
@@ -386,39 +333,48 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
     if (L <= 0) fail(where, "empty input_ids");
     const int C = channels;
 
-    // Embedding lookup -> (L, C) NLC.
+    // Embedding lookup -> (L, C) NLC. The lookup runs on `embedding`'s device.
     bt::Tensor x_nlc;
     bt::embedding_lookup_forward(embedding, input_ids.data(), L, x_nlc);
+    const bt::Device dev = x_nlc.device;
 
-    // Transpose to NCL: (1, C*L).
-    bt::Tensor x = bt::Tensor::zeros_on(bt::Device::CPU, 1, C * L, bt::Dtype::FP32);
-    {
-        const float* src = x_nlc.host_f32();
-        float* dst = x.host_f32_mut();
-        for (int l = 0; l < L; ++l) {
-            for (int c = 0; c < C; ++c) {
-                dst[c * L + l] = src[l * C + c];
-            }
-        }
-    }
+    // Transpose to NCL: (1, C*L). NLC (L, C) -> NCHW with N=1, H=1, W=L.
+    bt::Tensor x;
+    bt::sequence_to_nchw(x_nlc, /*N=*/1, /*C=*/C, /*H=*/1, /*W=*/L, x);
 
     // Apply mask: positions where text_mask == 1 (a *pad* mask) zero out the
     // feature vector. text_mask in PyTorch Kokoro is the PADDING mask (true =
-    // pad, false = valid). The vector handed in mirrors that convention.
-    auto apply_mask = [&](bt::Tensor& y, int N, int Cy, int Ly) {
+    // pad, false = valid). Build a per-(n, l) keep-mask on host (1=keep,
+    // 0=zero), upload to `dev`, and multiply channel-wise via broadcast_mul
+    // through the NCL -> NLC -> NCL composition. No-op when mask is empty.
+    auto apply_mask = [&](bt::Tensor& y, int Cy, int Ly) {
         if (text_mask.empty()) return;
-        float* yd = y.host_f32_mut();
-        for (int n = 0; n < N; ++n) {
-            for (int l = 0; l < Ly; ++l) {
-                if (l < static_cast<int>(text_mask.size()) && text_mask[l] != 0) {
-                    for (int c = 0; c < Cy; ++c) {
-                        yd[(static_cast<std::size_t>(n) * Cy + c) * Ly + l] = 0.0f;
-                    }
-                }
-            }
+        // The mask is the same length-Ly for the single batch row; turn it
+        // into a (Ly, 1) keep tensor on `dev`, broadcast-multiplied into a
+        // (Ly, Cy) NLC view, then sent back to NCL.
+        std::vector<float> keep_host(Ly, 1.0f);
+        for (int l = 0; l < Ly && l < static_cast<int>(text_mask.size()); ++l) {
+            if (text_mask[l] != 0) keep_host[l] = 0.0f;
         }
+        bt::Tensor y_seq;
+        bt::nchw_to_sequence(y, /*N=*/1, Cy, /*H=*/1, /*W=*/Ly, y_seq);  // (Ly, Cy)
+        bt::Tensor keep_col = bt::Tensor::from_host_on(dev, keep_host.data(), Ly, 1);
+        // Multiply each row of y_seq by keep_col[l]: do it manually as
+        // per-row scale via copy_d2d/scale — but the cleanest device-aware
+        // op is to fold the mask into a length-Cy vector per row. Cheaper:
+        // broadcast keep_col across Cy by expanding to a (Ly, Cy) factor
+        // and using mul_inplace.
+        std::vector<float> factor_host(static_cast<std::size_t>(Ly) * Cy);
+        for (int l = 0; l < Ly; ++l) {
+            const float k = keep_host[l];
+            for (int c = 0; c < Cy; ++c) factor_host[l * Cy + c] = k;
+        }
+        bt::Tensor factor = bt::Tensor::from_host_on(dev, factor_host.data(),
+                                                    Ly, Cy);
+        bt::mul_inplace(y_seq, factor);
+        bt::sequence_to_nchw(y_seq, /*N=*/1, Cy, /*H=*/1, /*W=*/Ly, y);
     };
-    apply_mask(x, 1, C, L);
+    apply_mask(x, C, L);
 
     // depth × (Conv1d + LayerNorm1dNCL + LeakyReLU + mask).
     for (int i = 0; i < depth; ++i) {
@@ -429,37 +385,20 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
                          /*N=*/1, C, L, 1e-5f, x_ln);
         bt::Tensor x_act;
         bt::leaky_relu_forward(x_ln, 0.2f, x_act);
-        apply_mask(x_act, 1, C, L);
+        apply_mask(x_act, C, L);
         x = std::move(x_act);
     }
 
-    // Transpose to (L, C) for the LSTM.
-    bt::Tensor x_lc = bt::Tensor::zeros_on(bt::Device::CPU, L, C, bt::Dtype::FP32);
-    {
-        const float* src = x.host_f32();
-        float* dst = x_lc.host_f32_mut();
-        for (int c = 0; c < C; ++c) {
-            for (int l = 0; l < L; ++l) {
-                dst[l * C + c] = src[c * L + l];
-            }
-        }
-    }
+    // Transpose to (L, C) for the LSTM via nchw_to_sequence (H=1, W=L).
+    bt::Tensor x_lc;
+    bt::nchw_to_sequence(x, /*N=*/1, C, /*H=*/1, /*W=*/L, x_lc);
 
     // BiLSTM: (L, C) -> (L, C). (hidden_size = C/2 per direction; concat = C.)
     bt::Tensor lstm_out;
     lstm.forward(x_lc, lstm_out);
 
-    // Transpose back to (C, L) and return as t_en flattened (1, C*L).
-    t_en.resize(1, C * L, bt::Dtype::FP32);
-    {
-        const float* src = lstm_out.host_f32();
-        float* dst = t_en.host_f32_mut();
-        for (int l = 0; l < L; ++l) {
-            for (int c = 0; c < C; ++c) {
-                dst[c * L + l] = src[l * C + c];
-            }
-        }
-    }
+    // Transpose back to (1, C*L) NCL via sequence_to_nchw.
+    bt::sequence_to_nchw(lstm_out, /*N=*/1, C, /*H=*/1, /*W=*/L, t_en);
 }
 
 // ─── Style-conditioned norms ───────────────────────────────────────────────
@@ -467,89 +406,85 @@ void TextEncoder::forward(const std::vector<int32_t>& input_ids,
 namespace {
 
 // Compute (gamma, beta) = chunk(fc(style)) for an AdaLayerNorm / AdaIN1d.
-// Returns two length-C views over a freshly-allocated (1, 2*C) buffer. The
-// caller keeps `scratch` alive until the views go out of scope.
+// Returns two length-C device tensors on the style's device — shape (C, 1) so
+// they slot directly into brotensor::modulate / ada_in_1d as the scale/shift
+// vectors. (fc.forward_batched yields a (1, 2*C) tensor; we split it via two
+// copy_d2d into freshly allocated (C, 1) buffers.)
 void compute_style_affine(const Linear& fc, int C,
-                          const bt::Tensor& style, bt::Tensor& scratch,
-                          const float*& gamma_out, const float*& beta_out) {
-    bt::linear_forward_batched(fc.W, fc.b, style, scratch);  // (1, 2*C)
-    const float* h = scratch.host_f32();
-    gamma_out = h;
-    beta_out  = h + C;
+                          const bt::Tensor& style,
+                          bt::Tensor& gamma, bt::Tensor& beta) {
+    bt::Tensor scratch;
+    bt::linear_forward_batched(fc.W, fc.b, style, scratch);  // (1, 2*C) on style.device
+    gamma = bt::Tensor::zeros_on(scratch.device, C, 1, bt::Dtype::FP32);
+    beta  = bt::Tensor::zeros_on(scratch.device, C, 1, bt::Dtype::FP32);
+    bt::copy_d2d(scratch, 0, gamma, 0, C);
+    bt::copy_d2d(scratch, C, beta,  0, C);
 }
 
 // AdaLayerNorm forward on (L, C):
 //   y = (1 + gamma) * LayerNorm_no_affine(x_row, C) + beta
+// Composed as `layernorm_forward_inference_batched` (with unit gamma / zero
+// beta to leave the affine for the modulate step) + `modulate` — both
+// dispatched on x_lc's device.
 void ada_layernorm(const AdaLayerNormWeights& w, int L,
                    const bt::Tensor& x_lc, const bt::Tensor& style,
                    bt::Tensor& y_lc) {
-    bt::Tensor scratch;
-    const float* gamma = nullptr;
-    const float* beta  = nullptr;
-    compute_style_affine(w.fc, w.channels, style, scratch, gamma, beta);
     const int C = w.channels;
-    y_lc.resize(L, C, bt::Dtype::FP32);
-    const float* xd = x_lc.host_f32();
-    float* yd       = y_lc.host_f32_mut();
-    for (int l = 0; l < L; ++l) {
-        const float* row = xd + static_cast<std::size_t>(l) * C;
-        // Two-pass variance to avoid catastrophic cancellation; see
-        // layernorm_1d_ncl for the same rationale.
-        double mean = 0.0;
-        for (int c = 0; c < C; ++c) mean += row[c];
-        mean /= C;
-        double sumsq_dev = 0.0;
-        for (int c = 0; c < C; ++c) {
-            const double d = row[c] - mean;
-            sumsq_dev += d * d;
-        }
-        const float var  = static_cast<float>(sumsq_dev / C);
-        const float rstd = 1.0f / std::sqrt(var + w.eps);
-        const float fmean = static_cast<float>(mean);
-        float* y_row = yd + static_cast<std::size_t>(l) * C;
-        for (int c = 0; c < C; ++c) {
-            const float xhat = (row[c] - fmean) * rstd;
-            y_row[c] = (1.0f + gamma[c]) * xhat + beta[c];
-        }
-    }
+    const bt::Device dev = x_lc.device;
+
+    bt::Tensor gamma, beta;
+    compute_style_affine(w.fc, C, style, gamma, beta);
+
+    // LayerNorm pass with unit gamma / zero beta so the per-row affine is
+    // exactly the identity inside the op — the modulate step below applies
+    // the style-conditioned scale + shift.
+    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
+    bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
+                                                    C, 1);
+    bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
+    bt::Tensor x_norm;
+    x_norm.resize(L, C, bt::Dtype::FP32);
+    bt::layernorm_forward_inference_batched(x_lc, unit_gamma, zero_beta,
+                                            x_norm, w.eps);
+    // modulate is AdaLN-style (Y = X*(1+scale)+shift); upstream Kokoro
+    // multiplies by (1 + gamma) which matches exactly — no -1 fix-up needed.
+    bt::modulate(x_norm, gamma, beta, y_lc);
 }
 
 // AdaIN1d forward on (1, C*L) NCL:
 //   per channel c: y[n,c,l] = (1 + gamma[c]) * (x[n,c,l] - mean_c)/std_c + beta[c]
 //   where mean_c / std_c are taken over the L axis (instance norm).
+// Composed via group_norm_forward (num_groups == C → instance norm, unit
+// gamma / zero beta) + per-channel affine using the existing device-aware
+// ada_in_1d composition (nchw_to_sequence + modulate + sequence_to_nchw).
 void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
                       const bt::Tensor& x_ncl, const bt::Tensor& style,
                       bt::Tensor& y_ncl) {
-    bt::Tensor scratch;
-    const float* gamma = nullptr;
-    const float* beta  = nullptr;
-    compute_style_affine(w.fc, w.channels, style, scratch, gamma, beta);
-    y_ncl.resize(N, C * L, bt::Dtype::FP32);
-    const float* xd = x_ncl.host_f32();
-    float* yd       = y_ncl.host_f32_mut();
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const std::size_t base = (static_cast<std::size_t>(n) * C + c) * L;
-            // Two-pass variance to avoid catastrophic cancellation; see
-            // layernorm_1d_ncl. The single-pass formula NaNs on long L when
-            // sumsq/L ≈ mean², which is what happens deep in the Generator.
-            double mean = 0.0;
-            for (int l = 0; l < L; ++l) mean += xd[base + l];
-            mean /= L;
-            double sumsq_dev = 0.0;
-            for (int l = 0; l < L; ++l) {
-                const double d = xd[base + l] - mean;
-                sumsq_dev += d * d;
-            }
-            const float var  = static_cast<float>(sumsq_dev / L);
-            const float rstd = 1.0f / std::sqrt(var + w.eps);
-            const float fmean = static_cast<float>(mean);
-            for (int l = 0; l < L; ++l) {
-                const float xhat = (xd[base + l] - fmean) * rstd;
-                yd[base + l] = (1.0f + gamma[c]) * xhat + beta[c];
-            }
-        }
-    }
+    const bt::Device dev = x_ncl.device;
+
+    bt::Tensor gamma, beta;
+    compute_style_affine(w.fc, C, style, gamma, beta);
+
+    // Instance norm = GroupNorm(C). Unit gamma + zero beta leaves the affine
+    // for the modulate composition below.
+    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
+    bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
+                                                    C, 1);
+    bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
+    bt::Tensor x_norm;
+    x_norm.resize(N, C * L, bt::Dtype::FP32);
+    bt::group_norm_forward(x_ncl, unit_gamma, zero_beta,
+                           N, C, /*H=*/1, /*W=*/L,
+                           /*num_groups=*/C, w.eps, x_norm);
+
+    // Per-channel affine y = x_norm * (1 + gamma) + beta. modulate's AdaLN
+    // contract (Y = X*(1+scale)+shift) is exactly this — pass gamma directly.
+    // Composed on the (N*L, C) sequence layout.
+    bt::Tensor x_seq;
+    bt::nchw_to_sequence(x_norm, N, C, /*H=*/1, /*W=*/L, x_seq);
+    bt::Tensor y_seq;
+    bt::modulate(x_seq, gamma, beta, y_seq);
+    bt::sequence_to_nchw(y_seq, N, C, /*H=*/1, /*W=*/L, y_ncl);
 }
 
 // Per-(L) leaky_relu on NCL.
@@ -560,23 +495,34 @@ void leaky_relu_ncl(bt::Tensor& y, float slope) {
 }
 
 // Nearest-neighbour 2x upsample along L: (1, C*L_in) NCL -> (1, C*(2*L_in)) NCL.
+// upsample_nearest_2x is the spatial NCHW (H, W) op; modelling our 1D case as
+// (H=1, W=L_in) gives an output of (H=2, W=2*L_in) — which is one row of dup
+// in H plus the dup in W we actually want. The composition we use instead:
+// nchw_to_sequence with H=1, W=L_in to land at (L_in, C); brotensor has no
+// 1D upsample so we cycle through host. Cheap (one (N*L_in, C) buffer) and
+// only runs for the upsampling AdaIN res block branch.
 void upsample_nearest_2x_ncl(const bt::Tensor& x, int N, int C, int L_in,
                              bt::Tensor& y) {
     const int L_out = 2 * L_in;
-    y.resize(N, C * L_out, bt::Dtype::FP32);
-    const float* xd = x.host_f32();
-    float* yd       = y.host_f32_mut();
+    const bt::Device dev = x.device;
+    // upsample_nearest_2x duplicates along BOTH H and W; with H=1, W=L_in it
+    // returns (N, C * 2 * (2*L_in)). Take just the H=0 row by slicing 2D —
+    // but that's two ops + a slice; the host-side gather is simpler and
+    // device-agnostic (round-trip via host).
+    std::vector<float> xh = x.to_host_vector();
+    std::vector<float> yh(static_cast<std::size_t>(N) * C * L_out);
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const std::size_t bx = (static_cast<std::size_t>(n) * C + c) * L_in;
             const std::size_t by = (static_cast<std::size_t>(n) * C + c) * L_out;
             for (int l = 0; l < L_in; ++l) {
-                const float v = xd[bx + l];
-                yd[by + 2 * l + 0] = v;
-                yd[by + 2 * l + 1] = v;
+                const float v = xh[bx + l];
+                yh[by + 2 * l + 0] = v;
+                yh[by + 2 * l + 1] = v;
             }
         }
     }
+    y = bt::Tensor::from_host_on(dev, yh.data(), N, C * L_out);
 }
 
 // AdainResBlk1d forward: residual + shortcut, both / sqrt(2). x in NCL with
@@ -698,26 +644,13 @@ void load_adain_resblk(const stf::File& f, const std::string& prefix,
     }
 }
 
-// Transpose (1, C*L) NCL <-> (L, C) NLC.
+// Transpose (1, C*L) NCL <-> (L, C) NLC via brotensor's NCHW<->sequence ops
+// (H=1, W=L). Both dispatched on the input's device.
 void ncl_to_lc(const bt::Tensor& x_ncl, int C, int L, bt::Tensor& x_lc) {
-    x_lc.resize(L, C, bt::Dtype::FP32);
-    const float* src = x_ncl.host_f32();
-    float* dst       = x_lc.host_f32_mut();
-    for (int c = 0; c < C; ++c) {
-        for (int l = 0; l < L; ++l) {
-            dst[l * C + c] = src[c * L + l];
-        }
-    }
+    bt::nchw_to_sequence(x_ncl, /*N=*/1, C, /*H=*/1, /*W=*/L, x_lc);
 }
 void lc_to_ncl(const bt::Tensor& x_lc, int L, int C, bt::Tensor& x_ncl) {
-    x_ncl.resize(1, C * L, bt::Dtype::FP32);
-    const float* src = x_lc.host_f32();
-    float* dst       = x_ncl.host_f32_mut();
-    for (int l = 0; l < L; ++l) {
-        for (int c = 0; c < C; ++c) {
-            dst[c * L + l] = src[l * C + c];
-        }
-    }
+    bt::sequence_to_nchw(x_lc, /*N=*/1, C, /*H=*/1, /*W=*/L, x_ncl);
 }
 
 }  // namespace
@@ -733,17 +666,14 @@ void DurationEncoder::forward(const bt::Tensor& d_en, const bt::Tensor& style,
     bt::Tensor x;
     ncl_to_lc(d_en, C, L, x);
 
-    // Concat style across L: (L, C) -> (L, C + S).
+    // Concat style across L: (L, C) -> (L, C + S). Each row's first C columns
+    // are copied from xs[l]; the next S columns are the (broadcast) style.
+    // Performed via copy_d2d per row — device-to-device, no host roundtrip.
     auto cat_with_style = [&](const bt::Tensor& xs, bt::Tensor& out) {
         out.resize(L, C + S, bt::Dtype::FP32);
-        const float* xd = xs.host_f32();
-        const float* sd = style.host_f32();
-        float* od = out.host_f32_mut();
         for (int l = 0; l < L; ++l) {
-            float* row = od + static_cast<std::size_t>(l) * (C + S);
-            std::memcpy(row, xd + static_cast<std::size_t>(l) * C,
-                        static_cast<std::size_t>(C) * sizeof(float));
-            std::memcpy(row + C, sd, static_cast<std::size_t>(S) * sizeof(float));
+            bt::copy_d2d(xs,    l * C,         out, l * (C + S),     C);
+            bt::copy_d2d(style, 0,             out, l * (C + S) + C, S);
         }
     };
 
@@ -841,13 +771,10 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     const int C = cfg.hidden_dim;
     const int S = cfg.style_dim;
 
-    // Style for predictor = ref_s[:, style_dim:].
-    bt::Tensor style = bt::Tensor::zeros_on(bt::Device::CPU, 1, S, bt::Dtype::FP32);
-    {
-        const float* rs = ref_s.host_f32();
-        std::memcpy(style.host_f32_mut(), rs + S,
-                    static_cast<std::size_t>(S) * sizeof(float));
-    }
+    // Style for predictor = ref_s[:, style_dim:]. ref_s lives on ref_s.device
+    // (the model's device); slice via copy_d2d so style stays on-device.
+    bt::Tensor style = bt::Tensor::zeros_on(ref_s.device, 1, S, bt::Dtype::FP32);
+    bt::copy_d2d(ref_s, S, style, 0, S);
 
     // ─── DurationEncoder ──────────────────────────────────────────────────
     text_encoder.forward(d_en, style, L, out.d);  // (L, C + S)
@@ -857,13 +784,15 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     duration_proj.forward_batched(out.lstm_x, out.duration);  // (L, max_dur)
 
     // sigmoid + sum over the max_dur axis, / speed, round, clamp to >= 1.
+    // The integer output is inherently host-side control flow — round-trip
+    // out.duration through to_host_vector to read the values.
     out.pred_dur.assign(L, 0);
-    const float* dur = out.duration.host_f32();
+    const std::vector<float> dur_host = out.duration.to_host_vector();
     int total = 0;
     for (int l = 0; l < L; ++l) {
         float s = 0.0f;
         for (int k = 0; k < cfg.max_dur; ++k) {
-            const float v = dur[l * cfg.max_dur + k];
+            const float v = dur_host[l * cfg.max_dur + k];
             s += 1.0f / (1.0f + std::exp(-v));
         }
         s /= speed;
@@ -876,21 +805,26 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     // ─── Length regulator ────────────────────────────────────────────────
     // en = d.T @ alignment, where alignment is (L, total) one-hot expansion.
     // Equivalently: en[c, t] = d[phoneme(t), c] (with `phoneme(t)` mapping
-    // each frame t back to the source phoneme).
-    out.en.resize(1, (C + S) * total, bt::Dtype::FP32);
+    // each frame t back to the source phoneme). The repeat-counts come from
+    // pred_dur (host control flow), so the gather runs on host once and the
+    // result is uploaded to ref_s.device.
+    const bt::Device dev = ref_s.device;
     {
-        const float* dd = out.d.host_f32();
-        float* en_d = out.en.host_f32_mut();
+        const std::vector<float> d_host = out.d.to_host_vector();
+        std::vector<float> en_host(static_cast<std::size_t>(C + S) * total);
         int t = 0;
         for (int l = 0; l < L; ++l) {
             const int reps = out.pred_dur[l];
             for (int r = 0; r < reps; ++r) {
                 for (int c = 0; c < C + S; ++c) {
-                    en_d[c * total + t] = dd[l * (C + S) + c];
+                    en_host[static_cast<std::size_t>(c) * total + t] =
+                        d_host[static_cast<std::size_t>(l) * (C + S) + c];
                 }
                 ++t;
             }
         }
+        out.en = bt::Tensor::from_host_on(dev, en_host.data(),
+                                          1, (C + S) * total);
     }
 
     // ─── F0Ntrain ────────────────────────────────────────────────────────
@@ -980,20 +914,18 @@ namespace {
 
 // Concat NCL tensors along the channel axis. Each part is (1, C_i * L) with
 // the same L; out is (1, (sum C_i) * L) with channel blocks laid end-to-end.
+// Implemented as one copy_d2d per part (each part is contiguous in its NCL
+// flat layout, so it copies as one slab into the right channel offset of out).
 void cat_channels_ncl(const std::vector<const bt::Tensor*>& parts,
                       int L, bt::Tensor& out) {
     int C_total = 0;
     for (const auto* p : parts) C_total += p->cols / L;
-    out.resize(1, C_total * L, bt::Dtype::FP32);
-    float* dst = out.host_f32_mut();
+    const bt::Device dev = parts.empty() ? bt::Device::CPU : parts[0]->device;
+    out = bt::Tensor::zeros_on(dev, 1, C_total * L, bt::Dtype::FP32);
     int c_off = 0;
     for (const auto* p : parts) {
         const int C = p->cols / L;
-        const float* src = p->host_f32();
-        for (int c = 0; c < C; ++c) {
-            std::memcpy(dst + (c_off + c) * L, src + c * L,
-                        static_cast<std::size_t>(L) * sizeof(float));
-        }
+        bt::copy_d2d(*p, 0, out, c_off * L, C * L);
         c_off += C;
     }
 }
@@ -1008,9 +940,8 @@ void DecoderBackbone::forward(const bt::Tensor& asr,
                               bt::Tensor& gen_in) const {
     const int style_dim = 128;
 
-    bt::Tensor style = bt::Tensor::zeros_on(bt::Device::CPU, 1, style_dim, bt::Dtype::FP32);
-    std::memcpy(style.host_f32_mut(), ref_s.host_f32(),
-                static_cast<std::size_t>(style_dim) * sizeof(float));
+    bt::Tensor style = bt::Tensor::zeros_on(ref_s.device, 1, style_dim, bt::Dtype::FP32);
+    bt::copy_d2d(ref_s, 0, style, 0, style_dim);
 
     // F0_pred / N_pred: (1, 2*T) -> unsqueeze to (1, 1*(2T)) NCL -> stride-2
     // conv -> (1, 1*T).
@@ -1281,7 +1212,16 @@ static void gdbg(const char* tag, const bt::Tensor& t) {
         return v && v[0] && v[0] != '0';
     }();
     if (!on || t.dtype != bt::Dtype::FP32) return;
-    const float* d = t.host_f32();
+    // Debug-only path: round-trip a device tensor through to_host_vector so
+    // the stats stay computable regardless of where the tensor lives.
+    std::vector<float> host_buf;
+    const float* d = nullptr;
+    if (t.device == bt::Device::CPU) {
+        d = t.host_f32();
+    } else {
+        host_buf = t.to_host_vector();
+        d = host_buf.data();
+    }
     const std::size_t n = t.size();
     if (n == 0) { std::fprintf(stderr, "[gen]   %-32s empty\n", tag); return; }
     float mn = d[0], mx = d[0];
@@ -1395,48 +1335,42 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
 
     // post is (1, (n_fft+2)*L). The first (n_fft/2+1) channels are log-magnitude;
     // the next (n_fft/2+1) channels are pre-sin phase.
+    //
+    // brotensor has no sin op on its current surface (exp is there, but that
+    // alone doesn't help us avoid the phase = sin(...) host pass), so the
+    // mag / phase assembly runs on host: download `post`, apply exp / sin
+    // and the NCL -> frame-major transpose at the same time, then upload the
+    // two (L, n_freq) frame-major tensors that complex_from_polar consumes.
+    // The buffers are small (a few hundred kB at most); the heavy lifting is
+    // the device-side complex_from_polar + istft that follow.
     const int n_freq = n_fft / 2 + 1;
-    bt::Tensor mag = bt::Tensor::zeros_on(bt::Device::CPU, 1, n_freq * L, bt::Dtype::FP32);
-    bt::Tensor pha = bt::Tensor::zeros_on(bt::Device::CPU, 1, n_freq * L, bt::Dtype::FP32);
+    const bt::Device dev = x.device;
+    bt::Tensor mag_frames;
+    bt::Tensor pha_frames;
     {
-        const float* pd = post.host_f32();
-        float* md = mag.host_f32_mut();
-        float* phd = pha.host_f32_mut();
+        const std::vector<float> ph = post.to_host_vector();
+        std::vector<float> mag_host(static_cast<std::size_t>(L) * n_freq);
+        std::vector<float> pha_host(static_cast<std::size_t>(L) * n_freq);
         for (int c = 0; c < n_freq; ++c) {
             for (int l = 0; l < L; ++l) {
-                md[c * L + l] = std::exp(pd[c * L + l]);
+                mag_host[l * n_freq + c] = std::exp(ph[c * L + l]);
+                pha_host[l * n_freq + c] = std::sin(ph[(n_freq + c) * L + l]);
             }
         }
-        for (int c = 0; c < n_freq; ++c) {
-            for (int l = 0; l < L; ++l) {
-                phd[c * L + l] = std::sin(pd[(n_freq + c) * L + l]);
-            }
-        }
+        mag_frames = bt::Tensor::from_host_on(dev, mag_host.data(), L, n_freq);
+        pha_frames = bt::Tensor::from_host_on(dev, pha_host.data(), L, n_freq);
     }
 
-    // Build complex spectrogram from polar form. brotensor stores complex in
-    // an interleaved (N*frames, 2*n_freq) layout — we have to transpose from
-    // NCL (channel-major over frames) to NFL (frame-major over channels).
-    bt::Tensor mag_frames = bt::Tensor::zeros_on(bt::Device::CPU, L, n_freq, bt::Dtype::FP32);
-    bt::Tensor pha_frames = bt::Tensor::zeros_on(bt::Device::CPU, L, n_freq, bt::Dtype::FP32);
-    {
-        const float* md = mag.host_f32();
-        const float* phd = pha.host_f32();
-        float* mfd = mag_frames.host_f32_mut();
-        float* pfd = pha_frames.host_f32_mut();
-        for (int c = 0; c < n_freq; ++c) {
-            for (int l = 0; l < L; ++l) {
-                mfd[l * n_freq + c] = md[c * L + l];
-                pfd[l * n_freq + c] = phd[c * L + l];
-            }
-        }
-    }
+    // Build complex spectrogram on `dev`; istft consumes the same layout.
     bt::Tensor spec_complex;  // (frames, 2*n_freq) interleaved
     bt::complex_from_polar(mag_frames, pha_frames, spec_complex);
 
-    // iSTFT: signal_len = (frames - 1) * hop for center-true mode.
+    // iSTFT: signal_len = (frames - 1) * hop for center-true mode. The window
+    // is a small length-win_size lookup table — built on host (lookup) then
+    // uploaded to `dev` so istft can consume it without a device mismatch.
     const int signal_len = (L - 1) * hop_size;
-    bt::Tensor window = hann_window_periodic(win_size);
+    bt::Tensor window_host = hann_window_periodic(win_size);
+    bt::Tensor window = window_host.to(dev);
     bt::istft(spec_complex, window,
               /*N=*/1, signal_len, n_fft, hop_size, win_size,
               /*center=*/true, /*normalized=*/false, audio);
@@ -1472,7 +1406,14 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
     //    instantaneous phase per harmonic. We deliberately skip torch's
     //    rand_ini and the additive noise step — this is the deterministic
     //    placeholder until a proper SineGen lands.
-    const float* f0_d = F0_pred.host_f32();
+    //
+    // The phase accumulator is intrinsically host control flow (a per-sample
+    // running sum that brotensor has no op for); we materialise sine_waves on
+    // host then upload to the device the model lives on. F0_pred sets that
+    // device — l_linear and the downstream STFT all dispatch from there.
+    const bt::Device dev = F0_pred.device;
+    const std::vector<float> f0_host = F0_pred.to_host_vector();
+    const float* f0_d = f0_host.data();
     const int dim = harmonic_num + 1;
 
     // sine_waves[t, h] = sin(phase[t][h]) * sine_amp * uv[t]
@@ -1500,25 +1441,24 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
         }
     }
 
-    // 2. l_linear: (signal_len, dim) -> (signal_len, 1).
-    bt::Tensor sine_t = bt::Tensor::from_host_on(bt::Device::CPU,
-                                                  sine_waves.data(),
-                                                  signal_len, dim);
+    // 2. l_linear: (signal_len, dim) -> (signal_len, 1). Upload sine_waves to
+    //    the model's device; the linear, tanh, and stft below run there.
+    bt::Tensor sine_t = bt::Tensor::from_host_on(dev, sine_waves.data(),
+                                                 signal_len, dim);
     bt::Tensor merged;  // (signal_len, 1)
     bt::linear_forward_batched(l_linear.W, l_linear.b, sine_t, merged);
     // 3. tanh.
     bt::Tensor tanh_out;
     bt::tanh_forward(merged, tanh_out);
 
-    // 4. STFT on har_source (1, signal_len).
-    bt::Tensor har_source = bt::Tensor::zeros_on(bt::Device::CPU,
-                                                  1, signal_len, bt::Dtype::FP32);
-    {
-        const float* t_d = tanh_out.host_f32();
-        float* h_d = har_source.host_f32_mut();
-        for (int t = 0; t < signal_len; ++t) h_d[t] = t_d[t];
-    }
-    bt::Tensor window = hann_window_periodic(win_size);
+    // 4. STFT on har_source (1, signal_len). merged / tanh_out are (signal_len, 1);
+    //    stft wants (N, signal_len) = (1, signal_len) — same flat buffer, just
+    //    reshaped. copy_d2d into a fresh (1, signal_len) tensor on `dev`.
+    bt::Tensor har_source = bt::Tensor::zeros_on(dev, 1, signal_len, bt::Dtype::FP32);
+    bt::copy_d2d(tanh_out, 0, har_source, 0, signal_len);
+
+    bt::Tensor window_host = hann_window_periodic(win_size);
+    bt::Tensor window = window_host.to(dev);
     bt::Tensor spec;
     bt::stft(har_source, window, /*N=*/1, n_fft, hop_size, win_size,
              /*center=*/true, /*normalized=*/false, spec);
@@ -1529,26 +1469,22 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
     stft_frames = spec.rows;  // == signal_len / hop + 1 with center=true
 
     bt::Tensor mag_frames, pha_frames;
-    bt::complex_abs(spec, mag_frames);    // (frames, n_freq)
-    bt::complex_angle(spec, pha_frames);  // (frames, n_freq)
+    bt::complex_abs(spec, mag_frames);    // (frames, n_freq) on `dev`
+    bt::complex_angle(spec, pha_frames);  // (frames, n_freq) on `dev`
 
     // Transpose frames-major -> channel-major NCL: (1, 2*n_freq * frames).
-    har.resize(1, (2 * n_freq) * stft_frames, bt::Dtype::FP32);
-    float* hd = har.host_f32_mut();
-    {
-        const float* md = mag_frames.host_f32();
-        for (int c = 0; c < n_freq; ++c) {
-            for (int f = 0; f < stft_frames; ++f) {
-                hd[c * stft_frames + f] = md[f * n_freq + c];
-            }
-        }
-        const float* pd = pha_frames.host_f32();
-        for (int c = 0; c < n_freq; ++c) {
-            for (int f = 0; f < stft_frames; ++f) {
-                hd[(n_freq + c) * stft_frames + f] = pd[f * n_freq + c];
-            }
-        }
-    }
+    // mag_frames is (frames, n_freq) NLC; sequence_to_nchw with H=1, W=frames
+    // gives the (1, n_freq * frames) NCL block we want for the first half of
+    // har. The same for pha_frames at the second-half offset. We materialise
+    // both halves into a single (1, 2*n_freq*frames) tensor via copy_d2d.
+    bt::Tensor mag_ncl, pha_ncl;
+    bt::sequence_to_nchw(mag_frames, /*N=*/1, /*C=*/n_freq,
+                         /*H=*/1, /*W=*/stft_frames, mag_ncl);
+    bt::sequence_to_nchw(pha_frames, /*N=*/1, /*C=*/n_freq,
+                         /*H=*/1, /*W=*/stft_frames, pha_ncl);
+    har = bt::Tensor::zeros_on(dev, 1, (2 * n_freq) * stft_frames, bt::Dtype::FP32);
+    bt::copy_d2d(mag_ncl, 0, har, 0,                       n_freq * stft_frames);
+    bt::copy_d2d(pha_ncl, 0, har, n_freq * stft_frames,    n_freq * stft_frames);
 }
 
 }  // namespace brosoundml

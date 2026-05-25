@@ -3,6 +3,7 @@
 #include "brosoundml/detail/json.h"
 #include "brosoundml/kokoro_modules.h"
 
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
@@ -39,7 +40,16 @@ void debug_stats(const char* tag, const brotensor::Tensor& t) {
         std::fprintf(stderr, "[stage] %-24s dtype != FP32\n", tag);
         return;
     }
-    const float* d = t.host_f32();
+    // Stats are a debug-only host operation; if the tensor lives on a GPU,
+    // round-trip it through to_host_vector() before reading.
+    std::vector<float> host_buf;
+    const float* d = nullptr;
+    if (t.device == brotensor::Device::CPU) {
+        d = t.host_f32();
+    } else {
+        host_buf = t.to_host_vector();
+        d = host_buf.data();
+    }
     const std::size_t n = t.size();
     if (n == 0) { std::fprintf(stderr, "[stage] %-24s empty\n", tag); return; }
     float mn = d[0], mx = d[0];
@@ -280,8 +290,11 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     ids.push_back(0);
     const int L = static_cast<int>(ids.size());
 
-    // Style row: upstream picks ref_s = voice[len(input_ids) - 1].
-    brotensor::Tensor ref_s = voice.pick_for(L);
+    // Style row: upstream picks ref_s = voice[len(input_ids) - 1]. Voice packs
+    // are loaded on CPU (raw host data on disk); upload the selected row to
+    // the model's device so every downstream op sees device-matched operands.
+    brotensor::Tensor ref_s_host = voice.pick_for(L);
+    brotensor::Tensor ref_s = ref_s_host.to(impl_->device);
 
     // 1. plBERT.
     brotensor::Tensor bert_dur;
@@ -305,25 +318,30 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     debug_stats("05_N_pred",  po.N_pred);
     debug_vec  ("03_pred_dur", po.pred_dur);
 
-    // 5. Length-regulate t_en into asr.
+    // 5. Length-regulate t_en into asr. The expansion is an irregular gather
+    //    along L (each phoneme is repeated pred_dur[l] times); there's no
+    //    brotensor op for this NCL-axis gather, so build the result on host
+    //    via to_host_vector / from_host_on. The work is O(C*total) memory —
+    //    negligible compared to the device-side decoder forward that follows.
     const int total = std::accumulate(po.pred_dur.begin(), po.pred_dur.end(), 0);
-    brotensor::Tensor asr = brotensor::Tensor::zeros_on(
-        brotensor::Device::CPU, 1, impl_->config.hidden_dim * total,
-        brotensor::Dtype::FP32);
+    const int C_hidden = impl_->config.hidden_dim;
+    std::vector<float> asr_host(static_cast<std::size_t>(C_hidden) * total);
     {
-        const float* te = t_en.host_f32();
-        float* ad = asr.host_f32_mut();
+        const std::vector<float> te_host = t_en.to_host_vector();
         int t = 0;
         for (int l = 0; l < L; ++l) {
             const int reps = po.pred_dur[l];
             for (int r = 0; r < reps; ++r) {
-                for (int c = 0; c < impl_->config.hidden_dim; ++c) {
-                    ad[c * total + t] = te[c * L + l];
+                for (int c = 0; c < C_hidden; ++c) {
+                    asr_host[static_cast<std::size_t>(c) * total + t] =
+                        te_host[static_cast<std::size_t>(c) * L + l];
                 }
                 ++t;
             }
         }
     }
+    brotensor::Tensor asr = brotensor::Tensor::from_host_on(
+        impl_->device, asr_host.data(), 1, C_hidden * total);
 
     debug_stats("07_asr", asr);
 
@@ -361,21 +379,22 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     }
     (void)har_channels;
 
-    // The decoder style (ref_s[:, :style_dim]) is what Generator wants.
+    // The decoder style (ref_s[:, :style_dim]) is what Generator wants. ref_s
+    // lives on impl_->device; slice the first style_dim elements via copy_d2d.
     brotensor::Tensor style_dec = brotensor::Tensor::zeros_on(
-        brotensor::Device::CPU, 1, impl_->config.style_dim, brotensor::Dtype::FP32);
-    std::memcpy(style_dec.host_f32_mut(), ref_s.host_f32(),
-                static_cast<std::size_t>(impl_->config.style_dim) * sizeof(float));
+        impl_->device, 1, impl_->config.style_dim, brotensor::Dtype::FP32);
+    brotensor::copy_d2d(ref_s, 0, style_dec, 0, impl_->config.style_dim);
 
     debug_stats("10_har_stub", har_stub);
 
     brotensor::Tensor audio_t;    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
     debug_stats("11_audio", audio_t);
 
-    // 8. Wrap as AudioBuffer.
+    // 8. Wrap as AudioBuffer. audio_t lives on impl_->device; round-trip to
+    //    host via to_host_vector so AudioBuffer can own a std::vector<float>.
     AudioBuffer out;
     out.sample_rate = impl_->config.sample_rate;
-    out.samples.assign(audio_t.host_f32(), audio_t.host_f32() + audio_t.size());
+    out.samples = audio_t.to_host_vector();
     return out;
 }
 
@@ -393,23 +412,15 @@ brotensor::Tensor Voice::pick_for(int n_phonemes) const {
              "n_phonemes=" + std::to_string(n_phonemes) +
              " out of range [1, " + std::to_string(packs.rows) + "]");
     }
-    if (packs.device != brotensor::Device::CPU) {
-        // brosoundml currently loads voice packs on the host (see load_voice).
-        // A GPU-resident row slice belongs in a brotensor slice op, not here.
-        fail("Voice::pick_for",
-             "GPU-resident voice packs are not supported yet; load voice on CPU");
-    }
-
     // Upstream Kokoro indexes voice[n_phonemes - 1]: row 0 carries the style
-    // for a single-phoneme utterance, row k-1 for a k-phoneme utterance.
+    // for a single-phoneme utterance, row k-1 for a k-phoneme utterance. The
+    // packs tensor stays on whichever device load_voice put it on (CPU today
+    // — file data — but the slice is correct for any device); the row copy
+    // uses copy_d2d so a future device-resident voice pack works transparently.
     brotensor::Tensor row = brotensor::Tensor::empty_on(
-        brotensor::Device::CPU, 1, packs.cols, packs.dtype);
-    const auto row_bytes = static_cast<std::size_t>(packs.cols)
-                         * static_cast<std::size_t>(brotensor::dtype_size_bytes(packs.dtype));
-    const auto offset = static_cast<std::size_t>(n_phonemes - 1) * row_bytes;
-    std::memcpy(row.host_raw_mut(),
-                static_cast<const uint8_t*>(packs.data) + offset,
-                row_bytes);
+        packs.device, 1, packs.cols, packs.dtype);
+    brotensor::copy_d2d(packs, (n_phonemes - 1) * packs.cols,
+                        row, 0, packs.cols);
     return row;
 }
 

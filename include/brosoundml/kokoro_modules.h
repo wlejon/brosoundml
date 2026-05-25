@@ -11,9 +11,10 @@
 // upstream PyTorch state dict (with PyTorch's `weight_norm` parameterizations
 // already fused into plain `.weight` by scripts/convert-kokoro.py).
 //
-// CPU FP32-only. The Kokoro forward pass moves to GPU once the AdaIN/affine
-// op gap in brotensor (see CLAUDE.md) is filled — until then these submodules
-// throw a clear runtime_error if the source tensors are not CPU FP32.
+// Device-aware FP32: every forward routes through brotensor ops that dispatch
+// on the input tensor's device (CPU / CUDA / Metal). Each submodule expects
+// its inputs / weights to share the same device; runtime checks reject
+// non-FP32 inputs (the loaded weights are FP32 today).
 
 #include "brosoundml/kokoro.h"
 #include "brosoundml/modules.h"
@@ -340,7 +341,7 @@ struct Generator {
 // The StyleTTS2 / Kokoro CNN-stack LayerNorm: at every (n, l) position,
 // normalise the length-C vector with per-channel `gamma`/`beta`. Exposed as
 // a free function so the TextEncoder forward stays readable.
-//   X, Y: (N, C*L) NCL.  gamma, beta: (C, 1).  CPU FP32-only.
+//   X, Y: (N, C*L) NCL.  gamma, beta: (C, 1).  FP32; dispatched on X's device.
 void layernorm_1d_ncl(const brotensor::Tensor& X,
                       const brotensor::Tensor& gamma,
                       const brotensor::Tensor& beta,

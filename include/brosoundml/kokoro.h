@@ -135,7 +135,8 @@ public:
     // `file_size_bytes / (voice_dim * 4)` must divide evenly. PyTorch .pt
     // voice packs from the upstream distribution should be converted to this
     // raw format once, by the caller — brosoundml does not pull in a pickle
-    // reader. The returned Voice's `packs` tensor lives on Device::CPU.
+    // reader. The returned Voice's `packs` tensor lives on Device::CPU; the
+    // row selected at synthesize() time is uploaded to the model's device.
     Voice load_voice(const std::string& voice_path) const;
 
     // Run the full pipeline: phoneme token ids (see the misaki G2P note above)
