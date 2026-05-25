@@ -10,9 +10,10 @@
 // Keys match the HuggingFace `transformers/models/whisper/modeling_whisper.py`
 // state dict.
 //
-// CPU FP32-only. The Whisper forward pass moves to GPU once we have a
-// fused-attention path on those backends — until then these submodules throw
-// a clear runtime_error if the source tensors are not CPU FP32.
+// FP32 on whichever device the weights are loaded to. The encoder / decoder
+// forward passes dispatch through brotensor ops (CPU/CUDA/Metal); LogMel's
+// inner loops stay CPU-resident (host-side STFT + filterbank build) and the
+// final feature tensor is uploaded to the model device at the boundary.
 
 #include "brosoundml/audio.h"
 #include "brosoundml/modules.h"
@@ -55,15 +56,25 @@ struct LogMel {
     int n_frames       = 3000;          // fixed: 30 s at 100 Hz frame rate
     int sample_rate    = 16000;
 
-    brotensor::Tensor mel_filters;      // (num_mel_bins, n_fft/2 + 1) FP32
-    brotensor::Tensor hann_window;      // (1, win_length) FP32
+    // Target device for the output mel feature tensor. mel_filters and
+    // hann_window themselves stay CPU-resident — the LogMel inner pipeline
+    // (audio padding, STFT, power spectrum, mel projection, log, normalize)
+    // runs on the host because the audio arrives as a host std::vector and
+    // the operation is one-shot per clip. The final result is uploaded to
+    // `device` at the end of `forward()`.
+    brotensor::Device device = brotensor::Device::CPU;
+
+    brotensor::Tensor mel_filters;      // (num_mel_bins, n_fft/2 + 1) FP32 (CPU)
+    brotensor::Tensor hann_window;      // (1, win_length) FP32 (CPU)
 
     // Build mel_filters + hann_window from scratch; no safetensors needed.
-    // Called once after WhisperConfig is parsed.
+    // `device` is stored as the target device for `forward()`'s output; the
+    // host-side tables are always built on CPU. Called once after
+    // WhisperConfig is parsed.
     void build(int num_mel_bins, brotensor::Device device);
 
     // audio.samples is mono FP32 [-1, 1] at sample_rate (must be 16 kHz).
-    // Out: (num_mel_bins, n_frames) FP32 on the same device as mel_filters.
+    // Out: (num_mel_bins, n_frames) FP32 on `device`.
     void forward(const AudioBuffer& audio, brotensor::Tensor& out) const;
 };
 
@@ -95,9 +106,10 @@ struct WhisperEncoderLayer {
 
     void load_from(const brotensor::safetensors::File& f,
                    const std::string& prefix,
-                   int d_model, int ffn_dim, int num_heads);
+                   int d_model, int ffn_dim, int num_heads,
+                   brotensor::Device device = brotensor::Device::CPU);
 
-    // X: (L, d_model). Y: (L, d_model), resized. CPU FP32 only.
+    // X: (L, d_model). Y: (L, d_model), resized. FP32 on X's device.
     void forward(const brotensor::Tensor& X, brotensor::Tensor& Y) const;
 };
 
@@ -129,11 +141,12 @@ struct WhisperEncoder {
                    int max_source_positions,
                    int encoder_layers,
                    int encoder_ffn_dim,
-                   int encoder_attention_heads);
+                   int encoder_attention_heads,
+                   brotensor::Device device = brotensor::Device::CPU);
 
     // mel: (num_mel_bins, 3000) FP32 — the LogMel output reshaped to NCL with
     // N=1 (i.e. (1, num_mel_bins*3000)). hidden: (max_source_positions, d_model)
-    // resized on output. CPU FP32 only.
+    // resized on output. FP32 on mel's device.
     void forward(const brotensor::Tensor& mel, brotensor::Tensor& hidden) const;
 };
 
@@ -152,7 +165,7 @@ struct WhisperEncoder {
 //     `prime_cross` on the owning `WhisperDecoderLayer`) and reused for every
 //     subsequent decode step. Shape (max_source_positions, d_model).
 //
-// All four tensors are CPU FP32. Reset between transcriptions with
+// All four tensors live on the model's device (FP32). Reset between transcriptions with
 // `WhisperKVCache::reset()`; the storage is kept so a fresh transcription is
 // allocation-free.
 struct WhisperLayerCache {
@@ -175,7 +188,8 @@ struct WhisperKVCache {
     // cross-K/V at (max_source_positions, d_model). Idempotent: calling twice
     // with the same shape leaves the cache unchanged.
     void allocate(int decoder_layers, int d_model,
-                  int max_target_positions, int max_source_positions);
+                  int max_target_positions, int max_source_positions,
+                  brotensor::Device device = brotensor::Device::CPU);
 
     // Zero `self_len` and clear `cross_primed` on every layer. Keeps the
     // storage so the next transcription is allocation-free.
@@ -190,9 +204,10 @@ struct WhisperKVCache {
 //
 // brosoundml's shared `MHA::forward` runs full self-attention with no causal
 // mask and no cache; that is not enough for the Whisper decoder's two
-// attention sublayers. Two new free functions cover the gap — both FP32 CPU
-// only, both share the open-coded scalar attention style of
-// `mha_attention_fp32` in modules.cpp.
+// attention sublayers. Two new free functions cover the gap — both FP32,
+// dispatched on the input tensors' device. Both compose
+// `brotensor::flash_attention_forward` with a copy-into-cache step for the
+// K/V append (self) and rely on the pre-projected cross K/V (cross).
 //
 // `mha_causal_cached_fp32`: causal self-attention with append-to-cache. The
 // caller supplies the current step's input X ((T, D)), the four Q/K/V/O
@@ -282,7 +297,8 @@ struct WhisperDecoderLayer {
 
     void load_from(const brotensor::safetensors::File& f,
                    const std::string& prefix,
-                   int d_model, int ffn_dim, int num_heads);
+                   int d_model, int ffn_dim, int num_heads,
+                   brotensor::Device device = brotensor::Device::CPU);
 
     // Project + cache the cross-attention K/V for this layer from the
     // encoder hidden state. Idempotent — re-priming overwrites the cache.
@@ -335,7 +351,8 @@ struct WhisperDecoder {
                    int decoder_attention_heads,
                    int vocab_size,
                    int max_target_positions,
-                   int max_source_positions);
+                   int max_source_positions,
+                   brotensor::Device device = brotensor::Device::CPU);
 
     // Prime every layer's cross-attention cache from encoder_hidden.
     // encoder_hidden: (max_source_positions, d_model). Must be called once

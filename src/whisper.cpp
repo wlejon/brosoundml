@@ -5,11 +5,13 @@
 
 #include <brotensor/safetensors.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brosoundml {
 
@@ -138,13 +140,11 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
     impl_->config = parse_config(config_path.string());
     impl_->device = device;
 
-    if (device != brotensor::Device::CPU) {
-        fail("Whisper::load", "stages 2-4 not yet ported off CPU");
-    }
-
     auto weights = brotensor::safetensors::File::open(weight_path.string());
 
-    // Stage 2: build the log-mel front-end (no learnable weights).
+    // Stage 2: build the log-mel front-end (no learnable weights). LogMel
+    // keeps its host-built mel filterbank + Hann window CPU-resident and
+    // uploads the final feature tensor to `device` at the end of forward().
     impl_->log_mel.build(impl_->config.num_mel_bins, device);
 
     // Stage 3: load the encoder backbone from the safetensors file.
@@ -154,7 +154,8 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
                              impl_->config.max_source_positions,
                              impl_->config.encoder_layers,
                              impl_->config.encoder_ffn_dim,
-                             impl_->config.encoder_attention_heads);
+                             impl_->config.encoder_attention_heads,
+                             device);
 
     // Stage 4: load the decoder + pre-allocate the per-layer KV cache. Cache
     // storage outlives every transcribe() call so the eventual greedy loop
@@ -166,28 +167,49 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
                              impl_->config.decoder_attention_heads,
                              impl_->config.vocab_size,
                              impl_->config.max_target_positions,
-                             impl_->config.max_source_positions);
+                             impl_->config.max_source_positions,
+                             device);
     impl_->cache.allocate(impl_->config.decoder_layers,
                           impl_->config.d_model,
                           impl_->config.max_target_positions,
-                          impl_->config.max_source_positions);
+                          impl_->config.max_source_positions,
+                          device);
 
     impl_->loaded = true;
 }
 
 namespace {
 
-// Greedy argmax over the last row of a (T, V) logits tensor. Scalar loop —
-// cheaper than building a (1, V) view + calling brotensor::argmax_rows for a
-// single row.
+// Greedy argmax over the last row of a (T, V) logits tensor. The decode loop
+// runs once per generated token, so we materialise the single (1, V) last
+// row on the host and pick its argmax with a scalar loop — cheaper than
+// allocating a (T, 1) argmax_rows output and downloading one int32.
 int32_t argmax_last_row(const brotensor::Tensor& logits) {
     const int T = logits.rows;
     const int V = logits.cols;
-    const float* p = logits.host_f32() + static_cast<std::size_t>(T - 1) * V;
+    std::vector<float> row(static_cast<std::size_t>(V));
+    if (logits.device == brotensor::Device::CPU) {
+        const float* p = logits.host_f32() + static_cast<std::size_t>(T - 1) * V;
+        std::copy(p, p + V, row.begin());
+    } else {
+        // Build a (1, V) view on the device over the final row, then move to
+        // CPU. Tensor::to copies the buffer; the .data pointer is the device
+        // buffer, and view + to is the standard scalar-readout path.
+        float* last_row_dev = static_cast<float*>(logits.data)
+                            + static_cast<std::size_t>(T - 1) * V;
+        brotensor::Tensor last_view = brotensor::Tensor::view(
+            logits.device, last_row_dev, 1, V, brotensor::Dtype::FP32);
+        brotensor::Tensor last_host = last_view.to(brotensor::Device::CPU);
+        const float* p = last_host.host_f32();
+        std::copy(p, p + V, row.begin());
+    }
     int   best_i = 0;
-    float best_v = p[0];
+    float best_v = row[0];
     for (int v = 1; v < V; ++v) {
-        if (p[v] > best_v) { best_v = p[v]; best_i = v; }
+        if (row[static_cast<std::size_t>(v)] > best_v) {
+            best_v = row[static_cast<std::size_t>(v)];
+            best_i = v;
+        }
     }
     return static_cast<int32_t>(best_i);
 }
