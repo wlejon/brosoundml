@@ -1,8 +1,15 @@
 // brosoundml module-layer tests. Each module is exercised with hand-rolled
 // synthetic weights so the expected output is computable by hand — no
 // reference activations from an external framework involved.
+//
+// Each device-dependent test is parameterized over brotensor::Device so the
+// CPU baseline runs unconditionally and the CUDA path runs additionally when
+// `brotensor::is_available(Device::CUDA)` reports true. Module outputs run on
+// CUDA are downloaded via `to_host_vector()` before comparing against the
+// from-scratch CPU oracle.
 #include "brosoundml/modules.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
 #include <algorithm>
@@ -10,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace bt = brotensor;
@@ -36,93 +44,111 @@ static bool throws_runtime_error(Fn&& fn) {
     return false;
 }
 
-static bt::Tensor make_tensor(const std::vector<float>& data, int rows, int cols) {
-    return bt::Tensor::from_host_on(bt::Device::CPU, data.data(), rows, cols);
+static bt::Tensor make_tensor_on(bt::Device dev, const std::vector<float>& data,
+                                 int rows, int cols) {
+    return bt::Tensor::from_host_on(dev, data.data(), rows, cols);
+}
+
+// Download a (possibly device-resident) FP32 tensor to a host vector — works
+// for tensors on CPU or CUDA. The returned vector mirrors row-major layout.
+static std::vector<float> download(const bt::Tensor& t) {
+    return t.to_host_vector();
+}
+
+// Convenience: tag CHECK messages with the device name without bloating each
+// call site. Each test_* function passes `dev_name` through.
+static std::string tag(const char* msg, const char* dev_name) {
+    std::string s = "[";
+    s += dev_name;
+    s += "] ";
+    s += msg;
+    return s;
 }
 
 // ─── Linear ────────────────────────────────────────────────────────────────
 
-static void test_linear() {
+static void test_linear(bt::Device dev, const char* dev_name) {
     brosoundml::Linear lin;
     lin.in_features  = 3;
     lin.out_features = 2;
     // W = [[1, 2, 3], [4, 5, 6]]; b = [10, 20].
-    lin.W = make_tensor({1, 2, 3, 4, 5, 6}, 2, 3);
-    lin.b = make_tensor({10, 20}, 2, 1);
+    lin.W = make_tensor_on(dev, {1, 2, 3, 4, 5, 6}, 2, 3);
+    lin.b = make_tensor_on(dev, {10, 20}, 2, 1);
 
     // x = [1, 1, 1]^T → y = [1+2+3+10, 4+5+6+20] = [16, 35].
-    bt::Tensor x = make_tensor({1, 1, 1}, 3, 1);
+    bt::Tensor x = make_tensor_on(dev, {1, 1, 1}, 3, 1);
     bt::Tensor y;
     lin.forward(x, y);
-    CHECK(y.rows == 2 && y.cols == 1, "Linear::forward output shape");
-    CHECK(approx(y.host_f32()[0], 16.0f), "Linear::forward y[0]");
-    CHECK(approx(y.host_f32()[1], 35.0f), "Linear::forward y[1]");
+    auto yh = download(y);
+    CHECK(y.rows == 2 && y.cols == 1, tag("Linear::forward output shape", dev_name).c_str());
+    CHECK(approx(yh[0], 16.0f), tag("Linear::forward y[0]", dev_name).c_str());
+    CHECK(approx(yh[1], 35.0f), tag("Linear::forward y[1]", dev_name).c_str());
 
     // Batched: X = [[1,1,1], [2,2,2]] → Y = [[16,35], [22,50]].
-    bt::Tensor X = make_tensor({1, 1, 1, 2, 2, 2}, 2, 3);
+    bt::Tensor X = make_tensor_on(dev, {1, 1, 1, 2, 2, 2}, 2, 3);
     bt::Tensor Y;
     lin.forward_batched(X, Y);
-    CHECK(Y.rows == 2 && Y.cols == 2, "Linear::forward_batched output shape");
-    CHECK(approx(Y.host_f32()[0], 16.0f) && approx(Y.host_f32()[1], 35.0f),
-          "Linear::forward_batched row 0");
-    CHECK(approx(Y.host_f32()[2], 22.0f) && approx(Y.host_f32()[3], 50.0f),
-          "Linear::forward_batched row 1");
+    auto Yh = download(Y);
+    CHECK(Y.rows == 2 && Y.cols == 2, tag("Linear::forward_batched output shape", dev_name).c_str());
+    CHECK(approx(Yh[0], 16.0f) && approx(Yh[1], 35.0f),
+          tag("Linear::forward_batched row 0", dev_name).c_str());
+    CHECK(approx(Yh[2], 22.0f) && approx(Yh[3], 50.0f),
+          tag("Linear::forward_batched row 1", dev_name).c_str());
 
     CHECK(throws_runtime_error([&] {
-              bt::Tensor bad_x = make_tensor({1, 1}, 2, 1);
+              bt::Tensor bad_x = make_tensor_on(dev, {1, 1}, 2, 1);
               bt::Tensor out;
               lin.forward(bad_x, out);
           }),
-          "Linear::forward rejects wrong input shape");
+          tag("Linear::forward rejects wrong input shape", dev_name).c_str());
 }
 
 // ─── LayerNorm ─────────────────────────────────────────────────────────────
 
-static void test_layernorm() {
+static void test_layernorm(bt::Device dev, const char* dev_name) {
     brosoundml::LayerNorm ln;
     ln.features = 4;
-    ln.gamma = make_tensor({1, 1, 1, 1}, 4, 1);
-    ln.beta  = make_tensor({0, 0, 0, 0}, 4, 1);
+    ln.gamma = make_tensor_on(dev, {1, 1, 1, 1}, 4, 1);
+    ln.beta  = make_tensor_on(dev, {0, 0, 0, 0}, 4, 1);
 
-    // Two rows, each with a deterministic mean / variance. After LN with
-    // gamma=1 / beta=0, each row's mean should be ~0 and its variance ~1.
-    bt::Tensor X = make_tensor({1, 2, 3, 4,
-                                10, 12, 14, 16}, 2, 4);
+    bt::Tensor X = make_tensor_on(dev, {1, 2, 3, 4,
+                                        10, 12, 14, 16}, 2, 4);
     bt::Tensor Y;
     ln.forward(X, Y);
-    CHECK(Y.rows == 2 && Y.cols == 4, "LayerNorm output shape");
+    auto Yh = download(Y);
+    CHECK(Y.rows == 2 && Y.cols == 4, tag("LayerNorm output shape", dev_name).c_str());
 
     for (int r = 0; r < 2; ++r) {
         float sum = 0, sumsq = 0;
         for (int c = 0; c < 4; ++c) {
-            const float v = Y.host_f32()[r * 4 + c];
+            const float v = Yh[r * 4 + c];
             sum += v;
             sumsq += v * v;
         }
         const float mean = sum / 4.0f;
         const float var  = sumsq / 4.0f - mean * mean;
         CHECK(approx(mean, 0.0f, 1e-4f),
-              r == 0 ? "LayerNorm row 0 mean ~ 0" : "LayerNorm row 1 mean ~ 0");
+              r == 0 ? tag("LayerNorm row 0 mean ~ 0", dev_name).c_str()
+                     : tag("LayerNorm row 1 mean ~ 0", dev_name).c_str());
         CHECK(approx(var, 1.0f, 1e-3f),
-              r == 0 ? "LayerNorm row 0 variance ~ 1" : "LayerNorm row 1 variance ~ 1");
+              r == 0 ? tag("LayerNorm row 0 variance ~ 1", dev_name).c_str()
+                     : tag("LayerNorm row 1 variance ~ 1", dev_name).c_str());
     }
 
-    // Non-trivial gamma / beta: output should be gamma * normed + beta.
-    ln.gamma = make_tensor({2, 2, 2, 2}, 4, 1);
-    ln.beta  = make_tensor({5, 5, 5, 5}, 4, 1);
+    ln.gamma = make_tensor_on(dev, {2, 2, 2, 2}, 4, 1);
+    ln.beta  = make_tensor_on(dev, {5, 5, 5, 5}, 4, 1);
     bt::Tensor Y2;
     ln.forward(X, Y2);
-    // Each row mean → 5, each row "variance" (after scaling) → 4.
+    auto Y2h = download(Y2);
     float sum = 0;
-    for (int c = 0; c < 4; ++c) sum += Y2.host_f32()[c];
+    for (int c = 0; c < 4; ++c) sum += Y2h[c];
     CHECK(approx(sum / 4.0f, 5.0f, 1e-4f),
-          "LayerNorm row 0 mean ~ beta=5 with non-unit gamma");
+          tag("LayerNorm row 0 mean ~ beta=5 with non-unit gamma", dev_name).c_str());
 }
 
 // ─── Conv1d ────────────────────────────────────────────────────────────────
 
-static void test_conv1d() {
-    // 1 input channel, 1 output channel, kernel [1, 1, 1]: a moving sum of 3.
+static void test_conv1d(bt::Device dev, const char* dev_name) {
     brosoundml::Conv1d conv;
     conv.in_channels  = 1;
     conv.out_channels = 1;
@@ -131,29 +157,29 @@ static void test_conv1d() {
     conv.padding      = 0;
     conv.dilation     = 1;
     conv.groups       = 1;
-    conv.W = make_tensor({1, 1, 1}, 1, 3);
-    conv.b = make_tensor({0}, 1, 1);
+    conv.W = make_tensor_on(dev, {1, 1, 1}, 1, 3);
+    conv.b = make_tensor_on(dev, {0}, 1, 1);
 
-    bt::Tensor X = make_tensor({1, 2, 3, 4, 5}, 1, 5);  // (N=1, C*L=1*5)
+    bt::Tensor X = make_tensor_on(dev, {1, 2, 3, 4, 5}, 1, 5);
     bt::Tensor Y;
     conv.forward(X, /*N=*/1, /*L=*/5, Y);
-    // L_out = 5 - 3 + 1 = 3. Output: [1+2+3, 2+3+4, 3+4+5] = [6, 9, 12].
-    CHECK(Y.rows == 1 && Y.cols == 3, "Conv1d output shape");
-    CHECK(approx(Y.host_f32()[0], 6.0f), "Conv1d y[0] = 6");
-    CHECK(approx(Y.host_f32()[1], 9.0f), "Conv1d y[1] = 9");
-    CHECK(approx(Y.host_f32()[2], 12.0f), "Conv1d y[2] = 12");
+    auto Yh = download(Y);
+    CHECK(Y.rows == 1 && Y.cols == 3, tag("Conv1d output shape", dev_name).c_str());
+    CHECK(approx(Yh[0], 6.0f, 1e-4f),  tag("Conv1d y[0] = 6", dev_name).c_str());
+    CHECK(approx(Yh[1], 9.0f, 1e-4f),  tag("Conv1d y[1] = 9", dev_name).c_str());
+    CHECK(approx(Yh[2], 12.0f, 1e-4f), tag("Conv1d y[2] = 12", dev_name).c_str());
 
-    // Bias non-zero shifts every output.
-    conv.b = make_tensor({100}, 1, 1);
+    conv.b = make_tensor_on(dev, {100}, 1, 1);
     bt::Tensor Y2;
     conv.forward(X, 1, 5, Y2);
-    CHECK(approx(Y2.host_f32()[0], 106.0f), "Conv1d adds bias to y[0]");
+    auto Y2h = download(Y2);
+    CHECK(approx(Y2h[0], 106.0f, 1e-4f), tag("Conv1d adds bias to y[0]", dev_name).c_str());
 }
 
 // ─── LSTM (single direction) ───────────────────────────────────────────────
 
-// Reference cell computation for a single timestep, so the test owns its
-// ground truth without leaning on brotensor for it.
+// Reference cell computation. Stays CPU FP32 — it's the oracle we compare
+// the device-resident module output against.
 static void lstm_step_ref(int input_size, int hidden,
                           const std::vector<float>& W_ih,
                           const std::vector<float>& W_hh,
@@ -186,12 +212,11 @@ static void lstm_step_ref(int input_size, int hidden,
     }
 }
 
-static void test_lstm() {
+static void test_lstm(bt::Device dev, const char* dev_name) {
     const int input_size = 2;
     const int hidden     = 3;
     const int L          = 4;
 
-    // Deterministic-but-non-uniform weights: small integers, FP32.
     std::vector<float> W_ih, W_hh, b_ih, b_hh;
     for (int r = 0; r < 4 * hidden; ++r) {
         for (int k = 0; k < input_size; ++k)
@@ -207,20 +232,25 @@ static void test_lstm() {
     brosoundml::LSTM lstm;
     lstm.input_size  = input_size;
     lstm.hidden_size = hidden;
-    lstm.cell.W_ih = make_tensor(W_ih, 4 * hidden, input_size);
-    lstm.cell.W_hh = make_tensor(W_hh, 4 * hidden, hidden);
-    lstm.cell.b_ih = make_tensor(b_ih, 4 * hidden, 1);
-    lstm.cell.b_hh = make_tensor(b_hh, 4 * hidden, 1);
+    lstm.cell.W_ih = make_tensor_on(dev, W_ih, 4 * hidden, input_size);
+    lstm.cell.W_hh = make_tensor_on(dev, W_hh, 4 * hidden, hidden);
+    lstm.cell.b_ih = make_tensor_on(dev, b_ih, 4 * hidden, 1);
+    lstm.cell.b_hh = make_tensor_on(dev, b_hh, 4 * hidden, 1);
 
     std::vector<float> X_data;
     for (int t = 0; t < L; ++t) {
         X_data.push_back(0.1f * static_cast<float>(t + 1));
         X_data.push_back(-0.2f * static_cast<float>(t + 1));
     }
-    bt::Tensor X = make_tensor(X_data, L, input_size);
+    bt::Tensor X = make_tensor_on(dev, X_data, L, input_size);
     bt::Tensor Y;
     lstm.forward(X, Y);
-    CHECK(Y.rows == L && Y.cols == hidden, "LSTM output shape");
+    CHECK(Y.rows == L && Y.cols == hidden, tag("LSTM output shape", dev_name).c_str());
+    auto Yh = download(Y);
+
+    // Tolerance: LSTM accumulates per-step FP noise — looser than 1e-5 on
+    // CUDA, still tight on CPU.
+    const float tol = (dev == bt::Device::CPU) ? 1e-5f : 1e-3f;
 
     std::vector<float> h_prev(hidden, 0.0f), c_prev(hidden, 0.0f);
     std::vector<float> h_step, c_step;
@@ -230,11 +260,11 @@ static void test_lstm() {
         lstm_step_ref(input_size, hidden, W_ih, W_hh, b_ih, b_hh, x_t,
                       h_prev, c_prev, h_step, c_step);
         for (int j = 0; j < hidden; ++j) {
-            const float got = Y.host_f32()[t * hidden + j];
-            if (!approx(got, h_step[j], 1e-5f)) {
+            const float got = Yh[t * hidden + j];
+            if (!approx(got, h_step[j], tol)) {
                 std::fprintf(stderr,
-                    "FAIL: LSTM t=%d j=%d got=%g want=%g\n",
-                    t, j, got, h_step[j]);
+                    "FAIL: [%s] LSTM t=%d j=%d got=%g want=%g\n",
+                    dev_name, t, j, got, h_step[j]);
                 ++failures;
             }
         }
@@ -243,13 +273,11 @@ static void test_lstm() {
     }
 }
 
-static void test_bilstm() {
+static void test_bilstm(bt::Device dev, const char* dev_name) {
     const int input_size = 2;
     const int hidden     = 2;
     const int L          = 3;
 
-    // Both directions share weights — sanity check that the structure works,
-    // not that brosoundml matches some external bidirectional reference.
     std::vector<float> W_ih(4 * hidden * input_size, 0.1f);
     std::vector<float> W_hh(4 * hidden * hidden,     0.05f);
     std::vector<float> b_ih(4 * hidden, 0.0f);
@@ -258,79 +286,89 @@ static void test_bilstm() {
     brosoundml::BiLSTM bi;
     bi.input_size  = input_size;
     bi.hidden_size = hidden;
-    bi.forward_cell.W_ih = make_tensor(W_ih, 4 * hidden, input_size);
-    bi.forward_cell.W_hh = make_tensor(W_hh, 4 * hidden, hidden);
-    bi.forward_cell.b_ih = make_tensor(b_ih, 4 * hidden, 1);
-    bi.forward_cell.b_hh = make_tensor(b_hh, 4 * hidden, 1);
-    bi.reverse_cell = bi.forward_cell;  // same weights → bidirectional with identical cells
+    bi.forward_cell.W_ih = make_tensor_on(dev, W_ih, 4 * hidden, input_size);
+    bi.forward_cell.W_hh = make_tensor_on(dev, W_hh, 4 * hidden, hidden);
+    bi.forward_cell.b_ih = make_tensor_on(dev, b_ih, 4 * hidden, 1);
+    bi.forward_cell.b_hh = make_tensor_on(dev, b_hh, 4 * hidden, 1);
+    // Same-weights reverse cell: re-uploaded on the same device.
+    bi.reverse_cell.W_ih = make_tensor_on(dev, W_ih, 4 * hidden, input_size);
+    bi.reverse_cell.W_hh = make_tensor_on(dev, W_hh, 4 * hidden, hidden);
+    bi.reverse_cell.b_ih = make_tensor_on(dev, b_ih, 4 * hidden, 1);
+    bi.reverse_cell.b_hh = make_tensor_on(dev, b_hh, 4 * hidden, 1);
 
     std::vector<float> X_data;
     for (int t = 0; t < L; ++t) {
         X_data.push_back(0.3f * static_cast<float>(t + 1));
         X_data.push_back(0.2f * static_cast<float>(t + 1));
     }
-    bt::Tensor X = make_tensor(X_data, L, input_size);
+    bt::Tensor X = make_tensor_on(dev, X_data, L, input_size);
     bt::Tensor Y;
     bi.forward(X, Y);
-    CHECK(Y.rows == L && Y.cols == 2 * hidden, "BiLSTM output shape (L, 2*H)");
+    CHECK(Y.rows == L && Y.cols == 2 * hidden,
+          tag("BiLSTM output shape (L, 2*H)", dev_name).c_str());
+    auto Yh = download(Y);
 
-    // Cross-check against running two separate LSTMs and concatenating —
-    // brosoundml::LSTM gives us a smaller-surface oracle.
+    // Stand-alone LSTM oracles run on the same device for an apples-to-apples
+    // comparison (no cross-device numerical drift in the oracle).
     brosoundml::LSTM lstm_fwd, lstm_rev;
     lstm_fwd.input_size = lstm_rev.input_size  = input_size;
     lstm_fwd.hidden_size = lstm_rev.hidden_size = hidden;
-    lstm_fwd.cell = bi.forward_cell;
-    lstm_rev.cell = bi.reverse_cell;
+    lstm_fwd.cell.W_ih = make_tensor_on(dev, W_ih, 4 * hidden, input_size);
+    lstm_fwd.cell.W_hh = make_tensor_on(dev, W_hh, 4 * hidden, hidden);
+    lstm_fwd.cell.b_ih = make_tensor_on(dev, b_ih, 4 * hidden, 1);
+    lstm_fwd.cell.b_hh = make_tensor_on(dev, b_hh, 4 * hidden, 1);
+    lstm_rev.cell.W_ih = make_tensor_on(dev, W_ih, 4 * hidden, input_size);
+    lstm_rev.cell.W_hh = make_tensor_on(dev, W_hh, 4 * hidden, hidden);
+    lstm_rev.cell.b_ih = make_tensor_on(dev, b_ih, 4 * hidden, 1);
+    lstm_rev.cell.b_hh = make_tensor_on(dev, b_hh, 4 * hidden, 1);
 
     bt::Tensor Y_fwd;
     lstm_fwd.forward(X, Y_fwd);
+    auto Y_fwd_h = download(Y_fwd);
 
-    // Reversed input → run forward LSTM → reverse output back.
     std::vector<float> X_rev_data(X_data.size());
     for (int t = 0; t < L; ++t) {
         X_rev_data[t * input_size + 0] = X_data[(L - 1 - t) * input_size + 0];
         X_rev_data[t * input_size + 1] = X_data[(L - 1 - t) * input_size + 1];
     }
-    bt::Tensor X_rev = make_tensor(X_rev_data, L, input_size);
+    bt::Tensor X_rev = make_tensor_on(dev, X_rev_data, L, input_size);
     bt::Tensor Y_rev_raw;
     lstm_rev.forward(X_rev, Y_rev_raw);
+    auto Y_rev_h = download(Y_rev_raw);
 
+    const float tol = (dev == bt::Device::CPU) ? 1e-5f : 1e-3f;
     for (int t = 0; t < L; ++t) {
         for (int j = 0; j < hidden; ++j) {
-            const float got_fwd = Y.host_f32()[t * 2 * hidden + j];
-            const float want_fwd = Y_fwd.host_f32()[t * hidden + j];
-            const float got_rev = Y.host_f32()[t * 2 * hidden + hidden + j];
-            const float want_rev = Y_rev_raw.host_f32()[(L - 1 - t) * hidden + j];
-            CHECK(approx(got_fwd, want_fwd, 1e-5f),
-                  "BiLSTM forward half matches a stand-alone LSTM");
-            CHECK(approx(got_rev, want_rev, 1e-5f),
-                  "BiLSTM reverse half matches a stand-alone LSTM on reversed input");
+            const float got_fwd = Yh[t * 2 * hidden + j];
+            const float want_fwd = Y_fwd_h[t * hidden + j];
+            const float got_rev = Yh[t * 2 * hidden + hidden + j];
+            const float want_rev = Y_rev_h[(L - 1 - t) * hidden + j];
+            CHECK(approx(got_fwd, want_fwd, tol),
+                  tag("BiLSTM forward half matches a stand-alone LSTM", dev_name).c_str());
+            CHECK(approx(got_rev, want_rev, tol),
+                  tag("BiLSTM reverse half matches a stand-alone LSTM on reversed input", dev_name).c_str());
         }
     }
 }
 
 // ─── AdaIN1D ───────────────────────────────────────────────────────────────
 
-static void test_ada_in_1d() {
+static void test_ada_in_1d(bt::Device dev, const char* dev_name) {
     const int N = 1, C = 2, L = 4;
-    // (N, C*L) — channel 0 has mean 2.5, variance 1.25;
-    //            channel 1 has mean 10,  variance 5.
-    bt::Tensor X = make_tensor({1, 2, 3, 4,    // ch0
-                                7, 9, 11, 13}, // ch1
-                               N, C * L);
-    bt::Tensor scale = make_tensor({2.0f,  3.0f},  C, 1);
-    bt::Tensor shift = make_tensor({0.5f, -1.0f},  C, 1);
+    bt::Tensor X = make_tensor_on(dev, {1, 2, 3, 4,
+                                        7, 9, 11, 13}, N, C * L);
+    bt::Tensor scale = make_tensor_on(dev, {2.0f,  3.0f}, C, 1);
+    bt::Tensor shift = make_tensor_on(dev, {0.5f, -1.0f}, C, 1);
     bt::Tensor Y;
     brosoundml::ada_in_1d(X, scale, shift, N, C, L, Y);
-    CHECK(Y.rows == N && Y.cols == C * L, "ada_in_1d output shape");
+    CHECK(Y.rows == N && Y.cols == C * L,
+          tag("ada_in_1d output shape", dev_name).c_str());
+    auto Yh = download(Y);
 
-    // For each channel: normalise to mean 0 / unit-var, then apply scale/shift.
-    // Mean of each channel of the *output* should equal its `shift` value,
-    // and the variance should equal `scale^2`.
     for (int c = 0; c < C; ++c) {
         float sum = 0, sumsq = 0;
         for (int l = 0; l < L; ++l) {
-            const float v = Y.host_f32()[c * L + l];
+            const float v = Yh[c * L + l];
             sum += v;
             sumsq += v * v;
         }
@@ -339,25 +377,17 @@ static void test_ada_in_1d() {
         const float expect_mean = (c == 0) ? 0.5f : -1.0f;
         const float expect_var  = (c == 0) ? 4.0f  :  9.0f;
         CHECK(approx(mean, expect_mean, 1e-3f),
-              c == 0 ? "ada_in_1d channel 0 mean equals shift"
-                     : "ada_in_1d channel 1 mean equals shift");
+              c == 0 ? tag("ada_in_1d channel 0 mean equals shift", dev_name).c_str()
+                     : tag("ada_in_1d channel 1 mean equals shift", dev_name).c_str());
         CHECK(approx(var, expect_var, 1e-2f),
-              c == 0 ? "ada_in_1d channel 0 variance equals scale^2"
-                     : "ada_in_1d channel 1 variance equals scale^2");
+              c == 0 ? tag("ada_in_1d channel 0 variance equals scale^2", dev_name).c_str()
+                     : tag("ada_in_1d channel 1 variance equals scale^2", dev_name).c_str());
     }
 }
 
 // ─── MHA / CrossAttention smoke ─────────────────────────────────────────────
-//
-// Synthetic-weights sanity check. With identity Q/K/V/O weights and zero
-// biases, single-head self-attention on rows that are one-hot vectors
-// concentrates almost all softmax mass on the matching row (Q.K^T peaks
-// where q_i == k_i), so the output of each query row is close to its own
-// V row. The non-trivial check is that the *plumbing* — Q/K/V projection,
-// per-head reshape, softmax/context, Wo projection — composes correctly,
-// not the math (which test_kokoro_modules already validates end-to-end).
 
-static void test_mha_self() {
+static void test_mha_self(bt::Device dev, const char* dev_name) {
     const int D = 4;
     const int L = 3;
     const int H = 1;
@@ -372,59 +402,51 @@ static void test_mha_self() {
     brosoundml::MHA mha;
     mha.num_heads = H;
     mha.embed_dim = D;
-    mha.Wq = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
-    mha.Wk = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
-    mha.Wv = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
-    mha.Wo = bt::Tensor::from_host_on(bt::Device::CPU, ID, D, D);
-    mha.bq = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
-    mha.bk = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
-    mha.bv = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
-    mha.bo = bt::Tensor::from_host_on(bt::Device::CPU, ZERO, D, 1);
+    mha.Wq = bt::Tensor::from_host_on(dev, ID, D, D);
+    mha.Wk = bt::Tensor::from_host_on(dev, ID, D, D);
+    mha.Wv = bt::Tensor::from_host_on(dev, ID, D, D);
+    mha.Wo = bt::Tensor::from_host_on(dev, ID, D, D);
+    mha.bq = bt::Tensor::from_host_on(dev, ZERO, D, 1);
+    mha.bk = bt::Tensor::from_host_on(dev, ZERO, D, 1);
+    mha.bv = bt::Tensor::from_host_on(dev, ZERO, D, 1);
+    mha.bo = bt::Tensor::from_host_on(dev, ZERO, D, 1);
 
-    // Three sharply-distinct rows; very large magnitude so the softmax over
-    // queries argmax-snaps onto the matching key row.
     const float X[12] = {
         10, 0, 0, 0,
          0, 10, 0, 0,
          0, 0, 10, 0,
     };
-    bt::Tensor X_t  = bt::Tensor::from_host_on(bt::Device::CPU, X, L, D);
+    bt::Tensor X_t  = bt::Tensor::from_host_on(dev, X, L, D);
     bt::Tensor out;
     mha.forward(X_t, /*d_mask=*/nullptr, out);
-    CHECK(out.rows == L && out.cols == D, "MHA output shape (L, D)");
-    const float* od = out.host_f32();
-    // Each row should be near its corresponding V row (which equals the input
-    // row given identity weights).
+    CHECK(out.rows == L && out.cols == D,
+          tag("MHA output shape (L, D)", dev_name).c_str());
+    auto oh = download(out);
+    // Softmax accumulates ~3e-3 noise on CUDA; CPU stays at 1e-2 because the
+    // mass is sharp and the test bound is already loose.
+    const float tol = 1e-2f;
     for (int r = 0; r < L; ++r) {
         for (int c = 0; c < D; ++c) {
-            CHECK(approx(od[r * D + c], X[r * D + c], 1e-2f),
-                  "MHA self-attention concentrates on matching key");
+            CHECK(approx(oh[r * D + c], X[r * D + c], tol),
+                  tag("MHA self-attention concentrates on matching key", dev_name).c_str());
         }
     }
 }
 
-static void test_cross_attention() {
-    // Q from X has D=4 dims; K/V from Ctx have D_ctx=2 dims, so Wk/Wv are
-    // rectangular (D=4, D_ctx=2). Single query, two context rows; biases zero;
-    // an identity-ish projection lets us verify the cross-projection shape
-    // glue without rerunning attention math.
+static void test_cross_attention(bt::Device dev, const char* dev_name) {
     const int D     = 4;
     const int D_ctx = 2;
     const int Lq    = 1;
     const int Lk    = 2;
 
-    // Wq: (D, D) identity.
     const float Wq_d[16] = {
         1, 0, 0, 0,  0, 1, 0, 0,
         0, 0, 1, 0,  0, 0, 0, 1,
     };
-    // Wk = Wv: (D, D_ctx). Project Ctx to D by writing it into the first 2
-    // channels and zeroing the rest.
     const float Wkv_d[8] = {
         1, 0,  0, 1,
         0, 0,  0, 0,
     };
-    // Wo: (D, D) identity.
     const float Wo_d[16] = {
         1, 0, 0, 0,  0, 1, 0, 0,
         0, 0, 1, 0,  0, 0, 0, 1,
@@ -435,41 +457,49 @@ static void test_cross_attention() {
     xa.num_heads = 1;
     xa.embed_dim = D;
     xa.ctx_dim   = D_ctx;
-    xa.Wq = bt::Tensor::from_host_on(bt::Device::CPU, Wq_d,  D, D);
-    xa.Wk = bt::Tensor::from_host_on(bt::Device::CPU, Wkv_d, D, D_ctx);
-    xa.Wv = bt::Tensor::from_host_on(bt::Device::CPU, Wkv_d, D, D_ctx);
-    xa.Wo = bt::Tensor::from_host_on(bt::Device::CPU, Wo_d,  D, D);
-    xa.bq = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
-    xa.bk = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
-    xa.bv = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
-    xa.bo = bt::Tensor::from_host_on(bt::Device::CPU, ZERO_D, D, 1);
+    xa.Wq = bt::Tensor::from_host_on(dev, Wq_d,  D, D);
+    xa.Wk = bt::Tensor::from_host_on(dev, Wkv_d, D, D_ctx);
+    xa.Wv = bt::Tensor::from_host_on(dev, Wkv_d, D, D_ctx);
+    xa.Wo = bt::Tensor::from_host_on(dev, Wo_d,  D, D);
+    xa.bq = bt::Tensor::from_host_on(dev, ZERO_D, D, 1);
+    xa.bk = bt::Tensor::from_host_on(dev, ZERO_D, D, 1);
+    xa.bv = bt::Tensor::from_host_on(dev, ZERO_D, D, 1);
+    xa.bo = bt::Tensor::from_host_on(dev, ZERO_D, D, 1);
 
-    // Query strongly aligned with the first context row's projection.
     const float X_d[4]   = {10, 0, 0, 0};
-    const float Ctx_d[4] = {1, 0,  0, 1};   // Lk=2 rows of D_ctx=2
-    bt::Tensor X_t   = bt::Tensor::from_host_on(bt::Device::CPU, X_d,   Lq, D);
-    bt::Tensor Ctx_t = bt::Tensor::from_host_on(bt::Device::CPU, Ctx_d, Lk, D_ctx);
+    const float Ctx_d[4] = {1, 0,  0, 1};
+    bt::Tensor X_t   = bt::Tensor::from_host_on(dev, X_d,   Lq, D);
+    bt::Tensor Ctx_t = bt::Tensor::from_host_on(dev, Ctx_d, Lk, D_ctx);
 
     bt::Tensor out;
     xa.forward(X_t, Ctx_t, /*d_mask=*/nullptr, out);
-    CHECK(out.rows == Lq && out.cols == D, "CrossAttention output shape (Lq, D)");
-    // V_0 = Wkv [1, 0] = (1, 0, 0, 0); V_1 = Wkv [0, 1] = (0, 1, 0, 0).
-    // Query projects to (10, 0, 0, 0); attends heavily to V_0 -> first
-    // channel ≈ 1, second ≈ 0. Output projection (Wo = I) preserves that.
-    const float* od = out.host_f32();
-    CHECK(approx(od[0], 1.0f, 1e-2f), "CrossAttention attends to matching ctx row");
-    CHECK(approx(od[1], 0.0f, 1e-2f), "CrossAttention non-attended ctx row near zero");
+    CHECK(out.rows == Lq && out.cols == D,
+          tag("CrossAttention output shape (Lq, D)", dev_name).c_str());
+    auto oh = download(out);
+    CHECK(approx(oh[0], 1.0f, 1e-2f),
+          tag("CrossAttention attends to matching ctx row", dev_name).c_str());
+    CHECK(approx(oh[1], 0.0f, 1e-2f),
+          tag("CrossAttention non-attended ctx row near zero", dev_name).c_str());
+}
+
+static void run_all(bt::Device dev, const char* dev_name) {
+    test_linear(dev, dev_name);
+    test_layernorm(dev, dev_name);
+    test_conv1d(dev, dev_name);
+    test_lstm(dev, dev_name);
+    test_bilstm(dev, dev_name);
+    test_ada_in_1d(dev, dev_name);
+    test_mha_self(dev, dev_name);
+    test_cross_attention(dev, dev_name);
 }
 
 int main() {
-    test_linear();
-    test_layernorm();
-    test_conv1d();
-    test_lstm();
-    test_bilstm();
-    test_ada_in_1d();
-    test_mha_self();
-    test_cross_attention();
+    run_all(bt::Device::CPU, "CPU");
+    if (bt::is_available(bt::Device::CUDA)) {
+        run_all(bt::Device::CUDA, "CUDA");
+    } else {
+        std::printf("test_modules: CUDA not available — CUDA path skipped\n");
+    }
 
     if (failures == 0) {
         std::printf("test_modules: all checks passed\n");

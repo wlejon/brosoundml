@@ -4,7 +4,9 @@
 // std::runtime_error naming the stage.
 #include "brosoundml/kokoro.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
+#include <brotensor/tensor.h>
 
 #include <cmath>
 #include <cstdint>
@@ -167,62 +169,69 @@ static int run() {
 
     // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
     //
-    // Runs only if the converted upstream Kokoro-82M artifacts are present
-    // under <repo>/weights/kokoro/. Skipped silently otherwise so CI / fresh
-    // clones still pass this test. Produce the artifacts with:
-    //   scripts/download-kokoro.sh && python scripts/convert-kokoro.py
+    // Runs on CPU and (if available) CUDA. Synthesized audio is not required
+    // to be sample-identical between devices — only that each device produces
+    // bounded, finite, non-silent audio on the same input.
+    auto run_real_smoke = [&](brotensor::Device dev, const char* dev_name) {
     const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "kokoro";
     const fs::path real_model = real_root / "model.safetensors";
     if (fs::exists(real_model)) {
         Kokoro real;
-        real.load(real_root.string());
+        real.load(real_root.string(), dev);
         const auto& rcfg = real.config();
-        // Kokoro-82M's published config: 178-token phoneme vocab, hidden=512,
-        // style=128, plBERT 768/12/12. If the loader silently dropped fields,
-        // these checks fire.
-        CHECK(rcfg.n_tokens    == 178, "real Kokoro: n_tokens == 178");
-        CHECK(rcfg.hidden_dim  == 512, "real Kokoro: hidden_dim == 512");
-        CHECK(rcfg.style_dim   == 128, "real Kokoro: style_dim == 128");
-        CHECK(rcfg.plbert.hidden_size         == 768, "real Kokoro: plbert.hidden_size");
-        CHECK(rcfg.plbert.num_attention_heads == 12,  "real Kokoro: plbert.heads");
-        CHECK(rcfg.plbert.num_hidden_layers   == 12,  "real Kokoro: plbert.layers");
+        auto tag = [&](const char* s) {
+            static std::string buf;
+            buf = "["; buf += dev_name; buf += "] "; buf += s;
+            return buf.c_str();
+        };
+        CHECK(rcfg.n_tokens    == 178, tag("real Kokoro: n_tokens == 178"));
+        CHECK(rcfg.hidden_dim  == 512, tag("real Kokoro: hidden_dim == 512"));
+        CHECK(rcfg.style_dim   == 128, tag("real Kokoro: style_dim == 128"));
+        CHECK(rcfg.plbert.hidden_size         == 768, tag("real Kokoro: plbert.hidden_size"));
+        CHECK(rcfg.plbert.num_attention_heads == 12,  tag("real Kokoro: plbert.heads"));
+        CHECK(rcfg.plbert.num_hidden_layers   == 12,  tag("real Kokoro: plbert.layers"));
         CHECK(rcfg.vocab.size() > 100,
-              "real Kokoro: vocab map populated");
+              tag("real Kokoro: vocab map populated"));
 
         const fs::path real_voice = real_root / "voices" / "af_heart.bin";
         if (fs::exists(real_voice)) {
             Voice v = real.load_voice(real_voice.string());
             CHECK(v.packs.rows == 510 && v.packs.cols == 256,
-                  "real Kokoro voice af_heart: shape (510, 256)");
+                  tag("real Kokoro voice af_heart: shape (510, 256)"));
 
-            // End-to-end synthesize on a fixed phoneme sequence ('hello'
-            // ids per the reference dumper).
             const std::vector<int32_t> phonemes = {50, 47, 54, 54, 57};
             AudioBuffer audio = real.synthesize(phonemes, v, 1.0f);
-            CHECK(audio.sample_rate == 24000, "synthesize: 24 kHz output");
+            CHECK(audio.sample_rate == 24000, tag("synthesize: 24 kHz output"));
             CHECK(audio.samples.size() >= 1000,
-                  "synthesize: nontrivial sample count");
+                  tag("synthesize: nontrivial sample count"));
 
-            // Numerical sanity: all samples finite, bounded.
             bool finite = true;
             float max_abs = 0.0f;
             for (float s : audio.samples) {
                 if (!std::isfinite(s)) { finite = false; break; }
                 if (std::abs(s) > max_abs) max_abs = std::abs(s);
             }
-            CHECK(finite, "synthesize: all output samples are finite");
-            CHECK(max_abs > 1e-4f, "synthesize: output is not silent");
-            CHECK(max_abs < 10.0f,  "synthesize: output is bounded");
-            std::printf("    synthesize: %zu samples, peak |x| = %.4f\n",
-                        audio.samples.size(), max_abs);
+            CHECK(finite, tag("synthesize: all output samples are finite"));
+            CHECK(max_abs > 1e-4f, tag("synthesize: output is not silent"));
+            CHECK(max_abs < 10.0f, tag("synthesize: output is bounded"));
+            std::printf("    [%s] synthesize: %zu samples, peak |x| = %.4f\n",
+                        dev_name, audio.samples.size(), max_abs);
 
-            // Save the synthesized audio so the user can listen and judge
-            // quality. Path is reused on subsequent runs — overwrite-on-write
-            // by AudioBuffer::write_wav is fine for our purposes.
-            const fs::path out_wav = real_root / "synth_hello.wav";
-            audio.write_wav(out_wav.string());
-            std::printf("    synthesize: wrote %s\n", out_wav.string().c_str());
+            // Only save the CPU output (deterministic baseline) to avoid
+            // overwriting it with the device-variant version.
+            if (dev == brotensor::Device::CPU) {
+                const fs::path out_wav = real_root / "synth_hello.wav";
+                audio.write_wav(out_wav.string());
+                std::printf("    synthesize: wrote %s\n",
+                            out_wav.string().c_str());
+            }
         }
+    }
+    };  // run_real_smoke
+
+    run_real_smoke(brotensor::Device::CPU, "CPU");
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        run_real_smoke(brotensor::Device::CUDA, "CUDA");
     }
 
     if (failures == 0) {

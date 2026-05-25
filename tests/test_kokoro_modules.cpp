@@ -11,6 +11,7 @@
 #include "brosoundml/kokoro.h"
 #include "brosoundml/kokoro_modules.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
@@ -255,6 +256,20 @@ int main() {
     compare(audio, audio_ref,
             static_cast<int>(audio_ref.numel()),
             "generator.audio", 5e-2f, 5e-3f);
+
+    // Note on CUDA coverage: test_kokoro_modules runs an exact-numerics
+    // parity check against the upstream Python reference (with sub-1e-3
+    // tolerances and an integer-exact `pred_dur` check). The kokoro_modules
+    // load_from family loads weights onto CPU; running these comparisons on
+    // CUDA would re-upload weights to the device and could shift integer
+    // durations across rounding boundaries — diluting the diagnostic value of
+    // the exact-match oracle. End-to-end CUDA coverage for Kokoro lives in
+    // test_kokoro (synthesize -> audio bounds), which exercises the same
+    // submodules on CUDA without requiring sample-identical outputs.
+    if (bt::is_available(bt::Device::CUDA)) {
+        std::printf("test_kokoro_modules: CUDA available — exact-numerics "
+                    "checks kept CPU-only; CUDA covered by test_kokoro\n");
+    }
 
     if (failures == 0) {
         std::printf("test_kokoro_modules: all checks passed\n");

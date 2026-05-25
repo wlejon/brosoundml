@@ -6,6 +6,7 @@
 
 #include <brolm/whisper_tokenizer.h>
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
 #include <algorithm>
@@ -212,76 +213,110 @@ static int run() {
     // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
     //
     // Runs only if a converted Whisper checkpoint is present under
-    // <repo>/weights/whisper/ (config.json + model.safetensors + vocab.json +
-    // merges.txt). Skipped silently otherwise so CI / fresh clones still pass.
-    //
-    // If `weights/whisper/test_audio_en.wav` exists, the test transcribes it
-    // and prints the result. When the filename contains a known target
-    // (e.g. `test_audio_en_hello.wav` -> "hello") we assert a case-
-    // insensitive substring match; otherwise we just print for the user
-    // to eyeball.
-    {
+    // <repo>/weights/whisper/. Run on CPU and (if available) CUDA. Token
+    // argmax can tip differently between devices on FP noise, so the
+    // filename-target substring check is CPU-only.
+    auto run_real_smoke = [&](brotensor::Device dev, const char* dev_name,
+                              bool enforce_filename_target) {
         const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "whisper";
         const fs::path real_model = real_root / "model.safetensors";
         const fs::path vocab_path = real_root / "vocab.json";
         const fs::path merges_path = real_root / "merges.txt";
         const fs::path test_wav   = real_root / "test_audio_en.wav";
-        if (fs::exists(real_model) && fs::exists(vocab_path) &&
-            fs::exists(merges_path)) {
-            Whisper real;
-            real.load(real_root.string());
-            CHECK(real.loaded(), "real Whisper: loaded()");
+        if (!(fs::exists(real_model) && fs::exists(vocab_path) &&
+              fs::exists(merges_path))) {
+            return;
+        }
+        Whisper real;
+        real.load(real_root.string(), dev);
+        if (!real.loaded()) {
+            std::fprintf(stderr, "FAIL: [%s] real Whisper: loaded()\n", dev_name);
+            ++failures;
+            return;
+        }
 
-            auto tok = brolm::whisper::Tokenizer::load(vocab_path.string(),
-                                                       merges_path.string());
-            if (fs::exists(test_wav)) {
-                AudioBuffer audio = brosoundml::read_wav(test_wav.string());
-                CHECK(audio.sample_rate == 16000,
-                      "real Whisper: test_audio_en.wav is 16 kHz");
+        auto tok = brolm::whisper::Tokenizer::load(vocab_path.string(),
+                                                    merges_path.string());
+        if (!fs::exists(test_wav)) return;
 
-                std::vector<int32_t> prompt =
-                    tok.build_prompt("en", "transcribe",
-                                     /*with_timestamps=*/false);
-                auto result = real.transcribe(audio, prompt);
-                CHECK(result.token_ids.size() > prompt.size(),
-                      "real Whisper: transcribe generated at least one token");
+        AudioBuffer audio = brosoundml::read_wav(test_wav.string());
+        if (audio.sample_rate != 16000) {
+            std::fprintf(stderr,
+                         "FAIL: [%s] real Whisper: test_audio_en.wav is 16 kHz\n",
+                         dev_name);
+            ++failures;
+            return;
+        }
 
-                std::vector<int32_t> generated(
-                    result.token_ids.begin() + prompt.size(),
-                    result.token_ids.end());
-                std::string transcript =
-                    tok.decode(generated, /*skip_special=*/true);
-                CHECK(!transcript.empty(),
-                      "real Whisper: decoded transcript is non-empty");
-                std::printf("    real Whisper transcript: %s\n",
-                            transcript.c_str());
+        std::vector<int32_t> prompt =
+            tok.build_prompt("en", "transcribe", /*with_timestamps=*/false);
+        auto result = real.transcribe(audio, prompt);
+        if (!(result.token_ids.size() > prompt.size())) {
+            std::fprintf(stderr,
+                         "FAIL: [%s] real Whisper: transcribe generated at "
+                         "least one token\n", dev_name);
+            ++failures;
+            return;
+        }
 
-                // Filename-driven optional substring assertion.
-                const std::string stem = test_wav.stem().string();
-                const std::string marker = "test_audio_en_";
-                if (stem.size() > marker.size() &&
-                    stem.compare(0, marker.size(), marker) == 0) {
-                    std::string target = stem.substr(marker.size());
-                    auto lower = [](std::string s) {
-                        for (auto& c : s) {
-                            c = static_cast<char>(std::tolower(
-                                static_cast<unsigned char>(c)));
-                        }
-                        return s;
-                    };
-                    if (lower(transcript).find(lower(target)) == std::string::npos) {
-                        std::fprintf(stderr,
-                                     "FAIL: real Whisper transcript does not"
-                                     " contain expected substring '%s'\n",
-                                     target.c_str());
-                        ++failures;
-                    } else {
-                        std::printf("    matched filename target '%s'\n",
-                                    target.c_str());
+        std::vector<int32_t> generated(
+            result.token_ids.begin() + prompt.size(),
+            result.token_ids.end());
+        // All ids in vocab range and the count is bounded.
+        bool ids_ok = !generated.empty();
+        for (auto id : generated) {
+            if (id < 0 || id >= real.config().vocab_size) { ids_ok = false; break; }
+        }
+        if (!ids_ok) {
+            std::fprintf(stderr,
+                         "FAIL: [%s] real Whisper: generated ids out of vocab\n",
+                         dev_name);
+            ++failures;
+        }
+        std::string transcript = tok.decode(generated, /*skip_special=*/true);
+        if (transcript.empty()) {
+            std::fprintf(stderr,
+                         "FAIL: [%s] real Whisper: decoded transcript is non-empty\n",
+                         dev_name);
+            ++failures;
+        }
+        std::printf("    [%s] real Whisper transcript: %s\n",
+                    dev_name, transcript.c_str());
+
+        if (enforce_filename_target) {
+            const std::string stem = test_wav.stem().string();
+            const std::string marker = "test_audio_en_";
+            if (stem.size() > marker.size() &&
+                stem.compare(0, marker.size(), marker) == 0) {
+                std::string target = stem.substr(marker.size());
+                auto lower = [](std::string s) {
+                    for (auto& c : s) {
+                        c = static_cast<char>(std::tolower(
+                            static_cast<unsigned char>(c)));
                     }
+                    return s;
+                };
+                if (lower(transcript).find(lower(target)) == std::string::npos) {
+                    std::fprintf(stderr,
+                                 "FAIL: [%s] real Whisper transcript does not"
+                                 " contain expected substring '%s'\n",
+                                 dev_name, target.c_str());
+                    ++failures;
+                } else {
+                    std::printf("    [%s] matched filename target '%s'\n",
+                                dev_name, target.c_str());
                 }
             }
         }
+    };
+    // CPU enforces the filename-target substring (the deterministic baseline);
+    // CUDA only checks that the pipeline runs and produces a well-formed
+    // transcript — token argmax may tip on FP noise.
+    run_real_smoke(brotensor::Device::CPU, "CPU",
+                   /*enforce_filename_target=*/true);
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        run_real_smoke(brotensor::Device::CUDA, "CUDA",
+                       /*enforce_filename_target=*/false);
     }
 
     if (failures) {

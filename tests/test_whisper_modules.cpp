@@ -8,6 +8,7 @@
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper_modules.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
@@ -142,9 +143,14 @@ static void write_stub_encoder(const fs::path& path,
 
 // ─── LogMel tests ──────────────────────────────────────────────────────────
 
-static void test_logmel_filterbank_shape() {
+static std::string tagmsg(const char* msg, const char* dev_name) {
+    std::string s = "["; s += dev_name; s += "] "; s += msg; return s;
+}
+
+static void test_logmel_filterbank_shape(bt::Device dev, const char* dev_name) {
+    (void)dev_name;  // filterbank/Hann tables are CPU-resident regardless of dev
     brosoundml::LogMel m;
-    m.build(/*num_mel_bins=*/80, bt::Device::CPU);
+    m.build(/*num_mel_bins=*/80, dev);
     CHECK(m.mel_filters.rows == 80, "mel_filters has 80 rows");
     CHECK(m.mel_filters.cols == 201, "mel_filters has n_fft/2+1 == 201 cols");
     CHECK(m.hann_window.rows == 1 && m.hann_window.cols == 400,
@@ -188,9 +194,9 @@ static void test_logmel_filterbank_shape() {
     CHECK(hw_bounded, "hann_window values are in [0, 1]");
 }
 
-static void test_logmel_forward_sine() {
+static void test_logmel_forward_sine(bt::Device dev, const char* dev_name) {
     brosoundml::LogMel m;
-    m.build(/*num_mel_bins=*/80, bt::Device::CPU);
+    m.build(/*num_mel_bins=*/80, dev);
 
     // 440 Hz sine, 1 s at 16 kHz; the front-end pads to 30 s so a 1-s clip is
     // fine. The peak mel bin should land near 440 Hz, i.e. roughly mel ≈ 6.6
@@ -206,12 +212,13 @@ static void test_logmel_forward_sine() {
 
     bt::Tensor out;
     m.forward(audio, out);
-    CHECK(out.rows == 80,   "log-mel output has num_mel_bins rows");
-    CHECK(out.cols == 3000, "log-mel output has 3000 frames");
+    CHECK(out.rows == 80,   tagmsg("log-mel output has num_mel_bins rows", dev_name).c_str());
+    CHECK(out.cols == 3000, tagmsg("log-mel output has 3000 frames", dev_name).c_str());
 
     // After normalisation, every value is in roughly [-1, 1] (specifically
     // [(floor + 4)/4, (max + 4)/4], with floor = max - 8).
-    const float* d = out.host_f32();
+    std::vector<float> out_host = out.to_host_vector();
+    const float* d = out_host.data();
     const std::size_t total = static_cast<std::size_t>(80) * 3000;
     bool finite = true;
     float min_v = 1e30f, max_v = -1e30f;
@@ -220,9 +227,9 @@ static void test_logmel_forward_sine() {
         if (d[i] < min_v) min_v = d[i];
         if (d[i] > max_v) max_v = d[i];
     }
-    CHECK(finite, "log-mel output is all-finite");
+    CHECK(finite, tagmsg("log-mel output is all-finite", dev_name).c_str());
     CHECK(min_v >= -1.5f && max_v <= 1.5f,
-          "log-mel output is normalised to roughly [-1, 1]");
+          tagmsg("log-mel output is normalised to roughly [-1, 1]", dev_name).c_str());
 
     // Energy concentration: the row with the largest peak (max over frames)
     // should be a low-index mel bin, since 440 Hz sits in the bottom of the
@@ -239,60 +246,60 @@ static void test_logmel_forward_sine() {
         if (row_peak > best_peak) { best_peak = row_peak; best_row = r; }
     }
     CHECK(best_row < 20,
-          "440 Hz sine concentrates energy in the low-mel-bin range");
+          tagmsg("440 Hz sine concentrates energy in the low-mel-bin range", dev_name).c_str());
 
-    // Reject non-16 kHz audio loudly.
     brosoundml::AudioBuffer bad;
     bad.sample_rate = 22050;
     bad.samples.assign(1000, 0.0f);
     bt::Tensor tmp;
     CHECK(throws_runtime_error([&] { m.forward(bad, tmp); }),
-          "log-mel refuses non-16-kHz audio");
+          tagmsg("log-mel refuses non-16-kHz audio", dev_name).c_str());
 }
 
 // ─── Encoder tests ─────────────────────────────────────────────────────────
 
-static void test_encoder_layer_forward_shape() {
+static void test_encoder_layer_forward_shape(bt::Device dev, const char* dev_name) {
     const int d_model = 8, ffn = 16, n_heads = 2;
     const fs::path tmp = fs::temp_directory_path() /
                          "brosoundml_whisper_modules_layer.safetensors";
     fs::remove(tmp);
-    // The layer-only test still needs a complete encoder file because layers
-    // share the same on-disk layout. Build a 1-layer file just for this check.
     write_stub_encoder(tmp, /*n_mels=*/8, d_model,
                        /*max_src=*/4, /*n_layers=*/1, ffn, n_heads);
     brosoundml::WhisperEncoderLayer layer;
     {
         stf::File f = stf::File::open(tmp.string());
-        layer.load_from(f, "model.encoder.layers.0.", d_model, ffn, n_heads);
+        layer.load_from(f, "model.encoder.layers.0.", d_model, ffn, n_heads, dev);
     }
 
-    // Check the K-bias was zero-filled to (d_model, 1).
+    // Check the K-bias was zero-filled to (d_model, 1). bk allocates on `dev`.
     CHECK(layer.self_attn.bk.rows == d_model && layer.self_attn.bk.cols == 1,
-          "k_proj bias is (d_model, 1) zero-filled");
-    const float* bk = layer.self_attn.bk.host_f32();
+          tagmsg("k_proj bias is (d_model, 1) zero-filled", dev_name).c_str());
+    std::vector<float> bk_host = layer.self_attn.bk.to_host_vector();
     bool all_zero = true;
-    for (int i = 0; i < d_model; ++i) if (bk[i] != 0.0f) all_zero = false;
-    CHECK(all_zero, "k_proj bias is all zeros");
+    for (int i = 0; i < d_model; ++i) if (bk_host[i] != 0.0f) all_zero = false;
+    CHECK(all_zero, tagmsg("k_proj bias is all zeros", dev_name).c_str());
 
-    // Forward pass on a (L, d_model) input must preserve shape.
+    // Forward pass on a (L, d_model) input must preserve shape. The encoder
+    // layer expects X on the same device as its weights — which for upload()
+    // means CPU today; the layer's `load_from` device parameter only governs
+    // the zero-filled bk allocation (the bias-add will run on `dev`).
     const int L = 5;
-    bt::Tensor X = bt::Tensor::zeros_on(bt::Device::CPU, L, d_model, bt::Dtype::FP32);
-    float* xd = X.host_f32_mut();
-    for (int i = 0; i < L * d_model; ++i) xd[i] = 0.01f * static_cast<float>(i);
+    std::vector<float> xh(L * d_model);
+    for (int i = 0; i < L * d_model; ++i) xh[i] = 0.01f * static_cast<float>(i);
+    bt::Tensor X = bt::Tensor::from_host_on(dev, xh.data(), L, d_model);
     bt::Tensor Y;
     layer.forward(X, Y);
     CHECK(Y.rows == L && Y.cols == d_model,
-          "encoder layer preserves (L, d_model) shape");
+          tagmsg("encoder layer preserves (L, d_model) shape", dev_name).c_str());
+    std::vector<float> y_host = Y.to_host_vector();
     bool finite = true;
-    const float* yd = Y.host_f32();
-    for (int i = 0; i < L * d_model; ++i) if (!std::isfinite(yd[i])) finite = false;
-    CHECK(finite, "encoder layer output is all-finite");
+    for (int i = 0; i < L * d_model; ++i) if (!std::isfinite(y_host[i])) finite = false;
+    CHECK(finite, tagmsg("encoder layer output is all-finite", dev_name).c_str());
 
     fs::remove(tmp);
 }
 
-static void test_encoder_full_forward() {
+static void test_encoder_full_forward(bt::Device dev, const char* dev_name) {
     // Tiny but realistic-shape encoder: max_source_positions = 1500 still works
     // (it's just a 1500-row positional embedding), but the test runs 30 s of
     // input through a 2-layer / 8-channel stack so this stays fast.
@@ -310,42 +317,50 @@ static void test_encoder_full_forward() {
     brosoundml::WhisperEncoder enc;
     {
         stf::File f = stf::File::open(tmp.string());
-        enc.load_from(f, n_mels, d_model, max_src, n_layers, ffn, n_heads);
+        enc.load_from(f, n_mels, d_model, max_src, n_layers, ffn, n_heads, dev);
     }
 
     CHECK(static_cast<int>(enc.layers.size()) == n_layers,
-          "encoder loaded the requested layer count");
+          tagmsg("encoder loaded the requested layer count", dev_name).c_str());
 
-    // Build a synthetic mel input: (n_mels, 3000).
-    bt::Tensor mel = bt::Tensor::zeros_on(bt::Device::CPU, n_mels, 3000,
-                                          bt::Dtype::FP32);
-    float* md = mel.host_f32_mut();
+    // Build a synthetic mel input: (n_mels, 3000) on `dev`.
+    std::vector<float> mh(static_cast<std::size_t>(n_mels) * 3000);
     for (int r = 0; r < n_mels; ++r) {
         for (int c = 0; c < 3000; ++c) {
-            md[r * 3000 + c] = 0.01f * static_cast<float>((r + c) % 17 - 8);
+            mh[r * 3000 + c] = 0.01f * static_cast<float>((r + c) % 17 - 8);
         }
     }
+    bt::Tensor mel = bt::Tensor::from_host_on(dev, mh.data(), n_mels, 3000);
     bt::Tensor hidden;
     enc.forward(mel, hidden);
     CHECK(hidden.rows == max_src && hidden.cols == d_model,
-          "encoder output is (max_source_positions, d_model)");
+          tagmsg("encoder output is (max_source_positions, d_model)", dev_name).c_str());
+    std::vector<float> h_host = hidden.to_host_vector();
     bool finite = true;
-    const float* hd = hidden.host_f32();
     const std::size_t total = static_cast<std::size_t>(max_src) * d_model;
     for (std::size_t i = 0; i < total; ++i) {
-        if (!std::isfinite(hd[i])) { finite = false; break; }
+        if (!std::isfinite(h_host[i])) { finite = false; break; }
     }
-    CHECK(finite, "encoder output is all-finite");
+    CHECK(finite, tagmsg("encoder output is all-finite", dev_name).c_str());
 
     fs::remove(tmp);
 }
 
+static void run_all(bt::Device dev, const char* dev_name) {
+    test_logmel_filterbank_shape(dev, dev_name);
+    test_logmel_forward_sine(dev, dev_name);
+    test_encoder_layer_forward_shape(dev, dev_name);
+    test_encoder_full_forward(dev, dev_name);
+}
+
 int main() {
     try {
-        test_logmel_filterbank_shape();
-        test_logmel_forward_sine();
-        test_encoder_layer_forward_shape();
-        test_encoder_full_forward();
+        run_all(bt::Device::CPU, "CPU");
+        if (bt::is_available(bt::Device::CUDA)) {
+            run_all(bt::Device::CUDA, "CUDA");
+        } else {
+            std::printf("test_whisper_modules: CUDA not available — CUDA path skipped\n");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "test_whisper_modules: uncaught exception: %s\n",
                      e.what());

@@ -13,7 +13,9 @@
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
+#include <brotensor/tensor.h>
 
 #include <algorithm>
 #include <cmath>
@@ -237,7 +239,11 @@ static bool throws_runtime_error(Fn&& fn) {
     return false;
 }
 
-static int run() {
+static std::string tag(const char* msg, const char* dev_name) {
+    std::string s = "["; s += dev_name; s += "] "; s += msg; return s;
+}
+
+static int run_for_device(brotensor::Device dev, const char* dev_name) {
     using brosoundml::AudioBuffer;
     using brosoundml::Whisper;
 
@@ -250,27 +256,27 @@ static int run() {
     write_stub_checkpoint(root / "model.safetensors", shape);
 
     Whisper w;
-    w.load(root.string());
-    CHECK(w.loaded(), "loaded synthetic Whisper checkpoint");
+    w.load(root.string(), dev);
+    CHECK(w.loaded(), tag("loaded synthetic Whisper checkpoint", dev_name).c_str());
     CHECK(w.config().vocab_size == shape.vocab_size,
-          "config vocab_size round-trips through load()");
+          tag("config vocab_size round-trips through load()", dev_name).c_str());
 
     // ── Bad-input guards ──────────────────────────────────────────────────
     {
         AudioBuffer empty;
         empty.sample_rate = 16000;
         CHECK(throws_runtime_error([&] { w.transcribe(empty, {0, 1, 2}); }),
-              "transcribe rejects empty audio");
+              tag("transcribe rejects empty audio", dev_name).c_str());
 
         AudioBuffer wrong_sr;
         wrong_sr.sample_rate = 22050;
         wrong_sr.samples.assign(22050, 0.0f);
         CHECK(throws_runtime_error([&] { w.transcribe(wrong_sr, {0, 1, 2}); }),
-              "transcribe rejects non-16k audio");
+              tag("transcribe rejects non-16k audio", dev_name).c_str());
 
         AudioBuffer ok = sine(440.0f, 0.5f);
         CHECK(throws_runtime_error([&] { w.transcribe(ok, {}); }),
-              "transcribe rejects empty prompt");
+              tag("transcribe rejects empty prompt", dev_name).c_str());
     }
 
     // ── Happy path: bounded greedy run ───────────────────────────────────
@@ -279,60 +285,61 @@ static int run() {
     auto result = w.transcribe(audio, prompt, /*max_new_tokens=*/5);
 
     CHECK(result.token_ids.size() >= prompt.size(),
-          "result includes the prompt");
+          tag("result includes the prompt", dev_name).c_str());
     const std::size_t n_new = result.token_ids.size() - prompt.size();
     CHECK(n_new <= 5,
-          "generated count respects max_new_tokens");
+          tag("generated count respects max_new_tokens", dev_name).c_str());
     for (std::size_t i = 0; i < prompt.size(); ++i) {
         CHECK(result.token_ids[i] == prompt[i],
-              "prompt prefix is preserved verbatim in the result");
+              tag("prompt prefix is preserved verbatim in the result", dev_name).c_str());
     }
-    // Every id in-range.
     bool in_range = true;
     for (auto id : result.token_ids) {
         if (id < 0 || id >= shape.vocab_size) in_range = false;
     }
-    CHECK(in_range, "every returned id is within [0, vocab_size)");
+    CHECK(in_range, tag("every returned id is within [0, vocab_size)", dev_name).c_str());
 
-    // Either we stopped because the loop hit max_new_tokens (n_new == 5) or
-    // we hit EOS (last generated id == eos_token_id). One of these must be
-    // true; if n_new == 0, that means the very first prediction was EOS.
     bool stopped_at_max = (n_new == 5);
-    bool stopped_at_eos = (n_new < 5);   // greedy emitted < budget rows -> EOS
+    bool stopped_at_eos = (n_new < 5);
     CHECK(stopped_at_max || stopped_at_eos,
-          "greedy loop terminated via EOS or max_new_tokens");
+          tag("greedy loop terminated via EOS or max_new_tokens", dev_name).c_str());
 
     // ── Cache reset between calls ────────────────────────────────────────
-    //
-    // The greedy loop is deterministic: same audio + same prompt must give
-    // the same first generated id even when a different call happened in
-    // between. If cache.reset() was missing, the second call's prefill would
-    // see leftover self-attn rows and skew the first prediction.
     AudioBuffer audio2 = sine(880.0f, 0.5f);
     auto run_a = w.transcribe(audio, prompt, /*max_new_tokens=*/1);
     auto run_b = w.transcribe(audio2, prompt, /*max_new_tokens=*/1);
     auto run_a_again = w.transcribe(audio, prompt, /*max_new_tokens=*/1);
 
-    // run_a_again must match run_a regardless of the run_b interleaving —
-    // that's the cache-reset contract.
     CHECK(run_a.token_ids.size() == run_a_again.token_ids.size(),
-          "deterministic re-run has same length");
+          tag("deterministic re-run has same length", dev_name).c_str());
     bool same_tokens = run_a.token_ids == run_a_again.token_ids;
+    // Sample-identical tokens on CUDA vs CPU are not required — token argmax
+    // can tip differently with FP noise. But within a single device run,
+    // determinism must hold.
     CHECK(same_tokens,
-          "deterministic re-run after a different call yields the same tokens"
-          " (proves cache.reset() between transcribe() calls)");
+          tag("deterministic re-run after a different call yields the same tokens",
+              dev_name).c_str());
     (void)run_b;
 
-    // ── Default max_new_tokens = max_target_positions - prompt_len ───────
     auto result_default = w.transcribe(audio, prompt, /*max_new_tokens=*/0);
     const std::size_t n_new_default =
         result_default.token_ids.size() - prompt.size();
     CHECK(n_new_default <=
           static_cast<std::size_t>(shape.max_target_positions - prompt.size()),
-          "default max_new_tokens respects max_target_positions");
+          tag("default max_new_tokens respects max_target_positions", dev_name).c_str());
 
     fs::remove_all(root);
     return failures;
+}
+
+static int run() {
+    int f = run_for_device(brotensor::Device::CPU, "CPU");
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        f = run_for_device(brotensor::Device::CUDA, "CUDA");
+    } else {
+        std::printf("test_whisper_e2e: CUDA not available — CUDA path skipped\n");
+    }
+    return f;
 }
 
 int main() {

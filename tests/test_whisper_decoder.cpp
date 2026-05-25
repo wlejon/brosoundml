@@ -7,6 +7,7 @@
 // Whisper weights required.
 #include "brosoundml/whisper_modules.h"
 
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
@@ -296,10 +297,13 @@ static void scalar_cross_attn(const std::vector<float>& X,    // (Tq, D)
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-static bt::Tensor make_f32(const std::vector<float>& v, int rows, int cols) {
-    bt::Tensor t = bt::Tensor::zeros_on(bt::Device::CPU, rows, cols, bt::Dtype::FP32);
-    std::memcpy(t.host_f32_mut(), v.data(), v.size() * sizeof(float));
-    return t;
+static bt::Tensor make_f32_on(bt::Device dev, const std::vector<float>& v,
+                              int rows, int cols) {
+    return bt::Tensor::from_host_on(dev, v.data(), rows, cols);
+}
+
+static std::string tagmsg(const char* msg, const char* dev_name) {
+    std::string s = "["; s += dev_name; s += "] "; s += msg; return s;
 }
 
 static std::vector<float> deterministic(std::size_t n, std::uint32_t seed,
@@ -313,201 +317,208 @@ static std::vector<float> deterministic(std::size_t n, std::uint32_t seed,
 
 // ─── KV-cache lifecycle test ───────────────────────────────────────────────
 
-static void test_cache_allocate_and_reset() {
+static void test_cache_allocate_and_reset(bt::Device dev, const char* dev_name) {
     brosoundml::WhisperKVCache c;
-    c.allocate(/*layers=*/3, /*d=*/8, /*max_tgt=*/16, /*max_src=*/20);
+    c.allocate(/*layers=*/3, /*d=*/8, /*max_tgt=*/16, /*max_src=*/20, dev);
     CHECK(static_cast<int>(c.layers.size()) == 3,
-          "cache.allocate creates one slab per decoder layer");
-    CHECK(c.size() == 0, "fresh cache has size 0");
+          tagmsg("cache.allocate creates one slab per decoder layer", dev_name).c_str());
+    CHECK(c.size() == 0, tagmsg("fresh cache has size 0", dev_name).c_str());
     for (auto& l : c.layers) {
         CHECK(l.self_k.rows == 16 && l.self_k.cols == 8,
-              "self_k preallocated to (max_tgt, d)");
+              tagmsg("self_k preallocated to (max_tgt, d)", dev_name).c_str());
         CHECK(l.self_v.rows == 16 && l.self_v.cols == 8,
-              "self_v preallocated to (max_tgt, d)");
+              tagmsg("self_v preallocated to (max_tgt, d)", dev_name).c_str());
         CHECK(l.cross_k.rows == 20 && l.cross_k.cols == 8,
-              "cross_k preallocated to (max_src, d)");
+              tagmsg("cross_k preallocated to (max_src, d)", dev_name).c_str());
         CHECK(l.cross_v.rows == 20 && l.cross_v.cols == 8,
-              "cross_v preallocated to (max_src, d)");
-        CHECK(l.self_len == 0,           "self_len initialised to 0");
-        CHECK(l.cross_primed == false,   "cross_primed initialised to false");
+              tagmsg("cross_v preallocated to (max_src, d)", dev_name).c_str());
+        CHECK(l.self_len == 0,
+              tagmsg("self_len initialised to 0", dev_name).c_str());
+        CHECK(l.cross_primed == false,
+              tagmsg("cross_primed initialised to false", dev_name).c_str());
     }
 
-    // Mutate then reset.
     c.layers[0].self_len = 5;
     c.layers[1].cross_primed = true;
     c.reset();
-    CHECK(c.size() == 0, "reset zeros size()");
+    CHECK(c.size() == 0, tagmsg("reset zeros size()", dev_name).c_str());
     CHECK(c.layers[0].self_len == 0 && c.layers[1].cross_primed == false,
-          "reset clears self_len and cross_primed on every layer");
+          tagmsg("reset clears self_len and cross_primed on every layer", dev_name).c_str());
 }
 
 // ─── mha_causal_cached_fp32 numeric test ──────────────────────────────────
 
-static void test_mha_causal_cached_matches_scalar_T1() {
+static void test_mha_causal_cached_matches_scalar_T1(bt::Device dev,
+                                                      const char* dev_name) {
     const int D = 4, H = 2, max_tgt = 8;
     auto Wq = deterministic(D * D, 11), bq = deterministic(D, 12);
-    auto Wk = deterministic(D * D, 13);                       // no bias
+    auto Wk = deterministic(D * D, 13);
     auto Wv = deterministic(D * D, 14), bv = deterministic(D, 15);
     auto Wo = deterministic(D * D, 16), bo = deterministic(D, 17);
 
-    auto X1 = deterministic(D, 21, 0.2f);                     // (1, D)
+    auto X1 = deterministic(D, 21, 0.2f);
 
-    // Reference: scalar causal attention on a 1-row input.
     std::vector<float> ref;
     scalar_causal_attn(X1, /*T=*/1, D, H, Wq, bq, Wk, Wv, bv, Wo, bo, ref);
 
-    // Our path.
     brosoundml::WhisperKVCache c;
-    c.allocate(/*layers=*/1, D, max_tgt, /*max_src=*/4);
-    bt::Tensor X = make_f32(X1, 1, D);
-    bt::Tensor Wq_t = make_f32(Wq, D, D),  bq_t = make_f32(bq, D, 1);
-    bt::Tensor Wk_t = make_f32(Wk, D, D);
-    bt::Tensor bk_t = bt::Tensor::zeros_on(bt::Device::CPU, D, 1, bt::Dtype::FP32);
-    bt::Tensor Wv_t = make_f32(Wv, D, D),  bv_t = make_f32(bv, D, 1);
-    bt::Tensor Wo_t = make_f32(Wo, D, D),  bo_t = make_f32(bo, D, 1);
+    c.allocate(/*layers=*/1, D, max_tgt, /*max_src=*/4, dev);
+    bt::Tensor X    = make_f32_on(dev, X1, 1, D);
+    bt::Tensor Wq_t = make_f32_on(dev, Wq, D, D), bq_t = make_f32_on(dev, bq, D, 1);
+    bt::Tensor Wk_t = make_f32_on(dev, Wk, D, D);
+    bt::Tensor bk_t = bt::Tensor::zeros_on(dev, D, 1, bt::Dtype::FP32);
+    bt::Tensor Wv_t = make_f32_on(dev, Wv, D, D), bv_t = make_f32_on(dev, bv, D, 1);
+    bt::Tensor Wo_t = make_f32_on(dev, Wo, D, D), bo_t = make_f32_on(dev, bo, D, 1);
 
     bt::Tensor out;
     brosoundml::mha_causal_cached_fp32(X, Wq_t, bq_t, Wk_t, bk_t,
                                        Wv_t, bv_t, Wo_t, bo_t, H,
                                        c.layers[0], out);
     CHECK(out.rows == 1 && out.cols == D,
-          "mha_causal_cached_fp32 T=1 output shape");
+          tagmsg("mha_causal_cached_fp32 T=1 output shape", dev_name).c_str());
     CHECK(c.layers[0].self_len == 1,
-          "self_len grew to 1 after a single-step call");
+          tagmsg("self_len grew to 1 after a single-step call", dev_name).c_str());
 
-    const float* od = out.host_f32();
+    std::vector<float> od = out.to_host_vector();
+    const float tol = (dev == bt::Device::CPU) ? 1e-5f : 1e-3f;
     bool close = true;
     for (int i = 0; i < D; ++i) {
-        if (std::abs(od[i] - ref[i]) > 1e-5f) close = false;
+        if (std::abs(od[i] - ref[i]) > tol) close = false;
     }
-    CHECK(close, "mha_causal_cached_fp32 T=1 matches scalar reference");
+    CHECK(close, tagmsg("mha_causal_cached_fp32 T=1 matches scalar reference",
+                        dev_name).c_str());
 }
 
-static void test_mha_causal_cached_prefill_then_step_equivalence() {
-    // Run two paths and check the trailing rows agree:
-    //   (A) Single prefill of T=7.
-    //   (B) Prefill of T=4 then three single steps.
-    // For each, the cache holds the same K/V history; the outputs corresponding
-    // to the last 7 queries must match within FP tolerance.
+static void test_mha_causal_cached_prefill_then_step_equivalence(
+        bt::Device dev, const char* dev_name) {
     const int D = 4, H = 2, max_tgt = 16;
     auto Wq = deterministic(D * D, 31), bq = deterministic(D, 32);
     auto Wk = deterministic(D * D, 33);
     auto Wv = deterministic(D * D, 34), bv = deterministic(D, 35);
     auto Wo = deterministic(D * D, 36), bo = deterministic(D, 37);
 
-    bt::Tensor Wq_t = make_f32(Wq, D, D),  bq_t = make_f32(bq, D, 1);
-    bt::Tensor Wk_t = make_f32(Wk, D, D);
-    bt::Tensor bk_t = bt::Tensor::zeros_on(bt::Device::CPU, D, 1, bt::Dtype::FP32);
-    bt::Tensor Wv_t = make_f32(Wv, D, D),  bv_t = make_f32(bv, D, 1);
-    bt::Tensor Wo_t = make_f32(Wo, D, D),  bo_t = make_f32(bo, D, 1);
+    bt::Tensor Wq_t = make_f32_on(dev, Wq, D, D), bq_t = make_f32_on(dev, bq, D, 1);
+    bt::Tensor Wk_t = make_f32_on(dev, Wk, D, D);
+    bt::Tensor bk_t = bt::Tensor::zeros_on(dev, D, 1, bt::Dtype::FP32);
+    bt::Tensor Wv_t = make_f32_on(dev, Wv, D, D), bv_t = make_f32_on(dev, bv, D, 1);
+    bt::Tensor Wo_t = make_f32_on(dev, Wo, D, D), bo_t = make_f32_on(dev, bo, D, 1);
 
-    auto X_all = deterministic(7 * D, 41, 0.2f);              // (7, D)
+    auto X_all = deterministic(7 * D, 41, 0.2f);
 
-    // ── Path A: one prefill of T=7.
     brosoundml::WhisperKVCache cA;
-    cA.allocate(1, D, max_tgt, 4);
-    bt::Tensor XA = make_f32(X_all, 7, D);
+    cA.allocate(1, D, max_tgt, 4, dev);
+    bt::Tensor XA = make_f32_on(dev, X_all, 7, D);
     bt::Tensor outA;
     brosoundml::mha_causal_cached_fp32(XA, Wq_t, bq_t, Wk_t, bk_t,
                                        Wv_t, bv_t, Wo_t, bo_t, H,
                                        cA.layers[0], outA);
-    CHECK(cA.layers[0].self_len == 7, "single prefill grows self_len to 7");
+    CHECK(cA.layers[0].self_len == 7,
+          tagmsg("single prefill grows self_len to 7", dev_name).c_str());
 
-    // ── Path B: prefill T=4 then three single steps.
     brosoundml::WhisperKVCache cB;
-    cB.allocate(1, D, max_tgt, 4);
-    bt::Tensor XB0 = make_f32(std::vector<float>(X_all.begin(),
-                                                 X_all.begin() + 4 * D), 4, D);
+    cB.allocate(1, D, max_tgt, 4, dev);
+    bt::Tensor XB0 = make_f32_on(dev,
+                                 std::vector<float>(X_all.begin(),
+                                                    X_all.begin() + 4 * D),
+                                 4, D);
     bt::Tensor outB0;
     brosoundml::mha_causal_cached_fp32(XB0, Wq_t, bq_t, Wk_t, bk_t,
                                        Wv_t, bv_t, Wo_t, bo_t, H,
                                        cB.layers[0], outB0);
-    std::vector<bt::Tensor> step_outs;
+    std::vector<std::vector<float>> step_outs_h;
     for (int s = 0; s < 3; ++s) {
         std::vector<float> row(X_all.begin() + (4 + s) * D,
                                X_all.begin() + (4 + s + 1) * D);
-        bt::Tensor xs = make_f32(row, 1, D);
+        bt::Tensor xs = make_f32_on(dev, row, 1, D);
         bt::Tensor ys;
         brosoundml::mha_causal_cached_fp32(xs, Wq_t, bq_t, Wk_t, bk_t,
                                            Wv_t, bv_t, Wo_t, bo_t, H,
                                            cB.layers[0], ys);
-        step_outs.push_back(std::move(ys));
+        step_outs_h.push_back(ys.to_host_vector());
     }
     CHECK(cB.layers[0].self_len == 7,
-          "prefill-then-steps grows self_len to 7");
+          tagmsg("prefill-then-steps grows self_len to 7", dev_name).c_str());
 
-    // The trailing 7 rows of A correspond to: outB0 rows 0..3, then each
-    // single-step output, in order. Compare element-wise.
-    const float* aA = outA.host_f32();
+    std::vector<float> aA = outA.to_host_vector();
+    std::vector<float> outB0_h = outB0.to_host_vector();
+    const float tol = (dev == bt::Device::CPU) ? 1e-4f : 3e-3f;
     bool ok = true;
     for (int t = 0; t < 4; ++t) {
         for (int j = 0; j < D; ++j) {
-            const float ref = outB0.host_f32()[t * D + j];
-            if (std::abs(aA[t * D + j] - ref) > 1e-4f) ok = false;
+            const float ref = outB0_h[t * D + j];
+            if (std::abs(aA[t * D + j] - ref) > tol) ok = false;
         }
     }
     for (int s = 0; s < 3; ++s) {
-        const float* sd = step_outs[s].host_f32();
+        const auto& sd = step_outs_h[s];
         for (int j = 0; j < D; ++j) {
-            if (std::abs(aA[(4 + s) * D + j] - sd[j]) > 1e-4f) ok = false;
+            if (std::abs(aA[(4 + s) * D + j] - sd[j]) > tol) ok = false;
         }
     }
-    CHECK(ok, "prefill T=7 == prefill T=4 + 3 single steps (cache equivalence)");
+    CHECK(ok, tagmsg("prefill T=7 == prefill T=4 + 3 single steps (cache equivalence)",
+                     dev_name).c_str());
 }
 
 // ─── cross_attn_cached_fp32 numeric test ──────────────────────────────────
 
-static void test_cross_attn_cached_matches_scalar() {
+static void test_cross_attn_cached_matches_scalar(bt::Device dev,
+                                                   const char* dev_name) {
     const int D = 4, H = 2, Lk = 5;
     auto Wq = deterministic(D * D, 51), bq = deterministic(D, 52);
     auto Wo = deterministic(D * D, 53), bo = deterministic(D, 54);
 
-    // Pretend we've already projected K/V into the cache.
     auto Kdata = deterministic(Lk * D, 55, 0.3f);
     auto Vdata = deterministic(Lk * D, 56, 0.3f);
 
-    auto X = deterministic(2 * D, 57, 0.2f);                  // (2, D)
+    auto X = deterministic(2 * D, 57, 0.2f);
     std::vector<float> ref;
     scalar_cross_attn(X, /*Tq=*/2, D, H, Kdata, Vdata, Lk,
                       Wq, bq, Wo, bo, ref);
 
+    // Seed the cross-K/V from host data by going through from_host_on and then
+    // copying into the cache slabs. For non-CPU devices we use a host
+    // round-trip: build a CPU tensor with the data, then `.to(dev)` and
+    // overwrite the cache slab via Tensor copy semantics — but the cache
+    // slabs are zeros_on(dev) allocations, so an upload-into-slab needs a
+    // copy_d2d. Simplest: just construct a fresh device tensor and reseat the
+    // slab via move-assignment (the WhisperLayerCache cross_k/cross_v are
+    // plain Tensor members).
     brosoundml::WhisperKVCache c;
-    c.allocate(1, D, /*max_tgt=*/4, /*max_src=*/Lk);
-    std::memcpy(c.layers[0].cross_k.host_f32_mut(), Kdata.data(),
-                Kdata.size() * sizeof(float));
-    std::memcpy(c.layers[0].cross_v.host_f32_mut(), Vdata.data(),
-                Vdata.size() * sizeof(float));
+    c.allocate(1, D, /*max_tgt=*/4, /*max_src=*/Lk, dev);
+    c.layers[0].cross_k = bt::Tensor::from_host_on(dev, Kdata.data(), Lk, D);
+    c.layers[0].cross_v = bt::Tensor::from_host_on(dev, Vdata.data(), Lk, D);
     c.layers[0].cross_primed = true;
 
-    bt::Tensor X_t = make_f32(X, 2, D);
-    bt::Tensor Wq_t = make_f32(Wq, D, D), bq_t = make_f32(bq, D, 1);
-    bt::Tensor Wo_t = make_f32(Wo, D, D), bo_t = make_f32(bo, D, 1);
+    bt::Tensor X_t = make_f32_on(dev, X, 2, D);
+    bt::Tensor Wq_t = make_f32_on(dev, Wq, D, D), bq_t = make_f32_on(dev, bq, D, 1);
+    bt::Tensor Wo_t = make_f32_on(dev, Wo, D, D), bo_t = make_f32_on(dev, bo, D, 1);
     bt::Tensor out;
     brosoundml::cross_attn_cached_fp32(X_t, Wq_t, bq_t, Wo_t, bo_t, H,
                                        c.layers[0], out);
 
     CHECK(out.rows == 2 && out.cols == D,
-          "cross_attn_cached_fp32 output shape (2, D)");
+          tagmsg("cross_attn_cached_fp32 output shape (2, D)", dev_name).c_str());
+    const float tol = (dev == bt::Device::CPU) ? 1e-5f : 1e-3f;
     bool ok = true;
-    const float* od = out.host_f32();
+    std::vector<float> od = out.to_host_vector();
     for (std::size_t i = 0; i < ref.size(); ++i) {
-        if (std::abs(od[i] - ref[i]) > 1e-5f) ok = false;
+        if (std::abs(od[i] - ref[i]) > tol) ok = false;
     }
-    CHECK(ok, "cross_attn_cached_fp32 matches scalar reference");
+    CHECK(ok, tagmsg("cross_attn_cached_fp32 matches scalar reference",
+                     dev_name).c_str());
 
-    // Un-primed cache must throw.
     brosoundml::WhisperKVCache c2;
-    c2.allocate(1, D, 4, Lk);
+    c2.allocate(1, D, 4, Lk, dev);
     bt::Tensor tmp;
     CHECK(throws_runtime_error([&] {
         brosoundml::cross_attn_cached_fp32(X_t, Wq_t, bq_t, Wo_t, bo_t, H,
                                            c2.layers[0], tmp);
-    }), "cross_attn_cached_fp32 rejects un-primed cache");
+    }), tagmsg("cross_attn_cached_fp32 rejects un-primed cache", dev_name).c_str());
 }
 
 // ─── DecoderLayer shape preservation ──────────────────────────────────────
 
-static void test_decoder_layer_forward_shape() {
+static void test_decoder_layer_forward_shape(bt::Device dev, const char* dev_name) {
     const int D = 8, ffn = 16, H = 2, max_tgt = 16, max_src = 6;
     const int vocab = 32, n_layers = 1;
     const fs::path tmp = fs::temp_directory_path() /
@@ -518,61 +529,61 @@ static void test_decoder_layer_forward_shape() {
     brosoundml::WhisperDecoderLayer layer;
     {
         stf::File f = stf::File::open(tmp.string());
-        layer.load_from(f, "model.decoder.layers.0.", D, ffn, H);
+        layer.load_from(f, "model.decoder.layers.0.", D, ffn, H, dev);
     }
     CHECK(layer.self_bk.rows == D && layer.self_bk.cols == 1,
-          "self-attn k_proj bias zero-filled to (D, 1)");
+          tagmsg("self-attn k_proj bias zero-filled to (D, 1)", dev_name).c_str());
     CHECK(layer.cross_bk.rows == D && layer.cross_bk.cols == 1,
-          "cross-attn k_proj bias zero-filled to (D, 1)");
-    const float* sbk = layer.self_bk.host_f32();
-    const float* cbk = layer.cross_bk.host_f32();
+          tagmsg("cross-attn k_proj bias zero-filled to (D, 1)", dev_name).c_str());
+    std::vector<float> sbk = layer.self_bk.to_host_vector();
+    std::vector<float> cbk = layer.cross_bk.to_host_vector();
     bool zero = true;
     for (int i = 0; i < D; ++i) {
         if (sbk[i] != 0.0f || cbk[i] != 0.0f) zero = false;
     }
-    CHECK(zero, "both k_proj biases are zero");
+    CHECK(zero, tagmsg("both k_proj biases are zero", dev_name).c_str());
 
-    // Prime the cross-attn cache from a synthetic "encoder_hidden".
     brosoundml::WhisperKVCache cache;
-    cache.allocate(n_layers, D, max_tgt, max_src);
-    bt::Tensor enc = bt::Tensor::zeros_on(bt::Device::CPU, max_src, D, bt::Dtype::FP32);
+    cache.allocate(n_layers, D, max_tgt, max_src, dev);
     auto edata = deterministic(max_src * D, 71, 0.2f);
-    std::memcpy(enc.host_f32_mut(), edata.data(), edata.size() * sizeof(float));
+    bt::Tensor enc = bt::Tensor::from_host_on(dev, edata.data(), max_src, D);
     layer.prime_cross(enc, cache.layers[0]);
     CHECK(cache.layers[0].cross_primed,
-          "prime_cross flips cross_primed");
+          tagmsg("prime_cross flips cross_primed", dev_name).c_str());
 
-    // Single-step forward.
     auto xdata = deterministic(D, 72, 0.2f);
-    bt::Tensor X = make_f32(xdata, 1, D);
+    bt::Tensor X = make_f32_on(dev, xdata, 1, D);
     bt::Tensor Y;
     layer.forward(X, cache.layers[0], Y);
-    CHECK(Y.rows == 1 && Y.cols == D, "decoder layer preserves (1, D)");
+    CHECK(Y.rows == 1 && Y.cols == D,
+          tagmsg("decoder layer preserves (1, D)", dev_name).c_str());
     CHECK(cache.layers[0].self_len == 1,
-          "layer.forward grew self_len by 1");
+          tagmsg("layer.forward grew self_len by 1", dev_name).c_str());
 
-    // Three-token prefill on a fresh cache.
     brosoundml::WhisperKVCache cache2;
-    cache2.allocate(n_layers, D, max_tgt, max_src);
+    cache2.allocate(n_layers, D, max_tgt, max_src, dev);
     layer.prime_cross(enc, cache2.layers[0]);
     auto xdata3 = deterministic(3 * D, 73, 0.2f);
-    bt::Tensor X3 = make_f32(xdata3, 3, D);
+    bt::Tensor X3 = make_f32_on(dev, xdata3, 3, D);
     bt::Tensor Y3;
     layer.forward(X3, cache2.layers[0], Y3);
-    CHECK(Y3.rows == 3 && Y3.cols == D, "decoder layer preserves (T, D)");
-    CHECK(cache2.layers[0].self_len == 3, "self_len grew by 3");
+    CHECK(Y3.rows == 3 && Y3.cols == D,
+          tagmsg("decoder layer preserves (T, D)", dev_name).c_str());
+    CHECK(cache2.layers[0].self_len == 3,
+          tagmsg("self_len grew by 3", dev_name).c_str());
 
+    std::vector<float> yd = Y3.to_host_vector();
     bool finite = true;
-    const float* yd = Y3.host_f32();
     for (int i = 0; i < 3 * D; ++i) if (!std::isfinite(yd[i])) finite = false;
-    CHECK(finite, "decoder layer output is all-finite");
+    CHECK(finite, tagmsg("decoder layer output is all-finite", dev_name).c_str());
 
     fs::remove(tmp);
 }
 
 // ─── End-to-end WhisperDecoder forward test ───────────────────────────────
 
-static void test_decoder_forward_e2e_and_cache_equivalence() {
+static void test_decoder_forward_e2e_and_cache_equivalence(bt::Device dev,
+                                                            const char* dev_name) {
     const int D = 8, ffn = 16, H = 2;
     const int n_layers = 2, vocab = 32, max_tgt = 16, max_src = 6;
 
@@ -584,86 +595,85 @@ static void test_decoder_forward_e2e_and_cache_equivalence() {
     brosoundml::WhisperDecoder dec;
     {
         stf::File f = stf::File::open(tmp.string());
-        dec.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src);
+        dec.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src, dev);
     }
     CHECK(static_cast<int>(dec.layers.size()) == n_layers,
-          "WhisperDecoder loads requested layer count");
+          tagmsg("WhisperDecoder loads requested layer count", dev_name).c_str());
     CHECK(dec.proj_out_explicit == false,
-          "no proj_out.weight on disk -> tied LM head");
+          tagmsg("no proj_out.weight on disk -> tied LM head", dev_name).c_str());
     CHECK(dec.embed_tokens.rows == vocab && dec.embed_tokens.cols == D,
-          "embed_tokens shape (vocab, d)");
+          tagmsg("embed_tokens shape (vocab, d)", dev_name).c_str());
     CHECK(dec.embed_positions.rows == max_tgt && dec.embed_positions.cols == D,
-          "embed_positions shape (max_tgt, d)");
+          tagmsg("embed_positions shape (max_tgt, d)", dev_name).c_str());
 
-    bt::Tensor enc = bt::Tensor::zeros_on(bt::Device::CPU, max_src, D, bt::Dtype::FP32);
     auto edata = deterministic(max_src * D, 81, 0.2f);
-    std::memcpy(enc.host_f32_mut(), edata.data(), edata.size() * sizeof(float));
+    bt::Tensor enc = bt::Tensor::from_host_on(dev, edata.data(), max_src, D);
 
-    // ── Path A: prefill 5 prompt tokens in one shot.
     const std::int32_t prompt[5] = {2, 7, 3, 11, 5};
     brosoundml::WhisperKVCache cacheA;
-    cacheA.allocate(n_layers, D, max_tgt, max_src);
+    cacheA.allocate(n_layers, D, max_tgt, max_src, dev);
     dec.prime_cross(enc, cacheA);
     bt::Tensor logitsA;
     dec.forward(prompt, 5, /*pos_offset=*/0, cacheA, logitsA);
     CHECK(logitsA.rows == 5 && logitsA.cols == vocab,
-          "decoder prefill produces (T, vocab) logits");
-    CHECK(cacheA.size() == 5, "decoder prefill grew cache by 5");
+          tagmsg("decoder prefill produces (T, vocab) logits", dev_name).c_str());
+    CHECK(cacheA.size() == 5,
+          tagmsg("decoder prefill grew cache by 5", dev_name).c_str());
 
+    std::vector<float> la = logitsA.to_host_vector();
     bool finite_A = true;
-    const float* la = logitsA.host_f32();
     for (int i = 0; i < 5 * vocab; ++i) if (!std::isfinite(la[i])) finite_A = false;
-    CHECK(finite_A, "decoder prefill logits all-finite");
+    CHECK(finite_A, tagmsg("decoder prefill logits all-finite", dev_name).c_str());
 
-    // ── Path B: prefill 4 tokens, then single-step the 5th.
     brosoundml::WhisperKVCache cacheB;
-    cacheB.allocate(n_layers, D, max_tgt, max_src);
+    cacheB.allocate(n_layers, D, max_tgt, max_src, dev);
     dec.prime_cross(enc, cacheB);
     bt::Tensor logitsB_pre;
     dec.forward(prompt, 4, 0, cacheB, logitsB_pre);
     CHECK(logitsB_pre.rows == 4 && logitsB_pre.cols == vocab,
-          "decoder prefill of 4 produces (4, vocab)");
+          tagmsg("decoder prefill of 4 produces (4, vocab)", dev_name).c_str());
 
     bt::Tensor logitsB_step;
     dec.forward(&prompt[4], 1, /*pos_offset=*/4, cacheB, logitsB_step);
     CHECK(logitsB_step.rows == 1 && logitsB_step.cols == vocab,
-          "decoder single-step produces (1, vocab)");
-    CHECK(cacheB.size() == 5, "decoder cache grew to 5 after the single step");
+          tagmsg("decoder single-step produces (1, vocab)", dev_name).c_str());
+    CHECK(cacheB.size() == 5,
+          tagmsg("decoder cache grew to 5 after the single step", dev_name).c_str());
 
-    // Single-step logits must match path A's last row.
-    const float* lb = logitsB_step.host_f32();
-    const float* la_last = la + 4 * vocab;
+    std::vector<float> lb = logitsB_step.to_host_vector();
+    const float tol = (dev == bt::Device::CPU) ? 5e-4f : 5e-3f;
     bool ok = true;
     float max_err = 0.0f;
     for (int v = 0; v < vocab; ++v) {
-        const float e = std::abs(lb[v] - la_last[v]);
+        const float e = std::abs(lb[v] - la[4 * vocab + v]);
         if (e > max_err) max_err = e;
-        if (e > 5e-4f) ok = false;
+        if (e > tol) ok = false;
     }
     if (!ok) {
-        std::fprintf(stderr, "  cache-equiv max error: %g\n", max_err);
+        std::fprintf(stderr, "  [%s] cache-equiv max error: %g\n", dev_name, max_err);
     }
-    CHECK(ok, "single-step logits at pos 4 == prefill-of-5 last row");
+    CHECK(ok, tagmsg("single-step logits at pos 4 == prefill-of-5 last row",
+                     dev_name).c_str());
 
-    // Misuse: forward without cross-prime must throw.
     brosoundml::WhisperKVCache cacheC;
-    cacheC.allocate(n_layers, D, max_tgt, max_src);
+    cacheC.allocate(n_layers, D, max_tgt, max_src, dev);
     bt::Tensor tmp_logits;
     CHECK(throws_runtime_error([&] {
         dec.forward(prompt, 1, 0, cacheC, tmp_logits);
-    }), "decoder forward refuses un-primed cross-attn cache");
+    }), tagmsg("decoder forward refuses un-primed cross-attn cache",
+               dev_name).c_str());
 
-    // Misuse: pos_offset != cache.self_len must throw.
     CHECK(throws_runtime_error([&] {
         dec.forward(prompt, 1, /*pos_offset=*/3, cacheA, tmp_logits);
-    }), "decoder forward refuses pos_offset != cache.self_len");
+    }), tagmsg("decoder forward refuses pos_offset != cache.self_len",
+               dev_name).c_str());
 
     fs::remove(tmp);
 }
 
 // ─── Tied vs. explicit LM head ────────────────────────────────────────────
 
-static void test_lm_head_tied_and_explicit() {
+static void test_lm_head_tied_and_explicit(bt::Device dev, const char* dev_name) {
     const int D = 8, ffn = 16, H = 2;
     const int n_layers = 1, vocab = 32, max_tgt = 8, max_src = 4;
 
@@ -678,60 +688,69 @@ static void test_lm_head_tied_and_explicit() {
     brosoundml::WhisperDecoder dT, dE;
     {
         stf::File f = stf::File::open(tied.string());
-        dT.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src);
+        dT.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src, dev);
     }
     {
         stf::File f = stf::File::open(expl.string());
-        dE.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src);
+        dE.load_from(f, D, n_layers, ffn, H, vocab, max_tgt, max_src, dev);
     }
-    CHECK(!dT.proj_out_explicit, "tied checkpoint reports proj_out_explicit=false");
-    CHECK(dE.proj_out_explicit,  "explicit checkpoint reports proj_out_explicit=true");
+    CHECK(!dT.proj_out_explicit,
+          tagmsg("tied checkpoint reports proj_out_explicit=false", dev_name).c_str());
+    CHECK(dE.proj_out_explicit,
+          tagmsg("explicit checkpoint reports proj_out_explicit=true", dev_name).c_str());
     CHECK(dT.proj_out_weight.rows == 0 || dT.proj_out_weight.cols == 0,
-          "tied path leaves proj_out_weight empty");
+          tagmsg("tied path leaves proj_out_weight empty", dev_name).c_str());
     CHECK(dE.proj_out_weight.rows == vocab && dE.proj_out_weight.cols == D,
-          "explicit path loads proj_out_weight (vocab, d)");
+          tagmsg("explicit path loads proj_out_weight (vocab, d)", dev_name).c_str());
 
-    // Drive both end-to-end and require their logits differ — proves the
-    // loader actually used the explicit weight on the dE path. (Same prompt,
-    // same encoder hidden state; only the LM head varies, but downstream
-    // weights also differ between the two stubs since the second stub draws
-    // extra random rows. The point of this assertion is "they both run and
-    // produce finite outputs" plus "proj_out_explicit flag is honored".)
-    bt::Tensor enc = bt::Tensor::zeros_on(bt::Device::CPU, max_src, D, bt::Dtype::FP32);
     auto edata = deterministic(max_src * D, 91, 0.2f);
-    std::memcpy(enc.host_f32_mut(), edata.data(), edata.size() * sizeof(float));
+    bt::Tensor enc = bt::Tensor::from_host_on(dev, edata.data(), max_src, D);
 
     auto run = [&](brosoundml::WhisperDecoder& d, bt::Tensor& logits) {
         brosoundml::WhisperKVCache c;
-        c.allocate(n_layers, D, max_tgt, max_src);
+        c.allocate(n_layers, D, max_tgt, max_src, dev);
         d.prime_cross(enc, c);
         const std::int32_t p[2] = {1, 4};
         d.forward(p, 2, 0, c, logits);
     };
     bt::Tensor lT, lE;
     run(dT, lT); run(dE, lE);
-    CHECK(lT.rows == 2 && lT.cols == vocab, "tied path logits shape");
-    CHECK(lE.rows == 2 && lE.cols == vocab, "explicit path logits shape");
+    CHECK(lT.rows == 2 && lT.cols == vocab,
+          tagmsg("tied path logits shape", dev_name).c_str());
+    CHECK(lE.rows == 2 && lE.cols == vocab,
+          tagmsg("explicit path logits shape", dev_name).c_str());
 
+    std::vector<float> lT_h = lT.to_host_vector();
+    std::vector<float> lE_h = lE.to_host_vector();
     bool finite = true;
     for (int i = 0; i < 2 * vocab; ++i) {
-        if (!std::isfinite(lT.host_f32()[i])) finite = false;
-        if (!std::isfinite(lE.host_f32()[i])) finite = false;
+        if (!std::isfinite(lT_h[i])) finite = false;
+        if (!std::isfinite(lE_h[i])) finite = false;
     }
-    CHECK(finite, "both LM-head paths produce finite logits");
+    CHECK(finite, tagmsg("both LM-head paths produce finite logits",
+                         dev_name).c_str());
 
     fs::remove(tied); fs::remove(expl);
 }
 
+static void run_all(bt::Device dev, const char* dev_name) {
+    test_cache_allocate_and_reset(dev, dev_name);
+    test_mha_causal_cached_matches_scalar_T1(dev, dev_name);
+    test_mha_causal_cached_prefill_then_step_equivalence(dev, dev_name);
+    test_cross_attn_cached_matches_scalar(dev, dev_name);
+    test_decoder_layer_forward_shape(dev, dev_name);
+    test_decoder_forward_e2e_and_cache_equivalence(dev, dev_name);
+    test_lm_head_tied_and_explicit(dev, dev_name);
+}
+
 int main() {
     try {
-        test_cache_allocate_and_reset();
-        test_mha_causal_cached_matches_scalar_T1();
-        test_mha_causal_cached_prefill_then_step_equivalence();
-        test_cross_attn_cached_matches_scalar();
-        test_decoder_layer_forward_shape();
-        test_decoder_forward_e2e_and_cache_equivalence();
-        test_lm_head_tied_and_explicit();
+        run_all(bt::Device::CPU, "CPU");
+        if (bt::is_available(bt::Device::CUDA)) {
+            run_all(bt::Device::CUDA, "CUDA");
+        } else {
+            std::printf("test_whisper_decoder: CUDA not available — CUDA path skipped\n");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "test_whisper_decoder: uncaught exception: %s\n",
                      e.what());
