@@ -35,6 +35,15 @@ else()
     target_compile_options(train_pos_tagger PRIVATE -Wall -Wextra)
 endif()
 
+# Confusion-matrix analyser — built but NOT a ctest (manual tool).
+add_executable(eval_pos_confusion eval_pos_confusion.cpp)
+target_link_libraries(eval_pos_confusion PRIVATE brosoundml)
+if(MSVC)
+    target_compile_options(eval_pos_confusion PRIVATE /W4)
+else()
+    target_compile_options(eval_pos_confusion PRIVATE -Wall -Wextra)
+endif()
+
 target_compile_definitions(brosoundml_test_kokoro PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE
