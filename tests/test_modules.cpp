@@ -501,6 +501,11 @@ int main() {
     } else {
         std::printf("test_modules: CUDA not available — CUDA path skipped\n");
     }
+    if (bt::is_available(bt::Device::Metal)) {
+        run_all(bt::Device::Metal, "Metal");
+    } else {
+        std::printf("test_modules: Metal not available — Metal path skipped\n");
+    }
 
     if (failures == 0) {
         std::printf("test_modules: all checks passed\n");

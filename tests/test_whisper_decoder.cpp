@@ -752,6 +752,11 @@ int main() {
         } else {
             std::printf("test_whisper_decoder: CUDA not available — CUDA path skipped\n");
         }
+        if (bt::is_available(bt::Device::Metal)) {
+            run_all(bt::Device::Metal, "Metal");
+        } else {
+            std::printf("test_whisper_decoder: Metal not available — Metal path skipped\n");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "test_whisper_decoder: uncaught exception: %s\n",
                      e.what());

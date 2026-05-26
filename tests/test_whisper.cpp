@@ -319,6 +319,10 @@ static int run() {
         run_real_smoke(brotensor::Device::CUDA, "CUDA",
                        /*enforce_filename_target=*/false);
     }
+    if (brotensor::is_available(brotensor::Device::Metal)) {
+        run_real_smoke(brotensor::Device::Metal, "Metal",
+                       /*enforce_filename_target=*/false);
+    }
 
     if (failures) {
         std::fprintf(stderr, "test_whisper: %d failure(s)\n", failures);

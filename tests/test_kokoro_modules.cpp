@@ -271,6 +271,10 @@ int main() {
         std::printf("test_kokoro_modules: CUDA available — exact-numerics "
                     "checks kept CPU-only; CUDA covered by test_kokoro\n");
     }
+    if (bt::is_available(bt::Device::Metal)) {
+        std::printf("test_kokoro_modules: Metal available — exact-numerics "
+                    "checks kept CPU-only; Metal covered by test_kokoro\n");
+    }
 
     if (failures == 0) {
         std::printf("test_kokoro_modules: all checks passed\n");

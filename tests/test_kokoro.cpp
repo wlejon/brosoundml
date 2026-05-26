@@ -194,11 +194,16 @@ static int run() {
         CHECK(rcfg.vocab.size() > 100,
               tag("real Kokoro: vocab map populated"));
 
-        const fs::path real_voice = real_root / "voices" / "af_heart.bin";
+        fs::path real_voice = real_root / "voices" / "af_heart.bin";
+        if (!fs::exists(real_voice) && fs::is_directory(real_root / "voices")) {
+            for (const auto& e : fs::directory_iterator(real_root / "voices")) {
+                if (e.path().extension() == ".bin") { real_voice = e.path(); break; }
+            }
+        }
         if (fs::exists(real_voice)) {
             Voice v = real.load_voice(real_voice.string());
             CHECK(v.packs.rows == 510 && v.packs.cols == 256,
-                  tag("real Kokoro voice af_heart: shape (510, 256)"));
+                  tag("real Kokoro voice: shape (510, 256)"));
 
             const std::vector<int32_t> phonemes = {50, 47, 54, 54, 57};
             AudioBuffer audio = real.synthesize(phonemes, v, 1.0f);
@@ -233,6 +238,9 @@ static int run() {
     run_real_smoke(brotensor::Device::CPU, "CPU");
     if (brotensor::is_available(brotensor::Device::CUDA)) {
         run_real_smoke(brotensor::Device::CUDA, "CUDA");
+    }
+    if (brotensor::is_available(brotensor::Device::Metal)) {
+        run_real_smoke(brotensor::Device::Metal, "Metal");
     }
 
     if (failures == 0) {
