@@ -14,6 +14,9 @@
 
 #include "brosoundml/kokoro.h"
 
+#include <brotensor/tensor.h>
+#include <brotensor/runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +57,7 @@ std::vector<int32_t> parse_ids(const std::string& line) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_dir, voice_path, out_path, out_dir, ids_file, ids_inline;
+    std::string model_dir, voice_path, out_path, out_dir, ids_file, ids_inline, device_str = "cpu";
     float speed = 1.0f;
 
     for (int i = 1; i < argc; ++i) {
@@ -69,6 +72,7 @@ int main(int argc, char** argv) {
         else if (a == "--out-dir")   out_dir    = next("--out-dir");
         else if (a == "--ids-file")  ids_file   = next("--ids-file");
         else if (a == "--speed")     speed      = std::stof(next("--speed"));
+        else if (a == "--device")    device_str = next("--device");
         else if (a == "-h" || a == "--help") {
             std::printf("Usage: synth --model DIR --voice voice.bin "
                         "(--out file.wav PHONEMEIDS | --out-dir DIR --ids-file FILE)\n");
@@ -82,8 +86,18 @@ int main(int argc, char** argv) {
     if (voice_path.empty()) die("--voice is required");
 
     try {
+        brotensor::init();
+        brotensor::Device dev = brotensor::Device::CPU;
+        if      (device_str == "cpu")   dev = brotensor::Device::CPU;
+        else if (device_str == "cuda")  dev = brotensor::Device::CUDA;
+        else if (device_str == "metal") dev = brotensor::Device::Metal;
+        else die("--device must be one of cpu|cuda|metal");
+        if (dev != brotensor::Device::CPU && !brotensor::is_available(dev))
+            die("--device " + device_str + " not available in this build");
+
         brosoundml::Kokoro k;
-        k.load(model_dir);
+        k.load(model_dir, dev);
+        std::fprintf(stderr, "device: %s\n", device_str.c_str());
         brosoundml::Voice voice = k.load_voice(voice_path);
         std::fprintf(stderr, "loaded voice %s (%dx%d)\n",
                      voice.name.c_str(), voice.packs.rows, voice.packs.cols);

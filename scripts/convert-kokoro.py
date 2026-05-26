@@ -62,7 +62,10 @@ def to_fp32_contiguous(t: torch.Tensor) -> torch.Tensor:
     """Force FP32, contiguous, on CPU. Stage 1 reads tensors as F32 from
     safetensors; the upstream Kokoro checkpoint is already FP32 but we keep
     the conversion defensive."""
-    return t.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    # `.clone()` forces a fresh allocation — PyTorch LSTM modules expose named
+    # parameters as views into one flat buffer, and safetensors refuses to
+    # write tensors that share storage.
+    return t.detach().to(dtype=torch.float32, device="cpu").contiguous().clone()
 
 
 def fuse_weight_norm(state: dict) -> dict:
