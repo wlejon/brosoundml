@@ -389,30 +389,10 @@ void forward_sentence(const g::PosWeights& w,
         C.Attnh = bt::Tensor{}; C.Yconcat = bt::Tensor{};
         C.attn_out = bt::Tensor::mat(L, D);
         bt::mha_forward(X, Lw.mha.Wq, Lw.mha.Wk, Lw.mha.Wv, Lw.mha.Wo,
+                        &Lw.mha.bq, &Lw.mha.bk, &Lw.mha.bv, &Lw.mha.bo,
                         /*d_mask=*/nullptr, w.num_heads,
                         C.Qh, C.Kh, C.Vh, C.Attnh, C.Yconcat,
                         C.attn_out);
-        // NOTE: mha_forward does NOT add the q/k/v/o biases — chunk 1 uses
-        // linear_forward_batched(Wq, bq, ...) for projections and Wo, bo
-        // for the output. We add the biases by hand here to stay faithful to
-        // the chunk 1 forward (biases on every attn projection).
-        // bq/bk/bv enter Q/K/V before the softmax — they shift columns of
-        // Qh/Kh/Vh row-wise. bo is added after the Wo projection.
-        // The simplest correct path: add bq.bv.bk pre-effect by adding bq to
-        // every row of the Q rows of Qh (Qh row layout is num_heads*L rows of
-        // head_dim cols; head h occupies rows [h*L, (h+1)*L). Slicing the
-        // (D,) bias vector across heads is non-trivial — instead we use the
-        // identity that linear_forward_batched(W, b, X) == mha_forward's
-        // implicit Q = X @ W^T + b would produce. Because mha_forward
-        // performs the projection internally we cannot inject the bias there.
-        //
-        // Pragmatic workaround: we use the no-bias variant of self-attention
-        // by setting bq=bk=bv=bo=0 at init. The chunk 1 loader REQUIRES the
-        // (D,1) bias tensors to be present in the file — they're shipped as
-        // zeros and contribute nothing. The trainer holds them in the param
-        // list (so they round-trip) but never produces non-zero gradients.
-        // This drops a few thousand effective parameters but matches the
-        // mha_forward op's contract exactly. See README note in docs/.
 
         // residual: h_resid += attn_out
         bt::add_inplace_batched(h_resid, C.attn_out);
@@ -469,7 +449,7 @@ struct ParamRefs {
     struct LRef {
         bt::Tensor* ln1_g; bt::Tensor* ln1_b;
         bt::Tensor* Wq; bt::Tensor* Wk; bt::Tensor* Wv; bt::Tensor* Wo;
-        // biases not trained — see note in forward_sentence.
+        bt::Tensor* bq; bt::Tensor* bk; bt::Tensor* bv; bt::Tensor* bo;
         bt::Tensor* ln2_g; bt::Tensor* ln2_b;
         bt::Tensor* ffn1_W; bt::Tensor* ffn1_b;
         bt::Tensor* ffn2_W; bt::Tensor* ffn2_b;
@@ -495,6 +475,8 @@ ParamRefs param_refs(std::vector<Param>& ps) {
         L.ln1_g  = find(p + "ln1.gamma"); L.ln1_b = find(p + "ln1.beta");
         L.Wq     = find(p + "attn.Wq"); L.Wk = find(p + "attn.Wk");
         L.Wv     = find(p + "attn.Wv"); L.Wo = find(p + "attn.Wo");
+        L.bq     = find(p + "attn.bq"); L.bk = find(p + "attn.bk");
+        L.bv     = find(p + "attn.bv"); L.bo = find(p + "attn.bo");
         L.ln2_g  = find(p + "ln2.gamma"); L.ln2_b = find(p + "ln2.beta");
         L.ffn1_W = find(p + "ffn1.W"); L.ffn1_b = find(p + "ffn1.b");
         L.ffn2_W = find(p + "ffn2.W"); L.ffn2_b = find(p + "ffn2.b");
@@ -579,7 +561,8 @@ void backward_sentence(const g::PosWeights& w,
                          C.Qh, C.Kh, C.Vh, C.Attnh, C.Yconcat,
                          Lw.mha.Wq, Lw.mha.Wk, Lw.mha.Wv, Lw.mha.Wo,
                          /*d_mask=*/nullptr, w.num_heads,
-                         dln1_y, *gL.Wq, *gL.Wk, *gL.Wv, *gL.Wo);
+                         dln1_y, *gL.Wq, *gL.Wk, *gL.Wv, *gL.Wo,
+                         gL.bq, gL.bk, gL.bv, gL.bo);
         // ln1 backward
         bt::Tensor dh_in_ln = bt::Tensor::mat(L, D);
         ln_backward_per_row(Lw.ln1.gamma, dln1_y, dh_in_ln,
