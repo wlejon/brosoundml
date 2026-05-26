@@ -110,6 +110,7 @@ target_sources(brosoundml PRIVATE
     src/whisper_modules.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
+    src/g2p/lexicon.cpp
 )
 
 # --- Install ---
