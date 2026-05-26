@@ -65,4 +65,7 @@ struct TokenChunk {
 
 std::vector<TokenChunk> tokenise_for_test(std::string_view s);
 
+// exposed for trainer
+std::vector<TokenChunk> tokenise_sentence(std::string_view s);
+
 }  // namespace brosoundml::g2p

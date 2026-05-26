@@ -24,6 +24,17 @@ target_compile_definitions(brosoundml_test_pos_tagger PRIVATE
 target_include_directories(brosoundml_test_pos_tagger PRIVATE
     "${CMAKE_SOURCE_DIR}/src")
 # Surface the repo root to the tests' optional real-weights smoke paths.
+# Training driver — built but NOT registered as a ctest (manual tool).
+add_executable(train_pos_tagger train_pos_tagger.cpp)
+target_link_libraries(train_pos_tagger PRIVATE brosoundml)
+target_include_directories(train_pos_tagger PRIVATE
+    "${CMAKE_SOURCE_DIR}/src")
+if(MSVC)
+    target_compile_options(train_pos_tagger PRIVATE /W4)
+else()
+    target_compile_options(train_pos_tagger PRIVATE -Wall -Wextra)
+endif()
+
 target_compile_definitions(brosoundml_test_kokoro PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE

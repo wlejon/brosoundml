@@ -86,6 +86,10 @@ std::vector<TokenChunk> tokenise_for_test(std::string_view s) {
     return tokenise(s);
 }
 
+std::vector<TokenChunk> tokenise_sentence(std::string_view s) {
+    return tokenise(s);
+}
+
 // ─── Encoder forward ───────────────────────────────────────────────────────
 
 struct PosTagger::Impl {
