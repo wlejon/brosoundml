@@ -23,22 +23,30 @@ import re
 import struct
 import sys
 
-MAGIC = 0x504F5301  # "POS\x01"
+MAGIC = 0x504F5302  # "POS\x02" — v2 adds a uint8 UPOS id block per sentence.
 MAX_SEQ_LEN = 384
+
+# Universal Dependencies v2 universal POS tag inventory (17 tags). Fixed —
+# the C++ side hardcodes the same order and never re-derives it from data.
+UPOS_TAGS = [
+    "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ", "NOUN", "NUM",
+    "PART", "PRON", "PROPN", "PUNCT", "SCONJ", "SYM", "VERB", "X",
+]
+UPOS_TO_ID = {t: i for i, t in enumerate(UPOS_TAGS)}
 
 
 def parse_conllu(path):
-    """Yield (forms, xpos) tuples, one per sentence. Skip sentences with any
-    missing XPOS. Multiword tokens (ID with '-') and empty nodes (ID with '.')
-    are skipped."""
-    forms, tags = [], []
+    """Yield (forms, xpos, upos) tuples, one per sentence. Skip sentences with
+    any missing XPOS or UPOS. Multiword tokens (ID with '-') and empty nodes
+    (ID with '.') are skipped."""
+    forms, xtags, utags = [], [], []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
             if not line:
                 if forms:
-                    yield forms, tags
-                    forms, tags = [], []
+                    yield forms, xtags, utags
+                    forms, xtags, utags = [], [], []
                 continue
             if line.startswith("#"):
                 continue
@@ -48,11 +56,12 @@ def parse_conllu(path):
             tok_id = cols[0]
             if "-" in tok_id or "." in tok_id:
                 continue
-            form, xpos = cols[1], cols[4]
+            form, upos, xpos = cols[1], cols[3], cols[4]
             forms.append(form)
-            tags.append(xpos)
+            xtags.append(xpos)
+            utags.append(upos)
         if forms:
-            yield forms, tags
+            yield forms, xtags, utags
 
 
 def tokenised_len(forms):
@@ -64,30 +73,30 @@ def tokenised_len(forms):
     return total
 
 
-def split_long(forms, tags):
+def split_long(forms, xtags, utags):
     """Split a sentence at word boundaries so each piece fits MAX_SEQ_LEN
     under the chunk 1 tokeniser. Also caps the joined byte buffer at 65535
     bytes (uint16 offsets in the binary format)."""
     out = []
-    cur_f, cur_t = [], []
+    cur_f, cur_x, cur_u = [], [], []
     cur_tok = 2  # bos + eos baseline
     cur_bytes = 0  # joined byte buffer length
-    for f, t in zip(forms, tags):
+    for f, x, u in zip(forms, xtags, utags):
         b = len(f.encode("utf-8"))
         add_tok = 1 + b
         add_bytes = (1 if cur_f else 0) + b
         if cur_f and (cur_tok + add_tok > MAX_SEQ_LEN or cur_bytes + add_bytes > 65000):
-            out.append((cur_f, cur_t))
-            cur_f, cur_t, cur_tok, cur_bytes = [], [], 2, 0
+            out.append((cur_f, cur_x, cur_u))
+            cur_f, cur_x, cur_u, cur_tok, cur_bytes = [], [], [], 2, 0
             add_bytes = b
         cur_f.append(f)
-        cur_t.append(t)
+        cur_x.append(x)
+        cur_u.append(u)
         cur_tok += add_tok
         cur_bytes += add_bytes
     if cur_f:
-        # Reject lone words that themselves overflow.
         if cur_tok <= MAX_SEQ_LEN and cur_bytes <= 65000:
-            out.append((cur_f, cur_t))
+            out.append((cur_f, cur_x, cur_u))
     return out
 
 
@@ -145,6 +154,19 @@ def write_tags_header(path, tags, treebanks):
         lines.append(f"    \"{esc}\",")
     lines.append("};")
     lines.append("")
+    lines.append("// Universal Dependencies v2 UPOS — fixed inventory, 17 tags.")
+    lines.append("enum class UPosTag : std::uint8_t {")
+    for u in UPOS_TAGS:
+        lines.append(f"    {u},")
+    lines.append("};")
+    lines.append("")
+    lines.append(f"inline constexpr std::uint32_t NUM_UPOS_TAGS = {len(UPOS_TAGS)};")
+    lines.append("")
+    lines.append("inline constexpr const char* kUPosTagNames[NUM_UPOS_TAGS] = {")
+    for u in UPOS_TAGS:
+        lines.append(f"    \"{u}\",")
+    lines.append("};")
+    lines.append("")
     lines.append("}  // namespace brosoundml::g2p")
     lines.append("")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -153,11 +175,21 @@ def write_tags_header(path, tags, treebanks):
 
 
 def serialize_sentences(path, sentences, tag_to_id):
+    """Binary layout v2 (magic 0x504F5302):
+       [u32 magic][u32 num_xpos_tags][u32 num_sentences]
+       per sentence:
+         [u32 num_bytes][bytes...]
+         [u32 num_words]
+         [u8  xpos_id  × num_words]
+         [u8  upos_id  × num_words]     ← new in v2
+         [u16 word_byte_start × num_words]
+         [u16 word_byte_len   × num_words]
+    """
     with open(path, "wb") as f:
         f.write(struct.pack("<I", MAGIC))
         f.write(struct.pack("<I", len(tag_to_id)))
         f.write(struct.pack("<I", len(sentences)))
-        for forms, tags in sentences:
+        for forms, xtags, utags in sentences:
             joined = " ".join(forms).encode("utf-8")
             offsets = []
             off = 0
@@ -168,8 +200,10 @@ def serialize_sentences(path, sentences, tag_to_id):
             f.write(struct.pack("<I", len(joined)))
             f.write(joined)
             f.write(struct.pack("<I", len(forms)))
-            for t in tags:
+            for t in xtags:
                 f.write(struct.pack("<B", tag_to_id[t]))
+            for u in utags:
+                f.write(struct.pack("<B", UPOS_TO_ID[u]))
             for start, _ in offsets:
                 f.write(struct.pack("<H", start))
             for _, ln in offsets:
@@ -197,22 +231,28 @@ def main():
             print(f"warn: no .conllu files under {tb_dir}", file=sys.stderr)
             continue
         for fp in files:
-            for forms, tags in parse_conllu(fp):
-                if any(t == "_" or not t for t in tags):
+            for forms, xtags, utags in parse_conllu(fp):
+                if any(t == "_" or not t for t in xtags):
                     dropped += 1
                     continue
-                pieces = split_long(forms, tags)
+                if any(t == "_" or not t for t in utags):
+                    dropped += 1
+                    continue
+                if any(t not in UPOS_TO_ID for t in utags):
+                    dropped += 1
+                    continue
+                pieces = split_long(forms, xtags, utags)
                 if not pieces:
                     dropped += 1
                     continue
-                for f, t in pieces:
-                    all_sentences.append((f, t))
+                for f, x, u in pieces:
+                    all_sentences.append((f, x, u))
 
-    tag_set = sorted({t for _, ts in all_sentences for t in ts})
+    tag_set = sorted({t for _, xs, _ in all_sentences for t in xs})
     tag_to_id = {t: i for i, t in enumerate(tag_set)}
 
     max_tok = 0
-    for forms, _ in all_sentences:
+    for forms, _, _ in all_sentences:
         l = tokenised_len(forms)
         if l > max_tok:
             max_tok = l

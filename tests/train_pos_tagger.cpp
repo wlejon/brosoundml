@@ -29,6 +29,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -52,7 +53,8 @@ struct Sentence {
     std::string                bytes;       // joined byte buffer (space-sep)
     std::vector<std::uint16_t> word_start;  // per-word byte offset into `bytes`
     std::vector<std::uint16_t> word_len;
-    std::vector<std::uint8_t>  tag_id;
+    std::vector<std::uint8_t>  tag_id;      // XPOS ids
+    std::vector<std::uint8_t>  upos_id;     // UPOS ids
 };
 
 std::vector<Sentence> load_dataset(const std::string& path) {
@@ -65,8 +67,9 @@ std::vector<Sentence> load_dataset(const std::string& path) {
         std::uint16_t v; f.read(reinterpret_cast<char*>(&v), 2); return v;
     };
     const std::uint32_t magic = u32();
-    if (magic != 0x504F5301u) fail("train_pos_tagger",
-        "bad dataset magic in '" + path + "'");
+    if (magic != 0x504F5302u) fail("train_pos_tagger",
+        "bad dataset magic in '" + path + "' (expected v2 0x504F5302; "
+        "regenerate with tools/build_pos_dataset.py)");
     const std::uint32_t num_tags    = u32();
     const std::uint32_t num_sentences = u32();
     if (static_cast<int>(num_tags) != g::NUM_TAGS) {
@@ -84,17 +87,21 @@ std::vector<Sentence> load_dataset(const std::string& path) {
         const std::uint32_t nw = u32();
         sent.tag_id.resize(nw);
         f.read(reinterpret_cast<char*>(sent.tag_id.data()), nw);
+        sent.upos_id.resize(nw);
+        f.read(reinterpret_cast<char*>(sent.upos_id.data()), nw);
         sent.word_start.resize(nw);
         for (std::uint32_t i = 0; i < nw; ++i) sent.word_start[i] = u16();
         sent.word_len.resize(nw);
         for (std::uint32_t i = 0; i < nw; ++i) sent.word_len[i] = u16();
-        // sanity: per-byte validity
         for (std::uint32_t i = 0; i < nw; ++i) {
             if (static_cast<std::uint32_t>(sent.word_start[i]) + sent.word_len[i] > nb) {
                 fail("train_pos_tagger", "word offset overflow in dataset");
             }
             if (sent.tag_id[i] >= g::NUM_TAGS) {
-                fail("train_pos_tagger", "tag id out of range in dataset");
+                fail("train_pos_tagger", "xpos id out of range in dataset");
+            }
+            if (sent.upos_id[i] >= g::NUM_UPOS_TAGS) {
+                fail("train_pos_tagger", "upos id out of range in dataset");
             }
         }
         out.push_back(std::move(sent));
@@ -135,6 +142,21 @@ void init_xavier(bt::Tensor& W, int out_dim, int in_dim,
     bt::Tensor cpu_W = bt::Tensor::mat(out_dim, in_dim);
     bt::xavier_init(cpu_W, rng_state);
     W = cpu_W.to(bt::default_device());
+}
+
+// Training-only auxiliary UPOS head — never serialised into model.bin.
+struct AuxHead {
+    int               in_features  = 0;
+    int               out_features = 0;
+    bt::Tensor        W;   // (NUM_UPOS_TAGS, d_model)
+    bt::Tensor        b;   // (NUM_UPOS_TAGS, 1)
+};
+
+void init_aux_head(AuxHead& h, int d_model, std::uint64_t& rng) {
+    h.in_features  = d_model;
+    h.out_features = static_cast<int>(g::NUM_UPOS_TAGS);
+    init_xavier(h.W, h.out_features, d_model, rng);
+    init_zero(h.b, h.out_features, 1);
 }
 
 void init_pos_weights(g::PosWeights& w, std::uint64_t seed) {
@@ -243,6 +265,21 @@ std::vector<Param> make_param_list(g::PosWeights& w) {
     return ps;
 }
 
+void append_aux_params(std::vector<Param>& ps, AuxHead& h) {
+    auto add = [&](bt::Tensor* t, bool decay, const std::string& nm) {
+        Param p;
+        p.data  = t;
+        p.grad  = bt::Tensor::zeros(t->rows, t->cols);
+        p.m     = bt::Tensor::zeros(t->rows, t->cols);
+        p.v     = bt::Tensor::zeros(t->rows, t->cols);
+        p.decay = decay;
+        p.name  = nm;
+        ps.push_back(std::move(p));
+    };
+    add(&h.W, true,  "upos_head.W");
+    add(&h.b, false, "upos_head.b");
+}
+
 void zero_grads(std::vector<Param>& ps) {
     for (auto& p : ps) p.grad.zero();
 }
@@ -285,12 +322,15 @@ struct ForwardCache {
     std::vector<std::int32_t> wsep_positions;
     bt::Tensor h0;        // (L, D) embedding sum
     std::vector<LayerCache> layers;
+    std::vector<std::uint8_t> layer_active;  // 1 = ran block, 0 = skipped
+    float      layer_eval_scale = 1.0f;      // eval scaling applied to outputs
     bt::Tensor h_pre_final_ln;   // (L, D)
     bt::Tensor h_final;          // (L, D) post final_ln
     bt::Tensor final_xhat;       // (L, D)
     bt::Tensor final_rstd;       // (L, 1)
     bt::Tensor pooled;           // (W, D)
-    bt::Tensor logits;           // (W, NUM_TAGS)
+    bt::Tensor logits;           // (W, NUM_TAGS) — XPOS
+    bt::Tensor upos_logits;      // (W, NUM_UPOS_TAGS) — aux
 };
 
 // Upload an int32 host vector to an INT32 tensor on the current default
@@ -323,11 +363,18 @@ void embed_forward(const g::PosWeights& w, const std::vector<std::int32_t>& ids,
     bt::add_inplace_batched(out, pe);
 }
 
-// Forward one sentence; populates fc.logits.
+// Forward one sentence; populates fc.logits and (when aux != nullptr)
+// fc.upos_logits. `layer_active` is a per-layer 0/1 mask: 1 = run the block,
+// 0 = skip (residual = identity). When non-empty its size must equal num
+// layers. `layer_eval_scale` is multiplied into each non-skipped block's
+// output (use 1.0 in training; (1 - p_drop_layer) at eval).
 void forward_sentence(const g::PosWeights& w,
                       const std::vector<std::int32_t>& token_ids,
                       const std::vector<std::int32_t>& wsep_positions,
-                      ForwardCache& fc) {
+                      ForwardCache& fc,
+                      const AuxHead* aux = nullptr,
+                      const std::vector<std::uint8_t>* layer_active = nullptr,
+                      float layer_eval_scale = 1.0f) {
     const int L = static_cast<int>(token_ids.size());
     const int D = w.d_model;
     fc.token_ids      = token_ids;
@@ -336,12 +383,22 @@ void forward_sentence(const g::PosWeights& w,
     embed_forward(w, token_ids, fc.h0);
 
     fc.layers.assign(w.layers.size(), LayerCache{});
+    fc.layer_active.assign(w.layers.size(), 1u);
+    if (layer_active && layer_active->size() == w.layers.size()) {
+        fc.layer_active = *layer_active;
+    }
+    fc.layer_eval_scale = layer_eval_scale;
     // residual stream — start as a deep copy of h0 (device-aware via clone()).
     bt::Tensor h_resid = fc.h0.clone();
 
     for (std::size_t li = 0; li < w.layers.size(); ++li) {
         const auto& Lw = w.layers[li];
         auto& C = fc.layers[li];
+
+        // Stochastic depth: skip the entire block (residual = identity).
+        if (!fc.layer_active[li]) {
+            continue;
+        }
 
         // Save input to ln1 (== current residual)
         C.h_in = h_resid.clone();
@@ -365,7 +422,10 @@ void forward_sentence(const g::PosWeights& w,
                         C.Qh, C.Kh, C.Vh, C.Attnh, C.Yconcat,
                         C.attn_out);
 
-        // residual: h_resid += attn_out
+        // residual: h_resid += scale * attn_out  (scale = 1 in train)
+        if (fc.layer_eval_scale != 1.0f) {
+            bt::scale_inplace(C.attn_out, fc.layer_eval_scale);
+        }
         bt::add_inplace_batched(h_resid, C.attn_out);
         // snapshot pre-ln2 state
         C.h_mid = h_resid.clone();
@@ -386,7 +446,10 @@ void forward_sentence(const g::PosWeights& w,
         // ffn2
         C.ffn2_out = bt::Tensor::zeros(L, D);
         Lw.ffn2.forward_batched(C.ffn1_act, C.ffn2_out);
-        // residual
+        // residual (scale eval-side)
+        if (fc.layer_eval_scale != 1.0f) {
+            bt::scale_inplace(C.ffn2_out, fc.layer_eval_scale);
+        }
         bt::add_inplace_batched(h_resid, C.ffn2_out);
     }
 
@@ -408,6 +471,11 @@ void forward_sentence(const g::PosWeights& w,
     }
     fc.logits = bt::Tensor::zeros(W, w.num_tags);
     w.head.forward_batched(fc.pooled, fc.logits);
+
+    if (aux) {
+        fc.upos_logits = bt::Tensor::zeros(W, aux->out_features);
+        bt::linear_forward_batched(aux->W, aux->b, fc.pooled, fc.upos_logits);
+    }
 }
 
 // Backward one sentence given dLogits — accumulates grads into Param entries.
@@ -459,16 +527,28 @@ ParamRefs param_refs(std::vector<Param>& ps) {
 
 void backward_sentence(const g::PosWeights& w,
                        const ForwardCache& fc,
-                       const bt::Tensor& dLogits,   // (W, NUM_TAGS)
-                       ParamRefs& gr) {
+                       const bt::Tensor& dLogits,        // (W, NUM_TAGS)
+                       ParamRefs& gr,
+                       const AuxHead* aux = nullptr,
+                       const bt::Tensor* dUposLogits = nullptr,
+                       bt::Tensor* gAuxW = nullptr,
+                       bt::Tensor* gAuxB = nullptr) {
     const int L = static_cast<int>(fc.token_ids.size());
     const int Wn = static_cast<int>(fc.wsep_positions.size());
     const int D = w.d_model;
 
-    // head backward
+    // head backward (XPOS)
     bt::Tensor dPooled = bt::Tensor::zeros(Wn, D);
     bt::linear_backward_batched(w.head.W, fc.pooled, dLogits,
                                 dPooled, *gr.head_W, *gr.head_b);
+
+    // aux head backward (UPOS) — gradient to dPooled is summed with XPOS branch.
+    if (aux && dUposLogits && gAuxW && gAuxB) {
+        bt::Tensor dPooled_upos = bt::Tensor::zeros(Wn, D);
+        bt::linear_backward_batched(aux->W, fc.pooled, *dUposLogits,
+                                    dPooled_upos, *gAuxW, *gAuxB);
+        bt::add_inplace_batched(dPooled, dPooled_upos);
+    }
 
     // scatter dPooled into dH_final at wsep positions (device-aware).
     bt::Tensor dH_final = bt::Tensor::zeros(L, D);
@@ -488,6 +568,12 @@ void backward_sentence(const g::PosWeights& w,
         const auto& Lw = w.layers[li];
         const auto& C  = fc.layers[li];
         auto& gL = gr.layers[li];
+
+        // Stochastic depth: layer was skipped — residual is identity, gradient
+        // passes through unchanged. No weight grads for this layer.
+        if (!fc.layer_active[static_cast<std::size_t>(li)]) {
+            continue;
+        }
 
         // dH_resid is grad w.r.t. h_resid AFTER this layer (= post ffn residual).
         // The residual edge propagates dH_resid through to h_mid as-is.
@@ -646,15 +732,78 @@ void save_checkpoint(const std::string& path, const g::PosWeights& w) {
     for (const auto& s : specs) w_tensor(f, s.name, *s.t);
 }
 
+// Aux UPOS head — never goes into model.bin. Magic 0x504F5303 ("POS\x03").
+void save_aux_head(const std::string& path, const AuxHead& h) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) fail("train_pos_tagger", "could not write aux head '" + path + "'");
+    w_u32(f, 0x504F5303u);
+    w_u32(f, 1u);
+    w_u32(f, static_cast<std::uint32_t>(h.out_features));
+    w_u32(f, static_cast<std::uint32_t>(h.in_features));
+    w_u32(f, 2u);  // num tensors
+    w_tensor(f, "upos_head.W", h.W);
+    w_tensor(f, "upos_head.b", h.b);
+}
+
 // ─── Byte-noise + tokeniser dispatch ─────────────────────────────────────
 
 void apply_byte_noise(std::vector<std::int32_t>& ids, std::mt19937& rng,
                       float p_noise) {
+    if (p_noise <= 0.0f) return;
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     std::uniform_int_distribution<int> b(4, 259);
     for (auto& t : ids) {
         if (t >= 4 && u(rng) < p_noise) t = b(rng);
     }
+}
+
+// Drop entire word byte ranges with probability p_word, keeping each <wsep>
+// anchor in place. Renumbers `wsep_positions` to match the trimmed sequence.
+// `ids` and `wsep_positions` are rewritten in-place. The tag vector is left
+// alone (one tag per surviving wsep, same order).
+void apply_word_dropout(std::vector<std::int32_t>& ids,
+                        std::vector<std::int32_t>& wsep_positions,
+                        std::mt19937& rng, float p_word) {
+    if (p_word <= 0.0f || wsep_positions.empty()) return;
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+
+    const int W = static_cast<int>(wsep_positions.size());
+    const int L = static_cast<int>(ids.size());
+    std::vector<std::int32_t> new_ids;
+    std::vector<std::int32_t> new_wsep;
+    new_ids.reserve(ids.size());
+    new_wsep.reserve(W);
+
+    // bytes before the first wsep (the <bos>): copy verbatim.
+    for (int i = 0; i < wsep_positions[0]; ++i) new_ids.push_back(ids[i]);
+
+    for (int wi = 0; wi < W; ++wi) {
+        const int wsep_pos = wsep_positions[wi];
+        const int next_pos = (wi + 1 < W) ? wsep_positions[wi + 1] : L;
+        new_wsep.push_back(static_cast<std::int32_t>(new_ids.size()));
+        new_ids.push_back(ids[wsep_pos]);                      // <wsep>
+        const bool drop = (u(rng) < p_word);
+        if (!drop) {
+            for (int j = wsep_pos + 1; j < next_pos; ++j) {
+                new_ids.push_back(ids[j]);
+            }
+        }
+    }
+    // Trailing <eos> (and anything past the last word) — copy from after last
+    // word's byte range; but we already consumed everything up to `L`. The
+    // tail after the final word is L..L → empty. The <eos> sat at L-1
+    // immediately after the final word's bytes, but it's included as part of
+    // the final word's [wsep_pos+1, next_pos=L) range above. Wait — the
+    // tokeniser places <eos> AFTER the final word's bytes; with wsep_positions
+    // listing only wseps, next_pos for the last word == L includes the eos.
+    // If the last word was dropped, we dropped the eos too. Append it back.
+    if (!ids.empty() && ids.back() == 2 /*kEos*/) {
+        if (new_ids.empty() || new_ids.back() != 2) {
+            new_ids.push_back(2);
+        }
+    }
+    ids = std::move(new_ids);
+    wsep_positions = std::move(new_wsep);
 }
 
 // ─── Synthetic dataset helper (--synthetic) ──────────────────────────────
@@ -693,6 +842,10 @@ std::vector<Sentence> make_synthetic_dataset(int n_sentences,
                 h = (h ^ static_cast<unsigned char>(joined[o.first + k])) * 16777619u;
             }
             sent.tag_id.push_back(static_cast<std::uint8_t>(h % g::NUM_TAGS));
+            // Deterministic UPOS by a separate hash variant.
+            std::uint32_t hu = h ^ 0x9E3779B9u;
+            sent.upos_id.push_back(
+                static_cast<std::uint8_t>(hu % g::NUM_UPOS_TAGS));
         }
         (void)tagpick;
         out.push_back(std::move(sent));
@@ -712,8 +865,12 @@ struct Args {
     int warmup = 1000;
     int seed   = 42;
     std::string device = "cpu";
-    bool synthetic = false;
-    bool help = false;
+    bool  synthetic    = false;
+    bool  help         = false;
+    float byte_noise   = 0.10f;
+    float word_dropout = 0.10f;
+    float layer_dropout = 0.10f;
+    float upos_weight  = 1.0f;
 };
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -733,6 +890,10 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--seed")      a.seed = std::stoi(next());
         else if (k == "--device")    a.device = next();
         else if (k == "--synthetic") a.synthetic = true;
+        else if (k == "--byte-noise")    a.byte_noise    = std::stof(next());
+        else if (k == "--word-dropout")  a.word_dropout  = std::stof(next());
+        else if (k == "--layer-dropout") a.layer_dropout = std::stof(next());
+        else if (k == "--upos-weight")   a.upos_weight   = std::stof(next());
         else if (k == "--help" || k == "-h") { a.help = true; return true; }
         else fail("cli", "unknown flag '" + k + "'");
     }
@@ -752,7 +913,11 @@ void print_help() {
         "  --seed N           (default 42)\n"
         "  --device cpu|cuda  (default cpu)\n"
         "  --synthetic        ignore --train/--val, build a tiny in-memory set\n"
-        "                     and run 2 epochs end-to-end (smoke test).\n";
+        "                     and run 2 epochs end-to-end (smoke test).\n"
+        "  --byte-noise F     byte-noise probability (default 0.10)\n"
+        "  --word-dropout F   whole-word dropout probability (default 0.10)\n"
+        "  --layer-dropout F  per-layer stochastic depth probability (default 0.10)\n"
+        "  --upos-weight F    aux UPOS loss weight (default 1.0)\n";
 }
 
 // ─── Main training loop ──────────────────────────────────────────────────
@@ -769,8 +934,37 @@ float lr_schedule(int step, int total_steps, int warmup, float lr_peak,
     return lr_floor + 0.5f * (lr_peak - lr_floor) * (1.0f + std::cos(pi * t));
 }
 
-float evaluate(const g::PosWeights& w, const std::vector<Sentence>& data) {
-    int total = 0, correct = 0;
+struct EvalStats {
+    float xpos_acc;
+    float upos_acc;
+    float val_loss;   // mean (xpos_xent + upos_weight * upos_xent) per word
+};
+
+// Compute mean cross-entropy on (logits, target_ids), no dropout, no noise.
+// Returns sum of per-word losses (caller divides by total).
+float xent_only(const bt::Tensor& logits,
+                const std::vector<std::uint8_t>& targets) {
+    const int Wn = logits.rows;
+    const int C  = logits.cols;
+    std::vector<float> lh = logits.to_host_vector();
+    std::vector<float> probs(C), tgt(C), dlog(C);
+    float total = 0.0f;
+    for (int i = 0; i < Wn; ++i) {
+        std::fill(tgt.begin(), tgt.end(), 0.0f);
+        tgt[targets[i]] = 1.0f;
+        const float* lg = lh.data() + static_cast<std::size_t>(i) * C;
+        total += bt::softmax_xent_segment(lg, tgt.data(), probs.data(),
+                                          dlog.data(), C, nullptr);
+    }
+    return total;
+}
+
+EvalStats evaluate(const g::PosWeights& w, const AuxHead& aux,
+                   const std::vector<Sentence>& data,
+                   float layer_dropout, float upos_weight) {
+    const float eval_scale = 1.0f - layer_dropout;
+    int total = 0, x_correct = 0, u_correct = 0;
+    float loss_sum = 0.0f;
     for (const auto& s : data) {
         std::string text = sentence_text(s);
         auto chunks = g::tokenise_sentence(text);
@@ -778,19 +972,39 @@ float evaluate(const g::PosWeights& w, const std::vector<Sentence>& data) {
         for (const auto& c : chunks) {
             if (c.wsep_positions.empty()) continue;
             ForwardCache fc;
-            forward_sentence(w, c.token_ids, c.wsep_positions, fc);
-            bt::Tensor idx_dev;
-            bt::argmax_rows(fc.logits, idx_dev);
-            auto idx = idx_dev.to_host_vector();
+            forward_sentence(w, c.token_ids, c.wsep_positions, fc,
+                             &aux, /*layer_active=*/nullptr, eval_scale);
+            bt::Tensor xi_dev, ui_dev;
+            bt::argmax_rows(fc.logits, xi_dev);
+            bt::argmax_rows(fc.upos_logits, ui_dev);
+            auto xi = xi_dev.to_host_vector();
+            auto ui = ui_dev.to_host_vector();
+
+            // Gather targets in chunk order.
+            std::vector<std::uint8_t> xtgt, utgt;
+            std::size_t saved_word_idx = word_idx;
             for (std::size_t i = 0; i < c.wsep_positions.size(); ++i, ++word_idx) {
                 if (word_idx >= s.tag_id.size()) break;
-                const int pred = static_cast<int>(idx[i]);
-                if (pred == s.tag_id[word_idx]) ++correct;
+                xtgt.push_back(s.tag_id[word_idx]);
+                utgt.push_back(s.upos_id[word_idx]);
+            }
+            loss_sum += xent_only(fc.logits, xtgt);
+            loss_sum += upos_weight * xent_only(fc.upos_logits, utgt);
+
+            word_idx = saved_word_idx;
+            for (std::size_t i = 0; i < c.wsep_positions.size(); ++i, ++word_idx) {
+                if (word_idx >= s.tag_id.size()) break;
+                if (static_cast<int>(xi[i]) == s.tag_id[word_idx])  ++x_correct;
+                if (static_cast<int>(ui[i]) == s.upos_id[word_idx]) ++u_correct;
                 ++total;
             }
         }
     }
-    return (total == 0) ? 0.0f : static_cast<float>(correct) / total;
+    EvalStats r;
+    r.xpos_acc = (total == 0) ? 0.0f : static_cast<float>(x_correct) / total;
+    r.upos_acc = (total == 0) ? 0.0f : static_cast<float>(u_correct) / total;
+    r.val_loss = (total == 0) ? 0.0f : loss_sum / total;
+    return r;
 }
 
 int run_training(Args& a) {
@@ -826,17 +1040,37 @@ int run_training(Args& a) {
 
     g::PosWeights w;
     init_pos_weights(w, static_cast<std::uint64_t>(a.seed) ^ 0xC0FFEEu);
+    AuxHead aux;
+    {
+        std::uint64_t aux_rng = static_cast<std::uint64_t>(a.seed) ^ 0xA0FACEu;
+        init_aux_head(aux, w.d_model, aux_rng);
+    }
     auto params = make_param_list(w);
+    append_aux_params(params, aux);
     auto grefs  = param_refs(params);
+
+    // Locate aux head grads so backward can find them by name.
+    bt::Tensor* gAuxW = nullptr;
+    bt::Tensor* gAuxB = nullptr;
+    for (auto& p : params) {
+        if (p.name == "upos_head.W") gAuxW = &p.grad;
+        if (p.name == "upos_head.b") gAuxB = &p.grad;
+    }
+
+    std::cout << "regularisation: byte_noise=" << a.byte_noise
+              << " word_dropout=" << a.word_dropout
+              << " layer_dropout=" << a.layer_dropout << "\n";
+    std::cout << "aux: upos_weight=" << a.upos_weight << "\n";
 
     const int steps_per_epoch = std::max(1, static_cast<int>(train.size()) / a.batch);
     const int total_steps = a.epochs * steps_per_epoch;
     std::mt19937 rng(static_cast<std::uint32_t>(a.seed));
 
     int global_step = 1;
-    float best_val = 0.0f;
+    float best_val_loss = std::numeric_limits<float>::infinity();
     int patience = 0;
     std::string best_ckpt;
+    std::string best_aux_ckpt;
 
     for (int epoch = 0; epoch < a.epochs; ++epoch) {
         std::vector<std::size_t> order(train.size());
@@ -849,14 +1083,16 @@ int run_training(Args& a) {
         for (int step = 0; step < steps_per_epoch; ++step) {
             zero_grads(params);
 
-            // Tokenise all sentences in this micro-batch first.
             struct Item {
                 std::vector<std::int32_t> ids;
                 std::vector<std::int32_t> wsep;
-                std::vector<std::uint8_t> tags;
+                std::vector<std::uint8_t> xtags;
+                std::vector<std::uint8_t> utags;
+                std::vector<std::uint8_t> layer_active;  // per-layer drop mask
             };
             std::vector<Item> items;
             items.reserve(a.batch);
+            std::uniform_real_distribution<float> u01(0.0f, 1.0f);
             for (int b = 0; b < a.batch; ++b) {
                 const auto& s = train[order[(step * a.batch + b) % train.size()]];
                 std::string text = sentence_text(s);
@@ -869,15 +1105,23 @@ int run_training(Args& a) {
                     }
                     Item it;
                     it.ids  = c.token_ids;
-                    apply_byte_noise(it.ids, rng, 0.02f);
                     it.wsep = c.wsep_positions;
                     for (std::size_t i = 0; i < c.word_spans.size(); ++i, ++word_idx) {
                         if (word_idx >= s.tag_id.size()) break;
-                        it.tags.push_back(s.tag_id[word_idx]);
+                        it.xtags.push_back(s.tag_id[word_idx]);
+                        it.utags.push_back(s.upos_id[word_idx]);
                     }
-                    if (it.tags.size() != it.wsep.size()) {
-                        // alignment drifted from chunking — skip
-                        continue;
+                    if (it.xtags.size() != it.wsep.size()) continue;
+
+                    // (b) whole-word dropout BEFORE byte-noise.
+                    apply_word_dropout(it.ids, it.wsep, rng, a.word_dropout);
+                    // (a) byte-noise.
+                    apply_byte_noise(it.ids, rng, a.byte_noise);
+
+                    // (c) per-layer stochastic-depth mask, sampled per-sentence.
+                    it.layer_active.assign(g::kNumLayers, 1u);
+                    for (int li = 0; li < g::kNumLayers; ++li) {
+                        if (u01(rng) < a.layer_dropout) it.layer_active[li] = 0u;
                     }
                     items.push_back(std::move(it));
                 }
@@ -885,22 +1129,31 @@ int run_training(Args& a) {
 
             if (items.empty()) continue;
 
-            // Per-sentence forward + xent + backward. The 1/total_words scaling
-            // is applied directly into dLogits before backward.
             int total_words = 0;
             for (const auto& it : items) total_words += static_cast<int>(it.wsep.size());
             const float scale = 1.0f / static_cast<float>(total_words);
 
-            float loss_sum = 0.0f;
+            float xpos_loss_sum = 0.0f;
+            float upos_loss_sum = 0.0f;
             for (std::size_t i = 0; i < items.size(); ++i) {
                 ForwardCache fc;
-                forward_sentence(w, items[i].ids, items[i].wsep, fc);
+                forward_sentence(w, items[i].ids, items[i].wsep, fc,
+                                 &aux, &items[i].layer_active, /*eval_scale=*/1.0f);
+
                 bt::Tensor dLogits;
-                loss_sum += xent_words(fc.logits, items[i].tags, dLogits);
+                xpos_loss_sum += xent_words(fc.logits, items[i].xtags, dLogits);
                 bt::scale_inplace(dLogits, scale);
-                backward_sentence(w, fc, dLogits, grefs);
+
+                bt::Tensor dUposLogits;
+                upos_loss_sum += xent_words(fc.upos_logits, items[i].utags, dUposLogits);
+                // Apply 1/total_words scaling and upos loss weight.
+                bt::scale_inplace(dUposLogits, scale * a.upos_weight);
+
+                backward_sentence(w, fc, dLogits, grefs,
+                                  &aux, &dUposLogits, gAuxW, gAuxB);
             }
 
+            const float loss_sum = xpos_loss_sum + a.upos_weight * upos_loss_sum;
             epoch_loss  += loss_sum;
             epoch_words += total_words;
 
@@ -911,47 +1164,67 @@ int run_training(Args& a) {
             if (global_step % 20 == 0) {
                 std::cout << "epoch " << epoch << " step " << global_step
                           << "/" << total_steps
-                          << " loss " << std::fixed << std::setprecision(4)
-                          << (loss_sum / total_words)
+                          << " xpos_loss " << std::fixed << std::setprecision(4)
+                          << (xpos_loss_sum / total_words)
+                          << " upos_loss " << (upos_loss_sum / total_words)
+                          << " total "     << (loss_sum / total_words)
                           << " lr " << std::scientific << std::setprecision(2) << lr
                           << std::defaultfloat << std::endl;
             }
             ++global_step;
         }
 
-        const float val_acc = evaluate(w, val);
+        const EvalStats es = evaluate(w, aux, val, a.layer_dropout, a.upos_weight);
         std::cout << "epoch " << epoch
-                  << " mean_loss " << (epoch_loss / std::max(1, epoch_words))
-                  << " val_acc " << val_acc << std::endl;
+                  << " mean_loss " << std::fixed << std::setprecision(4)
+                  << (epoch_loss / std::max(1, epoch_words))
+                  << " val_loss " << es.val_loss
+                  << " xpos_val_acc " << es.xpos_acc
+                  << " upos_val_acc " << es.upos_acc
+                  << std::defaultfloat << std::endl;
 
-        // Checkpoint.
+        // Checkpoint XPOS-only weights for the inference path. Aux head saved
+        // to a sibling file (different magic, training-only).
         char buf[64];
         std::snprintf(buf, sizeof(buf), "checkpoint_%02d.bin", epoch);
         std::string ckpt = (std::filesystem::path(a.out_dir) / buf).string();
         save_checkpoint(ckpt, w);
 
-        if (val_acc > best_val + 1e-6f) {
-            best_val = val_acc;
+        std::snprintf(buf, sizeof(buf), "aux_head_%02d.bin", epoch);
+        std::string aux_ckpt = (std::filesystem::path(a.out_dir) / buf).string();
+        save_aux_head(aux_ckpt, aux);
+
+        if (es.val_loss + 1e-4f < best_val_loss) {
+            best_val_loss = es.val_loss;
             best_ckpt = ckpt;
+            best_aux_ckpt = aux_ckpt;
             patience = 0;
         } else if (++patience >= 3) {
-            std::cout << "early stop at epoch " << epoch << "\n";
+            std::cout << "early stop at epoch " << epoch
+                      << " (val_loss plateau)\n";
             break;
         }
     }
 
-    // Copy best (or last) checkpoint to model.bin.
+    // Copy best (or last) checkpoint to model.bin and aux_head.bin.
     std::string final_ckpt = best_ckpt.empty() ? "" : best_ckpt;
     if (final_ckpt.empty()) {
         // fall back to last
         std::string last = (std::filesystem::path(a.out_dir) / "model.bin").string();
         save_checkpoint(last, w);
         final_ckpt = last;
+        std::string aux_last = (std::filesystem::path(a.out_dir) / "aux_head.bin").string();
+        save_aux_head(aux_last, aux);
     } else {
         std::string dst = (std::filesystem::path(a.out_dir) / "model.bin").string();
         std::filesystem::copy_file(final_ckpt, dst,
             std::filesystem::copy_options::overwrite_existing);
         final_ckpt = dst;
+        if (!best_aux_ckpt.empty()) {
+            std::string adst = (std::filesystem::path(a.out_dir) / "aux_head.bin").string();
+            std::filesystem::copy_file(best_aux_ckpt, adst,
+                std::filesystem::copy_options::overwrite_existing);
+        }
     }
 
     // Round-trip: load via PosTagger::load and tag a sentence.
