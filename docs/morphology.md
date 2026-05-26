@@ -267,7 +267,11 @@ Required coverage:
    - `"needed"` → stem `"need"`, glue `ᵻd` (after /d/).
    - `"waited"` → stem `"wait"`, replace trailing `t` with `ɾᵻd`
      (intervocalic flap).
-   - `"seed"` (ends in `eed`) → rule rejects.
+   - `"seed"` (ends in `eed`) → candidate 2 rejects (the `"eed"` guard is
+     on the `"ed"`-drop branch), but candidate 1 still fires by dropping
+     the trailing `d` and looking up `"see"`. The `"eed"` guard does not
+     short-circuit the whole rule. To exercise an actual all-candidates-
+     miss case use a non-lexical doubled-`d` stem like `"xyzzydd"`.
 3. **`-ing` inflection.**
    - `"walking"` → stem `"walk"`, glue `ɪŋ`.
    - `"loving"` → stem `"love"`, glue `ɪŋ`.
