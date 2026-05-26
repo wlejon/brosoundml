@@ -1,0 +1,102 @@
+The/DT cat/NN sat/VBD on/IN the/DT mat/NN ./.
+She/PRP quickly/RB ran/VBD to/IN the/DT store/NN ./.
+I/PRP have/VBP been/VBN working/VBG here/RB for/IN years/NNS ./.
+This/DT book/NN is/VBZ very/RB interesting/JJ ./.
+He/PRP gave/VBD me/PRP a/DT beautiful/JJ gift/NN ./.
+The/DT children/NNS are/VBP playing/VBG in/IN the/DT garden/NN ./.
+We/PRP should/MD leave/VB before/IN it/PRP rains/VBZ ./.
+My/PRP$ sister/NN bought/VBD a/DT new/JJ car/NN yesterday/NN ./.
+They/PRP were/VBD watching/VBG television/NN all/DT night/NN ./.
+The/DT old/JJ man/NN walked/VBD slowly/RB down/IN the/DT street/NN ./.
+Birds/NNS sing/VBP beautifully/RB in/IN the/DT morning/NN ./.
+You/PRP must/MD finish/VB your/PRP$ homework/NN today/NN ./.
+Tom/NNP and/CC Jane/NNP went/VBD shopping/VBG together/RB ./.
+She/PRP has/VBZ already/RB eaten/VBN her/PRP$ lunch/NN ./.
+The/DT teacher/NN explained/VBD the/DT lesson/NN clearly/RB ./.
+Dogs/NNS bark/VBP when/WRB strangers/NNS approach/VBP ./.
+He/PRP wants/VBZ to/TO learn/VB French/JJ next/JJ year/NN ./.
+There/EX is/VBZ a/DT problem/NN with/IN the/DT computer/NN ./.
+The/DT little/JJ girl/NN smiled/VBD shyly/RB at/IN her/PRP$ mother/NN ./.
+We/PRP often/RB visit/VBP our/PRP$ grandparents/NNS on/IN weekends/NNS ./.
+This/DT cake/NN tastes/VBZ really/RB good/JJ ./.
+I/PRP know/VBP what/WP you/PRP did/VBD last/JJ summer/NN ./.
+She/PRP can/MD speak/VB three/CD languages/NNS fluently/RB ./.
+The/DT movie/NN that/WDT we/PRP saw/VBD was/VBD terrible/JJ ./.
+Why/WRB are/VBP you/PRP always/RB so/RB late/RB ?/.
+He/PRP looked/VBD tired/JJ after/IN the/DT long/JJ flight/NN ./.
+The/DT sun/NN rises/VBZ in/IN the/DT east/NN every/DT morning/NN ./.
+My/PRP$ brother/NN works/VBZ at/IN a/DT large/JJ hospital/NN ./.
+Please/RB close/VB the/DT door/NN quietly/RB ./.
+They/PRP have/VBP lived/VBN in/IN Paris/NNP for/IN ten/CD years/NNS ./.
+The/DT students/NNS studied/VBD hard/RB for/IN their/PRP$ exams/NNS ./.
+Nobody/NN knew/VBD the/DT correct/JJ answer/NN to/IN the/DT question/NN ./.
+She/PRP wore/VBD a/DT red/JJ dress/NN to/IN the/DT party/NN ./.
+We/PRP must/MD respect/VB our/PRP$ elders/NNS ./.
+The/DT meeting/NN will/MD start/VB at/IN nine/CD ./.
+He/PRP drank/VBD the/DT coffee/NN slowly/RB while/IN reading/VBG ./.
+Several/JJ birds/NNS flew/VBD over/IN our/PRP$ house/NN ./.
+Her/PRP$ voice/NN is/VBZ soft/JJ and/CC pleasant/JJ ./.
+The/DT box/NN contains/VBZ many/JJ old/JJ photographs/NNS ./.
+I/PRP cannot/MD remember/VB his/PRP$ name/NN ./.
+The/DT wind/NN blew/VBD the/DT leaves/NNS away/RB ./.
+Mary/NNP often/RB cooks/VBZ dinner/NN for/IN the/DT family/NN ./.
+Who/WP gave/VBD you/PRP this/DT lovely/JJ flower/NN ?/.
+The/DT bridge/NN was/VBD built/VBN in/IN the/DT last/JJ century/NN ./.
+He/PRP plays/VBZ tennis/NN every/DT weekend/NN ./.
+She/PRP smiled/VBD when/WRB she/PRP saw/VBD the/DT puppy/NN ./.
+The/DT singer/NN performed/VBD several/JJ songs/NNS that/IN evening/NN ./.
+We/PRP need/VBP some/DT bread/NN and/CC milk/NN ./.
+This/DT chair/NN feels/VBZ very/RB comfortable/JJ ./.
+The/DT runner/NN crossed/VBD the/DT finish/NN line/NN first/RB ./.
+Children/NNS love/VBP playing/VBG with/IN toys/NNS ./.
+He/PRP carefully/RB opened/VBD the/DT mysterious/JJ letter/NN ./.
+The/DT lake/NN was/VBD calm/JJ and/CC quiet/JJ ./.
+My/PRP$ friend/NN lives/VBZ near/IN the/DT park/NN ./.
+She/PRP painted/VBD the/DT walls/NNS a/DT bright/JJ yellow/JJ ./.
+The/DT clock/NN on/IN the/DT wall/NN stopped/VBD working/VBG ./.
+They/PRP arrived/VBD before/IN noon/NN yesterday/NN ./.
+Many/JJ people/NNS believe/VBP in/IN that/DT theory/NN ./.
+He/PRP fixed/VBD the/DT broken/JJ window/NN himself/PRP ./.
+The/DT garden/NN looks/VBZ beautiful/JJ in/IN the/DT spring/NN ./.
+We/PRP enjoyed/VBD the/DT concert/NN very/RB much/RB ./.
+His/PRP$ father/NN is/VBZ a/DT famous/JJ doctor/NN ./.
+The/DT river/NN flows/VBZ through/IN the/DT valley/NN ./.
+I/PRP forgot/VBD where/WRB I/PRP put/VBD my/PRP$ keys/NNS ./.
+She/PRP studies/VBZ medicine/NN at/IN the/DT university/NN ./.
+The/DT children/NNS laughed/VBD loudly/RB at/IN the/DT joke/NN ./.
+He/PRP usually/RB walks/VBZ to/IN work/NN ./.
+The/DT ancient/JJ ruins/NNS attracted/VBD many/JJ tourists/NNS ./.
+We/PRP discussed/VBD the/DT plan/NN for/IN hours/NNS ./.
+This/DT idea/NN seems/VBZ promising/JJ ./.
+The/DT actor/NN won/VBD an/DT important/JJ award/NN ./.
+She/PRP was/VBD reading/VBG a/DT magazine/NN ./.
+We/PRP cleaned/VBD the/DT house/NN before/IN the/DT guests/NNS arrived/VBD ./.
+The/DT puppy/NN chased/VBD its/PRP$ tail/NN excitedly/RB ./.
+He/PRP whispered/VBD something/NN into/IN her/PRP$ ear/NN ./.
+The/DT museum/NN contains/VBZ several/JJ rare/JJ paintings/NNS ./.
+You/PRP can/MD borrow/VB my/PRP$ pencil/NN if/IN you/PRP want/VBP ./.
+They/PRP built/VBD a/DT large/JJ fire/NN in/IN the/DT yard/NN ./.
+The/DT food/NN smelled/VBD delicious/JJ ./.
+I/PRP would/MD rather/RB stay/VB at/IN home/NN tonight/NN ./.
+She/PRP carries/VBZ a/DT heavy/JJ bag/NN to/IN school/NN ./.
+The/DT engineer/NN designed/VBD a/DT new/JJ machine/NN ./.
+He/PRP refused/VBD to/TO answer/VB the/DT question/NN ./.
+The/DT mountain/NN rose/VBD high/RB above/IN the/DT clouds/NNS ./.
+My/PRP$ uncle/NN tells/VBZ funny/JJ stories/NNS ./.
+The/DT little/JJ boy/NN cried/VBD when/WRB he/PRP fell/VBD ./.
+We/PRP visited/VBD many/JJ countries/NNS last/JJ summer/NN ./.
+The/DT new/JJ restaurant/NN opens/VBZ tomorrow/NN ./.
+She/PRP wrote/VBD an/DT excellent/JJ essay/NN ./.
+The/DT roof/NN was/VBD damaged/VBN by/IN the/DT storm/NN ./.
+He/PRP planted/VBD several/JJ trees/NNS in/IN the/DT garden/NN ./.
+The/DT singer/NN has/VBZ a/DT wonderful/JJ voice/NN ./.
+They/PRP danced/VBD all/DT night/NN at/IN the/DT wedding/NN ./.
+I/PRP used/VBD to/TO play/VB chess/NN every/DT day/NN ./.
+The/DT cat/NN climbed/VBD onto/IN the/DT roof/NN ./.
+She/PRP looked/VBD happy/JJ when/WRB she/PRP heard/VBD the/DT news/NN ./.
+We/PRP should/MD always/RB tell/VB the/DT truth/NN ./.
+The/DT little/JJ stream/NN runs/VBZ behind/IN the/DT house/NN ./.
+He/PRP types/VBZ very/RB fast/RB ./.
+The/DT bakery/NN sells/VBZ fresh/JJ bread/NN every/DT morning/NN ./.
+Several/JJ guests/NNS have/VBP already/RB arrived/VBN ./.
+This/DT exercise/NN is/VBZ harder/JJR than/IN it/PRP looks/VBZ ./.
