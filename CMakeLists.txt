@@ -114,6 +114,7 @@ target_sources(brosoundml PRIVATE
     src/g2p/morphology.cpp
     src/g2p/special_cases.cpp
     src/g2p/phoneme_adapter.cpp
+    src/g2p/phonemizer.cpp
 )
 
 # --- Install ---
