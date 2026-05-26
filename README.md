@@ -32,6 +32,17 @@ CMake auto-detects standalone repos at `../<name>`, falling back to
 `third_party/` submodules — the pattern in
 [`bro/docs/multi-repo-workflow.md`](../bro/docs/multi-repo-workflow.md).
 
+## Data and weights
+
+brosoundml ships **code only** — no trained weights, no packed data, no
+voice packs are checked into this repo. Anything that gets built (POS tagger
+weights, the packed English lexicon, Kokoro voice packs, …) lives in the
+sibling [`brosoundml-data`](../brosoundml-data) repo. Loaders take file paths;
+the application (or the CLI tools in this repo) is responsible for resolving
+them — conventionally caller-supplied path > `BROSOUNDML_DATA_DIR` env var
+> `../brosoundml-data`. See `brosoundml-data/README.md` for the artifact
+inventory and per-file licenses.
+
 ## Build
 
 ```bash
@@ -73,9 +84,16 @@ text ──▶ [G2P: misaki]──▶ phonemes ──▶ [token ids]
                       and an iSTFT head ─▶ 24 kHz waveform.
 ```
 
-**G2P is out of scope.** Kokoro uses the [misaki](https://github.com/hexgrad/misaki)
-grapheme-to-phoneme frontend; brosoundml takes phoneme token ids as input and
-does not bundle a G2P engine.
+**G2P.** Kokoro upstream uses the [misaki](https://github.com/hexgrad/misaki)
+(Apache 2.0) grapheme-to-phoneme frontend. brosoundml is growing an in-tree
+English G2P at `brosoundml::g2p::` to remove that runtime dependency for
+embedded / no-Python deployments. Current state: byte-level Transformer POS
+tagger (`PosTagger`) is implemented and trained (weights in
+[`brosoundml-data`](../brosoundml-data) under `pos_tagger/`). The lexicon
+loader, morphology fallback, and the Kokoro phoneme-id adapter are in
+build-out. Until they land, callers must still pre-tokenize phonemes
+externally — `Kokoro::synthesize()` continues to accept phoneme ids
+directly.
 
 ### brotensor op coverage
 

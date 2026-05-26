@@ -51,8 +51,8 @@ the backend choice so a standalone GPU build resolves brotensor's backend.
 
 ## Dependencies
 
-Two siblings, resolved by the standard multi-repo pattern (standalone repo at
-`../<name>`, else a `third_party/` submodule fallback — see
+Code-side siblings, resolved by the standard multi-repo pattern (standalone
+repo at `../<name>`, else a `third_party/` submodule fallback — see
 `bro/docs/multi-repo-workflow.md`):
 
 - **bromath** — header-only math.
@@ -61,6 +61,18 @@ Two siblings, resolved by the standard multi-repo pattern (standalone repo at
   kernels. The audio op family it leans on (FFT/STFT, conv1d, vocoder/codec
   activations, codec quantization, resampling, `sample_logits`) is FP32 on all
   three backends — CPU, CUDA, Metal.
+- **brolm** — tokenizers for the speech models (e.g. `brolm::whisper::Tokenizer`).
+
+Data sibling, separate from the code dependency chain — loaders take paths,
+the application resolves them:
+
+- **brosoundml-data** (`../brosoundml-data`) — trained weights and packed data
+  artifacts (POS tagger `model.bin`, the planned lexicon binary, voice packs
+  not shipped with upstream model checkpoints). Local-only for now; eventual
+  home is a Hugging Face dataset repo. Path resolution convention used by
+  callers/tools: caller-supplied path > `BROSOUNDML_DATA_DIR` env var >
+  `../brosoundml-data`. The library itself never touches the filesystem
+  beyond the paths handed to it.
 
 ## Conventions
 
