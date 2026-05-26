@@ -112,6 +112,7 @@ target_sources(brosoundml PRIVATE
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
     src/g2p/morphology.cpp
+    src/g2p/special_cases.cpp
 )
 
 # --- Install ---

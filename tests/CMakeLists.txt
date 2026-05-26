@@ -29,6 +29,9 @@ target_compile_definitions(brosoundml_test_lexicon PRIVATE
 brosoundml_add_test(brosoundml_test_morphology test_morphology.cpp)
 target_compile_definitions(brosoundml_test_morphology PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+brosoundml_add_test(brosoundml_test_special_cases test_special_cases.cpp)
+target_compile_definitions(brosoundml_test_special_cases PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 # Surface the repo root to the tests' optional real-weights smoke paths.
 # Training driver — built but NOT registered as a ctest (manual tool).
 add_executable(train_pos_tagger train_pos_tagger.cpp)
