@@ -64,9 +64,6 @@ std::vector<Sentence> load_dataset(const std::string& path) {
     auto u16 = [&] {
         std::uint16_t v; f.read(reinterpret_cast<char*>(&v), 2); return v;
     };
-    auto u8 = [&] {
-        std::uint8_t v; f.read(reinterpret_cast<char*>(&v), 1); return v;
-    };
     const std::uint32_t magic = u32();
     if (magic != 0x504F5301u) fail("train_pos_tagger",
         "bad dataset magic in '" + path + "'");
@@ -113,6 +110,33 @@ std::string sentence_text(const Sentence& s) {
 
 // ─── Weight init ──────────────────────────────────────────────────────────
 
+// Device-aware init helpers. All allocate on the current default device.
+void init_zero(bt::Tensor& t, int r, int c) {
+    t = bt::Tensor::zeros(r, c);
+}
+
+void init_ones(bt::Tensor& t, int n) {
+    t = bt::Tensor::zeros(n, 1);
+    bt::add_scalar_inplace(t, 1.0f);
+}
+
+void init_normal(bt::Tensor& t, int r, int c, float stddev,
+                 std::uint64_t& rng_state) {
+    std::mt19937_64 mt(rng_state); rng_state = mt();
+    std::normal_distribution<float> dist(0.0f, stddev);
+    std::vector<float> buf(static_cast<std::size_t>(r) * c);
+    for (auto& v : buf) v = dist(mt);
+    t = bt::Tensor::from_host_on(bt::default_device(), buf.data(), r, c);
+}
+
+void init_xavier(bt::Tensor& W, int out_dim, int in_dim,
+                 std::uint64_t& rng_state) {
+    // xavier_init is documented CPU-only — build on host, migrate to device.
+    bt::Tensor cpu_W = bt::Tensor::mat(out_dim, in_dim);
+    bt::xavier_init(cpu_W, rng_state);
+    W = cpu_W.to(bt::default_device());
+}
+
 void init_pos_weights(g::PosWeights& w, std::uint64_t seed) {
     w.num_tags    = g::NUM_TAGS;
     w.d_model     = g::kDModel;
@@ -125,64 +149,45 @@ void init_pos_weights(g::PosWeights& w, std::uint64_t seed) {
 
     std::uint64_t rng = seed;
 
-    // embeddings: small normal init
-    auto fill_normal = [&](bt::Tensor& t, float stddev) {
-        const int n = t.size();
-        std::mt19937_64 mt(rng); rng = mt();
-        std::normal_distribution<float> dist(0.0f, stddev);
-        float* p = t.host_f32_mut();
-        for (int i = 0; i < n; ++i) p[i] = dist(mt);
-    };
-    auto fill_zero = [&](bt::Tensor& t) {
-        std::memset(t.host_raw_mut(), 0, t.bytes());
-    };
-    auto fill_ones = [&](bt::Tensor& t) {
-        const int n = t.size();
-        float* p = t.host_f32_mut();
-        for (int i = 0; i < n; ++i) p[i] = 1.0f;
-    };
-
-    w.token_emb = bt::Tensor::mat(g::kVocab, g::kDModel);
-    fill_normal(w.token_emb, 0.02f);
-    w.pos_emb = bt::Tensor::mat(g::kMaxSeqLen, g::kDModel);
-    fill_normal(w.pos_emb, 0.02f);
+    init_normal(w.token_emb, g::kVocab,     g::kDModel, 0.02f, rng);
+    init_normal(w.pos_emb,   g::kMaxSeqLen, g::kDModel, 0.02f, rng);
 
     for (int i = 0; i < g::kNumLayers; ++i) {
         auto& L = w.layers[i];
         L.ln1.features = g::kDModel; L.ln1.eps = 1e-5f;
-        L.ln1.gamma = bt::Tensor::vec(g::kDModel); fill_ones(L.ln1.gamma);
-        L.ln1.beta  = bt::Tensor::vec(g::kDModel); fill_zero(L.ln1.beta);
+        init_ones(L.ln1.gamma, g::kDModel);
+        init_zero(L.ln1.beta,  g::kDModel, 1);
 
         L.mha.num_heads = g::kNumHeads; L.mha.embed_dim = g::kDModel;
-        L.mha.Wq = bt::Tensor::mat(g::kDModel, g::kDModel); bt::xavier_init(L.mha.Wq, rng);
-        L.mha.Wk = bt::Tensor::mat(g::kDModel, g::kDModel); bt::xavier_init(L.mha.Wk, rng);
-        L.mha.Wv = bt::Tensor::mat(g::kDModel, g::kDModel); bt::xavier_init(L.mha.Wv, rng);
-        L.mha.Wo = bt::Tensor::mat(g::kDModel, g::kDModel); bt::xavier_init(L.mha.Wo, rng);
-        L.mha.bq = bt::Tensor::vec(g::kDModel); fill_zero(L.mha.bq);
-        L.mha.bk = bt::Tensor::vec(g::kDModel); fill_zero(L.mha.bk);
-        L.mha.bv = bt::Tensor::vec(g::kDModel); fill_zero(L.mha.bv);
-        L.mha.bo = bt::Tensor::vec(g::kDModel); fill_zero(L.mha.bo);
+        init_xavier(L.mha.Wq, g::kDModel, g::kDModel, rng);
+        init_xavier(L.mha.Wk, g::kDModel, g::kDModel, rng);
+        init_xavier(L.mha.Wv, g::kDModel, g::kDModel, rng);
+        init_xavier(L.mha.Wo, g::kDModel, g::kDModel, rng);
+        init_zero(L.mha.bq, g::kDModel, 1);
+        init_zero(L.mha.bk, g::kDModel, 1);
+        init_zero(L.mha.bv, g::kDModel, 1);
+        init_zero(L.mha.bo, g::kDModel, 1);
 
         L.ln2.features = g::kDModel; L.ln2.eps = 1e-5f;
-        L.ln2.gamma = bt::Tensor::vec(g::kDModel); fill_ones(L.ln2.gamma);
-        L.ln2.beta  = bt::Tensor::vec(g::kDModel); fill_zero(L.ln2.beta);
+        init_ones(L.ln2.gamma, g::kDModel);
+        init_zero(L.ln2.beta,  g::kDModel, 1);
 
         L.ffn1.in_features = g::kDModel; L.ffn1.out_features = g::kFFN;
-        L.ffn1.W = bt::Tensor::mat(g::kFFN, g::kDModel); bt::xavier_init(L.ffn1.W, rng);
-        L.ffn1.b = bt::Tensor::vec(g::kFFN); fill_zero(L.ffn1.b);
+        init_xavier(L.ffn1.W, g::kFFN, g::kDModel, rng);
+        init_zero(L.ffn1.b, g::kFFN, 1);
 
         L.ffn2.in_features = g::kFFN; L.ffn2.out_features = g::kDModel;
-        L.ffn2.W = bt::Tensor::mat(g::kDModel, g::kFFN); bt::xavier_init(L.ffn2.W, rng);
-        L.ffn2.b = bt::Tensor::vec(g::kDModel); fill_zero(L.ffn2.b);
+        init_xavier(L.ffn2.W, g::kDModel, g::kFFN, rng);
+        init_zero(L.ffn2.b, g::kDModel, 1);
     }
 
     w.final_ln.features = g::kDModel; w.final_ln.eps = 1e-5f;
-    w.final_ln.gamma = bt::Tensor::vec(g::kDModel); fill_ones(w.final_ln.gamma);
-    w.final_ln.beta  = bt::Tensor::vec(g::kDModel); fill_zero(w.final_ln.beta);
+    init_ones(w.final_ln.gamma, g::kDModel);
+    init_zero(w.final_ln.beta,  g::kDModel, 1);
 
     w.head.in_features = g::kDModel; w.head.out_features = g::NUM_TAGS;
-    w.head.W = bt::Tensor::mat(g::NUM_TAGS, g::kDModel); bt::xavier_init(w.head.W, rng);
-    w.head.b = bt::Tensor::vec(g::NUM_TAGS); fill_zero(w.head.b);
+    init_xavier(w.head.W, g::NUM_TAGS, g::kDModel, rng);
+    init_zero(w.head.b, g::NUM_TAGS, 1);
 }
 
 // ─── Parameter registry (for AdamW state) ─────────────────────────────────
@@ -201,12 +206,9 @@ std::vector<Param> make_param_list(g::PosWeights& w) {
     auto add = [&](bt::Tensor* t, bool decay, const std::string& nm) {
         Param p;
         p.data  = t;
-        p.grad  = bt::Tensor::mat(t->rows, t->cols);
-        p.m     = bt::Tensor::mat(t->rows, t->cols);
-        p.v     = bt::Tensor::mat(t->rows, t->cols);
-        std::memset(p.grad.host_raw_mut(), 0, p.grad.bytes());
-        std::memset(p.m.host_raw_mut(),    0, p.m.bytes());
-        std::memset(p.v.host_raw_mut(),    0, p.v.bytes());
+        p.grad  = bt::Tensor::zeros(t->rows, t->cols);
+        p.m     = bt::Tensor::zeros(t->rows, t->cols);
+        p.v     = bt::Tensor::zeros(t->rows, t->cols);
         p.decay = decay;
         p.name  = nm;
         ps.push_back(std::move(p));
@@ -242,7 +244,7 @@ std::vector<Param> make_param_list(g::PosWeights& w) {
 }
 
 void zero_grads(std::vector<Param>& ps) {
-    for (auto& p : ps) std::memset(p.grad.host_raw_mut(), 0, p.grad.bytes());
+    for (auto& p : ps) p.grad.zero();
 }
 
 void adamw_step(std::vector<Param>& ps, float lr, float beta1, float beta2,
@@ -254,11 +256,8 @@ void adamw_step(std::vector<Param>& ps, float lr, float beta1, float beta2,
         }
         bt::adam_step(*p.data, p.grad, p.m, p.v, lr, beta1, beta2, eps, step);
         if (p.decay && wd > 0.0f) {
-            // decoupled weight decay: p -= lr * wd * p
-            const int n = p.data->size();
-            float* d = p.data->host_f32_mut();
-            const float k = lr * wd;
-            for (int i = 0; i < n; ++i) d[i] -= k * d[i];
+            // decoupled weight decay: p -= lr * wd * p  ==  p *= (1 - lr*wd)
+            bt::scale_inplace(*p.data, 1.0f - lr * wd);
         }
     }
 }
@@ -268,14 +267,14 @@ void adamw_step(std::vector<Param>& ps, float lr, float beta1, float beta2,
 struct LayerCache {
     bt::Tensor h_in;     // (L, D) input to ln1 (== residual stream pre-attn)
     bt::Tensor ln1_y;    // (L, D)
-    std::vector<bt::Tensor> ln1_xhat;  // L rows, each (D,1)
-    std::vector<float>      ln1_rstd;
+    bt::Tensor ln1_xhat; // (L, D)
+    bt::Tensor ln1_rstd; // (L, 1) FP32
     bt::Tensor Qh, Kh, Vh, Attnh, Yconcat;  // mha caches
     bt::Tensor attn_out; // (L, D)
     bt::Tensor h_mid;    // (L, D) after attn residual
     bt::Tensor ln2_y;
-    std::vector<bt::Tensor> ln2_xhat;
-    std::vector<float>      ln2_rstd;
+    bt::Tensor ln2_xhat;
+    bt::Tensor ln2_rstd;
     bt::Tensor ffn1_pre;  // (L, ffn) pre-gelu
     bt::Tensor ffn1_act;  // (L, ffn) post-gelu
     bt::Tensor ffn2_out;  // (L, D)
@@ -288,66 +287,39 @@ struct ForwardCache {
     std::vector<LayerCache> layers;
     bt::Tensor h_pre_final_ln;   // (L, D)
     bt::Tensor h_final;          // (L, D) post final_ln
-    std::vector<bt::Tensor> final_xhat;
-    std::vector<float>      final_rstd;
+    bt::Tensor final_xhat;       // (L, D)
+    bt::Tensor final_rstd;       // (L, 1)
     bt::Tensor pooled;           // (W, D)
     bt::Tensor logits;           // (W, NUM_TAGS)
 };
 
-// Apply layernorm per-row over (L, D). Caches xhat (D,1) and rstd per row.
-void ln_forward_per_row(const bt::Tensor& gamma, const bt::Tensor& beta,
-                        const bt::Tensor& X, bt::Tensor& Y,
-                        std::vector<bt::Tensor>& xhats,
-                        std::vector<float>& rstds,
-                        float eps) {
-    const int L = X.rows;
-    const int D = X.cols;
-    if (Y.rows != L || Y.cols != D || Y.dtype != bt::Dtype::FP32) {
-        Y = bt::Tensor::mat(L, D);
-    }
-    xhats.assign(L, bt::Tensor::vec(D));
-    rstds.assign(L, 0.0f);
-    bt::Tensor xrow = bt::Tensor::vec(D);
-    bt::Tensor yrow = bt::Tensor::vec(D);
-    for (int i = 0; i < L; ++i) {
-        std::memcpy(xrow.host_f32_mut(), X.host_f32() + i * D, D * sizeof(float));
-        float mean_out = 0.0f, rstd_out = 0.0f;
-        bt::layernorm_forward(xrow, gamma, beta, yrow, xhats[i],
-                              mean_out, rstd_out, eps);
-        rstds[i] = rstd_out;
-        std::memcpy(Y.host_f32_mut() + i * D, yrow.host_f32(), D * sizeof(float));
-    }
-}
-
-void ln_backward_per_row(const bt::Tensor& gamma,
-                         const bt::Tensor& dY, bt::Tensor& dX,
-                         const std::vector<bt::Tensor>& xhats,
-                         const std::vector<float>& rstds,
-                         bt::Tensor& dGamma, bt::Tensor& dBeta) {
-    const int L = dY.rows;
-    const int D = dY.cols;
-    if (dX.rows != L || dX.cols != D || dX.dtype != bt::Dtype::FP32) {
-        dX = bt::Tensor::mat(L, D);
-    }
-    bt::Tensor dy_row = bt::Tensor::vec(D);
-    bt::Tensor dx_row = bt::Tensor::vec(D);
-    for (int i = 0; i < L; ++i) {
-        std::memcpy(dy_row.host_f32_mut(), dY.host_f32() + i * D, D * sizeof(float));
-        bt::layernorm_backward(dy_row, xhats[i], gamma, rstds[i],
-                               dx_row, dGamma, dBeta);
-        std::memcpy(dX.host_f32_mut() + i * D, dx_row.host_f32(), D * sizeof(float));
-    }
+// Upload an int32 host vector to an INT32 tensor on the current default
+// device, return the device-resident int32 pointer. The Tensor is held in
+// `out_buf` by the caller to keep storage alive. On CPU default this is just
+// a host INT32 tensor (no copy).
+const std::int32_t* upload_idx(const std::int32_t* host, int n,
+                               bt::Tensor& out_buf) {
+    bt::Tensor cpu = bt::Tensor::zeros_on(bt::Device::CPU, n, 1,
+                                          bt::Dtype::INT32);
+    auto* p = static_cast<std::int32_t*>(cpu.host_raw_mut());
+    for (int i = 0; i < n; ++i) p[i] = host[i];
+    out_buf = cpu.to(bt::default_device());
+    return static_cast<const std::int32_t*>(out_buf.data);
 }
 
 // Build the embedding sum (token_emb[ids] + pos_emb[0..L-1]).
 void embed_forward(const g::PosWeights& w, const std::vector<std::int32_t>& ids,
                    bt::Tensor& out) {
     const int L = static_cast<int>(ids.size());
-    bt::embedding_lookup_forward(w.token_emb, ids.data(), L, out);
+    bt::Tensor tok_idx_buf;
+    const std::int32_t* d_tok = upload_idx(ids.data(), L, tok_idx_buf);
+    bt::embedding_lookup_forward(w.token_emb, d_tok, L, out);
     std::vector<std::int32_t> pidx(L);
     for (int i = 0; i < L; ++i) pidx[i] = i;
+    bt::Tensor pos_idx_buf;
+    const std::int32_t* d_pos = upload_idx(pidx.data(), L, pos_idx_buf);
     bt::Tensor pe;
-    bt::embedding_lookup_forward(w.pos_emb, pidx.data(), L, pe);
+    bt::embedding_lookup_forward(w.pos_emb, d_pos, L, pe);
     bt::add_inplace_batched(out, pe);
 }
 
@@ -364,30 +336,29 @@ void forward_sentence(const g::PosWeights& w,
     embed_forward(w, token_ids, fc.h0);
 
     fc.layers.assign(w.layers.size(), LayerCache{});
-    bt::Tensor h = fc.h0;  // deep copy via copy ctor; we want a residual stream
-                            // we can mutate without overwriting h0.
-    // Force separate storage.
-    bt::Tensor h_resid = bt::Tensor::mat(L, D);
-    std::memcpy(h_resid.host_f32_mut(), fc.h0.host_f32(), L * D * sizeof(float));
+    // residual stream — start as a deep copy of h0 (device-aware via clone()).
+    bt::Tensor h_resid = fc.h0.clone();
 
     for (std::size_t li = 0; li < w.layers.size(); ++li) {
         const auto& Lw = w.layers[li];
         auto& C = fc.layers[li];
 
         // Save input to ln1 (== current residual)
-        C.h_in = bt::Tensor::mat(L, D);
-        std::memcpy(C.h_in.host_f32_mut(), h_resid.host_f32(),
-                    L * D * sizeof(float));
+        C.h_in = h_resid.clone();
 
-        // pre-norm ln1
-        ln_forward_per_row(Lw.ln1.gamma, Lw.ln1.beta, h_resid, C.ln1_y,
-                           C.ln1_xhat, C.ln1_rstd, Lw.ln1.eps);
+        // pre-norm ln1 (batched, with caches)
+        C.ln1_y    = bt::Tensor::zeros(L, D);
+        C.ln1_xhat = bt::Tensor::zeros(L, D);
+        bt::Tensor ln1_mean;
+        bt::layernorm_forward_batched_with_caches(
+            h_resid, Lw.ln1.gamma, Lw.ln1.beta,
+            C.ln1_y, C.ln1_xhat, ln1_mean, C.ln1_rstd, Lw.ln1.eps);
 
         // MHA over ln1_y
         bt::Tensor& X = C.ln1_y;
         C.Qh = bt::Tensor{}; C.Kh = bt::Tensor{}; C.Vh = bt::Tensor{};
         C.Attnh = bt::Tensor{}; C.Yconcat = bt::Tensor{};
-        C.attn_out = bt::Tensor::mat(L, D);
+        C.attn_out = bt::Tensor::zeros(L, D);
         bt::mha_forward(X, Lw.mha.Wq, Lw.mha.Wk, Lw.mha.Wv, Lw.mha.Wo,
                         &Lw.mha.bq, &Lw.mha.bk, &Lw.mha.bv, &Lw.mha.bo,
                         /*d_mask=*/nullptr, w.num_heads,
@@ -397,48 +368,49 @@ void forward_sentence(const g::PosWeights& w,
         // residual: h_resid += attn_out
         bt::add_inplace_batched(h_resid, C.attn_out);
         // snapshot pre-ln2 state
-        C.h_mid = bt::Tensor::mat(L, D);
-        std::memcpy(C.h_mid.host_f32_mut(), h_resid.host_f32(),
-                    L * D * sizeof(float));
+        C.h_mid = h_resid.clone();
 
-        // pre-norm ln2
-        ln_forward_per_row(Lw.ln2.gamma, Lw.ln2.beta, h_resid, C.ln2_y,
-                           C.ln2_xhat, C.ln2_rstd, Lw.ln2.eps);
+        // pre-norm ln2 (batched)
+        C.ln2_y    = bt::Tensor::zeros(L, D);
+        C.ln2_xhat = bt::Tensor::zeros(L, D);
+        bt::Tensor ln2_mean;
+        bt::layernorm_forward_batched_with_caches(
+            h_resid, Lw.ln2.gamma, Lw.ln2.beta,
+            C.ln2_y, C.ln2_xhat, ln2_mean, C.ln2_rstd, Lw.ln2.eps);
 
         // ffn1: linear -> gelu
-        C.ffn1_pre = bt::Tensor::mat(L, w.ffn_hidden);
+        C.ffn1_pre = bt::Tensor::zeros(L, w.ffn_hidden);
         Lw.ffn1.forward_batched(C.ln2_y, C.ffn1_pre);
-        C.ffn1_act = bt::Tensor::mat(L, w.ffn_hidden);
+        C.ffn1_act = bt::Tensor::zeros(L, w.ffn_hidden);
         bt::gelu_forward(C.ffn1_pre, C.ffn1_act);
         // ffn2
-        C.ffn2_out = bt::Tensor::mat(L, D);
+        C.ffn2_out = bt::Tensor::zeros(L, D);
         Lw.ffn2.forward_batched(C.ffn1_act, C.ffn2_out);
         // residual
         bt::add_inplace_batched(h_resid, C.ffn2_out);
     }
 
     // final_ln (pre-residual snapshot for backward)
-    fc.h_pre_final_ln = bt::Tensor::mat(L, D);
-    std::memcpy(fc.h_pre_final_ln.host_f32_mut(), h_resid.host_f32(),
-                L * D * sizeof(float));
-    ln_forward_per_row(w.final_ln.gamma, w.final_ln.beta, h_resid, fc.h_final,
-                       fc.final_xhat, fc.final_rstd, w.final_ln.eps);
+    fc.h_pre_final_ln = h_resid.clone();
+    fc.h_final    = bt::Tensor::zeros(L, D);
+    fc.final_xhat = bt::Tensor::zeros(L, D);
+    bt::Tensor final_mean;
+    bt::layernorm_forward_batched_with_caches(
+        h_resid, w.final_ln.gamma, w.final_ln.beta,
+        fc.h_final, fc.final_xhat, final_mean, fc.final_rstd, w.final_ln.eps);
 
-    // Word pool + head
+    // Word pool + head (device-aware row gather via copy_d2d).
     const int W = static_cast<int>(wsep_positions.size());
-    fc.pooled = bt::Tensor::mat(W, D);
+    fc.pooled = bt::Tensor::zeros(W, D);
     for (int i = 0; i < W; ++i) {
         const int t = wsep_positions[i];
-        std::memcpy(fc.pooled.host_f32_mut() + i * D,
-                    fc.h_final.host_f32() + t * D, D * sizeof(float));
+        bt::copy_d2d(fc.h_final, t * D, fc.pooled, i * D, D);
     }
-    fc.logits = bt::Tensor::mat(W, w.num_tags);
+    fc.logits = bt::Tensor::zeros(W, w.num_tags);
     w.head.forward_batched(fc.pooled, fc.logits);
 }
 
 // Backward one sentence given dLogits — accumulates grads into Param entries.
-// Param index lookups by name; we build a small map per call but that's fine
-// at micro-batch scale.
 struct ParamRefs {
     bt::Tensor* token_emb;
     bt::Tensor* pos_emb;
@@ -494,25 +466,22 @@ void backward_sentence(const g::PosWeights& w,
     const int D = w.d_model;
 
     // head backward
-    bt::Tensor dPooled = bt::Tensor::mat(Wn, D);
+    bt::Tensor dPooled = bt::Tensor::zeros(Wn, D);
     bt::linear_backward_batched(w.head.W, fc.pooled, dLogits,
                                 dPooled, *gr.head_W, *gr.head_b);
 
-    // scatter dPooled into dH_final at wsep positions
-    bt::Tensor dH_final = bt::Tensor::mat(L, D);
-    std::memset(dH_final.host_raw_mut(), 0, dH_final.bytes());
+    // scatter dPooled into dH_final at wsep positions (device-aware).
+    bt::Tensor dH_final = bt::Tensor::zeros(L, D);
     for (int i = 0; i < Wn; ++i) {
         const int t = fc.wsep_positions[i];
-        float* dst = dH_final.host_f32_mut() + t * D;
-        const float* src = dPooled.host_f32() + i * D;
-        for (int j = 0; j < D; ++j) dst[j] = src[j];
+        bt::copy_d2d(dPooled, i * D, dH_final, t * D, D);
     }
 
-    // final_ln backward (per-row)
-    bt::Tensor dH_resid = bt::Tensor::mat(L, D);
-    ln_backward_per_row(w.final_ln.gamma, dH_final, dH_resid,
-                        fc.final_xhat, fc.final_rstd,
-                        *gr.final_ln_gamma, *gr.final_ln_beta);
+    // final_ln backward (batched)
+    bt::Tensor dH_resid = bt::Tensor::zeros(L, D);
+    bt::layernorm_backward_batched_with_caches(
+        dH_final, fc.final_xhat, w.final_ln.gamma, fc.final_rstd,
+        dH_resid, *gr.final_ln_gamma, *gr.final_ln_beta);
 
     // Walk layers in reverse.
     for (int li = static_cast<int>(w.layers.size()) - 1; li >= 0; --li) {
@@ -520,43 +489,35 @@ void backward_sentence(const g::PosWeights& w,
         const auto& C  = fc.layers[li];
         auto& gL = gr.layers[li];
 
-        // dH_resid is grad w.r.t. h_resid AFTER this layer (= post ffn residual)
-        // = dh_mid + dffn2_out. The residual edge propagates the dH_resid
-        // straight through; we also need to push it through the ffn branch.
-        //
-        // Save the residual edge contribution to h_mid (= dH_resid as-is).
-        bt::Tensor dh_mid_resid = bt::Tensor::mat(L, D);
-        std::memcpy(dh_mid_resid.host_f32_mut(), dH_resid.host_f32(),
-                    L * D * sizeof(float));
+        // dH_resid is grad w.r.t. h_resid AFTER this layer (= post ffn residual).
+        // The residual edge propagates dH_resid through to h_mid as-is.
+        bt::Tensor dh_mid_resid = dH_resid.clone();
 
-        // dffn2_out = dH_resid
         // ffn2 backward
-        bt::Tensor dffn1_act = bt::Tensor::mat(L, w.ffn_hidden);
+        bt::Tensor dffn1_act = bt::Tensor::zeros(L, w.ffn_hidden);
         bt::linear_backward_batched(Lw.ffn2.W, C.ffn1_act, dH_resid,
                                     dffn1_act, *gL.ffn2_W, *gL.ffn2_b);
         // gelu backward (tanh approx)
-        bt::Tensor dffn1_pre = bt::Tensor::mat(L, w.ffn_hidden);
+        bt::Tensor dffn1_pre = bt::Tensor::zeros(L, w.ffn_hidden);
         bt::gelu_backward(C.ffn1_pre, dffn1_act, dffn1_pre);
         // ffn1 backward
-        bt::Tensor dln2_y = bt::Tensor::mat(L, D);
+        bt::Tensor dln2_y = bt::Tensor::zeros(L, D);
         bt::linear_backward_batched(Lw.ffn1.W, C.ln2_y, dffn1_pre,
                                     dln2_y, *gL.ffn1_W, *gL.ffn1_b);
         // ln2 backward
-        bt::Tensor dh_mid_ffn = bt::Tensor::mat(L, D);
-        ln_backward_per_row(Lw.ln2.gamma, dln2_y, dh_mid_ffn,
-                            C.ln2_xhat, C.ln2_rstd,
-                            *gL.ln2_g, *gL.ln2_b);
+        bt::Tensor dh_mid_ffn = bt::Tensor::zeros(L, D);
+        bt::layernorm_backward_batched_with_caches(
+            dln2_y, C.ln2_xhat, Lw.ln2.gamma, C.ln2_rstd,
+            dh_mid_ffn, *gL.ln2_g, *gL.ln2_b);
         // sum branches
         bt::add_inplace_batched(dh_mid_resid, dh_mid_ffn);
         // Now dh_mid_resid is the grad w.r.t. h_mid.
 
         // Residual on h_mid: h_mid = h_in + attn_out
-        bt::Tensor dh_in_resid = bt::Tensor::mat(L, D);
-        std::memcpy(dh_in_resid.host_f32_mut(), dh_mid_resid.host_f32(),
-                    L * D * sizeof(float));
+        bt::Tensor dh_in_resid = dh_mid_resid.clone();
 
         // attn backward: dh_mid -> dattn_out -> dln1_y -> dh_in
-        bt::Tensor dln1_y = bt::Tensor::mat(L, D);
+        bt::Tensor dln1_y = bt::Tensor::zeros(L, D);
         bt::mha_backward(dh_mid_resid, C.ln1_y,
                          C.Qh, C.Kh, C.Vh, C.Attnh, C.Yconcat,
                          Lw.mha.Wq, Lw.mha.Wk, Lw.mha.Wv, Lw.mha.Wo,
@@ -564,10 +525,10 @@ void backward_sentence(const g::PosWeights& w,
                          dln1_y, *gL.Wq, *gL.Wk, *gL.Wv, *gL.Wo,
                          gL.bq, gL.bk, gL.bv, gL.bo);
         // ln1 backward
-        bt::Tensor dh_in_ln = bt::Tensor::mat(L, D);
-        ln_backward_per_row(Lw.ln1.gamma, dln1_y, dh_in_ln,
-                            C.ln1_xhat, C.ln1_rstd,
-                            *gL.ln1_g, *gL.ln1_b);
+        bt::Tensor dh_in_ln = bt::Tensor::zeros(L, D);
+        bt::layernorm_backward_batched_with_caches(
+            dln1_y, C.ln1_xhat, Lw.ln1.gamma, C.ln1_rstd,
+            dh_in_ln, *gL.ln1_g, *gL.ln1_b);
         // combine
         bt::add_inplace_batched(dh_in_resid, dh_in_ln);
         dH_resid = dh_in_resid;
@@ -575,38 +536,43 @@ void backward_sentence(const g::PosWeights& w,
 
     // dH_resid is now the grad w.r.t. h0 (token_emb + pos_emb).
     // Embedding backward: scatter-add into token_emb and pos_emb grads.
-    bt::embedding_lookup_backward(dH_resid, fc.token_ids.data(), L, *gr.token_emb);
+    bt::Tensor tok_idx_buf;
+    const std::int32_t* d_tok = upload_idx(fc.token_ids.data(), L, tok_idx_buf);
+    bt::embedding_lookup_backward(dH_resid, d_tok, L, *gr.token_emb);
     std::vector<std::int32_t> pidx(L);
     for (int i = 0; i < L; ++i) pidx[i] = i;
-    bt::embedding_lookup_backward(dH_resid, pidx.data(), L, *gr.pos_emb);
+    bt::Tensor pos_idx_buf;
+    const std::int32_t* d_pos = upload_idx(pidx.data(), L, pos_idx_buf);
+    bt::embedding_lookup_backward(dH_resid, d_pos, L, *gr.pos_emb);
 }
 
 // ─── Loss ─────────────────────────────────────────────────────────────────
 
-// Run softmax_xent_segment row-by-row (CPU-only — matches our CPU trainer).
-// Returns sum of per-row CE losses; writes per-row dLogits.
+// Compute softmax cross-entropy over the W rows of `logits` and return loss
+// sum plus an on-device dLogits tensor. softmax_xent_segment is a host
+// scalar op, so we transfer logits to host once, compute on host, then upload
+// dLogits back to the default device.
 float xent_words(const bt::Tensor& logits, const std::vector<std::uint8_t>& tags,
-                bt::Tensor& dLogits) {
+                 bt::Tensor& dLogits_dev) {
     const int Wn = logits.rows;
     const int C = logits.cols;
-    if (dLogits.rows != Wn || dLogits.cols != C || dLogits.dtype != bt::Dtype::FP32) {
-        dLogits = bt::Tensor::mat(Wn, C);
-    }
+    std::vector<float> logits_host = logits.to_host_vector();
+    std::vector<float> dlog_host(static_cast<std::size_t>(Wn) * C);
     std::vector<float> probs_row(C);
-    std::vector<float> dlog_row(C);
     std::vector<float> target_row(C);
     float total = 0.0f;
     for (int i = 0; i < Wn; ++i) {
         std::fill(target_row.begin(), target_row.end(), 0.0f);
         target_row[tags[i]] = 1.0f;
-        const float* lg = logits.host_f32() + i * C;
+        const float* lg = logits_host.data() + static_cast<std::size_t>(i) * C;
+        float* dl = dlog_host.data() + static_cast<std::size_t>(i) * C;
         float loss = bt::softmax_xent_segment(lg, target_row.data(),
                                               probs_row.data(),
-                                              dlog_row.data(), C, nullptr);
+                                              dl, C, nullptr);
         total += loss;
-        std::memcpy(dLogits.host_f32_mut() + i * C, dlog_row.data(),
-                    C * sizeof(float));
     }
+    dLogits_dev = bt::Tensor::from_host_on(bt::default_device(),
+                                           dlog_host.data(), Wn, C);
     return total;
 }
 
@@ -629,6 +595,7 @@ void w_tensor(std::ofstream& f, const std::string& name,
     w_u8(f, rank);
     w_u32(f, static_cast<std::uint32_t>(t.rows));
     if (rank == 2) w_u32(f, static_cast<std::uint32_t>(t.cols));
+    // to_host_vector handles d2h for non-CPU tensors.
     auto host = t.to_host_vector();
     f.write(reinterpret_cast<const char*>(host.data()),
             host.size() * sizeof(float));
@@ -827,12 +794,16 @@ float evaluate(const g::PosWeights& w, const std::vector<Sentence>& data) {
 }
 
 int run_training(Args& a) {
+    const bool cuda_avail = bt::is_available(bt::Device::CUDA);
+    std::cout << "cuda available: " << (cuda_avail ? "yes" : "no") << "\n";
     if (a.device == "cuda") {
-        if (bt::is_available(bt::Device::CUDA)) bt::set_default_device(bt::Device::CUDA);
+        if (cuda_avail) bt::set_default_device(bt::Device::CUDA);
         else std::cerr << "warn: cuda requested but unavailable, falling back to cpu\n";
     } else {
         bt::set_default_device(bt::Device::CPU);
     }
+    std::cout << "train_pos_tagger: device="
+              << bt::device_name(bt::default_device()) << "\n";
 
     std::vector<Sentence> train, val;
     if (a.synthetic) {
@@ -914,46 +885,24 @@ int run_training(Args& a) {
 
             if (items.empty()) continue;
 
-            // Forward all sentences, concat logits + targets.
-            std::vector<ForwardCache> fcs(items.size());
+            // Per-sentence forward + xent + backward. The 1/total_words scaling
+            // is applied directly into dLogits before backward.
             int total_words = 0;
-            for (std::size_t i = 0; i < items.size(); ++i) {
-                forward_sentence(w, items[i].ids, items[i].wsep, fcs[i]);
-                total_words += static_cast<int>(items[i].wsep.size());
-            }
-            bt::Tensor logits_cat = bt::Tensor::mat(total_words, g::NUM_TAGS);
-            std::vector<std::uint8_t> tags_cat;
-            tags_cat.reserve(total_words);
-            int off = 0;
-            for (std::size_t i = 0; i < items.size(); ++i) {
-                const int Wn = static_cast<int>(items[i].wsep.size());
-                std::memcpy(logits_cat.host_f32_mut() + off * g::NUM_TAGS,
-                            fcs[i].logits.host_f32(),
-                            Wn * g::NUM_TAGS * sizeof(float));
-                off += Wn;
-                for (auto t : items[i].tags) tags_cat.push_back(t);
-            }
-            // Loss + dLogits.
-            bt::Tensor dLogits;
-            float loss_sum = xent_words(logits_cat, tags_cat, dLogits);
-            // Mean-over-words scaling of gradients.
+            for (const auto& it : items) total_words += static_cast<int>(it.wsep.size());
             const float scale = 1.0f / static_cast<float>(total_words);
-            bt::scale_inplace(dLogits, scale);
+
+            float loss_sum = 0.0f;
+            for (std::size_t i = 0; i < items.size(); ++i) {
+                ForwardCache fc;
+                forward_sentence(w, items[i].ids, items[i].wsep, fc);
+                bt::Tensor dLogits;
+                loss_sum += xent_words(fc.logits, items[i].tags, dLogits);
+                bt::scale_inplace(dLogits, scale);
+                backward_sentence(w, fc, dLogits, grefs);
+            }
 
             epoch_loss  += loss_sum;
             epoch_words += total_words;
-
-            // Slice dLogits back per-sentence and backward.
-            off = 0;
-            for (std::size_t i = 0; i < items.size(); ++i) {
-                const int Wn = static_cast<int>(items[i].wsep.size());
-                bt::Tensor dlog_i = bt::Tensor::mat(Wn, g::NUM_TAGS);
-                std::memcpy(dlog_i.host_f32_mut(),
-                            dLogits.host_f32() + off * g::NUM_TAGS,
-                            Wn * g::NUM_TAGS * sizeof(float));
-                off += Wn;
-                backward_sentence(w, fcs[i], dlog_i, grefs);
-            }
 
             const float lr = lr_schedule(global_step, total_steps, a.warmup, a.lr);
             adamw_step(params, lr, 0.9f, 0.98f, 1e-9f, /*wd=*/0.01f,
