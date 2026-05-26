@@ -480,25 +480,12 @@ void packed_forward(const g::PosWeights& w,
         bt::linear_forward_batched(Lw.mha.Wk, Lw.mha.bk, C.ln1_y, C.K);
         bt::linear_forward_batched(Lw.mha.Wv, Lw.mha.bv, C.ln1_y, C.V);
 
-        // Varlen flash attention. CUDA/Metal need FP16; CPU is FP32-only.
-        if (bt::default_device() == bt::Device::CPU) {
-            bt::flash_attention_varlen_forward(
-                C.Q, C.K, C.V, cuq, cuq,
-                pb.B, pb.max_seqlen, pb.max_seqlen,
-                w.num_heads, w.d_model / w.num_heads,
-                /*causal=*/false, C.attn_out);
-        } else {
-            bt::Tensor Qh, Kh, Vh, Oh;
-            bt::cast(C.Q, Qh, bt::Dtype::FP16);
-            bt::cast(C.K, Kh, bt::Dtype::FP16);
-            bt::cast(C.V, Vh, bt::Dtype::FP16);
-            bt::flash_attention_varlen_forward(
-                Qh, Kh, Vh, cuq, cuq,
-                pb.B, pb.max_seqlen, pb.max_seqlen,
-                w.num_heads, w.d_model / w.num_heads,
-                /*causal=*/false, Oh);
-            bt::cast(Oh, C.attn_out, bt::Dtype::FP32);
-        }
+        // Varlen flash attention — FP32 on all backends (dtype-dispatched).
+        bt::flash_attention_varlen_forward(
+            C.Q, C.K, C.V, cuq, cuq,
+            pb.B, pb.max_seqlen, pb.max_seqlen,
+            w.num_heads, w.d_model / w.num_heads,
+            /*causal=*/false, C.attn_out);
 
         // Wo projection.
         C.attn_proj = bt::Tensor::zeros(T, D);
@@ -670,31 +657,13 @@ void packed_backward(const g::PosWeights& w,
         bt::linear_backward_batched(Lw.mha.Wo, C.attn_out, dh_mid_resid,
                                     dattn_out, *gL.Wo, *gL.bo);
 
-        // Varlen attention backward. CUDA/Metal need FP16.
+        // Varlen attention backward — FP32 on all backends (dtype-dispatched).
         bt::Tensor dQ, dK, dV;
-        if (bt::default_device() == bt::Device::CPU) {
-            bt::flash_attention_varlen_backward(
-                C.Q, C.K, C.V, C.attn_out, dattn_out, cuq, cuq,
-                pb.B, pb.max_seqlen, pb.max_seqlen,
-                w.num_heads, w.d_model / w.num_heads,
-                /*causal=*/false, dQ, dK, dV);
-        } else {
-            bt::Tensor Qh, Kh, Vh, Oh, dOh;
-            bt::cast(C.Q, Qh, bt::Dtype::FP16);
-            bt::cast(C.K, Kh, bt::Dtype::FP16);
-            bt::cast(C.V, Vh, bt::Dtype::FP16);
-            bt::cast(C.attn_out, Oh, bt::Dtype::FP16);
-            bt::cast(dattn_out, dOh, bt::Dtype::FP16);
-            bt::Tensor dQh, dKh, dVh;
-            bt::flash_attention_varlen_backward(
-                Qh, Kh, Vh, Oh, dOh, cuq, cuq,
-                pb.B, pb.max_seqlen, pb.max_seqlen,
-                w.num_heads, w.d_model / w.num_heads,
-                /*causal=*/false, dQh, dKh, dVh);
-            bt::cast(dQh, dQ, bt::Dtype::FP32);
-            bt::cast(dKh, dK, bt::Dtype::FP32);
-            bt::cast(dVh, dV, bt::Dtype::FP32);
-        }
+        bt::flash_attention_varlen_backward(
+            C.Q, C.K, C.V, C.attn_out, dattn_out, cuq, cuq,
+            pb.B, pb.max_seqlen, pb.max_seqlen,
+            w.num_heads, w.d_model / w.num_heads,
+            /*causal=*/false, dQ, dK, dV);
 
         // Q/K/V projection backwards → dln1_y is the sum of three branches.
         bt::Tensor dln1_y = bt::Tensor::zeros(T, D);
@@ -727,46 +696,80 @@ void packed_backward(const g::PosWeights& w,
         static_cast<const std::int32_t*>(pb.pos_ids.data), T, *gr.pos_emb);
 }
 
-// ─── Loss ─────────────────────────────────────────────────────────────────
+// ─── Loss (device-side fused softmax-xent) ────────────────────────────────
 
-// softmax_xent over (W, C) logits; returns sum and writes dLogits on device.
-float xent_words_packed(const bt::Tensor& logits,
-                        const std::vector<std::uint8_t>& tags,
-                        bt::Tensor& dLogits_dev) {
-    const int Wn = logits.rows;
-    const int C  = logits.cols;
-    std::vector<float> logits_host = logits.to_host_vector();
-    std::vector<float> dlog_host(static_cast<std::size_t>(Wn) * C);
-    std::vector<float> probs_row(C), target_row(C);
-    float total = 0.0f;
+// Build a (Wn, C) FP32 one-hot target tensor on the default device.
+bt::Tensor make_onehot_dev(const std::vector<std::uint8_t>& tags, int C) {
+    const int Wn = static_cast<int>(tags.size());
+    bt::Tensor cpu = bt::Tensor::zeros_on(bt::Device::CPU, Wn, C, bt::Dtype::FP32);
+    auto* p = static_cast<float*>(cpu.host_raw_mut());
     for (int i = 0; i < Wn; ++i) {
-        std::fill(target_row.begin(), target_row.end(), 0.0f);
-        target_row[tags[i]] = 1.0f;
-        const float* lg = logits_host.data() + static_cast<std::size_t>(i) * C;
-        float* dl = dlog_host.data() + static_cast<std::size_t>(i) * C;
-        total += bt::softmax_xent_segment(lg, target_row.data(),
-                                          probs_row.data(),
-                                          dl, C, nullptr);
+        p[static_cast<std::size_t>(i) * C + tags[i]] = 1.0f;
     }
-    dLogits_dev = bt::Tensor::from_host_on(bt::default_device(),
-                                           dlog_host.data(), Wn, C);
-    return total;
+    return cpu.to(bt::default_device());
 }
 
-float xent_only(const bt::Tensor& logits,
-                const std::vector<std::uint8_t>& targets) {
+// head_offsets for a single-head call: length 2, {0, C}. CPU: host ptr; else
+// upload to a device buffer kept alive by `dev_buf`. Returns the pointer to
+// pass to softmax_xent_fused_batched.
+const int* head_offsets_ptr(int C, std::vector<int>& host_buf,
+                            bt::Tensor& dev_buf) {
+    host_buf = {0, C};
+    if (bt::default_device() == bt::Device::CPU) {
+        return host_buf.data();
+    }
+    bt::Tensor cpu = bt::Tensor::zeros_on(bt::Device::CPU, 2, 1, bt::Dtype::INT32);
+    auto* p = static_cast<std::int32_t*>(cpu.host_raw_mut());
+    p[0] = 0; p[1] = C;
+    dev_buf = cpu.to(bt::default_device());
+    return static_cast<const int*>(dev_buf.data);
+}
+
+// Device-side fused softmax-xent over (Wn, C) logits with INT8 class targets.
+// Writes dLogits on device; loss_per_sample is the per-row loss on device.
+void xent_words_packed_dev(const bt::Tensor& logits,
+                           const std::vector<std::uint8_t>& tags,
+                           bt::Tensor& probs_dev,
+                           bt::Tensor& dLogits_dev,
+                           bt::Tensor& loss_per_sample_dev) {
     const int Wn = logits.rows;
     const int C  = logits.cols;
-    std::vector<float> lh = logits.to_host_vector();
-    std::vector<float> probs(C), tgt(C), dlog(C);
+    bt::Tensor target = make_onehot_dev(tags, C);
+    std::vector<int> hoff;
+    bt::Tensor doff_buf;
+    const int* hoff_ptr = head_offsets_ptr(C, hoff, doff_buf);
+    probs_dev           = bt::Tensor::zeros(Wn, C);
+    dLogits_dev         = bt::Tensor::zeros(Wn, C);
+    loss_per_sample_dev = bt::Tensor::zeros(Wn, 1);
+    bt::softmax_xent_fused_batched(logits, target, /*d_mask=*/nullptr,
+                                   hoff_ptr, /*n_heads=*/1,
+                                   probs_dev, dLogits_dev,
+                                   loss_per_sample_dev);
+}
+
+// Sum-reduce a (Wn,1) device tensor into a (1,1) device tensor by
+// matmul(ones(1,Wn), x(Wn,1)). No device→host sync.
+void accum_scalar(const bt::Tensor& loss_per_sample,
+                  bt::Tensor& running_scalar /* (1,1) */) {
+    const int Wn = loss_per_sample.rows;
+    if (Wn == 0) return;
+    std::vector<float> ones_host(Wn, 1.0f);
+    bt::Tensor ones = bt::Tensor::from_host_on(bt::default_device(),
+                                               ones_host.data(), 1, Wn);
+    bt::Tensor s = bt::Tensor::zeros(1, 1);
+    bt::matmul(ones, loss_per_sample, s);
+    bt::add_inplace(running_scalar, s);
+}
+
+// Loss-only variant used in eval: returns the host-side sum (single small sync
+// per batch — eval is not throughput-critical, but we still keep it cheap).
+float xent_only_dev(const bt::Tensor& logits,
+                    const std::vector<std::uint8_t>& targets) {
+    bt::Tensor probs, dLog, lps;
+    xent_words_packed_dev(logits, targets, probs, dLog, lps);
+    auto v = lps.to_host_vector();
     float total = 0.0f;
-    for (int i = 0; i < Wn; ++i) {
-        std::fill(tgt.begin(), tgt.end(), 0.0f);
-        tgt[targets[i]] = 1.0f;
-        const float* lg = lh.data() + static_cast<std::size_t>(i) * C;
-        total += bt::softmax_xent_segment(lg, tgt.data(), probs.data(),
-                                          dlog.data(), C, nullptr);
-    }
+    for (float x : v) total += x;
     return total;
 }
 
@@ -1118,8 +1121,8 @@ EvalStats evaluate(const g::PosWeights& w, const AuxHead& aux,
         auto xi = xi_dev.to_host_vector();
         auto ui = ui_dev.to_host_vector();
 
-        loss_sum += xent_only(fc.logits, pb.xtags_host);
-        loss_sum += upos_weight * xent_only(fc.upos_logits, pb.utags_host);
+        loss_sum += xent_only_dev(fc.logits, pb.xtags_host);
+        loss_sum += upos_weight * xent_only_dev(fc.upos_logits, pb.utags_host);
 
         for (int k = 0; k < pb.total_words; ++k) {
             if (static_cast<int>(xi[k]) == pb.xtags_host[k]) ++x_correct;
@@ -1205,7 +1208,9 @@ int run_training(Args& a) {
         std::iota(order.begin(), order.end(), 0);
         std::shuffle(order.begin(), order.end(), rng);
 
-        float epoch_loss = 0.0f;
+        // Device-side accumulators avoid per-step host syncs of the loss.
+        bt::Tensor epoch_xpos_dev = bt::Tensor::zeros(1, 1);
+        bt::Tensor epoch_upos_dev = bt::Tensor::zeros(1, 1);
         int   epoch_words = 0;
 
         for (int step = 0; step < steps_per_epoch; ++step) {
@@ -1233,17 +1238,21 @@ int run_training(Args& a) {
 
             const float scale = 1.0f / static_cast<float>(pb.total_words);
 
-            bt::Tensor dLogits, dUposLogits;
-            const float xpos_loss_sum = xent_words_packed(fc.logits, pb.xtags_host, dLogits);
-            const float upos_loss_sum = xent_words_packed(fc.upos_logits, pb.utags_host, dUposLogits);
+            bt::Tensor xpos_probs, dLogits, xpos_lps;
+            bt::Tensor upos_probs, dUposLogits, upos_lps;
+            xent_words_packed_dev(fc.logits,      pb.xtags_host,
+                                  xpos_probs, dLogits,     xpos_lps);
+            xent_words_packed_dev(fc.upos_logits, pb.utags_host,
+                                  upos_probs, dUposLogits, upos_lps);
             bt::scale_inplace(dLogits, scale);
             bt::scale_inplace(dUposLogits, scale * a.upos_weight);
 
             packed_backward(w, pb, fc, dLogits, dUposLogits, grefs,
                             aux, *gAuxW, *gAuxB);
 
-            const float loss_sum = xpos_loss_sum + a.upos_weight * upos_loss_sum;
-            epoch_loss  += loss_sum;
+            // Accumulate epoch loss on device — no per-step D→H sync.
+            accum_scalar(xpos_lps, epoch_xpos_dev);
+            accum_scalar(upos_lps, epoch_upos_dev);
             epoch_words += pb.total_words;
 
             const float lr = lr_schedule(global_step, total_steps, a.warmup, a.lr);
@@ -1251,6 +1260,13 @@ int run_training(Args& a) {
                        global_step, /*grad_scale=*/1.0f);
 
             if (global_step % 20 == 0) {
+                // Sync just the small (Wn,1) per-sample losses for this step.
+                auto xv = xpos_lps.to_host_vector();
+                auto uv = upos_lps.to_host_vector();
+                float xpos_loss_sum = 0.0f, upos_loss_sum = 0.0f;
+                for (float x : xv) xpos_loss_sum += x;
+                for (float x : uv) upos_loss_sum += x;
+                const float loss_sum = xpos_loss_sum + a.upos_weight * upos_loss_sum;
                 std::cout << "epoch " << epoch << " step " << global_step
                           << "/" << total_steps
                           << " xpos_loss " << std::fixed << std::setprecision(4)
@@ -1264,6 +1280,9 @@ int run_training(Args& a) {
         }
 
         const EvalStats es = evaluate(w, aux, val, a.batch, a.layer_dropout, a.upos_weight);
+        const float xpos_total = epoch_xpos_dev.to_host_vector().at(0);
+        const float upos_total = epoch_upos_dev.to_host_vector().at(0);
+        const float epoch_loss = xpos_total + a.upos_weight * upos_total;
         std::cout << "epoch " << epoch
                   << " mean_loss " << std::fixed << std::setprecision(4)
                   << (epoch_loss / std::max(1, epoch_words))
