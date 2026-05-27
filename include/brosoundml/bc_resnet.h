@@ -146,6 +146,59 @@ public:
     // checkpoint).
     bool fused() const;
 
+    // ── Training surface (chunk 6) ──
+    //
+    // Inference forward() takes a single (n_mels, T) clip and returns one logit
+    // sliding-window-pooled over the receptive field; for training we hand-roll
+    // a parallel forward+backward that
+    //   • runs on a (B, n_mels, T) minibatch (training clips are uniformly
+    //     1.0 s = T=100 frames after chunk 3 — fixed-length, never padded);
+    //   • uses unfused BN (CPU-only — the chunk-5 BN-inplace path is host-side)
+    //     with batch statistics for the forward pass and the standard BN
+    //     backward; running mean/var are updated for inference.
+    //   • does a plain global average pool over T (T <= receptive_field, so the
+    //     streaming GAP and the plain GAP agree at the last frame anyway);
+    //   • uses brotensor's fused BCE-with-logits op (no separate sigmoid).
+    // The forward path here is independent of forward() / forward_streaming():
+    // it caches per-block activations so backward can walk back through them.
+
+    // Re-init every trainable tensor: xavier-uniform on every conv W + head W,
+    // zeros on biases, gamma=1, beta=0, running mean=0, running var=1. `seed`
+    // drives a splitmix64 state — two calls with the same seed produce
+    // bit-identical weights. Must be called on a freshly-made (un-loaded)
+    // model; throws on a fused model.
+    void xavier_init_weights(std::uint64_t seed);
+
+    // Adam state — one (m, v) pair per trainable tensor. Stored inside the
+    // impl; created on first call to train_step(). zero_grads() and adam state
+    // reset are bundled into train_step()'s rhythm — the caller doesn't manage
+    // them. `pos_weight` is the BCE positive-class scaler (KWS recipes pick 2-5
+    // to offset the 10:1 negative skew).
+    //
+    // `mel_batch`: (B, n_mels*T) NCL FP32 — B samples packed flat by channel.
+    // `labels`:    (B, 1)         FP32 — 0.0/1.0 per sample.
+    // Returns the mean BCE-with-logits loss over the batch.
+    float train_step(const brotensor::Tensor& mel_batch,
+                     const brotensor::Tensor& labels,
+                     int B, int T,
+                     float lr, float pos_weight);
+
+    struct EvalMetrics {
+        float loss     = 0.0f;
+        float accuracy = 0.0f;
+        float frr      = 0.0f;   // false-reject rate (positives missed)
+        float fpr      = 0.0f;   // false-accept rate (negatives flagged)
+        int   n        = 0;
+    };
+
+    // Forward-only on a minibatch — no gradient state touched. BN runs in
+    // *eval mode* (uses running mean/var, matching inference), so this is what
+    // the trainer prints between epochs and what the saved fused checkpoint
+    // will replicate. Threshold for accuracy/frr/fpr is sigmoid(logit) >= 0.5.
+    EvalMetrics eval_step(const brotensor::Tensor& mel_batch,
+                          const brotensor::Tensor& labels,
+                          int B, int T, float pos_weight);
+
 public:
     // Exposed so the .cpp's free-function binary-format helpers can walk the
     // model's tensors by name. Not part of the stable surface — treat as

@@ -19,6 +19,10 @@
 
 namespace brosoundml {
 
+// Forward-declared so BcResnet::Impl can hold a unique_ptr to it; full
+// definition lives below in the training-surface section.
+struct BcResnetTrainState;
+
 namespace bt = brotensor;
 
 namespace {
@@ -360,6 +364,10 @@ struct BcResnet::Impl {
     int                gap_head  = 0;    // ring write position
     int                gap_cap   = 0;    // = receptive_field_frames
 
+    // Adam state + grads — lazy-built on first train_step(). Empty during
+    // inference-only sessions.
+    std::unique_ptr<BcResnetTrainState> train_state;
+
     int block_cout(int idx) const {
         switch (idx) {
             case 1: return cfg.c1;
@@ -591,7 +599,9 @@ struct BcResnet::Impl {
 // ─── BcResnet public ──────────────────────────────────────────────────────
 
 BcResnet::BcResnet() : impl_(std::make_unique<Impl>()) {}
-BcResnet::~BcResnet() = default;
+// Out-of-line below — needs the full type of BcResnetTrainState (defined in
+// the training-surface section further down) so unique_ptr<Impl>::~unique_ptr
+// can resolve Impl's implicit destructor.
 BcResnet::BcResnet(BcResnet&&) noexcept = default;
 BcResnet& BcResnet::operator=(BcResnet&&) noexcept = default;
 
@@ -873,5 +883,878 @@ BcResnet BcResnet::load(const std::string& path, bt::Device device) {
     if (!on_disk_fused) m.fuse_bn();
     return m;
 }
+
+// ─── Training surface (chunk 6) ───────────────────────────────────────────
+//
+// Hand-rolled CPU-only backward through the BC-ResNet, mirroring the chunk-5
+// inference forward but with batched layout (N=B) and BN running in
+// train-mode (batch statistics) so the running mean/var pick up the dataset
+// distribution. Eval mode uses the running stats and is the same path the
+// final fused checkpoint takes after fuse_bn().
+//
+// Topology (matches the chunk-5 header):
+//   stem_conv → stem_bn → relu
+//   block × 4: dw_conv → dw_bn → relu → pw_conv → pw_bn → +residual → relu
+//   GAP over T → linear head → 1 logit per sample → fused BCE-with-logits.
+//
+// All ops are CPU FP32. The BN backward is hand-rolled here (no brotensor
+// op).  Backward through causal_conv1d is implemented by left-padding the
+// forward input by pad_left=dilation*(kL-1), running conv1d_backward_*
+// against the padded buffer, and slicing the trailing L cols of dX_padded
+// back into dX (the pad columns are discarded).
+
+namespace {
+
+// Splitmix64 — same routine brotensor::xavier_init advances internally; we
+// keep one local copy so xavier_init_weights stays deterministic regardless
+// of how many other things the global rng has been used for.
+inline std::uint64_t sm64(std::uint64_t& s) {
+    std::uint64_t z = (s += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+// Fill a (rows, cols) FP32 tensor on CPU with xavier-uniform; bound = sqrt(6 /
+// (fan_in + fan_out)). For conv weight (C_out, (C_in/groups)*kL), fan_in =
+// (C_in/groups)*kL, fan_out = C_out * kL / groups — but PyTorch's default
+// _calculate_fan_in_and_fan_out treats the weight as (out, in*kL) so fan_in =
+// cols, fan_out = rows. We follow that convention.
+void xavier_uniform_fill(bt::Tensor& t, std::uint64_t& seed) {
+    bt::xavier_init(t, seed);
+}
+
+// Run a forward pass through BN with batch statistics (training mode).
+// X is NCL (N, C*L). Updates running mean/var via 0.1 momentum (PyTorch
+// default). Caches xhat / mean / inv_std for the backward pass.
+void bn_train_forward(BatchNorm1d& bn, const bt::Tensor& X, int N, int C, int L,
+                      bt::Tensor& Y,
+                      std::vector<float>& xhat_cache,
+                      std::vector<float>& mean_cache,
+                      std::vector<float>& inv_std_cache,
+                      float momentum = 0.1f) {
+    if (X.device != bt::Device::CPU) {
+        fail("bc_resnet::bn_train", "training BN is CPU-only");
+    }
+    const int M = N * L;
+    const float* x = X.host_f32();
+    Y = bt::Tensor::empty_on(bt::Device::CPU, X.rows, X.cols, bt::Dtype::FP32);
+    float* y = Y.host_f32_mut();
+
+    xhat_cache.assign(static_cast<std::size_t>(N) * C * L, 0.0f);
+    mean_cache.assign(static_cast<std::size_t>(C), 0.0f);
+    inv_std_cache.assign(static_cast<std::size_t>(C), 0.0f);
+
+    float* g    = bn.gamma.host_f32_mut();
+    float* be   = bn.beta .host_f32_mut();
+    float* rmu  = bn.mean .host_f32_mut();
+    float* rvar = bn.var  .host_f32_mut();
+
+    for (int c = 0; c < C; ++c) {
+        // mean & var over the (N, L) plane for channel c.
+        double sum = 0.0;
+        for (int n = 0; n < N; ++n) {
+            const float* row = x + (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) sum += row[t];
+        }
+        const double mean = sum / static_cast<double>(M);
+        double sq = 0.0;
+        for (int n = 0; n < N; ++n) {
+            const float* row = x + (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) {
+                const double d = row[t] - mean;
+                sq += d * d;
+            }
+        }
+        const double var     = sq / static_cast<double>(M);
+        const double inv_std = 1.0 / std::sqrt(var + bn.eps);
+
+        mean_cache[static_cast<std::size_t>(c)]    = static_cast<float>(mean);
+        inv_std_cache[static_cast<std::size_t>(c)] = static_cast<float>(inv_std);
+
+        const float gc  = g[c];
+        const float bec = be[c];
+        for (int n = 0; n < N; ++n) {
+            const float* xr = x + (static_cast<std::size_t>(n) * C + c) * L;
+            float*       yr = y + (static_cast<std::size_t>(n) * C + c) * L;
+            float*       xh = xhat_cache.data() +
+                              (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) {
+                const float h = static_cast<float>((xr[t] - mean) * inv_std);
+                xh[t] = h;
+                yr[t] = gc * h + bec;
+            }
+        }
+        // Running stats update (PyTorch-style): the unbiased variance is used
+        // for the running estimate (denominator M-1 instead of M).
+        const double var_unbiased = (M > 1) ? sq / static_cast<double>(M - 1)
+                                            : var;
+        rmu[c]  = static_cast<float>((1.0 - momentum) * rmu[c]  +
+                                     momentum * mean);
+        rvar[c] = static_cast<float>((1.0 - momentum) * rvar[c] +
+                                     momentum * var_unbiased);
+    }
+}
+
+// Eval-mode BN forward: uses running mean/var. NCL layout. Y overwritten.
+void bn_eval_forward(const BatchNorm1d& bn, const bt::Tensor& X, int N, int C,
+                     int L, bt::Tensor& Y) {
+    const float* x = X.host_f32();
+    Y = bt::Tensor::empty_on(bt::Device::CPU, X.rows, X.cols, bt::Dtype::FP32);
+    float* y = Y.host_f32_mut();
+    const float* g  = bn.gamma.host_f32();
+    const float* be = bn.beta .host_f32();
+    const float* mu = bn.mean .host_f32();
+    const float* va = bn.var  .host_f32();
+    for (int c = 0; c < C; ++c) {
+        const float inv = 1.0f / std::sqrt(va[c] + bn.eps);
+        const float a   = g[c] * inv;
+        const float b   = be[c] - mu[c] * g[c] * inv;
+        for (int n = 0; n < N; ++n) {
+            const float* xr = x + (static_cast<std::size_t>(n) * C + c) * L;
+            float*       yr = y + (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) yr[t] = xr[t] * a + b;
+        }
+    }
+}
+
+// Standard BN backward over NCL (N, C*L). dX overwritten. dGamma, dBeta
+// overwritten (not accumulated — the trainer aggregates by Adam's m/v).
+void bn_train_backward(BatchNorm1d& bn,
+                       const std::vector<float>& xhat,
+                       const std::vector<float>& /*mean*/,
+                       const std::vector<float>& inv_std,
+                       const bt::Tensor& dY,
+                       int N, int C, int L,
+                       bt::Tensor& dX,
+                       bt::Tensor& dGamma, bt::Tensor& dBeta) {
+    const float* dy = dY.host_f32();
+    dX = bt::Tensor::empty_on(bt::Device::CPU, dY.rows, dY.cols,
+                              bt::Dtype::FP32);
+    float* dx = dX.host_f32_mut();
+    dGamma = bt::Tensor::zeros_on(bt::Device::CPU, C, 1, bt::Dtype::FP32);
+    dBeta  = bt::Tensor::zeros_on(bt::Device::CPU, C, 1, bt::Dtype::FP32);
+    float* dg = dGamma.host_f32_mut();
+    float* db = dBeta .host_f32_mut();
+    const float* g = bn.gamma.host_f32();
+    const int M = N * L;
+
+    for (int c = 0; c < C; ++c) {
+        // Per-channel reductions: sum_dy, sum_dy_xhat, plus the accumulators
+        // for dgamma/dbeta.
+        double sum_dy      = 0.0;
+        double sum_dy_xhat = 0.0;
+        for (int n = 0; n < N; ++n) {
+            const float* dyr = dy   + (static_cast<std::size_t>(n) * C + c) * L;
+            const float* xh  = xhat.data() +
+                               (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) {
+                sum_dy      += dyr[t];
+                sum_dy_xhat += static_cast<double>(dyr[t]) * xh[t];
+            }
+        }
+        db[c] = static_cast<float>(sum_dy);
+        dg[c] = static_cast<float>(sum_dy_xhat);
+
+        // dx = (gamma * inv_std / M) * (M*dy - sum_dy - xhat*sum_dy_xhat)
+        const double scale = static_cast<double>(g[c]) * inv_std[c] /
+                             static_cast<double>(M);
+        for (int n = 0; n < N; ++n) {
+            const float* dyr = dy   + (static_cast<std::size_t>(n) * C + c) * L;
+            const float* xh  = xhat.data() +
+                               (static_cast<std::size_t>(n) * C + c) * L;
+            float*       dxr = dx   + (static_cast<std::size_t>(n) * C + c) * L;
+            for (int t = 0; t < L; ++t) {
+                const double term = static_cast<double>(M) * dyr[t] -
+                                    sum_dy -
+                                    static_cast<double>(xh[t]) * sum_dy_xhat;
+                dxr[t] = static_cast<float>(scale * term);
+            }
+        }
+    }
+}
+
+// Left-pad an NCL tensor along L by `pad_left` zeros. Out shape (N, C*(L+pad)).
+bt::Tensor left_pad_ncl(const bt::Tensor& X, int N, int C, int L, int pad) {
+    if (pad == 0) return X.to(bt::Device::CPU);  // no-op clone
+    bt::Tensor Y = bt::Tensor::zeros_on(bt::Device::CPU, N, C * (L + pad),
+                                        bt::Dtype::FP32);
+    const float* x = X.host_f32();
+    float*       y = Y.host_f32_mut();
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < C; ++c) {
+            const float* src = x + (static_cast<std::size_t>(n) * C + c) * L;
+            float*       dst = y + (static_cast<std::size_t>(n) * C + c) *
+                                    (L + pad) + pad;
+            std::memcpy(dst, src,
+                        static_cast<std::size_t>(L) * sizeof(float));
+        }
+    }
+    return Y;
+}
+
+// Strip the leading `pad` cols per (n,c) row from an NCL (N, C*(L+pad)) tensor,
+// returning a fresh NCL (N, C*L).
+bt::Tensor strip_left_pad_ncl(const bt::Tensor& X, int N, int C, int L,
+                              int pad) {
+    if (pad == 0) return X.to(bt::Device::CPU);
+    bt::Tensor Y = bt::Tensor::empty_on(bt::Device::CPU, N, C * L,
+                                        bt::Dtype::FP32);
+    const float* x = X.host_f32();
+    float*       y = Y.host_f32_mut();
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < C; ++c) {
+            const float* src = x + (static_cast<std::size_t>(n) * C + c) *
+                                    (L + pad) + pad;
+            float*       dst = y + (static_cast<std::size_t>(n) * C + c) * L;
+            std::memcpy(dst, src,
+                        static_cast<std::size_t>(L) * sizeof(float));
+        }
+    }
+    return Y;
+}
+
+// Forward of one conv in training mode: store the padded forward input so the
+// backward can use it for the weight grad. Y is (N, C_out*L) NCL.
+void conv_train_forward(const ConvLayer& c, const bt::Tensor& X, int N, int L,
+                        bt::Tensor& X_padded,    // (N, C_in*(L+pad_left))
+                        bt::Tensor& Y) {
+    X_padded = left_pad_ncl(X, N, c.in_channels, L, c.pad_left);
+    bt::conv1d(X_padded, c.W, &c.b, N, c.in_channels, L + c.pad_left,
+               c.out_channels, c.kernel_size, /*stride=*/1, /*padding=*/0,
+               c.dilation, c.groups, Y);
+}
+
+// Backward of one conv. dY (N, C_out*L). dX overwritten (N, C_in*L). dW + dB
+// accumulated into the provided grads (caller zeros).
+void conv_train_backward(const ConvLayer& c, const bt::Tensor& X_padded,
+                         const bt::Tensor& dY, int N, int L,
+                         bt::Tensor& dX,
+                         bt::Tensor& dW, bt::Tensor& dB) {
+    // dX_padded via conv1d_backward_input on the padded buffer (padding=0).
+    bt::Tensor dX_padded;
+    bt::conv1d_backward_input(c.W, dY, N, c.in_channels, L + c.pad_left,
+                              c.out_channels, c.kernel_size, /*stride=*/1,
+                              /*padding=*/0, c.dilation, c.groups, dX_padded);
+    dX = strip_left_pad_ncl(dX_padded, N, c.in_channels, L, c.pad_left);
+
+    // dW accumulates from X_padded.
+    bt::conv1d_backward_weight(X_padded, dY, N, c.in_channels, L + c.pad_left,
+                               c.out_channels, c.kernel_size, /*stride=*/1,
+                               /*padding=*/0, c.dilation, c.groups, dW);
+
+    // dB accumulates from dY.
+    bt::conv1d_backward_bias(dY, N, c.out_channels, L, dB);
+}
+
+// ReLU forward over NCL — writes Y, returns nothing. Mask = (x > 0) cached
+// implicitly via X (we still have X around for backward).
+void relu_train_forward(const bt::Tensor& X, bt::Tensor& Y) {
+    Y = bt::Tensor::empty_on(bt::Device::CPU, X.rows, X.cols, bt::Dtype::FP32);
+    const float* x = X.host_f32();
+    float*       y = Y.host_f32_mut();
+    const int n = X.rows * X.cols;
+    for (int i = 0; i < n; ++i) y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+}
+
+// Caches collected for a single training forward, enough to walk the whole
+// graph back. Allocated once per train_step. (B, C*L) for everything below
+// is NCL with N=B.
+struct ConvCache {
+    bt::Tensor X_padded;     // (B, C_in*(L+pad_left)) — what the W grad needs
+};
+struct BnCache {
+    std::vector<float> xhat;     // (B, C, L) flat
+    std::vector<float> mean;     // (C)
+    std::vector<float> inv_std;  // (C)
+};
+struct BlockCache {
+    bt::Tensor X_in;          // block input — needed for residual_proj backward
+    ConvCache  dw, pw, res;
+    BnCache    bn_dw, bn_pw, bn_res;
+    bt::Tensor dw_pre;        // pre-relu dw branch (== bn_dw output) — needed
+                              // to mask dw-branch backward through ReLU
+    bt::Tensor pw_post_bn;    // pw + bn_pw output, pre-residual-add
+    bt::Tensor pre_relu;      // pw_post_bn + residual (input to final ReLU)
+};
+
+struct TrainCache {
+    bt::Tensor stem_X_padded;
+    BnCache    bn_stem;
+    bt::Tensor stem_pre_relu;
+    BlockCache b1, b2, b3, b4;
+    bt::Tensor y4;            // (B, c4*T)
+    bt::Tensor pooled;        // (B, c4)
+};
+
+// Per-tensor Adam state.
+struct AdamSlot {
+    bt::Tensor m;
+    bt::Tensor v;
+};
+
+}  // namespace
+
+// The training state lives in a separate object hung off the Impl. Built
+// lazily on first train_step() so untrained inference users don't pay for it.
+struct BcResnetTrainState {
+    int step = 0;
+
+    // Every trainable tensor + its grad + Adam (m, v). The pointer goes back
+    // into the model's Impl so adam_step rewrites the parameter in place.
+    struct Slot {
+        bt::Tensor* param;
+        bt::Tensor  grad;
+        bt::Tensor  m;
+        bt::Tensor  v;
+        std::string name;
+    };
+    std::vector<Slot> slots;
+
+    void add(bt::Tensor* p, const std::string& name) {
+        Slot s;
+        s.param = p;
+        s.grad  = bt::Tensor::zeros_on(bt::Device::CPU, p->rows, p->cols,
+                                       bt::Dtype::FP32);
+        s.m     = bt::Tensor::zeros_on(bt::Device::CPU, p->rows, p->cols,
+                                       bt::Dtype::FP32);
+        s.v     = bt::Tensor::zeros_on(bt::Device::CPU, p->rows, p->cols,
+                                       bt::Dtype::FP32);
+        s.name  = name;
+        slots.push_back(std::move(s));
+    }
+
+    bt::Tensor& grad(const std::string& name) {
+        for (auto& s : slots) if (s.name == name) return s.grad;
+        throw std::runtime_error("brosoundml: train: grad not found: " + name);
+    }
+
+    void zero_grads() {
+        for (auto& s : slots) s.grad.zero();
+    }
+
+    void adam(float lr) {
+        ++step;
+        for (auto& s : slots) {
+            bt::adam_step(*s.param, s.grad, s.m, s.v,
+                          lr, 0.9f, 0.999f, 1e-8f, step);
+        }
+    }
+};
+
+namespace {
+
+void register_params(BcResnetTrainState& t, BcResnet::Impl& m) {
+    auto add_conv = [&](const std::string& p, ConvLayer& c) {
+        t.add(&c.W, p + ".W");
+        t.add(&c.b, p + ".b");
+    };
+    auto add_bn = [&](const std::string& p, BatchNorm1d& bn) {
+        t.add(&bn.gamma, p + ".gamma");
+        t.add(&bn.beta,  p + ".beta");
+    };
+    auto add_block = [&](const std::string& p, Block& b) {
+        add_conv(p + ".dw", b.dw);
+        add_bn  (p + ".bn_dw", b.bn_dw);
+        add_conv(p + ".pw", b.pw);
+        add_bn  (p + ".bn_pw", b.bn_pw);
+        if (b.has_residual_proj) {
+            add_conv(p + ".res_proj", b.res_proj);
+            add_bn  (p + ".bn_res",   b.bn_res);
+        }
+    };
+    add_conv("stem", m.stem);
+    add_bn  ("bn_stem", m.bn_stem);
+    add_block("b1", m.b1);
+    add_block("b2", m.b2);
+    add_block("b3", m.b3);
+    add_block("b4", m.b4);
+    t.add(&m.head_W, "head.W");
+    t.add(&m.head_b, "head.b");
+}
+
+// Forward through one residual block in training mode. X is (B, ci*T) NCL.
+void block_train_forward(Block& blk, const bt::Tensor& X, int B, int ci,
+                         int co, int T, BlockCache& bc, bt::Tensor& Y) {
+    bc.X_in = X.to(bt::Device::CPU);   // deep copy for backward
+
+    // Depthwise.
+    bt::Tensor dw_conv_out;
+    conv_train_forward(blk.dw, X, B, T, bc.dw.X_padded, dw_conv_out);
+    bt::Tensor dw_bn_out;
+    bn_train_forward(blk.bn_dw, dw_conv_out, B, ci, T, dw_bn_out,
+                     bc.bn_dw.xhat, bc.bn_dw.mean, bc.bn_dw.inv_std);
+    bc.dw_pre = dw_bn_out.to(bt::Device::CPU);   // for ReLU backward
+    bt::Tensor dw_relu;
+    relu_train_forward(dw_bn_out, dw_relu);
+
+    // Pointwise.
+    bt::Tensor pw_conv_out;
+    conv_train_forward(blk.pw, dw_relu, B, T, bc.pw.X_padded, pw_conv_out);
+    bt::Tensor pw_bn_out;
+    bn_train_forward(blk.bn_pw, pw_conv_out, B, co, T, pw_bn_out,
+                     bc.bn_pw.xhat, bc.bn_pw.mean, bc.bn_pw.inv_std);
+    bc.pw_post_bn = pw_bn_out.to(bt::Device::CPU);
+
+    // Residual.
+    bt::Tensor res;
+    if (blk.has_residual_proj) {
+        bt::Tensor res_conv;
+        conv_train_forward(blk.res_proj, X, B, T, bc.res.X_padded, res_conv);
+        bt::Tensor res_bn;
+        bn_train_forward(blk.bn_res, res_conv, B, co, T, res_bn,
+                         bc.bn_res.xhat, bc.bn_res.mean, bc.bn_res.inv_std);
+        res = res_bn;
+    } else {
+        res = X.to(bt::Device::CPU);
+    }
+    // pre_relu = pw_post_bn + res
+    bt::Tensor pre_relu = bt::Tensor::empty_on(bt::Device::CPU, B, co * T,
+                                                bt::Dtype::FP32);
+    {
+        const float* a = pw_bn_out.host_f32();
+        const float* b = res.host_f32();
+        float* o = pre_relu.host_f32_mut();
+        const int n = B * co * T;
+        for (int i = 0; i < n; ++i) o[i] = a[i] + b[i];
+    }
+    bc.pre_relu = pre_relu;
+
+    relu_train_forward(pre_relu, Y);
+}
+
+// Eval-mode (running-stats BN, no caches) version.
+void block_eval_forward(const Block& blk, const bt::Tensor& X, int B, int ci,
+                        int co, int T, bt::Tensor& Y) {
+    bt::Tensor dw_padded = left_pad_ncl(X, B, ci, T, blk.dw.pad_left);
+    bt::Tensor dw_conv;
+    bt::conv1d(dw_padded, blk.dw.W, &blk.dw.b, B, ci, T + blk.dw.pad_left,
+               ci, blk.dw.kernel_size, 1, 0, blk.dw.dilation, blk.dw.groups,
+               dw_conv);
+    bt::Tensor dw_bn;
+    bn_eval_forward(blk.bn_dw, dw_conv, B, ci, T, dw_bn);
+    bt::Tensor dw_relu;
+    relu_train_forward(dw_bn, dw_relu);
+
+    bt::Tensor pw_padded = left_pad_ncl(dw_relu, B, ci, T, blk.pw.pad_left);
+    bt::Tensor pw_conv;
+    bt::conv1d(pw_padded, blk.pw.W, &blk.pw.b, B, ci, T + blk.pw.pad_left,
+               co, blk.pw.kernel_size, 1, 0, blk.pw.dilation, blk.pw.groups,
+               pw_conv);
+    bt::Tensor pw_bn;
+    bn_eval_forward(blk.bn_pw, pw_conv, B, co, T, pw_bn);
+
+    bt::Tensor res;
+    if (blk.has_residual_proj) {
+        bt::Tensor r_padded = left_pad_ncl(X, B, ci, T, blk.res_proj.pad_left);
+        bt::Tensor r_conv;
+        bt::conv1d(r_padded, blk.res_proj.W, &blk.res_proj.b, B, ci,
+                   T + blk.res_proj.pad_left, co, blk.res_proj.kernel_size, 1,
+                   0, blk.res_proj.dilation, blk.res_proj.groups, r_conv);
+        bn_eval_forward(blk.bn_res, r_conv, B, co, T, res);
+    } else {
+        res = X.to(bt::Device::CPU);
+    }
+    bt::Tensor pre_relu = bt::Tensor::empty_on(bt::Device::CPU, B, co * T,
+                                                bt::Dtype::FP32);
+    const float* a = pw_bn.host_f32();
+    const float* b = res.host_f32();
+    float* o = pre_relu.host_f32_mut();
+    const int n = B * co * T;
+    for (int i = 0; i < n; ++i) o[i] = a[i] + b[i];
+    relu_train_forward(pre_relu, Y);
+}
+
+// Backward through one block. dY is the upstream grad (B, co*T).
+// Updates dW/dB for every conv and dGamma/dBeta for every BN (via train_state
+// names). Returns dX (B, ci*T) overwritten.
+void block_train_backward(Block& blk, BlockCache& bc, const bt::Tensor& dY,
+                          int B, int ci, int co, int T,
+                          BcResnetTrainState& ts,
+                          const std::string& prefix,
+                          bt::Tensor& dX) {
+    // Backward through the final ReLU using pre_relu as the mask source.
+    bt::Tensor dPreRelu = bt::Tensor::empty_on(bt::Device::CPU, B, co * T,
+                                                bt::Dtype::FP32);
+    {
+        const float* m = bc.pre_relu.host_f32();
+        const float* g = dY.host_f32();
+        float* o = dPreRelu.host_f32_mut();
+        const int n = B * co * T;
+        for (int i = 0; i < n; ++i) o[i] = (m[i] > 0.0f) ? g[i] : 0.0f;
+    }
+
+    // pre_relu = pw_post_bn + res → both branches receive dPreRelu.
+    // ── PW BN backward ──
+    bt::Tensor d_pw_conv, d_pw_g, d_pw_b;
+    bn_train_backward(blk.bn_pw, bc.bn_pw.xhat, bc.bn_pw.mean,
+                      bc.bn_pw.inv_std, dPreRelu, B, co, T,
+                      d_pw_conv, d_pw_g, d_pw_b);
+    bt::add_inplace(ts.grad(prefix + ".bn_pw.gamma"), d_pw_g);
+    bt::add_inplace(ts.grad(prefix + ".bn_pw.beta"),  d_pw_b);
+
+    // ── PW conv backward ──
+    bt::Tensor d_dw_relu;
+    conv_train_backward(blk.pw, bc.pw.X_padded, d_pw_conv, B, T,
+                        d_dw_relu, ts.grad(prefix + ".pw.W"),
+                        ts.grad(prefix + ".pw.b"));
+
+    // ── DW ReLU backward ──
+    bt::Tensor d_dw_bn = bt::Tensor::empty_on(bt::Device::CPU, B, ci * T,
+                                               bt::Dtype::FP32);
+    {
+        const float* m = bc.dw_pre.host_f32();
+        const float* g = d_dw_relu.host_f32();
+        float* o = d_dw_bn.host_f32_mut();
+        const int n = B * ci * T;
+        for (int i = 0; i < n; ++i) o[i] = (m[i] > 0.0f) ? g[i] : 0.0f;
+    }
+
+    // ── DW BN backward ──
+    bt::Tensor d_dw_conv, d_dw_g, d_dw_b;
+    bn_train_backward(blk.bn_dw, bc.bn_dw.xhat, bc.bn_dw.mean,
+                      bc.bn_dw.inv_std, d_dw_bn, B, ci, T,
+                      d_dw_conv, d_dw_g, d_dw_b);
+    bt::add_inplace(ts.grad(prefix + ".bn_dw.gamma"), d_dw_g);
+    bt::add_inplace(ts.grad(prefix + ".bn_dw.beta"),  d_dw_b);
+
+    // ── DW conv backward → dX_main (block input via main path) ──
+    bt::Tensor dX_main;
+    conv_train_backward(blk.dw, bc.dw.X_padded, d_dw_conv, B, T,
+                        dX_main, ts.grad(prefix + ".dw.W"),
+                        ts.grad(prefix + ".dw.b"));
+
+    // ── Residual branch backward ──
+    bt::Tensor dX_res;
+    if (blk.has_residual_proj) {
+        bt::Tensor d_res_conv, d_res_g, d_res_b;
+        bn_train_backward(blk.bn_res, bc.bn_res.xhat, bc.bn_res.mean,
+                          bc.bn_res.inv_std, dPreRelu, B, co, T,
+                          d_res_conv, d_res_g, d_res_b);
+        bt::add_inplace(ts.grad(prefix + ".bn_res.gamma"), d_res_g);
+        bt::add_inplace(ts.grad(prefix + ".bn_res.beta"),  d_res_b);
+        conv_train_backward(blk.res_proj, bc.res.X_padded, d_res_conv, B, T,
+                            dX_res, ts.grad(prefix + ".res_proj.W"),
+                            ts.grad(prefix + ".res_proj.b"));
+    } else {
+        // res = X identity → dX_res = dPreRelu (the residual branch's grad
+        // equals the upstream pre-relu grad directly).
+        dX_res = dPreRelu.to(bt::Device::CPU);
+    }
+
+    // dX = dX_main + dX_res
+    dX = bt::Tensor::empty_on(bt::Device::CPU, B, ci * T, bt::Dtype::FP32);
+    const float* a = dX_main.host_f32();
+    const float* b = dX_res.host_f32();
+    float* o = dX.host_f32_mut();
+    const int n = B * ci * T;
+    for (int i = 0; i < n; ++i) o[i] = a[i] + b[i];
+}
+
+}  // namespace
+
+// ─── Public training surface ──────────────────────────────────────────────
+
+void BcResnet::xavier_init_weights(std::uint64_t seed) {
+    if (impl_->fused) {
+        fail("BcResnet::xavier_init_weights",
+             "cannot re-init a fused model — make() first");
+    }
+    if (impl_->device != bt::Device::CPU) {
+        fail("BcResnet::xavier_init_weights",
+             "training-mode init is CPU-only (consume on CPU, then move once "
+             "fused)");
+    }
+    std::uint64_t s = seed;
+
+    auto init_conv_w = [&](ConvLayer& c) {
+        xavier_uniform_fill(c.W, s);
+        c.b.zero();
+    };
+    auto init_bn_w = [&](BatchNorm1d& bn) {
+        if (!bn.present) return;
+        std::vector<float> ones(static_cast<std::size_t>(bn.channels), 1.0f);
+        bn.gamma = bt::Tensor::from_host_on(bt::Device::CPU, ones.data(),
+                                            bn.channels, 1);
+        bn.beta.zero();
+        bn.mean.zero();
+        bn.var  = bt::Tensor::from_host_on(bt::Device::CPU, ones.data(),
+                                            bn.channels, 1);
+    };
+    init_conv_w(impl_->stem);
+    init_bn_w(impl_->bn_stem);
+
+    auto init_block_w = [&](Block& b) {
+        init_conv_w(b.dw); init_bn_w(b.bn_dw);
+        init_conv_w(b.pw); init_bn_w(b.bn_pw);
+        if (b.has_residual_proj) {
+            init_conv_w(b.res_proj);
+            init_bn_w(b.bn_res);
+        }
+    };
+    init_block_w(impl_->b1);
+    init_block_w(impl_->b2);
+    init_block_w(impl_->b3);
+    init_block_w(impl_->b4);
+
+    xavier_uniform_fill(impl_->head_W, s);
+    impl_->head_b.zero();
+
+    // Splitmix64 advance to swallow any unused state — sm64 mutates `s`.
+    (void)sm64(s);
+}
+
+// Forward + backward + adam step on one minibatch. Returns mean BCE loss.
+float BcResnet::train_step(const bt::Tensor& mel_batch,
+                           const bt::Tensor& labels,
+                           int B, int T,
+                           float lr, float pos_weight) {
+    if (impl_->fused) {
+        fail("BcResnet::train_step",
+             "cannot train a fused model — make() + xavier_init_weights() "
+             "first");
+    }
+    if (impl_->device != bt::Device::CPU) {
+        fail("BcResnet::train_step", "training is CPU-only");
+    }
+    if (mel_batch.rows != B || mel_batch.cols != impl_->cfg.n_mels * T) {
+        fail("BcResnet::train_step",
+             "mel_batch shape (" + std::to_string(mel_batch.rows) + "," +
+             std::to_string(mel_batch.cols) + ") != expected (" +
+             std::to_string(B) + "," +
+             std::to_string(impl_->cfg.n_mels * T) + ")");
+    }
+    if (labels.rows != B || labels.cols != 1) {
+        fail("BcResnet::train_step",
+             "labels shape (" + std::to_string(labels.rows) + "," +
+             std::to_string(labels.cols) + ") != (" + std::to_string(B) +
+             ",1)");
+    }
+
+    // Lazy build of the training state.
+    if (!impl_->train_state) {
+        impl_->train_state = std::make_unique<BcResnetTrainState>();
+        register_params(*impl_->train_state, *impl_);
+    }
+    auto& ts = *impl_->train_state;
+    ts.zero_grads();
+
+    const auto& cfg = impl_->cfg;
+    const int C0 = cfg.c0, C1 = cfg.c1, C2 = cfg.c2, C3 = cfg.c3, C4 = cfg.c4;
+
+    TrainCache tc;
+
+    // Stem.
+    bt::Tensor stem_conv;
+    conv_train_forward(impl_->stem, mel_batch, B, T, tc.stem_X_padded,
+                       stem_conv);
+    bt::Tensor stem_bn;
+    bn_train_forward(impl_->bn_stem, stem_conv, B, C0, T, stem_bn,
+                     tc.bn_stem.xhat, tc.bn_stem.mean, tc.bn_stem.inv_std);
+    tc.stem_pre_relu = stem_bn.to(bt::Device::CPU);
+    bt::Tensor stem_relu;
+    relu_train_forward(stem_bn, stem_relu);
+
+    // Blocks.
+    bt::Tensor y1, y2, y3, y4;
+    block_train_forward(impl_->b1, stem_relu, B, C0, C1, T, tc.b1, y1);
+    block_train_forward(impl_->b2, y1,        B, C1, C2, T, tc.b2, y2);
+    block_train_forward(impl_->b3, y2,        B, C2, C3, T, tc.b3, y3);
+    block_train_forward(impl_->b4, y3,        B, C3, C4, T, tc.b4, y4);
+    tc.y4 = y4.to(bt::Device::CPU);
+
+    // GAP over T → (B, C4).
+    tc.pooled = bt::Tensor::zeros_on(bt::Device::CPU, B, C4, bt::Dtype::FP32);
+    {
+        const float* y = y4.host_f32();
+        float*       p = tc.pooled.host_f32_mut();
+        const float inv = 1.0f / static_cast<float>(T);
+        for (int n = 0; n < B; ++n) {
+            for (int c = 0; c < C4; ++c) {
+                double s = 0.0;
+                const float* row = y + (static_cast<std::size_t>(n) * C4 + c)
+                                       * T;
+                for (int t = 0; t < T; ++t) s += row[t];
+                p[static_cast<std::size_t>(n) * C4 + c] =
+                    static_cast<float>(s) * inv;
+            }
+        }
+    }
+
+    // Head: linear (B, C4) → (B, 1) logits.
+    bt::Tensor logits = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                              bt::Dtype::FP32);
+    bt::linear_forward_batched(impl_->head_W, impl_->head_b, tc.pooled, logits);
+
+    // Fused BCE. Targets (B,1), pos_weight scales the positive class.
+    bt::Tensor probs       = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                  bt::Dtype::FP32);
+    bt::Tensor dLogits     = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                  bt::Dtype::FP32);
+    bt::Tensor loss_per    = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                  bt::Dtype::FP32);
+    bt::bce_with_logits_fused_batched(logits, labels, /*mask=*/nullptr,
+                                      pos_weight, probs, dLogits, loss_per);
+
+    // Mean loss = sum(loss_per) / B.  Scale dLogits by 1/B so the gradient is
+    // the mean-reduction gradient (matches PyTorch's mean reduction).
+    float total_loss = 0.0f;
+    {
+        const float* l = loss_per.host_f32();
+        for (int i = 0; i < B; ++i) total_loss += l[i];
+    }
+    const float mean_loss = total_loss / static_cast<float>(B);
+    bt::scale_inplace(dLogits, 1.0f / static_cast<float>(B));
+
+    // Head backward.
+    bt::Tensor dPooled = bt::Tensor::zeros_on(bt::Device::CPU, B, C4,
+                                               bt::Dtype::FP32);
+    bt::linear_backward_batched(impl_->head_W, tc.pooled, dLogits,
+                                dPooled, ts.grad("head.W"), ts.grad("head.b"));
+
+    // GAP backward: scatter dPooled[b,c] / T across T frames into dY4.
+    bt::Tensor dY4 = bt::Tensor::empty_on(bt::Device::CPU, B, C4 * T,
+                                           bt::Dtype::FP32);
+    {
+        const float* p = dPooled.host_f32();
+        float*       y = dY4.host_f32_mut();
+        const float inv = 1.0f / static_cast<float>(T);
+        for (int n = 0; n < B; ++n) {
+            for (int c = 0; c < C4; ++c) {
+                const float v = p[static_cast<std::size_t>(n) * C4 + c] * inv;
+                float* row = y + (static_cast<std::size_t>(n) * C4 + c) * T;
+                for (int t = 0; t < T; ++t) row[t] = v;
+            }
+        }
+    }
+
+    // Blocks backward.
+    bt::Tensor dY3, dY2, dY1, dStemRelu;
+    block_train_backward(impl_->b4, tc.b4, dY4, B, C3, C4, T, ts, "b4", dY3);
+    block_train_backward(impl_->b3, tc.b3, dY3, B, C2, C3, T, ts, "b3", dY2);
+    block_train_backward(impl_->b2, tc.b2, dY2, B, C1, C2, T, ts, "b2", dY1);
+    block_train_backward(impl_->b1, tc.b1, dY1, B, C0, C1, T, ts, "b1",
+                         dStemRelu);
+
+    // Stem ReLU backward.
+    bt::Tensor dStemBn = bt::Tensor::empty_on(bt::Device::CPU, B, C0 * T,
+                                                bt::Dtype::FP32);
+    {
+        const float* m = tc.stem_pre_relu.host_f32();
+        const float* g = dStemRelu.host_f32();
+        float* o = dStemBn.host_f32_mut();
+        const int n = B * C0 * T;
+        for (int i = 0; i < n; ++i) o[i] = (m[i] > 0.0f) ? g[i] : 0.0f;
+    }
+
+    // Stem BN backward.
+    bt::Tensor dStemConv, dStemG, dStemBeta;
+    bn_train_backward(impl_->bn_stem, tc.bn_stem.xhat, tc.bn_stem.mean,
+                      tc.bn_stem.inv_std, dStemBn, B, C0, T,
+                      dStemConv, dStemG, dStemBeta);
+    bt::add_inplace(ts.grad("bn_stem.gamma"), dStemG);
+    bt::add_inplace(ts.grad("bn_stem.beta"),  dStemBeta);
+
+    // Stem conv backward. We discard dX into the input — not used.
+    bt::Tensor dInput;
+    conv_train_backward(impl_->stem, tc.stem_X_padded, dStemConv, B, T,
+                        dInput, ts.grad("stem.W"), ts.grad("stem.b"));
+
+    // Adam step.
+    ts.adam(lr);
+
+    return mean_loss;
+}
+
+BcResnet::EvalMetrics BcResnet::eval_step(const bt::Tensor& mel_batch,
+                                          const bt::Tensor& labels,
+                                          int B, int T, float pos_weight) {
+    if (impl_->fused) {
+        fail("BcResnet::eval_step",
+             "fused models are inference-ready; call forward() instead");
+    }
+    if (impl_->device != bt::Device::CPU) {
+        fail("BcResnet::eval_step", "training-mode eval is CPU-only");
+    }
+    const auto& cfg = impl_->cfg;
+    const int C0 = cfg.c0, C1 = cfg.c1, C2 = cfg.c2, C3 = cfg.c3, C4 = cfg.c4;
+
+    // Forward (eval) — running BN, no caches.
+    bt::Tensor stem_padded = left_pad_ncl(mel_batch, B, cfg.n_mels, T,
+                                          impl_->stem.pad_left);
+    bt::Tensor stem_conv;
+    bt::conv1d(stem_padded, impl_->stem.W, &impl_->stem.b, B, cfg.n_mels,
+               T + impl_->stem.pad_left, C0, impl_->stem.kernel_size, 1, 0,
+               impl_->stem.dilation, impl_->stem.groups, stem_conv);
+    bt::Tensor stem_bn;
+    bn_eval_forward(impl_->bn_stem, stem_conv, B, C0, T, stem_bn);
+    bt::Tensor stem_relu;
+    relu_train_forward(stem_bn, stem_relu);
+
+    bt::Tensor y1, y2, y3, y4;
+    block_eval_forward(impl_->b1, stem_relu, B, C0, C1, T, y1);
+    block_eval_forward(impl_->b2, y1,        B, C1, C2, T, y2);
+    block_eval_forward(impl_->b3, y2,        B, C2, C3, T, y3);
+    block_eval_forward(impl_->b4, y3,        B, C3, C4, T, y4);
+
+    bt::Tensor pooled = bt::Tensor::zeros_on(bt::Device::CPU, B, C4,
+                                              bt::Dtype::FP32);
+    {
+        const float* y = y4.host_f32();
+        float*       p = pooled.host_f32_mut();
+        const float inv = 1.0f / static_cast<float>(T);
+        for (int n = 0; n < B; ++n) {
+            for (int c = 0; c < C4; ++c) {
+                double s = 0.0;
+                const float* row = y + (static_cast<std::size_t>(n) * C4 + c)
+                                       * T;
+                for (int t = 0; t < T; ++t) s += row[t];
+                p[static_cast<std::size_t>(n) * C4 + c] =
+                    static_cast<float>(s) * inv;
+            }
+        }
+    }
+
+    bt::Tensor logits = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                              bt::Dtype::FP32);
+    bt::linear_forward_batched(impl_->head_W, impl_->head_b, pooled, logits);
+
+    bt::Tensor probs    = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                bt::Dtype::FP32);
+    bt::Tensor dLogits  = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                bt::Dtype::FP32);
+    bt::Tensor loss_per = bt::Tensor::zeros_on(bt::Device::CPU, B, 1,
+                                                bt::Dtype::FP32);
+    bt::bce_with_logits_fused_batched(logits, labels, nullptr, pos_weight,
+                                      probs, dLogits, loss_per);
+
+    EvalMetrics m{};
+    m.n = B;
+    float total = 0.0f;
+    int correct = 0, fp = 0, fn_ = 0, n_pos = 0, n_neg = 0;
+    const float* lab = labels.host_f32();
+    const float* pr  = probs.host_f32();
+    const float* lp  = loss_per.host_f32();
+    for (int i = 0; i < B; ++i) {
+        total += lp[i];
+        const int yhat = (pr[i] >= 0.5f) ? 1 : 0;
+        const int yt   = (lab[i] >= 0.5f) ? 1 : 0;
+        if (yhat == yt) ++correct;
+        if (yt == 1) {
+            ++n_pos;
+            if (yhat == 0) ++fn_;
+        } else {
+            ++n_neg;
+            if (yhat == 1) ++fp;
+        }
+    }
+    m.loss     = total / static_cast<float>(B);
+    m.accuracy = static_cast<float>(correct) / static_cast<float>(B);
+    m.frr      = n_pos > 0 ? static_cast<float>(fn_) / n_pos : 0.0f;
+    m.fpr      = n_neg > 0 ? static_cast<float>(fp)  / n_neg : 0.0f;
+    return m;
+}
+
+BcResnet::~BcResnet() = default;
 
 }  // namespace brosoundml
