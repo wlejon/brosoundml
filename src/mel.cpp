@@ -1,0 +1,359 @@
+#include "brosoundml/mel.h"
+
+#include <brotensor/ops.h>
+#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace brosoundml {
+
+namespace bt = brotensor;
+
+namespace {
+
+[[noreturn]] void fail(const std::string& where, const std::string& msg) {
+    throw std::runtime_error("brosoundml: " + where + ": " + msg);
+}
+
+constexpr float kEps = 1e-10f;
+
+// HTK mel: m = 2595 * log10(1 + f/700).
+double hz_to_mel_htk(double hz) {
+    return 2595.0 * std::log10(1.0 + hz / 700.0);
+}
+double mel_to_hz_htk(double m) {
+    return 700.0 * (std::pow(10.0, m / 2595.0) - 1.0);
+}
+
+// Triangular HTK mel filterbank, (n_mels, n_bins) row-major.
+std::vector<float> build_mel_filterbank_htk(int n_mels, int n_fft,
+                                            int sample_rate,
+                                            double fmin, double fmax) {
+    const int n_bins = n_fft / 2 + 1;
+    // Bin centre frequencies (Hz) — linearly spaced from 0 to sr/2 across the
+    // n_bins rfft outputs.
+    std::vector<double> bin_hz(static_cast<std::size_t>(n_bins));
+    for (int k = 0; k < n_bins; ++k) {
+        bin_hz[static_cast<std::size_t>(k)] =
+            static_cast<double>(k) * sample_rate / static_cast<double>(n_fft);
+    }
+    // n_mels + 2 mel-spaced edges, converted back to Hz.
+    const double mel_lo = hz_to_mel_htk(fmin);
+    const double mel_hi = hz_to_mel_htk(fmax);
+    std::vector<double> edges_hz(static_cast<std::size_t>(n_mels) + 2);
+    for (int i = 0; i < n_mels + 2; ++i) {
+        const double m = mel_lo + (mel_hi - mel_lo) * i / (n_mels + 1);
+        edges_hz[static_cast<std::size_t>(i)] = mel_to_hz_htk(m);
+    }
+    std::vector<float> fb(static_cast<std::size_t>(n_mels) * n_bins, 0.0f);
+    for (int m = 0; m < n_mels; ++m) {
+        const double lo = edges_hz[static_cast<std::size_t>(m)];
+        const double ce = edges_hz[static_cast<std::size_t>(m) + 1];
+        const double hi = edges_hz[static_cast<std::size_t>(m) + 2];
+        for (int k = 0; k < n_bins; ++k) {
+            const double f = bin_hz[static_cast<std::size_t>(k)];
+            double w = 0.0;
+            if (f >= lo && f <= ce && ce > lo) {
+                w = (f - lo) / (ce - lo);
+            } else if (f > ce && f <= hi && hi > ce) {
+                w = (hi - f) / (hi - ce);
+            }
+            if (w < 0.0) w = 0.0;
+            fb[static_cast<std::size_t>(m) * n_bins + k] = static_cast<float>(w);
+        }
+    }
+    return fb;
+}
+
+// Periodic Hann: w[n] = 0.5 * (1 - cos(2*pi*n / N)). Matches torch.hann_window
+// (periodic=True, the default).
+std::vector<float> build_hann_window(int win_length) {
+    std::vector<float> w(static_cast<std::size_t>(win_length));
+    for (int n = 0; n < win_length; ++n) {
+        const double phase = 2.0 * 3.14159265358979323846 *
+                             static_cast<double>(n) /
+                             static_cast<double>(win_length);
+        w[static_cast<std::size_t>(n)] =
+            static_cast<float>(0.5 * (1.0 - std::cos(phase)));
+    }
+    return w;
+}
+
+// Compute mel frames from a (1, signal_len) CPU FP32 signal — assumes
+// signal_len >= win_length. Pipeline runs on `device`: stft → complex_abs →
+// matmul(mel_filter) → log_forward, all out tensors device-resident. Result
+// is written to `out` as (n_mels, T) row-major on `device`. Returns T.
+int compute_frames(const float* signal_host, int signal_len,
+                   const MelConfig& cfg,
+                   const bt::Tensor& mel_filter,
+                   const bt::Tensor& window,
+                   bt::Device device,
+                   bt::Tensor& out) {
+    const std::string where = "MelFrontend::compute_frames";
+    if (signal_len < cfg.win_length) {
+        fail(where, "signal_len < win_length — caller must filter this out");
+    }
+    const int T      = 1 + (signal_len - cfg.win_length) / cfg.hop_length;
+    const int n_bins = cfg.n_fft / 2 + 1;
+
+    // Upload signal to `device`. brotensor's stft expects (N, signal_len).
+    bt::Tensor signal = bt::Tensor::from_host_on(device, signal_host, 1, signal_len);
+
+    // STFT (center=false): frames = 1 + (L - n_fft)/hop. We're using
+    // win_length <= n_fft framing with center=false — the op centres the
+    // win_length samples inside the n_fft buffer per frame; the first frame
+    // starts at sample 0. The op's center=false formula uses n_fft (not
+    // win_length) for the frame-count denominator, so feed it a buffer sized
+    // so the formula yields the same T as our offline rule. Specifically:
+    // 1 + (L_padded - n_fft)/hop == T  ⇒  L_padded == (T-1)*hop + n_fft.
+    // We right-pad with zeros from signal_len up to L_padded. The mel result
+    // is identical because the analysis window has length win_length and is
+    // centred in n_fft, so the n_fft - win_length tail samples are multiplied
+    // by zero — they never reach the spectrum.
+    // brotensor's stft (center=false) frames the signal as:
+    //   frame f reads padded[f*hop + pad_lo : f*hop + pad_lo + win_length)
+    //   with pad_lo = (n_fft - win_length) / 2.
+    // For T frames we need padded length L_padded = (T-1)*hop + n_fft (from
+    // brotensor's frames = 1 + (L - n_fft)/hop), and to make frame f land on
+    // our logical sample f*hop we left-pad the signal by pad_lo zeros. That
+    // produces matching tail-pad on the right too: L_padded - (pad_lo +
+    // signal_len) = (n_fft - win_length)/2 = pad_lo.
+    const int pad_lo   = (cfg.n_fft - cfg.win_length) / 2;
+    const int L_padded = (T - 1) * cfg.hop_length + cfg.n_fft;
+    {
+        std::vector<float> padded(static_cast<std::size_t>(L_padded), 0.0f);
+        // Clip the copy to the destination capacity. signal_len may exceed
+        // (T-1)*hop + win_length when the caller passes a non-aligned N; the
+        // extra tail samples sit past the last frame's read window anyway.
+        const int max_copy = L_padded - pad_lo;
+        const int copy_n   = std::min(signal_len, max_copy);
+        std::memcpy(padded.data() + pad_lo, signal_host,
+                    static_cast<std::size_t>(copy_n) * sizeof(float));
+        signal = bt::Tensor::from_host_on(device, padded.data(), 1, L_padded);
+    }
+
+    bt::Tensor spec;
+    bt::stft(signal, window, /*N=*/1, cfg.n_fft, cfg.hop_length, cfg.win_length,
+             /*center=*/false, /*normalized=*/false, spec);
+    if (spec.rows < T) {
+        fail(where, "stft returned " + std::to_string(spec.rows) +
+                    " frames; expected " + std::to_string(T));
+    }
+
+    // Magnitude: (T, n_bins) on `device`.
+    bt::Tensor mag;
+    bt::complex_abs(spec, mag);
+    // Drop any extra trailing frames stft may have emitted (defensive — the
+    // L_padded math above is exact, so this is a no-op in practice).
+    if (mag.rows != T) {
+        // View the first T rows — but Tensor::view returns a non-owning view
+        // and downstream matmul would refuse to resize a view output. Instead
+        // copy out the prefix via a host round-trip. This branch should never
+        // fire under the L_padded math; assert it doesn't to avoid the cost.
+        fail(where, "magnitude frame count " + std::to_string(mag.rows) +
+                    " != expected " + std::to_string(T));
+    }
+
+    // Mel projection: (T, n_bins) @ (n_bins, n_mels) = (T, n_mels). We hold
+    // mel_filter as (n_mels, n_bins) so build the transpose host-side once
+    // per call and upload — same approach as src/whisper_modules.cpp. The
+    // alternative (a transpose op) doesn't exist in brotensor and we're not
+    // adding one here.
+    bt::Tensor mel_filter_T;
+    {
+        // mel_filter is device-resident; download → transpose → reupload.
+        // For typical KWS sizes (40 × 257) this is ~10 KB and fires once per
+        // streaming chunk — cheap relative to the STFT.
+        std::vector<float> fb_host = mel_filter.to_host_vector();
+        std::vector<float> fb_T_host(
+            static_cast<std::size_t>(n_bins) * cfg.n_mels);
+        for (int m = 0; m < cfg.n_mels; ++m) {
+            for (int k = 0; k < n_bins; ++k) {
+                fb_T_host[static_cast<std::size_t>(k) * cfg.n_mels + m] =
+                    fb_host[static_cast<std::size_t>(m) * n_bins + k];
+            }
+        }
+        mel_filter_T = bt::Tensor::from_host_on(
+            device, fb_T_host.data(), n_bins, cfg.n_mels);
+    }
+    bt::Tensor mel_T;  // (T, n_mels)
+    bt::matmul(mag, mel_filter_T, mel_T);
+
+    // log(max(mel, eps)). brotensor's log_forward does NOT clamp, so lift the
+    // floor host-side first. The host pass is one round-trip + a clamp; the
+    // alternative — building an eps tensor on `device` and using element-wise
+    // max — would need an op we don't have. The trip is small (T × n_mels;
+    // ~12 KB at 100 frames × 40 mels) and matches the dataset-builder cost
+    // profile (offline mel pre-cache writes to disk anyway).
+    std::vector<float> mel_host = mel_T.to_host_vector();
+    for (auto& v : mel_host) {
+        if (v < kEps) v = kEps;
+    }
+    bt::Tensor mel_clamped = bt::Tensor::from_host_on(
+        device, mel_host.data(), T, cfg.n_mels);
+    bt::Tensor log_TM;
+    bt::log_forward(mel_clamped, log_TM);
+
+    // Transpose (T, n_mels) → (n_mels, T). Again no transpose op — host
+    // round-trip. NCL convention with N=1 means the receiver reads this as
+    // (1, n_mels * T) flat.
+    std::vector<float> log_host = log_TM.to_host_vector();
+    std::vector<float> out_host(
+        static_cast<std::size_t>(cfg.n_mels) * T);
+    for (int t = 0; t < T; ++t) {
+        for (int m = 0; m < cfg.n_mels; ++m) {
+            out_host[static_cast<std::size_t>(m) * T + t] =
+                log_host[static_cast<std::size_t>(t) * cfg.n_mels + m];
+        }
+    }
+    out = bt::Tensor::from_host_on(device, out_host.data(), cfg.n_mels, T);
+    return T;
+}
+
+}  // namespace
+
+// ─── MelFrontend ───────────────────────────────────────────────────────────
+
+MelFrontend::MelFrontend(const MelConfig& cfg, bt::Device device)
+    : cfg_(cfg), device_(device) {
+    const std::string where = "MelFrontend::MelFrontend";
+    if (cfg_.sample_rate <= 0) fail(where, "sample_rate must be positive");
+    if (cfg_.n_fft <= 0)       fail(where, "n_fft must be positive");
+    if (cfg_.win_length <= 0)  fail(where, "win_length must be positive");
+    if (cfg_.hop_length <= 0)  fail(where, "hop_length must be positive");
+    if (cfg_.n_mels <= 0)      fail(where, "n_mels must be positive");
+    if (cfg_.win_length > cfg_.n_fft) {
+        fail(where, "win_length (" + std::to_string(cfg_.win_length) +
+                    ") > n_fft (" + std::to_string(cfg_.n_fft) + ")");
+    }
+    if (!(cfg_.fmin >= 0.0f && cfg_.fmax > cfg_.fmin)) {
+        fail(where, "require 0 <= fmin < fmax");
+    }
+    if (cfg_.fmax > static_cast<float>(cfg_.sample_rate) / 2.0f + 1e-3f) {
+        fail(where, "fmax exceeds Nyquist (sample_rate/2)");
+    }
+    if (cfg_.formula != MelFormula::HTK) {
+        fail(where, "only MelFormula::HTK is implemented");
+    }
+    if (cfg_.window != MelWindow::Hann) {
+        fail(where, "only MelWindow::Hann is implemented");
+    }
+    bt::init();
+
+    // Host-build the mel filterbank + window, then upload to `device_`.
+    std::vector<float> fb = build_mel_filterbank_htk(
+        cfg_.n_mels, cfg_.n_fft, cfg_.sample_rate, cfg_.fmin, cfg_.fmax);
+    const int n_bins = cfg_.n_fft / 2 + 1;
+    mel_filter_ = bt::Tensor::from_host_on(device_, fb.data(),
+                                           cfg_.n_mels, n_bins);
+
+    std::vector<float> w = build_hann_window(cfg_.win_length);
+    window_ = bt::Tensor::from_host_on(device_, w.data(), 1, cfg_.win_length);
+
+    ring_.reserve(static_cast<std::size_t>(cfg_.win_length + cfg_.hop_length));
+}
+
+void MelFrontend::reset() {
+    ring_.clear();
+    samples_dropped_ = 0;
+}
+
+int MelFrontend::frames_buffered() const {
+    return static_cast<int>(ring_.size());
+}
+
+int MelFrontend::consume(const float* samples, int n,
+                         bt::Tensor& out_frames_appended) {
+    const std::string where = "MelFrontend::consume";
+    if (n < 0) fail(where, "negative sample count");
+    if (n > 0 && samples == nullptr) fail(where, "null samples with n > 0");
+
+    if (n > 0) {
+        ring_.insert(ring_.end(), samples, samples + n);
+    }
+    const int buffered = static_cast<int>(ring_.size());
+    if (buffered < cfg_.win_length) {
+        return 0;
+    }
+    // How many frames can we emit from the current ring?
+    const int T_new = 1 + (buffered - cfg_.win_length) / cfg_.hop_length;
+    if (T_new <= 0) return 0;
+
+    // The compute pass needs a contiguous host buffer covering the samples
+    // for those T_new frames. Frame f spans [f*hop, f*hop + win_length).
+    // Frame T_new-1 ends at (T_new-1)*hop + win_length, which is the chunk
+    // length we hand to compute_frames.
+    const int chunk_len = (T_new - 1) * cfg_.hop_length + cfg_.win_length;
+
+    bt::Tensor frames;
+    compute_frames(ring_.data(), chunk_len, cfg_, mel_filter_, window_,
+                   device_, frames);
+
+    // Drop the consumed prefix from the ring. Carry-over is whatever's past
+    // sample (T_new * hop_length) — the start of the next un-emitted frame.
+    const int consumed = T_new * cfg_.hop_length;
+    if (consumed >= buffered) {
+        ring_.clear();
+    } else {
+        ring_.erase(ring_.begin(), ring_.begin() + consumed);
+    }
+    samples_dropped_ += consumed;
+
+    // Append `frames` (n_mels, T_new) along the time axis of out_frames_appended
+    // (n_mels, T_existing). Result: (n_mels, T_existing + T_new). The whole
+    // append happens on the host (download → splice → upload) because there's
+    // no concat op exposed and the per-call sizes are small.
+    if (out_frames_appended.rows == 0 && out_frames_appended.cols == 0) {
+        out_frames_appended = frames;
+        return T_new;
+    }
+    if (out_frames_appended.rows != cfg_.n_mels) {
+        fail(where, "out_frames_appended.rows (" +
+                    std::to_string(out_frames_appended.rows) +
+                    ") != n_mels (" + std::to_string(cfg_.n_mels) + ")");
+    }
+    const int T_old = out_frames_appended.cols;
+    std::vector<float> old_host = out_frames_appended.to_host_vector();
+    std::vector<float> new_host = frames.to_host_vector();
+    std::vector<float> merged(
+        static_cast<std::size_t>(cfg_.n_mels) * (T_old + T_new));
+    for (int m = 0; m < cfg_.n_mels; ++m) {
+        // Old prefix: T_old samples per row.
+        std::memcpy(
+            merged.data() +
+                static_cast<std::size_t>(m) * (T_old + T_new),
+            old_host.data() + static_cast<std::size_t>(m) * T_old,
+            static_cast<std::size_t>(T_old) * sizeof(float));
+        // New suffix: T_new samples per row.
+        std::memcpy(
+            merged.data() +
+                static_cast<std::size_t>(m) * (T_old + T_new) + T_old,
+            new_host.data() + static_cast<std::size_t>(m) * T_new,
+            static_cast<std::size_t>(T_new) * sizeof(float));
+    }
+    out_frames_appended = bt::Tensor::from_host_on(
+        device_, merged.data(), cfg_.n_mels, T_old + T_new);
+    return T_new;
+}
+
+void MelFrontend::compute_offline(const float* samples, int n,
+                                  bt::Tensor& out) {
+    const std::string where = "MelFrontend::compute_offline";
+    if (n < 0) fail(where, "negative sample count");
+    if (n > 0 && samples == nullptr) fail(where, "null samples with n > 0");
+
+    if (n < cfg_.win_length) {
+        // Zero frames. Allocate an empty (n_mels, 0) tensor for shape sanity.
+        out = bt::Tensor::empty_on(device_, cfg_.n_mels, 0, bt::Dtype::FP32);
+        return;
+    }
+    compute_frames(samples, n, cfg_, mel_filter_, window_, device_, out);
+}
+
+}  // namespace brosoundml
