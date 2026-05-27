@@ -106,6 +106,7 @@ target_sources(brosoundml PRIVATE
     src/modules.cpp
     src/kokoro_modules.cpp
     src/kokoro.cpp
+    src/wake.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
     src/g2p/pos_tagger.cpp
