@@ -135,4 +135,91 @@ class Manifest {
 // Escape a single field per RFC 4180. Public for the tests.
 std::string csv_escape_field(const std::string& s);
 
+// ─── Manifest reader ───────────────────────────────────────────────────────
+//
+// Parses the CSV emitted by `Manifest::append`. Throws on a missing/wrong
+// header, the wrong column count, or an unknown class label. Honours the
+// RFC-4180 quoting used by `csv_escape_field` (double-quote wrapped, embedded
+// `""` → `"`). Newlines/CRs inside quoted fields are accepted.
+std::vector<ManifestRow> read_manifest(const std::string& path);
+
+// ─── Audio quality stats ───────────────────────────────────────────────────
+
+struct AudioStats {
+    float peak           = 0.0f;
+    float rms            = 0.0f;
+    int   silent_samples = 0;   // |x| < 1e-4
+    int   clipped_samples= 0;   // |x| >= 0.999
+    bool  has_nan        = false;
+};
+
+AudioStats compute_audio_stats(const std::vector<float>& x);
+
+// ─── Dataset validation ────────────────────────────────────────────────────
+
+struct ValidationConfig {
+    int   expected_sample_rate = 16000;
+    float min_duration_s       = 0.95f;
+    float max_duration_s       = 1.05f;
+    // Per-clip silence / clip / NaN gates expressed as fractions of the buffer.
+    float max_silent_fraction  = 0.99f;  // a clip is "silent" if >= this
+    float max_clipped_fraction = 0.01f;  // a clip is "clipped" if >= this
+    // Dataset-wide thresholds (percent of total clips).
+    float max_silent_pct       = 1.0f;
+    float max_clipped_pct      = 0.5f;
+    // Class-balance requirements.
+    bool  require_positive_class = true;
+    bool  require_negative_class = true;
+};
+
+// One bucket = 5 dB; index 0 is the "clean" bucket (rows with no noise_kind).
+struct DatasetReport {
+    int total_rows            = 0;
+    int missing_files         = 0;
+    int malformed_wavs        = 0;
+    int sample_rate_mismatch  = 0;
+    int duration_out_of_range = 0;
+    int label_path_mismatch   = 0;
+    int unknown_class         = 0;
+    int silent_clips          = 0;
+    int clipped_clips         = 0;
+    int nan_clips             = 0;
+    int rejected_clips        = 0;   // unique clips that hit >= 1 anomaly
+
+    // Distribution summaries over the clips that were successfully decoded.
+    int   decoded_clips = 0;
+    float peak_min  = 0.0f, peak_mean = 0.0f, peak_max = 0.0f, peak_std = 0.0f;
+    float rms_min   = 0.0f, rms_mean  = 0.0f, rms_max  = 0.0f, rms_std  = 0.0f;
+
+    // path,label,class,voice,speed,snr_db,noise_kind keyed histograms.
+    // class -> count
+    std::vector<std::pair<std::string, int>> class_counts;
+    // label -> count (label is 0/1 → key "0" / "1")
+    std::vector<std::pair<std::string, int>> label_counts;
+    // voice -> count (skips empty voice)
+    std::vector<std::pair<std::string, int>> voice_counts;
+    // noise_kind -> count ("" rendered as "clean")
+    std::vector<std::pair<std::string, int>> noise_counts;
+    // speed bucket key (e.g. "1.00") -> count, bucketed by 0.05
+    std::vector<std::pair<std::string, int>> speed_counts;
+    // snr bucket key (e.g. "clean", "-5", "0", "5", "10", ...) -> count
+    std::vector<std::pair<std::string, int>> snr_counts;
+};
+
+DatasetReport validate_dataset(const std::vector<ManifestRow>& rows,
+                               const std::string& dataset_root,
+                               const ValidationConfig& cfg);
+
+// True if the report clears every dataset-wide threshold and no fatal
+// per-row anomalies (missing files, malformed WAVs, label/path mismatch,
+// unknown class) were recorded. On failure, fills `*reason` with a one-line
+// human-readable description of the first failing check. `reason` may be
+// nullptr.
+bool report_passes(const DatasetReport& r, const ValidationConfig& cfg,
+                   std::string* reason);
+
+// Plain-text human summary. The output line order is stable so two runs over
+// the same dataset diff cleanly.
+void print_report(const DatasetReport& r, std::FILE* out);
+
 }  // namespace brosoundml

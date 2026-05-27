@@ -150,6 +150,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_wake_synth tools/wake_synth.cpp)
     target_link_libraries(brosoundml_wake_synth PRIVATE brosoundml)
+
+    add_executable(brosoundml_wake_inspect tools/wake_inspect.cpp)
+    target_link_libraries(brosoundml_wake_inspect PRIVATE brosoundml)
 endif()
 
 # --- Tests ---
