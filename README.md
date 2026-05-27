@@ -6,8 +6,8 @@ audio models — it composes the FP32 audio op family in `brotensor` (FFT/STFT,
 autoregressive sampling) into runnable text-to-speech, speech-to-text, and
 neural-codec models.
 
-It is to audio what [`brodiffusion`](../brodiffusion) is to images and
-[`brolm`](../brolm) is to text: a sibling library that turns a tensor op
+It is to audio what [`brodiffusion`](https://github.com/wlejon/brodiffusion) is to images and
+[`brolm`](https://github.com/wlejon/brolm) is to text: a sibling library that turns a tensor op
 surface into a model.
 
 Models implemented:
@@ -24,13 +24,9 @@ GPU kernels of its own — GPU work happens inside `brotensor`.
 
 | Library | Role |
 |---|---|
-| [`bromath`](../bromath) | header-only math (Vec/Quat/Mat, easing) |
-| [`brotensor`](../brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) |
-| [`brolm`](../brolm) | tokenizers used by the speech models (e.g. `brolm::whisper::Tokenizer`) |
-
-CMake auto-detects standalone repos at `../<name>`, falling back to
-`third_party/` submodules — the pattern in
-[`bro/docs/multi-repo-workflow.md`](../bro/docs/multi-repo-workflow.md).
+| [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
+| [`brotensor`](https://github.com/wlejon/brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) |
+| [`brolm`](https://github.com/wlejon/brolm) | tokenizers used by the speech models (e.g. `brolm::whisper::Tokenizer`) |
 
 ## Data and weights
 
@@ -89,7 +85,7 @@ text ──▶ [G2P: misaki]──▶ phonemes ──▶ [token ids]
 English G2P at `brosoundml::g2p::` to remove that runtime dependency for
 embedded / no-Python deployments. Current state: byte-level Transformer POS
 tagger (`PosTagger`) is implemented and trained (weights in
-[`brosoundml-data`](../brosoundml-data) under `pos_tagger/`). The lexicon
+[`brosoundml-data`](https://github.com/wlejon/brosoundml-data) under `pos_tagger/`). The lexicon
 loader, morphology fallback, and the Kokoro phoneme-id adapter are in
 build-out. Until they land, callers must still pre-tokenize phonemes
 externally — `Kokoro::synthesize()` continues to accept phoneme ids
