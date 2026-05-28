@@ -4,16 +4,17 @@
 
 // brosoundml_wake_train — wake-word BC-ResNet trainer.
 //
-// Reads a chunk-3 synth-dataset manifest, pre-caches log-mel tensors on disk
-// (so each epoch is just tensor I/O), trains the chunk-5 BcResnet with Adam +
-// fused BCE-with-logits, evaluates on a stratified held-out split, and writes
-// a fused-BN inference-ready `.bw` checkpoint at the end of training.
+// Reads a chunk-3 synth-dataset manifest, pre-caches PCEN-mel tensors on disk
+// (so each epoch is just tensor I/O), trains the 2D BC-ResNet (BcResnet2d) with
+// Adam + fused BCE-with-logits, evaluates on a stratified held-out split, and
+// writes a fused-BN inference-ready 'BWK2' checkpoint at the end of training.
 //
-// All compute is on the CPU. The model is 22k parameters and the chunk-5
-// unfused BN backward is host-only, so CPU is the only valid device.
+// Compute runs on the model's device — CUDA in production (the 2D backward is
+// device-resident through brotensor's conv2d/batch_norm/relu ops). The PCEN
+// front-end is computed once on the CPU during the cache-build prep step.
 
 #include "brosoundml/audio.h"
-#include "brosoundml/bc_resnet.h"
+#include "brosoundml/bc_resnet2d.h"
 #include "brosoundml/mel.h"
 #include "brosoundml/wake_data.h"
 
@@ -284,58 +285,34 @@ float cosine_lr(int epoch, int total_epochs, float lr_peak, float lr_min) {
     return lr_min + 0.5f * (lr_peak - lr_min) * (1.0f + std::cos(pi * t));
 }
 
-// Pack a minibatch: copy each mel row (n_mels*T floats) into (B, n_mels*T)
-// NCL.  Labels (B,1) FP32 0/1.
+// Pack a minibatch: copy each cached PCEN-mel row (n_mels*T floats) into
+// (B, n_mels*T) NCL.  Labels (B,1) FP32 0/1.
 //
-// When `volume_rng` is non-null, every clip in the batch is volume-augmented
-// by sampling α ∈ [kVolMin, kVolMax] uniformly and adding `2 * ln(α)` to
-// every log-mel bin. That's mathematically identical to scaling the source
-// waveform by α before mel extraction (since log(α²·mel) = log(mel)+2·ln(α)),
-// so the cache stays valid. Each call to pack_batch with a non-null rng
-// draws fresh α's, giving the model a different volume per clip per epoch.
+// No feature-domain volume augmentation here. The old path added 2·ln(α) to
+// every log-mel bin to emulate a waveform gain change — valid only for the Log
+// front-end. PCEN normalises per-channel energy (loudness) out before the model
+// sees it, so a constant additive offset is NOT a loudness change under PCEN and
+// the trick is invalid. Channel/level robustness now comes from PCEN itself plus
+// waveform-domain acquisition augmentation applied during dataset synthesis.
 //
-// The training data was peak-normalized to 0.99 — a desktop mic delivers
-// speech at 0.02–0.10 peak. Without this augmentation, BC-ResNet learns to
-// rely on absolute log-mel magnitude and stops firing on quiet input. With
-// kVolMin=0.05 / kVolMax=0.95, every training clip gets at least 5%
-// reduction and up to 95% — covering the real mic delivery range and well
-// past it. (Earlier kVolMin=0.20 left a gap below 0.20 peak that desktop
-// mics often land in, which the chunk-7 probe flagged.)
-constexpr float kVolMin = 0.05f;
-constexpr float kVolMax = 0.95f;
-constexpr float kLogEpsFloor = -23.025851f;  // ln(1e-10) — matches mel kEps
-
-// Build host-side batch tensors first (cheap host loops with the volume
-// augmentation), then upload to `device` in a single h2d copy. Allocating
-// directly on a GPU device and looping with host_f32 would be a per-cell
-// roundtrip — unworkable. The host-stage-then-upload pattern is what
-// brotensor::Tensor::from_host_on is for.
+// Build host-side batch tensors first, then upload to `device` in a single h2d
+// copy. Allocating on a GPU device and looping with host_f32 would be a per-cell
+// roundtrip — the host-stage-then-upload pattern is what from_host_on is for.
 void pack_batch(const std::vector<std::vector<float>>& cache_buf,
                 const std::vector<int>& idx, int start, int B,
                 int n_mels, int T,
                 const std::vector<bsm::ManifestRow>& rows,
                 bt::Device device,
-                bt::Tensor& mel_out, bt::Tensor& lab_out,
-                std::mt19937* volume_rng = nullptr) {
+                bt::Tensor& mel_out, bt::Tensor& lab_out) {
     const std::size_t row_size = static_cast<std::size_t>(n_mels) * T;
     std::vector<float> mel_host(static_cast<std::size_t>(B) * row_size, 0.0f);
     std::vector<float> lab_host(static_cast<std::size_t>(B), 0.0f);
-    std::uniform_real_distribution<float> vol_dist(kVolMin, kVolMax);
     for (int b = 0; b < B; ++b) {
         const int ri = idx[static_cast<std::size_t>(start + b)];
         float* dst = mel_host.data() + static_cast<std::size_t>(b) * row_size;
         std::memcpy(dst,
                     cache_buf[static_cast<std::size_t>(ri)].data(),
                     row_size * sizeof(float));
-        if (volume_rng) {
-            const float alpha = vol_dist(*volume_rng);
-            const float delta = 2.0f * std::log(alpha);   // negative
-            for (std::size_t k = 0; k < row_size; ++k) {
-                float v = dst[k] + delta;
-                if (v < kLogEpsFloor) v = kLogEpsFloor;
-                dst[k] = v;
-            }
-        }
         lab_host[static_cast<std::size_t>(b)] =
             static_cast<float>(rows[static_cast<std::size_t>(ri)].label);
     }
@@ -382,6 +359,10 @@ int main(int argc, char** argv) try {
     // the offline mel computation on CPU because it's a one-shot prep step
     // (and it's already plenty fast at our dataset sizes).
     bsm::MelConfig mcfg;   // defaults match wake-synth: 16 kHz, 40 mels, 25 ms / 10 ms
+    // PCEN front-end: per-channel energy normalization cancels the microphone /
+    // channel spectral tilt and loudness before the model sees it — the lever
+    // that closes the synthetic→real gap (the 2D BC-ResNet supplies the rest).
+    mcfg.compression = bsm::MelCompression::PCEN;
     bsm::MelFrontend mel(mcfg, bt::Device::CPU);
     const int T_expected = 1 + (mcfg.sample_rate - mcfg.win_length) /
                             mcfg.hop_length;   // 1.0 s clip → 98 frames
@@ -436,26 +417,19 @@ int main(int argc, char** argv) try {
     }
 
     // ── Model ──
-    // Bumped from the BcResnetConfig defaults (32,32,48,56,64 ≈ 22k params).
-    // The chunk-7 probe showed the tiny model collapsed onto a narrow
-    // band-energy shortcut (any sustained tone in 500-2000 Hz fired it at 1.0)
-    // because it had enough capacity to memorise that shortcut but not the
-    // phonetic structure of "computer". Widening to ~55k params gives the
-    // network room to learn temporal phonetic patterns without breaching the
-    // 2 ms/frame inference budget on CPU.
-    bsm::BcResnetConfig bcfg;
-    bcfg.c0 =  64;
-    bcfg.c1 =  80;
-    bcfg.c2 =  96;
-    bcfg.c3 = 112;
-    bcfg.c4 = 128;
+    // The 2D BC-ResNet: a single-channel (freq × time) image with convolutions
+    // sliding over both axes and weights shared across frequency. That structure
+    // — not absolute-bin weighting — is what makes it spectral-tilt invariant.
+    // The compact default recipe (~16k params) keeps the always-on inference
+    // budget; widen the BcResnet2dConfig recipe only if capacity proves short.
+    bsm::BcResnet2dConfig bcfg;
     if (bcfg.n_mels != mcfg.n_mels) {
-        fail("wake_train", "BcResnet n_mels=" + std::to_string(bcfg.n_mels) +
+        fail("wake_train", "BcResnet2d n_mels=" + std::to_string(bcfg.n_mels) +
               " != MelConfig n_mels=" + std::to_string(mcfg.n_mels));
     }
-    bsm::BcResnet model = a.resume.empty()
-        ? bsm::BcResnet::make(bcfg, device)
-        : bsm::BcResnet::load(a.resume, device);
+    bsm::BcResnet2d model = a.resume.empty()
+        ? bsm::BcResnet2d::make(bcfg, device)
+        : bsm::BcResnet2d::load(a.resume, device);
     if (a.resume.empty()) {
         model.xavier_init_weights(static_cast<std::uint64_t>(a.seed));
     }
@@ -478,18 +452,13 @@ int main(int argc, char** argv) try {
                          static_cast<std::uint32_t>(epoch * 9176u));
         std::shuffle(train_idx.begin(), train_idx.end(), rng);
 
-        // Separate rng for volume augmentation so it advances independently
-        // of the shuffle draws (keeps either-or determinism debugging clean).
-        std::mt19937 vol_rng(static_cast<std::uint32_t>(a.seed) ^
-                             static_cast<std::uint32_t>(epoch * 0xD1B54A35u));
-
         double train_loss_sum = 0.0;
         int    train_seen     = 0;
 
         for (int step = 0; step < n_train_batches; ++step) {
             bt::Tensor mel_batch, labels;
             pack_batch(cache_buf, train_idx, step * B, B, mcfg.n_mels,
-                        T_expected, rows, device, mel_batch, labels, &vol_rng);
+                        T_expected, rows, device, mel_batch, labels);
             const float loss = model.train_step(mel_batch, labels, B,
                                                 T_expected, lr, a.pos_weight);
             train_loss_sum += loss;
