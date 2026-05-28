@@ -399,9 +399,14 @@ bool read_csv_row(const std::string& body, std::size_t& pos,
 }
 
 // Whitelist of class labels accepted by the chunk-3 producer.
+// The probe-style synthetic stimulus families (silence/tone/formant/am/sweep)
+// are added by the chunk-7 dataset expansion to anchor the band-energy
+// shortcut failure modes directly into the negative class.
 bool is_known_class(const std::string& c) {
     return c == "positive" || c == "confusable" ||
-           c == "sentence" || c == "noise";
+           c == "sentence" || c == "noise" ||
+           c == "silence"  || c == "tone"   ||
+           c == "formant"  || c == "am"     || c == "sweep";
 }
 
 }  // namespace

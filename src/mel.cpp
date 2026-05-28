@@ -85,16 +85,19 @@ std::vector<float> build_hann_window(int win_length) {
     return w;
 }
 
-// Compute mel frames from a (1, signal_len) CPU FP32 signal — assumes
+// Compute LINEAR mel frames from a (1, signal_len) CPU FP32 signal — assumes
 // signal_len >= win_length. Pipeline runs on `device`: stft → complex_abs →
-// matmul(mel_filter) → log_forward, all out tensors device-resident. Result
-// is written to `out` as (n_mels, T) row-major on `device`. Returns T.
+// matmul(mel_filter), all out tensors device-resident. The linear mel energy
+// is downloaded to `out_linear_TM` as (T, n_mels) row-major (T frames, each a
+// contiguous n_mels row — the layout PCEN's per-frame recursion wants).
+// Compression (log / PCEN) and the transpose to (n_mels, T) happen in the
+// MelFrontend member that owns the streaming state. Returns T.
 int compute_frames(const float* signal_host, int signal_len,
                    const MelConfig& cfg,
                    const bt::Tensor& mel_filter,
                    const bt::Tensor& window,
                    bt::Device device,
-                   bt::Tensor& out) {
+                   std::vector<float>& out_linear_TM) {
     const std::string where = "MelFrontend::compute_frames";
     if (signal_len < cfg.win_length) {
         fail(where, "signal_len < win_length — caller must filter this out");
@@ -182,37 +185,12 @@ int compute_frames(const float* signal_host, int signal_len,
         mel_filter_T = bt::Tensor::from_host_on(
             device, fb_T_host.data(), n_bins, cfg.n_mels);
     }
-    bt::Tensor mel_T;  // (T, n_mels)
+    bt::Tensor mel_T;  // (T, n_mels) linear
     bt::matmul(mag, mel_filter_T, mel_T);
 
-    // log(max(mel, eps)). brotensor's log_forward does NOT clamp, so lift the
-    // floor host-side first. The host pass is one round-trip + a clamp; the
-    // alternative — building an eps tensor on `device` and using element-wise
-    // max — would need an op we don't have. The trip is small (T × n_mels;
-    // ~12 KB at 100 frames × 40 mels) and matches the dataset-builder cost
-    // profile (offline mel pre-cache writes to disk anyway).
-    std::vector<float> mel_host = mel_T.to_host_vector();
-    for (auto& v : mel_host) {
-        if (v < kEps) v = kEps;
-    }
-    bt::Tensor mel_clamped = bt::Tensor::from_host_on(
-        device, mel_host.data(), T, cfg.n_mels);
-    bt::Tensor log_TM;
-    bt::log_forward(mel_clamped, log_TM);
-
-    // Transpose (T, n_mels) → (n_mels, T). Again no transpose op — host
-    // round-trip. NCL convention with N=1 means the receiver reads this as
-    // (1, n_mels * T) flat.
-    std::vector<float> log_host = log_TM.to_host_vector();
-    std::vector<float> out_host(
-        static_cast<std::size_t>(cfg.n_mels) * T);
-    for (int t = 0; t < T; ++t) {
-        for (int m = 0; m < cfg.n_mels; ++m) {
-            out_host[static_cast<std::size_t>(m) * T + t] =
-                log_host[static_cast<std::size_t>(t) * cfg.n_mels + m];
-        }
-    }
-    out = bt::Tensor::from_host_on(device, out_host.data(), cfg.n_mels, T);
+    // Download the linear mel energy as (T, n_mels). Compression (log / PCEN)
+    // is applied by the caller, which owns the streaming state PCEN needs.
+    out_linear_TM = mel_T.to_host_vector();
     return T;
 }
 
@@ -262,6 +240,50 @@ MelFrontend::MelFrontend(const MelConfig& cfg, bt::Device device)
 void MelFrontend::reset() {
     ring_.clear();
     samples_dropped_ = 0;
+    pcen_init_ = false;            // next frame re-seeds the PCEN smoother
+}
+
+// Apply cfg_.compression to linear mel laid out (T, n_mels) row-major, writing
+// the result transposed to (n_mels, T) into `out` on device_. For PCEN this
+// advances pcen_m_ one frame at a time, carrying state across calls so the
+// streaming path matches compute_offline frame-for-frame.
+void MelFrontend::compress_and_emit(const std::vector<float>& linear_mel_TM,
+                                    int T, bt::Tensor& out) {
+    const int M = cfg_.n_mels;
+    std::vector<float> out_host(static_cast<std::size_t>(M) * T);
+
+    if (cfg_.compression == MelCompression::Log) {
+        // log(max(mel, eps)) — bit-identical to the previous front-end.
+        for (int t = 0; t < T; ++t) {
+            for (int m = 0; m < M; ++m) {
+                float v = linear_mel_TM[static_cast<std::size_t>(t) * M + m];
+                if (v < kEps) v = kEps;
+                out_host[static_cast<std::size_t>(m) * T + t] = std::log(v);
+            }
+        }
+    } else {  // PCEN
+        const float s     = cfg_.pcen_s;
+        const float alpha = cfg_.pcen_alpha;
+        const float delta = cfg_.pcen_delta;
+        const float r     = cfg_.pcen_r;
+        const float eps   = cfg_.pcen_eps;
+        const float delta_r = std::pow(delta, r);
+        if (static_cast<int>(pcen_m_.size()) != M) pcen_m_.assign(M, 0.0f);
+        for (int t = 0; t < T; ++t) {
+            for (int m = 0; m < M; ++m) {
+                const float E = linear_mel_TM[static_cast<std::size_t>(t) * M + m];
+                float& Mst = pcen_m_[static_cast<std::size_t>(m)];
+                // Seed the smoother with the first frame's energy to avoid a
+                // startup transient (matches librosa's filter init).
+                Mst = pcen_init_ ? (1.0f - s) * Mst + s * E : E;
+                const float smooth = std::pow(eps + Mst, alpha);
+                const float v = std::pow(E / smooth + delta, r) - delta_r;
+                out_host[static_cast<std::size_t>(m) * T + t] = v;
+            }
+            pcen_init_ = true;
+        }
+    }
+    out = bt::Tensor::from_host_on(device_, out_host.data(), M, T);
 }
 
 int MelFrontend::frames_buffered() const {
@@ -291,9 +313,11 @@ int MelFrontend::consume(const float* samples, int n,
     // length we hand to compute_frames.
     const int chunk_len = (T_new - 1) * cfg_.hop_length + cfg_.win_length;
 
-    bt::Tensor frames;
+    std::vector<float> linear_TM;
     compute_frames(ring_.data(), chunk_len, cfg_, mel_filter_, window_,
-                   device_, frames);
+                   device_, linear_TM);
+    bt::Tensor frames;  // (n_mels, T_new) after compression
+    compress_and_emit(linear_TM, T_new, frames);
 
     // Drop the consumed prefix from the ring. Carry-over is whatever's past
     // sample (T_new * hop_length) — the start of the next un-emitted frame.
@@ -353,7 +377,13 @@ void MelFrontend::compute_offline(const float* samples, int n,
         out = bt::Tensor::empty_on(device_, cfg_.n_mels, 0, bt::Dtype::FP32);
         return;
     }
-    compute_frames(samples, n, cfg_, mel_filter_, window_, device_, out);
+    // One-shot: re-seed PCEN from this call's first frame (independent of any
+    // prior streaming state). No-op for Log.
+    pcen_init_ = false;
+    std::vector<float> linear_TM;
+    const int T = compute_frames(samples, n, cfg_, mel_filter_, window_,
+                                 device_, linear_TM);
+    compress_and_emit(linear_TM, T, out);
 }
 
 }  // namespace brosoundml

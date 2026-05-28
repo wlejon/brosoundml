@@ -18,6 +18,7 @@
 #include "brosoundml/wake_data.h"
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
 #include <algorithm>
@@ -51,6 +52,7 @@ struct Args {
     std::string cache_dir;                          // <dataset>/mel-cache by default
     std::string out_checkpoint = "weights/wake/computer.bw";
     std::string resume;                             // empty = none
+    std::string device         = "auto";            // 'auto'|'cpu'|'cuda'|'metal'
     float       val_frac       = 0.1f;
     int         epochs         = 50;
     int         batch_size     = 32;
@@ -78,6 +80,7 @@ void print_help() {
         "  --seed N             (default 42)\n"
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bw\n"
+        "  --device cpu|cuda    target device (default auto — CUDA if available)\n"
         "  --small              3 epochs / batch 4 — smoke-test preset\n";
 }
 
@@ -101,7 +104,7 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--save-every")     a.save_every = std::stoi(next());
         else if (k == "--resume")         a.resume = next();
         else if (k == "--small")          a.small = true;
-        else if (k == "--device")         { (void)next(); /* CPU only — flag ignored */ }
+        else if (k == "--device")         a.device = next();
         else if (k == "--help" || k == "-h") { a.help = true; return true; }
         else fail("cli", "unknown flag '" + k + "'");
     }
@@ -141,6 +144,17 @@ std::uint32_t mel_cfg_hash(const bsm::MelConfig& c) {
     bump(fmax_bits);
     bump(static_cast<std::uint32_t>(c.window));
     bump(static_cast<std::uint32_t>(c.formula));
+    // Compression + PCEN params — changing the front-end output must
+    // invalidate every cached mel.
+    bump(static_cast<std::uint32_t>(c.compression));
+    if (c.compression == bsm::MelCompression::PCEN) {
+        std::uint32_t b;
+        std::memcpy(&b, &c.pcen_s,     4); bump(b);
+        std::memcpy(&b, &c.pcen_alpha, 4); bump(b);
+        std::memcpy(&b, &c.pcen_delta, 4); bump(b);
+        std::memcpy(&b, &c.pcen_r,     4); bump(b);
+        std::memcpy(&b, &c.pcen_eps,   4); bump(b);
+    }
     return h;
 }
 
@@ -272,23 +286,62 @@ float cosine_lr(int epoch, int total_epochs, float lr_peak, float lr_min) {
 
 // Pack a minibatch: copy each mel row (n_mels*T floats) into (B, n_mels*T)
 // NCL.  Labels (B,1) FP32 0/1.
+//
+// When `volume_rng` is non-null, every clip in the batch is volume-augmented
+// by sampling α ∈ [kVolMin, kVolMax] uniformly and adding `2 * ln(α)` to
+// every log-mel bin. That's mathematically identical to scaling the source
+// waveform by α before mel extraction (since log(α²·mel) = log(mel)+2·ln(α)),
+// so the cache stays valid. Each call to pack_batch with a non-null rng
+// draws fresh α's, giving the model a different volume per clip per epoch.
+//
+// The training data was peak-normalized to 0.99 — a desktop mic delivers
+// speech at 0.02–0.10 peak. Without this augmentation, BC-ResNet learns to
+// rely on absolute log-mel magnitude and stops firing on quiet input. With
+// kVolMin=0.05 / kVolMax=0.95, every training clip gets at least 5%
+// reduction and up to 95% — covering the real mic delivery range and well
+// past it. (Earlier kVolMin=0.20 left a gap below 0.20 peak that desktop
+// mics often land in, which the chunk-7 probe flagged.)
+constexpr float kVolMin = 0.05f;
+constexpr float kVolMax = 0.95f;
+constexpr float kLogEpsFloor = -23.025851f;  // ln(1e-10) — matches mel kEps
+
+// Build host-side batch tensors first (cheap host loops with the volume
+// augmentation), then upload to `device` in a single h2d copy. Allocating
+// directly on a GPU device and looping with host_f32 would be a per-cell
+// roundtrip — unworkable. The host-stage-then-upload pattern is what
+// brotensor::Tensor::from_host_on is for.
 void pack_batch(const std::vector<std::vector<float>>& cache_buf,
                 const std::vector<int>& idx, int start, int B,
                 int n_mels, int T,
                 const std::vector<bsm::ManifestRow>& rows,
-                bt::Tensor& mel_out, bt::Tensor& lab_out) {
-    mel_out = bt::Tensor::zeros_on(bt::Device::CPU, B, n_mels * T,
-                                   bt::Dtype::FP32);
-    lab_out = bt::Tensor::zeros_on(bt::Device::CPU, B, 1, bt::Dtype::FP32);
-    float* mp = mel_out.host_f32_mut();
-    float* lp = lab_out.host_f32_mut();
+                bt::Device device,
+                bt::Tensor& mel_out, bt::Tensor& lab_out,
+                std::mt19937* volume_rng = nullptr) {
+    const std::size_t row_size = static_cast<std::size_t>(n_mels) * T;
+    std::vector<float> mel_host(static_cast<std::size_t>(B) * row_size, 0.0f);
+    std::vector<float> lab_host(static_cast<std::size_t>(B), 0.0f);
+    std::uniform_real_distribution<float> vol_dist(kVolMin, kVolMax);
     for (int b = 0; b < B; ++b) {
         const int ri = idx[static_cast<std::size_t>(start + b)];
-        std::memcpy(mp + static_cast<std::size_t>(b) * n_mels * T,
+        float* dst = mel_host.data() + static_cast<std::size_t>(b) * row_size;
+        std::memcpy(dst,
                     cache_buf[static_cast<std::size_t>(ri)].data(),
-                    static_cast<std::size_t>(n_mels) * T * sizeof(float));
-        lp[b] = static_cast<float>(rows[static_cast<std::size_t>(ri)].label);
+                    row_size * sizeof(float));
+        if (volume_rng) {
+            const float alpha = vol_dist(*volume_rng);
+            const float delta = 2.0f * std::log(alpha);   // negative
+            for (std::size_t k = 0; k < row_size; ++k) {
+                float v = dst[k] + delta;
+                if (v < kLogEpsFloor) v = kLogEpsFloor;
+                dst[k] = v;
+            }
+        }
+        lab_host[static_cast<std::size_t>(b)] =
+            static_cast<float>(rows[static_cast<std::size_t>(ri)].label);
     }
+    mel_out = bt::Tensor::from_host_on(device, mel_host.data(),
+                                        B, static_cast<int>(row_size));
+    lab_out = bt::Tensor::from_host_on(device, lab_host.data(), B, 1);
 }
 
 }  // namespace
@@ -310,7 +363,24 @@ int main(int argc, char** argv) try {
     fs::create_directories(a.cache_dir);
     fs::create_directories(fs::path(a.out_checkpoint).parent_path());
 
+    // ── Device selection ──
+    bt::init();
+    bt::Device device = bt::Device::CPU;
+    if (a.device == "auto") {
+        device = bt::is_available(bt::Device::CUDA) ? bt::Device::CUDA
+                                                    : bt::Device::CPU;
+    } else if (a.device == "cuda")  device = bt::Device::CUDA;
+    else if  (a.device == "metal") device = bt::Device::Metal;
+    else if  (a.device == "cpu")   device = bt::Device::CPU;
+    else fail("wake_train", "unknown --device '" + a.device + "'");
+
+    const char* dev_name = (device == bt::Device::CUDA)  ? "CUDA"  :
+                           (device == bt::Device::Metal) ? "Metal" : "CPU";
+
     // ── Mel front-end + cache key ──
+    // Mel features are cached to disk as device-agnostic FP32 bytes; we keep
+    // the offline mel computation on CPU because it's a one-shot prep step
+    // (and it's already plenty fast at our dataset sizes).
     bsm::MelConfig mcfg;   // defaults match wake-synth: 16 kHz, 40 mels, 25 ms / 10 ms
     bsm::MelFrontend mel(mcfg, bt::Device::CPU);
     const int T_expected = 1 + (mcfg.sample_rate - mcfg.win_length) /
@@ -319,6 +389,7 @@ int main(int argc, char** argv) try {
 
     std::cout << "wake_train: dataset='" << dataset_root.string() << "'\n"
               << "            cache='"   << a.cache_dir << "'\n"
+              << "            device="   << dev_name << "\n"
               << "            n_mels="   << mcfg.n_mels
               << "  T="                  << T_expected
               << "  cfg_hash=0x" << std::hex << cfg_hash << std::dec << "\n";
@@ -365,14 +436,26 @@ int main(int argc, char** argv) try {
     }
 
     // ── Model ──
+    // Bumped from the BcResnetConfig defaults (32,32,48,56,64 ≈ 22k params).
+    // The chunk-7 probe showed the tiny model collapsed onto a narrow
+    // band-energy shortcut (any sustained tone in 500-2000 Hz fired it at 1.0)
+    // because it had enough capacity to memorise that shortcut but not the
+    // phonetic structure of "computer". Widening to ~55k params gives the
+    // network room to learn temporal phonetic patterns without breaching the
+    // 2 ms/frame inference budget on CPU.
     bsm::BcResnetConfig bcfg;
+    bcfg.c0 =  64;
+    bcfg.c1 =  80;
+    bcfg.c2 =  96;
+    bcfg.c3 = 112;
+    bcfg.c4 = 128;
     if (bcfg.n_mels != mcfg.n_mels) {
         fail("wake_train", "BcResnet n_mels=" + std::to_string(bcfg.n_mels) +
               " != MelConfig n_mels=" + std::to_string(mcfg.n_mels));
     }
     bsm::BcResnet model = a.resume.empty()
-        ? bsm::BcResnet::make(bcfg, bt::Device::CPU)
-        : bsm::BcResnet::load(a.resume, bt::Device::CPU);
+        ? bsm::BcResnet::make(bcfg, device)
+        : bsm::BcResnet::load(a.resume, device);
     if (a.resume.empty()) {
         model.xavier_init_weights(static_cast<std::uint64_t>(a.seed));
     }
@@ -395,13 +478,18 @@ int main(int argc, char** argv) try {
                          static_cast<std::uint32_t>(epoch * 9176u));
         std::shuffle(train_idx.begin(), train_idx.end(), rng);
 
+        // Separate rng for volume augmentation so it advances independently
+        // of the shuffle draws (keeps either-or determinism debugging clean).
+        std::mt19937 vol_rng(static_cast<std::uint32_t>(a.seed) ^
+                             static_cast<std::uint32_t>(epoch * 0xD1B54A35u));
+
         double train_loss_sum = 0.0;
         int    train_seen     = 0;
 
         for (int step = 0; step < n_train_batches; ++step) {
             bt::Tensor mel_batch, labels;
             pack_batch(cache_buf, train_idx, step * B, B, mcfg.n_mels,
-                        T_expected, rows, mel_batch, labels);
+                        T_expected, rows, device, mel_batch, labels, &vol_rng);
             const float loss = model.train_step(mel_batch, labels, B,
                                                 T_expected, lr, a.pos_weight);
             train_loss_sum += loss;
@@ -419,7 +507,7 @@ int main(int argc, char** argv) try {
             if (eB == 0) break;
             bt::Tensor mel_batch, labels;
             pack_batch(cache_buf, val_idx, s, eB, mcfg.n_mels,
-                        T_expected, rows, mel_batch, labels);
+                        T_expected, rows, device, mel_batch, labels);
             const auto m = model.eval_step(mel_batch, labels, eB, T_expected,
                                             a.pos_weight);
             val_loss_sum += m.loss;

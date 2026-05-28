@@ -43,6 +43,25 @@ enum class MelFormula : std::uint8_t {
     HTK = 0,
 };
 
+// Output compression applied to the linear mel energy.
+//   Log  — log(max(mel, eps)). The classic KWS front-end. Absolute: a static
+//          per-channel gain (microphone frequency response, spectral tilt)
+//          passes straight through as an additive offset the model must learn.
+//   PCEN — per-channel energy normalization (Wang et al. 2017, "Trainable
+//          Frontend For Robust and Far-Field Keyword Spotting"). Divides each
+//          channel by a causal IIR-smoothed energy estimate, then root-
+//          compresses. The division cancels any slowly-varying per-channel
+//          gain — i.e. it normalises out microphone/channel spectral tilt and
+//          loudness before the model sees it. Streaming-friendly: the smoother
+//          carries one float of state per mel bin.
+//
+//      PCEN(t,f) = ( E(t,f) / (eps + M(t,f))^alpha + delta )^r - delta^r
+//      M(t,f)    = (1 - s)*M(t-1,f) + s*E(t,f),   M(0,f) = E(0,f)
+enum class MelCompression : std::uint8_t {
+    Log  = 0,
+    PCEN = 1,
+};
+
 struct MelConfig {
     int        sample_rate = 16000;
     int        n_fft       = 512;
@@ -53,6 +72,19 @@ struct MelConfig {
     float      fmax        = 8000.0f; // Nyquist @ 16 kHz
     MelWindow  window      = MelWindow::Hann;
     MelFormula formula     = MelFormula::HTK;
+
+    // Output compression. Defaults to Log for backward compatibility; the
+    // wake recipe selects PCEN for channel/tilt robustness.
+    MelCompression compression = MelCompression::Log;
+
+    // PCEN parameters (used only when compression == PCEN). Defaults match
+    // librosa.pcen at a 10 ms hop: smoother time-constant ~0.4 s (s≈0.025),
+    // alpha 0.98, delta 2.0, r 0.5.
+    float pcen_s     = 0.025f;   // IIR smoother coefficient
+    float pcen_alpha = 0.98f;    // gain-normalisation exponent
+    float pcen_delta = 2.0f;     // bias added before root compression
+    float pcen_r     = 0.5f;     // root-compression exponent
+    float pcen_eps   = 1e-6f;    // denominator floor
 };
 
 class MelFrontend {
@@ -101,6 +133,21 @@ private:
     // Number of samples discarded from the front of the conceptual stream
     // since the last reset(). Used only for diagnostics / frames_buffered().
     std::int64_t       samples_dropped_ = 0;
+
+    // PCEN per-channel IIR smoother state (size n_mels when active). Carried
+    // across consume() calls so streaming PCEN matches the offline pass
+    // frame-for-frame. `pcen_init_` is false until the first frame after a
+    // reset() seeds M with that frame's energy (avoids a startup transient).
+    // Unused when cfg_.compression == Log.
+    std::vector<float> pcen_m_;
+    bool               pcen_init_ = false;
+
+    // Apply cfg_.compression to a linear-mel host buffer laid out (T, n_mels)
+    // row-major and write the result transposed to (n_mels, T) into `out` on
+    // device_. For PCEN this advances pcen_m_ frame-by-frame (carrying state),
+    // so callers must invoke it in stream order.
+    void compress_and_emit(const std::vector<float>& linear_mel_TM, int T,
+                           brotensor::Tensor& out);
 };
 
 }  // namespace brosoundml

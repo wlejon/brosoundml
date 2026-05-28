@@ -85,9 +85,27 @@ int main(int argc, char** argv) {
     std::string voices_dir  = "";
     std::string out_dir     = "../brosoundml-data/wake/computer";
     std::string target_word = "computer";
+    // Confusables fall into two groups:
+    //  1) Real English words that share spelling / morphology with "computer"
+    //     ("compute", "computes", "commuter", ...).
+    //  2) Nonsense words that share the *acoustic* trajectory /kəm-pjuː-tɚ/ —
+    //     one phoneme off the target. The chunk-7 probe showed the previous
+    //     all-real-word list left the model free to ignore phonetic structure
+    //     because all confusables shared the same vowel sequence; adding
+    //     phoneme-neighbour nonsense forces the model to require the exact
+    //     /k-ə-m-p-j-uː-t-ɚ/ trajectory rather than a band-energy heuristic.
     std::string confusables_csv =
+        // group 1 — spelling neighbours
         "compute,computes,computing,computed,commuter,commuters,"
-        "completer,putter,computa,compu";
+        "completer,putter,computa,compu,"
+        // group 2 — acoustic neighbours (Kokoro-pronounceable nonsense)
+        "kombuter,pomputer,tomputer,gomputer,bomputer,"
+        "computor,computa,compooter,computeer,"
+        "kemputer,kamputer,kumputer,kimputer,"
+        "compater,compiter,compoter,compyter,"
+        "kompukar,konputer,komputter,"
+        // group 3 — same-vowel-sequence different-onsets (forces phoneme attention)
+        "container,consumer,carpenter,confuser,conductor";
     std::string lexicon_path;
     std::string pos_path;
     std::string device_str = "cpu";
@@ -407,6 +425,11 @@ int main(int argc, char** argv) {
         }
 
         // ─── Sentence negatives ────────────────────────────────────────
+        // Sentence negatives carry both clean and noisy variants so the noise
+        // distribution is symmetric with positives + confusables. Without
+        // this, every noisy-speech clip in training is either a positive or a
+        // confusable, and BC-ResNet learns "speech + noise ⇒ positive" as a
+        // free shortcut. Same noise/SNR rotation as the positive path.
         std::fprintf(stderr, "synthesizing sentence negatives...\n");
         const int small_sent_cap = small_mode ? 20 : -1;
         for (std::size_t si = 0; si < sentences.size(); ++si) {
@@ -417,15 +440,42 @@ int main(int argc, char** argv) {
                     if (small_sent_cap >= 0 && sent_neg >= small_sent_cap) break;
                     const std::uint64_t clean_seed = (master_rng)();
                     auto clean = synth_word(sentences[si], voices[vi], speed);
-                    char buf[64];
+                    char buf[96];
                     std::snprintf(buf, sizeof(buf),
-                                  "neg_sent_%03zu_%s_sp%03d",
+                                  "neg_sent_%03zu_%s_sp%03d_clean",
                                   si,
                                   voice_names[vi].c_str(),
                                   static_cast<int>(speed * 100 + 0.5f));
                     write_clip(clean, "negatives", buf, 0, "sentence",
                                voice_names[vi], speed, 0.0f, "", clean_seed);
                     ++sent_neg;
+
+                    // Noisy variants — mirror the positive/confusable path.
+                    for (int nv = 0; nv < noise_variants_per_clean; ++nv) {
+                        if (small_sent_cap >= 0 && sent_neg >= small_sent_cap) break;
+                        auto rng = sub_rng();
+                        const brosoundml::NoiseKind nk =
+                            all_noises[static_cast<std::size_t>(
+                                nv % static_cast<int>(all_noises.size()))];
+                        const float snr = snrs[static_cast<std::size_t>(
+                            nv % static_cast<int>(snrs.size()))];
+                        auto noise = brosoundml::gen_noise(
+                            nk, target_samples, 1.0f, rng);
+                        auto mixed = brosoundml::mix_at_snr(clean, noise, snr);
+                        brosoundml::peak_normalize(mixed, 0.99f);
+                        std::snprintf(buf, sizeof(buf),
+                                      "neg_sent_%03zu_%s_sp%03d_%s_snr%d",
+                                      si,
+                                      voice_names[vi].c_str(),
+                                      static_cast<int>(speed * 100 + 0.5f),
+                                      brosoundml::noise_kind_name(nk),
+                                      static_cast<int>(snr));
+                        write_clip(mixed, "negatives", buf, 0, "sentence",
+                                   voice_names[vi], speed, snr,
+                                   brosoundml::noise_kind_name(nk),
+                                   clean_seed + nv + 1);
+                        ++sent_neg;
+                    }
                 }
             }
         }
@@ -454,15 +504,223 @@ int main(int argc, char** argv) {
             ++noise_neg;
         }
 
+        // ─── Probe-style synthetic stimulus negatives ──────────────────
+        //
+        // The chunk-7 wake_probe surfaced a band-energy shortcut: the small
+        // model fired on any sustained tone in the 500-2000 Hz / 5-7 kHz
+        // bands, on two-tone formant pairs, on AM tones, and on sweeps
+        // through those bands. It also produced a 0.51 score on pure silence
+        // because no truly-silent samples appear anywhere in the negative
+        // class. We close every one of those by emitting the same stimulus
+        // families as labelled negatives — directly anchoring the failure
+        // modes to label=0 during training.
+        std::fprintf(stderr, "synthesizing probe-style negatives...\n");
+        int probe_neg = 0;
+
+        const auto pi_d = 3.14159265358979323846;
+        auto write_synth_neg = [&](const std::vector<float>& clip,
+                                   const std::string& tag,
+                                   const std::string& clazz,
+                                   const std::string& noise_kind_tag,
+                                   float snr_for_row) {
+            const std::uint64_t row_seed = (master_rng)();
+            write_clip(clip, "negatives", tag, 0, clazz, "", 1.0f,
+                       snr_for_row, noise_kind_tag, row_seed);
+            ++probe_neg;
+        };
+
+        // (a) Pure silence + near-silence — closes the 0.51 silence baseline.
+        // Several samples so the model sees silence with a stable label.
+        {
+            const int n_silence = small_mode ? 5 : 40;
+            for (int i = 0; i < n_silence; ++i) {
+                std::vector<float> z(target_samples, 0.0f);
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "neg_silence_zero_%03d", i);
+                write_synth_neg(z, nm, "silence", "", 0.0f);
+            }
+            // Near-silence: very-low-amplitude white noise (mic floor).
+            const std::vector<float> floor_amps = {1e-5f, 1e-4f, 1e-3f};
+            const int n_floor = small_mode ? 6 : 30;
+            for (int i = 0; i < n_floor; ++i) {
+                auto rng = sub_rng();
+                const float amp = floor_amps[
+                    static_cast<std::size_t>(i % floor_amps.size())];
+                auto buf = brosoundml::gen_white_noise(target_samples, amp, rng);
+                char nm[64];
+                std::snprintf(nm, sizeof(nm),
+                              "neg_silence_floor_%03d_amp%.0e", i, amp);
+                write_synth_neg(buf, nm, "silence", "white", 0.0f);
+            }
+        }
+
+        // (b) Sustained pure tones at the probe's loved frequencies × amps.
+        //     Each tone gets one clean and one noisy variant. Forces the
+        //     model off "narrow band of energy in 500-2000/5-7k Hz ⇒
+        //     positive" by labelling that exact stimulus as negative.
+        {
+            const std::vector<float> tone_hz = small_mode
+                ? std::vector<float>{500.f, 1000.f, 2000.f}
+                : std::vector<float>{300.f, 500.f, 800.f, 1000.f, 1200.f,
+                                     1500.f, 1800.f, 2000.f, 2500.f, 3000.f,
+                                     4000.f, 5000.f, 6000.f, 7000.f};
+            const std::vector<float> tone_amps = small_mode
+                ? std::vector<float>{0.1f, 0.5f}
+                : std::vector<float>{0.02f, 0.05f, 0.1f, 0.3f, 0.5f, 0.7f};
+            int ti = 0;
+            for (float hz : tone_hz) {
+                for (float amp : tone_amps) {
+                    std::vector<float> tone(target_samples);
+                    const double w = 2.0 * pi_d * hz / 16000.0;
+                    for (int n = 0; n < target_samples; ++n) {
+                        tone[static_cast<std::size_t>(n)] =
+                            amp * static_cast<float>(std::sin(w * n));
+                    }
+                    char nm[80];
+                    std::snprintf(nm, sizeof(nm),
+                                  "neg_tone_%05dhz_amp%03d",
+                                  static_cast<int>(hz),
+                                  static_cast<int>(amp * 100 + 0.5f));
+                    write_synth_neg(tone, nm, "tone", "", 0.0f);
+                    if (!small_mode && (ti % 2 == 0)) {
+                        auto rng = sub_rng();
+                        const brosoundml::NoiseKind nk =
+                            all_noises[static_cast<std::size_t>(
+                                ti % all_noises.size())];
+                        auto nz = brosoundml::gen_noise(nk, target_samples,
+                                                       1.0f, rng);
+                        auto mixed = brosoundml::mix_at_snr(tone, nz, 10.0f);
+                        brosoundml::peak_normalize(mixed, 0.99f);
+                        char nm2[96];
+                        std::snprintf(nm2, sizeof(nm2),
+                                      "neg_tone_%05dhz_amp%03d_%s_snr10",
+                                      static_cast<int>(hz),
+                                      static_cast<int>(amp * 100 + 0.5f),
+                                      brosoundml::noise_kind_name(nk));
+                        write_synth_neg(mixed, nm2, "tone",
+                                        brosoundml::noise_kind_name(nk), 10.0f);
+                    }
+                    ++ti;
+                }
+            }
+        }
+
+        // (c) Two-tone formant pairs — every vowel in /kəm-pjuː-tɚ/ in
+        //     isolation scored 1.0 in the probe. Label them as negative when
+        //     sustained for the full second so the model has to require
+        //     temporal vowel transitions, not steady-state vowel energy.
+        {
+            struct FP { const char* name; float f1; float f2; };
+            const std::vector<FP> fps = {
+                {"ee", 300.f, 2800.f}, {"ih", 400.f, 2000.f},
+                {"eh", 600.f, 1900.f}, {"ae", 700.f, 1700.f},
+                {"ah", 800.f, 1200.f}, {"aw", 600.f,  900.f},
+                {"uh", 600.f, 1200.f}, {"oo", 300.f,  900.f},
+                {"ow", 500.f,  800.f}, {"er", 500.f, 1400.f}
+            };
+            const std::vector<float> fp_amps = small_mode
+                ? std::vector<float>{0.3f}
+                : std::vector<float>{0.1f, 0.3f, 0.5f};
+            for (const auto& fp : fps) {
+                for (float amp : fp_amps) {
+                    std::vector<float> tone(target_samples);
+                    const double w1 = 2.0 * pi_d * fp.f1 / 16000.0;
+                    const double w2 = 2.0 * pi_d * fp.f2 / 16000.0;
+                    for (int n = 0; n < target_samples; ++n) {
+                        tone[static_cast<std::size_t>(n)] = amp * 0.5f *
+                            (static_cast<float>(std::sin(w1 * n)) +
+                             static_cast<float>(std::sin(w2 * n)));
+                    }
+                    char nm[96];
+                    std::snprintf(nm, sizeof(nm),
+                                  "neg_formant_%s_%04d_%04d_amp%03d",
+                                  fp.name,
+                                  static_cast<int>(fp.f1),
+                                  static_cast<int>(fp.f2),
+                                  static_cast<int>(amp * 100 + 0.5f));
+                    write_synth_neg(tone, nm, "formant", "", 0.0f);
+                }
+            }
+        }
+
+        // (d) AM-modulated tones — speech-rate envelope on speech-band
+        //     carriers; the probe lit these up at 1.0 in the loved bands.
+        {
+            const std::vector<float> carriers = small_mode
+                ? std::vector<float>{1000.f}
+                : std::vector<float>{500.f, 1000.f, 1500.f, 2000.f, 5000.f};
+            const std::vector<float> mods = small_mode
+                ? std::vector<float>{10.f}
+                : std::vector<float>{4.f, 10.f, 25.f};
+            const std::vector<float> am_amps = small_mode
+                ? std::vector<float>{0.3f}
+                : std::vector<float>{0.1f, 0.3f, 0.5f};
+            for (float c : carriers) {
+                for (float m : mods) {
+                    for (float amp : am_amps) {
+                        std::vector<float> buf(target_samples);
+                        const double wc = 2.0 * pi_d * c / 16000.0;
+                        const double wm = 2.0 * pi_d * m / 16000.0;
+                        for (int n = 0; n < target_samples; ++n) {
+                            const double env = 0.5 + 0.5 * std::sin(wm * n);
+                            buf[static_cast<std::size_t>(n)] = amp *
+                                static_cast<float>(env * std::sin(wc * n));
+                        }
+                        char nm[96];
+                        std::snprintf(nm, sizeof(nm),
+                                      "neg_am_c%04d_m%02d_amp%03d",
+                                      static_cast<int>(c),
+                                      static_cast<int>(m),
+                                      static_cast<int>(amp * 100 + 0.5f));
+                        write_synth_neg(buf, nm, "am", "", 0.0f);
+                    }
+                }
+            }
+        }
+
+        // (e) Linear chirps — sweeps that pass through the loved bands all
+        //     scored 0.9+. Label them as negative.
+        if (!small_mode) {
+            struct Sw { float f0; float f1; };
+            const std::vector<Sw> sweeps = {
+                {200.f, 4000.f}, {4000.f, 200.f},
+                {100.f, 8000.f}, {8000.f, 100.f},
+                {500.f, 2000.f}, {2000.f, 500.f}
+            };
+            const std::vector<float> sw_amps = {0.1f, 0.3f, 0.5f};
+            for (const auto& s : sweeps) {
+                for (float amp : sw_amps) {
+                    std::vector<float> buf(target_samples);
+                    const double T = static_cast<double>(target_samples) / 16000.0;
+                    const double k = (s.f1 - s.f0) / T;
+                    for (int n = 0; n < target_samples; ++n) {
+                        const double t = static_cast<double>(n) / 16000.0;
+                        const double phase = 2.0 * pi_d *
+                            (s.f0 * t + 0.5 * k * t * t);
+                        buf[static_cast<std::size_t>(n)] =
+                            amp * static_cast<float>(std::sin(phase));
+                    }
+                    char nm[96];
+                    std::snprintf(nm, sizeof(nm),
+                                  "neg_sweep_%04d_to_%04d_amp%03d",
+                                  static_cast<int>(s.f0),
+                                  static_cast<int>(s.f1),
+                                  static_cast<int>(amp * 100 + 0.5f));
+                    write_synth_neg(buf, nm, "sweep", "", 0.0f);
+                }
+            }
+        }
+
         std::fprintf(stderr,
                      "\nDone.\n"
                      "  positives:        %d\n"
                      "  confusables:      %d\n"
                      "  sentences:        %d\n"
                      "  pure-noise:       %d\n"
+                     "  probe-style:      %d\n"
                      "  total wav bytes:  %lld\n"
                      "  manifest:         %s\n",
-                     positives, conf_neg, sent_neg, noise_neg,
+                     positives, conf_neg, sent_neg, noise_neg, probe_neg,
                      static_cast<long long>(total_bytes),
                      (out_dir + "/manifest.csv").c_str());
         return 0;
