@@ -109,6 +109,7 @@ target_sources(brosoundml PRIVATE
     src/wake.cpp
     src/wake_data.cpp
     src/bc_resnet.cpp
+    src/bc_resnet2d.cpp
     src/mel.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
