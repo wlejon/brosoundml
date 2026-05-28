@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace brosoundml {
@@ -151,6 +152,16 @@ public:
     EvalMetrics eval_step(const brotensor::Tensor& feats_batch,
                           const brotensor::Tensor& labels,
                           int B, int T, float pos_weight);
+
+    // ── Test/debug seam for the hand-rolled backward ──
+    // Enumerate the trainable parameters (name, element count) and read/write
+    // individual elements, plus read the gradient produced by the most recent
+    // train_step. Used by the finite-difference gradient check; lazily builds
+    // the training state. Not a stable runtime API.
+    std::vector<std::pair<std::string, int>> debug_params() const;
+    float debug_get_param(const std::string& name, int idx) const;
+    void  debug_set_param(const std::string& name, int idx, float value);
+    float debug_grad(const std::string& name, int idx) const;
 
 public:
     struct Impl;   // exposed for the .cpp binary-format helpers; not stable.
