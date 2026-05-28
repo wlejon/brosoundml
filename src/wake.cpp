@@ -1,6 +1,10 @@
+#if defined(_MSC_VER)
+#  define _CRT_SECURE_NO_WARNINGS 1
+#endif
+
 #include "brosoundml/wake.h"
 
-#include "brosoundml/bc_resnet.h"
+#include "brosoundml/bc_resnet2d.h"
 #include "brosoundml/mel.h"
 
 #include <brotensor/runtime.h>
@@ -8,6 +12,8 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -23,6 +29,20 @@ namespace {
 
 [[noreturn]] void fail(const std::string& where, const std::string& msg) {
     throw std::runtime_error("brosoundml: " + where + ": " + msg);
+}
+
+constexpr std::uint32_t kMagicBWK2 = 0x324B5742u;  // 'B''W''K''2' — 2D BC-ResNet
+constexpr std::uint32_t kMagicBWAK = 0x4B415742u;  // 'B''W''A''K' — legacy 1D
+
+// Peek the 4-byte magic at the head of a checkpoint without parsing it.
+std::uint32_t peek_magic(const std::string& path) {
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) fail("WakeWord::load", "could not open '" + path + "'");
+    std::uint32_t magic = 0;
+    const bool ok = std::fread(&magic, 4, 1, fp) == 1;
+    std::fclose(fp);
+    if (!ok) fail("WakeWord::load", "could not read magic from '" + path + "'");
+    return magic;
 }
 
 inline float sigmoidf(float x) {
@@ -59,7 +79,7 @@ struct WakeWord::Impl {
 
     // Streaming state.
     std::unique_ptr<MelFrontend> mel;       // built on load()
-    std::unique_ptr<BcResnet>    model;     // loaded on load()
+    std::unique_ptr<BcResnet2d>  model;     // loaded on load()
     bt::Device                   device = bt::Device::CPU;
 
     // Sample-side buffering: feed() appends incoming samples here, then drains
@@ -97,9 +117,25 @@ void WakeWord::load(const std::string& weights_path,
                     brotensor::Device device) {
     brotensor::init();
 
-    // Load the BC-ResNet. Throws on missing / bad-magic / bad-version.
-    auto model = std::make_unique<BcResnet>(
-        BcResnet::load(weights_path, device));
+    // Detect the checkpoint format. The microphone-robust recipe ships the 2D
+    // BC-ResNet ('BWK2'); the legacy 1D model ('BWAK') keyed on the TTS
+    // acquisition envelope and was dead on real speech, so it is not loadable
+    // here — fail loudly pointing at the retrain rather than mis-running it.
+    const std::uint32_t magic = peek_magic(weights_path);
+    if (magic == kMagicBWAK) {
+        fail("WakeWord::load",
+             "'" + weights_path + "' is a legacy 1D ('BWAK') checkpoint; the "
+             "wake stack now requires a 2D PCEN model ('BWK2') — retrain with "
+             "brosoundml_wake_train");
+    }
+    if (magic != kMagicBWK2) {
+        fail("WakeWord::load", "'" + weights_path + "' has unrecognised magic "
+             "(expected 'BWK2')");
+    }
+
+    // Load the 2D BC-ResNet. Throws on bad-version / shape mismatch.
+    auto model = std::make_unique<BcResnet2d>(
+        BcResnet2d::load(weights_path, device));
 
     const int model_n_mels = model->config().n_mels;
     if (model_n_mels <= 0) {
@@ -113,7 +149,9 @@ void WakeWord::load(const std::string& weights_path,
         impl_->config.n_mels = model_n_mels;
     }
 
-    // Build the mel front-end with config matching the model.
+    // Build the mel front-end with config matching the model. The 2D recipe is
+    // trained on PCEN features (per-channel energy normalization that cancels
+    // mic/channel spectral tilt), so the runtime front-end must match.
     MelConfig mcfg;
     mcfg.sample_rate = impl_->config.sample_rate;
     mcfg.n_fft       = impl_->config.n_fft;
@@ -122,6 +160,7 @@ void WakeWord::load(const std::string& weights_path,
     mcfg.n_mels      = impl_->config.n_mels;
     mcfg.fmin        = impl_->config.mel_fmin;
     mcfg.fmax        = impl_->config.mel_fmax;
+    mcfg.compression = MelCompression::PCEN;
     auto mel = std::make_unique<MelFrontend>(mcfg, device);
 
     // Commit on success.

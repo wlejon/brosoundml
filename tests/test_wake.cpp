@@ -8,7 +8,7 @@
 // The original chunk-1 "throws stage-5/7" checks have been replaced with
 // real-behaviour assertions; surface checks (defaults, setter validation,
 // move semantics) are unchanged.
-#include "brosoundml/bc_resnet.h"
+#include "brosoundml/bc_resnet2d.h"
 #include "brosoundml/wake.h"
 
 #include <brotensor/runtime.h>
@@ -50,12 +50,12 @@ static std::string runtime_error_message(Fn&& fn) {
     return {};
 }
 
-// Build a tiny xavier-init BcResnet, fuse + save to a unique temp path,
-// return the path. Used by every load()-based check below so they don't
+// Build a tiny xavier-init 2D BC-ResNet ('BWK2'), fuse + save to a unique temp
+// path, return the path. Used by every load()-based check below so they don't
 // depend on any real on-disk artefact.
 static std::string make_smoke_checkpoint(std::uint64_t seed, const char* tag) {
-    brosoundml::BcResnetConfig cfg;   // defaults — n_mels=40, ~22k params
-    auto model = brosoundml::BcResnet::make(cfg, brotensor::Device::CPU);
+    brosoundml::BcResnet2dConfig cfg;   // defaults — n_mels=40, ~16k params
+    auto model = brosoundml::BcResnet2d::make(cfg, brotensor::Device::CPU);
     model.xavier_init_weights(seed);
     model.fuse_bn();
     namespace fs = std::filesystem;
