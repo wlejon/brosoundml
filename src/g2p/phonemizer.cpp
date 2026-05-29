@@ -71,6 +71,39 @@ bool is_ascii_ws(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
+// ─── Input normalisation ───────────────────────────────────────────────────
+//
+// Fold typographic apostrophes/quotes to their ASCII equivalents. The lexicon
+// is keyed with straight ' and ", so text that uses smart punctuation — e.g. an
+// LLM writing "don't" with a U+2019 apostrophe — would otherwise miss the
+// lexicon entirely and fall through to letter-by-letter spelling ("d-o-n-t").
+// Folding here, before pre-tokenisation, fixes every downstream stage at once.
+std::string normalize_input(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ) {
+        const std::size_t n = utf8_len_at(s, i);
+        if (n == 0) { out.push_back(s[i]); ++i; continue; }
+        const char32_t cp = utf8_decode_at(s, i, n);
+        switch (cp) {
+            case U'‘':  // ‘ left single quotation mark
+            case U'’':  // ’ right single quotation mark (the apostrophe LLMs emit)
+            case U'ʼ':  // ʼ modifier letter apostrophe
+                out.push_back('\'');
+                break;
+            case U'“':  // “ left double quotation mark
+            case U'”':  // ” right double quotation mark
+                out.push_back('"');
+                break;
+            default:
+                out.append(s.data() + i, n);
+                break;
+        }
+        i += n;
+    }
+    return out;
+}
+
 // ─── Pre-tokeniser ───────────────────────────────────────────────────────
 
 struct Triple {
@@ -378,7 +411,8 @@ Phonemizer::Phonemizer(const PosTagger&      tagger,
       adapter_(&adapter) {}
 
 std::vector<std::int32_t> Phonemizer::phonemize(std::string_view sentence) const {
-    PipelineResult r = run_pipeline(sentence, *tagger_, *lexicon_,
+    const std::string norm = normalize_input(sentence);
+    PipelineResult r = run_pipeline(norm, *tagger_, *lexicon_,
                                     *morphology_, *special_);
     if (r.triples.empty()) return {};
     const std::string ipa = assemble_ipa(r);
@@ -386,7 +420,8 @@ std::vector<std::int32_t> Phonemizer::phonemize(std::string_view sentence) const
 }
 
 std::string Phonemizer::phonemize_to_ipa(std::string_view sentence) const {
-    PipelineResult r = run_pipeline(sentence, *tagger_, *lexicon_,
+    const std::string norm = normalize_input(sentence);
+    PipelineResult r = run_pipeline(norm, *tagger_, *lexicon_,
                                     *morphology_, *special_);
     if (r.triples.empty()) return {};
     return assemble_ipa(r);

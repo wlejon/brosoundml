@@ -290,6 +290,29 @@ int main() {
             CHECK(phon.phonemize_to_ipa("").empty(),
                   "phonemize_to_ipa('') → empty");
         }
+
+        // ─── Test 9: Smart-apostrophe normalisation ─────────────────────
+        // Contractions written with a typographic apostrophe (U+2019, the one
+        // LLMs emit) must phonemise identically to the straight-ASCII form, and
+        // must NOT degrade to letter-by-letter spelling.
+        {
+            const auto straight = phon.phonemize_to_ipa("don't");
+            const auto curly    = phon.phonemize_to_ipa("don\xE2\x80\x99t");  // don’t
+            const auto spelled  = sc.spell_letter_by_letter("dont");
+            CHECK(!straight.empty(), "'don\\'t' (straight) is non-empty");
+            CHECK(curly == straight,
+                  "'don\\u2019t' (curly) phonemises like the straight form");
+            CHECK(curly != spelled,
+                  "'don\\u2019t' is not spelled letter-by-letter");
+            // Smart double quotes fold too: same ids as straight ASCII quotes.
+            const auto dq_curly    = phon.phonemize("\xE2\x80\x9Cyes\xE2\x80\x9D"); // “yes”
+            const auto dq_straight = phon.phonemize("\"yes\"");
+            CHECK(!dq_straight.empty(), "phonemize('\"yes\"') is non-empty");
+            CHECK(dq_curly == dq_straight,
+                  "smart double quotes phonemise like straight quotes");
+            std::printf("  smart-apos: straight=%s curly=%s\n",
+                        straight.c_str(), curly.c_str());
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: phonemizer section threw: %s\n", e.what());
         ++failures;
