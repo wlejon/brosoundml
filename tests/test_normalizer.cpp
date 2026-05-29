@@ -109,6 +109,12 @@ int main() {
     check_eq("state-of-the-art", "state of the art");
     check_eq("5-10", "five ten");
 
+    // Em-dash is a prose break (-> comma pause); en-dash behaves like a hyphen.
+    check_eq("the figure\xE2\x80\x94his eyes", "the figure, his eyes");   // em dash
+    check_eq("wait\xE2\x80\x94stop now", "wait, stop now");               // em dash
+    check_eq("well\xE2\x80\x93known", "well known");                      // en dash
+    check_eq("pages 5\xE2\x80\x93" "10", "pages five ten");              // en dash range
+
     // ── Smart-quote folding ──
     check_eq("don\xE2\x80\x99t", "don't");                 // don’t
     check_eq("\xE2\x80\x9Cyes\xE2\x80\x9D", "\"yes\"");    // “yes”

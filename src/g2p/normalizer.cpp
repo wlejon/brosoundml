@@ -51,9 +51,15 @@ char32_t utf8_decode_at(std::string_view s, std::size_t i, std::size_t n) {
     return cp;
 }
 
-// ─── Step 1: fold typographic apostrophes/quotes to ASCII ───────────────────
-
-std::string fold_quotes(std::string_view s) {
+// ─── Step 1: fold typographic punctuation to ASCII ──────────────────────────
+//
+// Apostrophes/quotes fold to their straight ASCII forms so the lexicon matches.
+// Dashes are normalized too: an em-dash (or horizontal bar) marks a prose break
+// and becomes a comma so the phonemizer pauses instead of gluing the
+// surrounding words into one un-pronounceable token ("figure—his"); an en-dash,
+// figure dash, and the real minus sign become an ASCII hyphen so the
+// compound/range/minus hyphen rule downstream handles them.
+std::string fold_punct(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ) {
@@ -69,6 +75,15 @@ std::string fold_quotes(std::string_view s) {
             case U'“':  // left double quotation mark
             case U'”':  // right double quotation mark
                 out.push_back('"');
+                break;
+            case U'—':  // em dash
+            case U'―':  // horizontal bar
+                out.append(", ");
+                break;
+            case U'–':  // en dash
+            case U'‒':  // figure dash
+            case U'−':  // minus sign
+                out.push_back('-');
                 break;
             default:
                 out.append(s.data() + i, n);
@@ -402,7 +417,7 @@ std::string render_currency(int unit, const NumToken& t) {
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 std::string normalize_text(std::string_view sentence) {
-    const std::string s = fold_quotes(strip_markdown(sentence));
+    const std::string s = fold_punct(strip_markdown(sentence));
     const std::size_t n = s.size();
 
     std::string out;
