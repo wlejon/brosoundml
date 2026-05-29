@@ -40,6 +40,7 @@ target_compile_definitions(brosoundml_test_morphology PRIVATE
 brosoundml_add_test(brosoundml_test_special_cases test_special_cases.cpp)
 target_compile_definitions(brosoundml_test_special_cases PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+brosoundml_add_test(brosoundml_test_normalizer test_normalizer.cpp)
 brosoundml_add_test(brosoundml_test_phoneme_adapter test_phoneme_adapter.cpp)
 target_compile_definitions(brosoundml_test_phoneme_adapter PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
