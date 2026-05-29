@@ -97,7 +97,93 @@ constexpr std::array<const char*, 7> SCALES = {
 
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
 bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+bool is_alnum(char c) { return is_alpha(c) || is_digit(c); }
 char lower(char c)    { return (c >= 'A' && c <= 'Z') ? char(c + 32) : c; }
+
+// ─── Markdown stripping ─────────────────────────────────────────────────────
+//
+// LLMs frequently emit inline markdown even when asked not to. The markers are
+// attached to words (*Hamlet*, **bold**, `code`), so the pre-tokenizer can't
+// peel them and the word degrades to letter-by-letter spelling. Strip the
+// formatting, keeping the readable text:
+//   - links     [text](url) / ![alt](url) -> text / alt
+//   - emphasis  *  **  ~~  -> removed; _ removed only at word boundaries
+//   - code      `code` -> code
+//   - line lead headings (#), blockquotes (>), and bullets (-, *, +) removed
+// A '*' kept only between two digits survives as a multiplication operator
+// (3*4 -> "three times four", handled downstream).
+std::string strip_markdown(std::string_view in) {
+    // Pass 1: unwrap links, dropping the URL.
+    std::string a;
+    a.reserve(in.size());
+    for (std::size_t i = 0; i < in.size(); ) {
+        if (in[i] == '!' && i + 1 < in.size() && in[i + 1] == '[') { ++i; continue; }
+        if (in[i] == '[') {
+            const std::size_t close = in.find(']', i + 1);
+            if (close != std::string_view::npos && close + 1 < in.size() &&
+                in[close + 1] == '(') {
+                const std::size_t paren = in.find(')', close + 2);
+                if (paren != std::string_view::npos) {
+                    a.append(in.data() + i + 1, close - (i + 1));  // the link text
+                    i = paren + 1;
+                    continue;
+                }
+            }
+        }
+        a.push_back(in[i]);
+        ++i;
+    }
+
+    // Pass 2: line-lead structure + inline markers.
+    std::string out;
+    out.reserve(a.size());
+    bool at_line_start = true;
+    for (std::size_t i = 0; i < a.size(); ) {
+        if (at_line_start) {
+            std::size_t j = i;
+            while (j < a.size() && (a[j] == ' ' || a[j] == '\t')) ++j;
+            // Heading: #{1,6} followed by space.
+            std::size_t k = j; int hashes = 0;
+            while (k < a.size() && a[k] == '#') { ++hashes; ++k; }
+            if (hashes >= 1 && hashes <= 6 && k < a.size() && (a[k] == ' ' || a[k] == '\t')) {
+                while (k < a.size() && (a[k] == ' ' || a[k] == '\t')) ++k;
+                i = k; at_line_start = false; continue;
+            }
+            // Blockquote: one or more '>' with optional spaces.
+            if (j < a.size() && a[j] == '>') {
+                std::size_t b = j;
+                while (b < a.size() && (a[b] == '>' || a[b] == ' ')) ++b;
+                i = b; at_line_start = false; continue;
+            }
+            // Bullet: -, *, or + followed by whitespace.
+            if (j + 1 < a.size() && (a[j] == '-' || a[j] == '*' || a[j] == '+') &&
+                (a[j + 1] == ' ' || a[j + 1] == '\t')) {
+                std::size_t b = j + 1;
+                while (b < a.size() && (a[b] == ' ' || a[b] == '\t')) ++b;
+                i = b; at_line_start = false; continue;
+            }
+            at_line_start = false;
+        }
+
+        const char c = a[i];
+        if (c == '\n') { out.push_back('\n'); at_line_start = true; ++i; continue; }
+        if (c == '`' || c == '~') { ++i; continue; }
+        if (c == '*') {
+            const char prev = out.empty() ? '\0' : out.back();
+            const char next = (i + 1 < a.size()) ? a[i + 1] : '\0';
+            if (is_digit(prev) && is_digit(next)) { out.push_back('*'); ++i; continue; }
+            ++i; continue;  // emphasis/bold marker
+        }
+        if (c == '_') {
+            const char prev = out.empty() ? '\0' : out.back();
+            const char next = (i + 1 < a.size()) ? a[i + 1] : '\0';
+            if (!(is_alnum(prev) && is_alnum(next))) { ++i; continue; }  // boundary → drop
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
 
 // 0..999 → words ("" for 0).
 std::string three(unsigned n) {
@@ -316,7 +402,7 @@ std::string render_currency(int unit, const NumToken& t) {
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 std::string normalize_text(std::string_view sentence) {
-    const std::string s = fold_quotes(sentence);
+    const std::string s = fold_quotes(strip_markdown(sentence));
     const std::size_t n = s.size();
 
     std::string out;
@@ -357,6 +443,7 @@ std::string normalize_text(std::string_view sentence) {
         // Bare operators → spoken words (spaced so they tokenize cleanly).
         switch (c) {
             case '+': out += " plus ";    ++i; continue;
+            case '*': out += " times ";   ++i; continue;
             case '=': out += " equals ";  ++i; continue;
             case '&': out += " and ";     ++i; continue;
             case '@': out += " at ";      ++i; continue;

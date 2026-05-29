@@ -7,6 +7,7 @@
 // (numbers, %, $) or get spelled letter-by-letter.
 //
 // Transforms (US English only):
+//   - markdown stripping        (*Hamlet* -> "Hamlet", [text](url) -> "text")
 //   - smart apostrophes/quotes -> ASCII   ('’“” -> ' ")
 //   - cardinal numbers          (42      -> "forty two")
 //   - thousands separators       (1,000   -> "one thousand")

@@ -107,6 +107,28 @@ int main() {
     check_eq("don\xE2\x80\x99t", "don't");                 // don’t
     check_eq("\xE2\x80\x9Cyes\xE2\x80\x9D", "\"yes\"");    // “yes”
 
+    // ── Markdown stripping ──
+    check_eq("*Hamlet*", "Hamlet");
+    check_eq("**bold** text", "bold text");
+    check_eq("***both***", "both");
+    check_eq("_italic_", "italic");
+    check_eq("`code`", "code");
+    check_eq("~~strike~~", "strike");
+    check_eq("such as *Hamlet*, *Macbeth*, and *Romeo and Juliet*",
+             "such as Hamlet, Macbeth, and Romeo and Juliet");
+    check_eq("[OpenAI](https://openai.com)", "OpenAI");
+    check_eq("see ![logo](a.png) here", "see logo here");
+    check_eq("# Heading", "Heading");
+    check_eq("### Deep heading", "Deep heading");
+    check_eq("- item one", "item one");
+    check_eq("* item two", "item two");
+    check_eq("+ item three", "item three");
+    check_eq("> a quote", "a quote");
+    // Intra-word underscore is preserved (not markdown emphasis).
+    check_eq("foo_bar", "foo_bar");
+    // Asterisk between digits is multiplication, not emphasis.
+    check_eq("3*4", "three times four");
+
     // ── Mixed sentence ──
     check_eq("It costs $20 and is 15% off on the 2nd.",
              "It costs twenty dollars and is fifteen percent off on the second.");
