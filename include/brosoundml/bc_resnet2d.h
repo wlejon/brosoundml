@@ -131,6 +131,12 @@ public:
     const BcResnet2dConfig& config() const;
     brotensor::Device       device() const;
     int receptive_field_frames() const;   // causal time lookback of the logit
+    // Streaming GAP-ring capacity in frames. The per-frame streaming logit
+    // pools the head feature over the last min(frames_seen, this) frames; only
+    // once `frames_seen` reaches this value does the streaming pool match the
+    // whole-clip GAP the model is trained on. Detectors should warm up for this
+    // many frames before trusting a fire.
+    int gap_window_frames() const;
     int param_count() const;
     bool fused() const;
 

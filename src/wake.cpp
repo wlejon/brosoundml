@@ -100,6 +100,17 @@ struct WakeWord::Impl {
     // suppressed. Decremented once per emitted frame.
     int refractory_frames = 0;
 
+    // Warmup: the 2D model's streaming per-frame logit pools the head feature
+    // over a GAP ring that only fills after `warmup_frames` frames. Before that
+    // the logit is computed over a partial average (a few onset/silence frames)
+    // that the model never saw in training — it can read as a confident fire on
+    // any clip, which is a 100% false-accept at every stream start. We suppress
+    // fires until `frames_since_reset >= warmup_frames` so the first trusted
+    // decision pools a full window, matching the whole-clip GAP used in
+    // training. Set from BcResnet2d::gap_window_frames() at load().
+    int warmup_frames      = 0;
+    int frames_since_reset = 0;
+
     // Thread-safe view of the detector policy. Loaded relaxed at the top of
     // every frame, matching the contract in wake.h.
     std::atomic<float> a_threshold{0.55f};
@@ -163,11 +174,16 @@ void WakeWord::load(const std::string& weights_path,
     mcfg.compression = MelCompression::PCEN;
     auto mel = std::make_unique<MelFrontend>(mcfg, device);
 
+    // Warmup span = the model's GAP-ring capacity (read before the move).
+    const int warmup = model->gap_window_frames();
+
     // Commit on success.
     impl_->mel    = std::move(mel);
     impl_->model  = std::move(model);
     impl_->device = device;
     impl_->loaded = true;
+    impl_->warmup_frames      = warmup > 0 ? warmup : 0;
+    impl_->frames_since_reset = 0;
 
     // Mirror policy into atomics so feed() picks them up.
     impl_->a_threshold       .store(impl_->config.threshold,        std::memory_order_relaxed);
@@ -301,8 +317,15 @@ bool WakeWord::feed(const float* samples, int n) {
             --impl_->refractory_frames;
         }
 
-        // Fire test: refractory clear AND >= hits true in the last window.
-        if (impl_->refractory_frames == 0 && !fired_this_call) {
+        // Count frames since reset for the warmup guard (saturate to avoid
+        // overflow on a long-running stream).
+        if (impl_->frames_since_reset < impl_->warmup_frames) {
+            ++impl_->frames_since_reset;
+        }
+        const bool warmed = impl_->frames_since_reset >= impl_->warmup_frames;
+
+        // Fire test: warmed up AND refractory clear AND >= hits true in window.
+        if (warmed && impl_->refractory_frames == 0 && !fired_this_call) {
             int hits = 0;
             for (int i = 0; i < impl_->decision_len; ++i) {
                 if (impl_->decisions[static_cast<std::size_t>(i)]) {
@@ -367,6 +390,7 @@ void WakeWord::reset() {
     impl_->decision_head = 0;
     impl_->decision_len  = 0;
     impl_->refractory_frames = 0;
+    impl_->frames_since_reset = 0;
     impl_->last_score.store(0.0f, std::memory_order_relaxed);
 }
 

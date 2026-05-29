@@ -539,6 +539,8 @@ int BcResnet2d::receptive_field_frames() const {
     return impl_->rf_frames() + impl_->gap_cap - 1;
 }
 
+int BcResnet2d::gap_window_frames() const { return impl_->gap_cap; }
+
 int BcResnet2d::param_count() const {
     int n = 0;
     auto conv = [](const Conv2dLayer& c) { return c.Cout * (c.Cin / c.groups) * c.kH * c.kW + c.Cout; };
