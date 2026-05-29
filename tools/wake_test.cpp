@@ -48,6 +48,7 @@ struct Args {
     bool        per_class        = false;
     bool        bench            = false;
     int         chunk_samples    = 320;   // ~20 ms @ 16 kHz
+    bool        trace            = false; // single-clip: print per-chunk score
     bool        help             = false;
 };
 
@@ -79,6 +80,7 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--per-class")        a.per_class = true;
         else if (k == "--bench")            a.bench = true;
         else if (k == "--chunk-samples")    a.chunk_samples = std::stoi(next());
+        else if (k == "--trace")            a.trace = true;
         else if (k == "--help" || k == "-h"){ a.help = true; return true; }
         else fail("cli", "unknown flag '" + k + "'");
     }
@@ -117,20 +119,29 @@ int run_single_wav(const Args& a) {
     int detections = 0;
     const int N = static_cast<int>(audio.samples.size());
     int pos = 0;
+    float peak_score = 0.0f;
+    double peak_t = 0.0;
     while (pos < N) {
         const int csz = std::min(a.chunk_samples, N - pos);
         const bool fired = w.feed(audio.samples.data() + pos, csz);
+        const double t = (pos + csz) / 16000.0;
+        const float sc = w.last_score();
+        if (sc > peak_score) { peak_score = sc; peak_t = t; }
+        if (a.trace) std::printf("  t=%.3f  score=%.4f\n", t, sc);
         if (fired) {
             ++detections;
-            // Approximate detection time = end-of-chunk timestamp.
-            const double t = (pos + csz) / 16000.0;
             std::printf("  detection #%d  t=%.3fs  score=%.4f\n",
-                        detections, t, w.last_score());
+                        detections, t, sc);
         }
         pos += csz;
     }
-    std::printf("           detections=%d  final_score=%.4f\n",
-                detections, w.last_score());
+    // Peak score over the whole clip — the model's strongest response,
+    // independent of the fire policy (threshold/smoothing/warmup). A near-zero
+    // peak means the model never lit up at all; a high peak that didn't fire
+    // points at the detector policy rather than the model.
+    std::printf("           detections=%d  peak_score=%.4f @ t=%.3fs"
+                "  final_score=%.4f\n",
+                detections, peak_score, peak_t, w.last_score());
     return detections > 0 ? 0 : 1;
 }
 
