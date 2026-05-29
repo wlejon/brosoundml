@@ -142,9 +142,17 @@ public:
     // Run the full pipeline: phoneme token ids (see the misaki G2P note above)
     // + a voice -> a mono 24 kHz waveform. `speed` scales the predicted
     // durations: > 1 speaks faster, < 1 slower.
+    //
+    // When `pred_dur_out` is non-null, it receives the predictor's per-phoneme
+    // frame counts — one entry per token in the BOS/EOS-wrapped sequence, so
+    // its length is `phoneme_ids.size() + 2` ([0, ...ids, 0]). The output
+    // sample count is a fixed multiple of the summed frame count, so callers
+    // can recover per-phoneme timing as
+    // `frame_offset * (samples.size() / sum(pred_dur))`.
     AudioBuffer synthesize(const std::vector<int32_t>& phoneme_ids,
                            const Voice& voice,
-                           float speed = 1.0f) const;
+                           float speed = 1.0f,
+                           std::vector<int32_t>* pred_dur_out = nullptr) const;
 
     const KokoroConfig& config() const;
     bool loaded() const;

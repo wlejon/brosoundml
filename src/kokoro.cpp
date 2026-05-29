@@ -290,7 +290,8 @@ Voice Kokoro::load_voice(const std::string& voice_path) const {
 
 AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                const Voice& voice,
-                               float speed) const {
+                               float speed,
+                               std::vector<int32_t>* pred_dur_out) const {
     if (!impl_->loaded) {
         fail("Kokoro::synthesize", "no model loaded; call Kokoro::load() first");
     }
@@ -339,6 +340,11 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     debug_stats("05_F0_pred", po.F0_pred);
     debug_stats("05_N_pred",  po.N_pred);
     debug_vec  ("03_pred_dur", po.pred_dur);
+
+    // Surface the per-phoneme frame counts when the caller asked for them.
+    // po.pred_dur is indexed over the BOS/EOS-wrapped `ids` (length L), so the
+    // output has one entry per wrapped token.
+    if (pred_dur_out) *pred_dur_out = po.pred_dur;
 
     // 5. Length-regulate t_en into asr. The expansion is an irregular gather
     //    along L (each phoneme is repeated pred_dur[l] times); there's no
