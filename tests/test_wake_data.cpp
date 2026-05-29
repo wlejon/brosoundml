@@ -269,6 +269,106 @@ int main() {
               "resample_to: peak frequency preserved within one bin");
     }
 
+    // ─── Biquad: low-pass kills the high half of the spectrum ───────────
+    {
+        std::mt19937 rng(2024);
+        auto x = brosoundml::gen_white_noise(16384, 1.0f, rng);
+        double lo0 = 0, hi0 = 0;
+        spectral_halves(x, 1024, 512, lo0, hi0);
+        CHECK(hi0 > 0.0, "biquad: baseline noise has high-half energy");
+        brosoundml::apply_biquad(x, brosoundml::design_lowpass(16000.f, 1000.f,
+                                                               0.707f));
+        double lo1 = 0, hi1 = 0;
+        spectral_halves(x, 1024, 512, lo1, hi1);
+        // 1 kHz LPF leaves the lower spectral half dominant by a wide margin.
+        CHECK(lo1 > 50.0 * hi1, "biquad lowpass: lo-half >> hi-half after filter");
+        CHECK(hi1 < 0.1 * hi0, "biquad lowpass: high-half energy collapses");
+    }
+
+    // ─── Shelves move band power in the expected direction ──────────────
+    {
+        std::mt19937 r1(55), r2(55);
+        auto x  = brosoundml::gen_white_noise(16384, 1.0f, r1);
+        auto xb = brosoundml::gen_white_noise(16384, 1.0f, r2);  // same noise
+        double lo0 = 0, hi0 = 0; spectral_halves(x, 1024, 512, lo0, hi0);
+        brosoundml::apply_biquad(xb,
+            brosoundml::design_low_shelf(16000.f, 300.f, 0.707f, +12.f));
+        double lo1 = 0, hi1 = 0; spectral_halves(xb, 1024, 512, lo1, hi1);
+        CHECK(lo1 > lo0 * 1.5, "low_shelf +12dB: low-half power rises");
+        CHECK(std::fabs(hi1 - hi0) < hi0 * 0.5,
+              "low_shelf +12dB: high-half power roughly unchanged");
+    }
+
+    // ─── DRC compresses the loud/quiet level ratio ──────────────────────
+    {
+        // Quiet sustained tone (≈ threshold) with a loud central burst. A
+        // feed-forward compressor lets the burst's leading transient through
+        // (finite attack), so crest-factor isn't a robust witness; the right
+        // invariant is that the steady-state loud-region level is pulled toward
+        // the quiet-region level — i.e. dynamic range is compressed.
+        const int N = 16000;
+        std::vector<float> x(static_cast<std::size_t>(N));
+        for (int n = 0; n < N; ++n) {
+            const float base = 0.05f * std::sin(2.f * 3.14159265f * 300.f * n / 16000.f);
+            const float burst = (n > 7000 && n < 9000)
+                ? 0.9f * std::sin(2.f * 3.14159265f * 300.f * n / 16000.f) : 0.f;
+            x[static_cast<std::size_t>(n)] = base + burst;
+        }
+        auto slice_rms = [](const std::vector<float>& v, int a, int b) {
+            double acc = 0.0;
+            for (int n = a; n < b; ++n) acc += static_cast<double>(v[n]) * v[n];
+            return std::sqrt(acc / std::max(1, b - a));
+        };
+        // Steady-state windows, clear of the attack transient at n≈7000.
+        const double loud0  = slice_rms(x, 8000, 9000);
+        const double quiet0 = slice_rms(x,  3000, 5000);
+        brosoundml::CompressorConfig cc;
+        cc.threshold_db = -26.f; cc.ratio = 6.f; cc.makeup_db = 0.f;
+        brosoundml::apply_drc(x, 16000, cc);
+        const double loud1  = slice_rms(x, 8000, 9000);
+        const double quiet1 = slice_rms(x,  3000, 5000);
+        CHECK(loud1 / std::max(1e-12, quiet1) <
+              0.5 * (loud0 / std::max(1e-12, quiet0)),
+              "drc: loud/quiet level ratio compressed");
+        CHECK(brosoundml::compute_audio_stats(x).has_nan == false,
+              "drc: output finite");
+    }
+
+    // ─── pitch_jitter: shifts sample count, no-op at zero ───────────────
+    {
+        const int N = 16000;
+        std::vector<float> x(static_cast<std::size_t>(N));
+        for (int n = 0; n < N; ++n)
+            x[static_cast<std::size_t>(n)] =
+                std::sin(2.f * 3.14159265f * 200.f * n / 16000.f);
+        auto up   = brosoundml::pitch_jitter(x, 16000, +2.f);
+        auto down = brosoundml::pitch_jitter(x, 16000, -2.f);
+        auto zero = brosoundml::pitch_jitter(x, 16000, 0.f);
+        CHECK(up.size()   < x.size(), "pitch_jitter +: fewer samples (pitch up)");
+        CHECK(down.size() > x.size(), "pitch_jitter -: more samples (pitch down)");
+        CHECK(zero.size() == x.size(), "pitch_jitter 0: no-op length");
+    }
+
+    // ─── apply_acquisition_channel: grid-locked, finite, deterministic ──
+    {
+        const int N = 16000;
+        std::mt19937 src(1);
+        std::vector<float> clean(static_cast<std::size_t>(N));
+        for (int n = 0; n < N; ++n)
+            clean[static_cast<std::size_t>(n)] =
+                0.3f * std::sin(2.f * 3.14159265f * 500.f * n / 16000.f);
+        std::mt19937 ra(7), rb(7), rc(8);
+        auto a = brosoundml::apply_acquisition_channel(clean, 16000, N, ra);
+        auto b = brosoundml::apply_acquisition_channel(clean, 16000, N, rb);
+        auto c = brosoundml::apply_acquisition_channel(clean, 16000, N, rc);
+        CHECK(static_cast<int>(a.size()) == N,
+              "acq channel: output re-landed on target grid");
+        CHECK(a == b, "acq channel: deterministic for same rng seed");
+        CHECK(a != c, "acq channel: differs for different rng seed");
+        CHECK(brosoundml::compute_audio_stats(a).has_nan == false,
+              "acq channel: output finite");
+    }
+
     if (failures) {
         std::fprintf(stderr, "test_wake_data: %d failure(s)\n", failures);
         return 1;

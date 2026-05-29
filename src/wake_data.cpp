@@ -243,6 +243,262 @@ std::vector<float> resample_to(const std::vector<float>& in,
     return Y.to_host_vector();
 }
 
+// ─── Biquad IIR filtering ────────────────────────────────────────────────
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+// Clamp a corner frequency to a safe (0, Nyquist) interval so the bilinear
+// designers never see f0 == 0 or f0 >= sr/2 (which blow up tan / produce NaNs).
+float clamp_freq(float sr, float f0) {
+    const float nyq = 0.5f * sr;
+    const float lo = 1.0f;
+    const float hi = 0.999f * nyq;
+    if (f0 < lo) return lo;
+    if (f0 > hi) return hi;
+    return f0;
+}
+
+Biquad normalize(double b0, double b1, double b2,
+                 double a0, double a1, double a2) {
+    Biquad q;
+    q.b0 = static_cast<float>(b0 / a0);
+    q.b1 = static_cast<float>(b1 / a0);
+    q.b2 = static_cast<float>(b2 / a0);
+    q.a1 = static_cast<float>(a1 / a0);
+    q.a2 = static_cast<float>(a2 / a0);
+    return q;
+}
+
+}  // namespace
+
+Biquad design_lowpass(float sr, float f0, float q) {
+    f0 = clamp_freq(sr, f0);
+    if (q <= 0.0f) q = 0.707f;
+    const double w0 = 2.0 * kPi * f0 / sr;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * q);
+    const double b0 = (1.0 - cw) / 2.0;
+    const double b1 = 1.0 - cw;
+    const double b2 = (1.0 - cw) / 2.0;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cw;
+    const double a2 = 1.0 - alpha;
+    return normalize(b0, b1, b2, a0, a1, a2);
+}
+
+Biquad design_highpass(float sr, float f0, float q) {
+    f0 = clamp_freq(sr, f0);
+    if (q <= 0.0f) q = 0.707f;
+    const double w0 = 2.0 * kPi * f0 / sr;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * q);
+    const double b0 =  (1.0 + cw) / 2.0;
+    const double b1 = -(1.0 + cw);
+    const double b2 =  (1.0 + cw) / 2.0;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cw;
+    const double a2 = 1.0 - alpha;
+    return normalize(b0, b1, b2, a0, a1, a2);
+}
+
+Biquad design_peaking(float sr, float f0, float q, float gain_db) {
+    f0 = clamp_freq(sr, f0);
+    if (q <= 0.0f) q = 0.707f;
+    const double A = std::pow(10.0, gain_db / 40.0);
+    const double w0 = 2.0 * kPi * f0 / sr;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * q);
+    const double b0 = 1.0 + alpha * A;
+    const double b1 = -2.0 * cw;
+    const double b2 = 1.0 - alpha * A;
+    const double a0 = 1.0 + alpha / A;
+    const double a1 = -2.0 * cw;
+    const double a2 = 1.0 - alpha / A;
+    return normalize(b0, b1, b2, a0, a1, a2);
+}
+
+Biquad design_low_shelf(float sr, float f0, float q, float gain_db) {
+    f0 = clamp_freq(sr, f0);
+    if (q <= 0.0f) q = 0.707f;
+    const double A = std::pow(10.0, gain_db / 40.0);
+    const double w0 = 2.0 * kPi * f0 / sr;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * q);
+    const double tsa = 2.0 * std::sqrt(A) * alpha;
+    const double b0 =      A * ((A + 1.0) - (A - 1.0) * cw + tsa);
+    const double b1 =  2.0 * A * ((A - 1.0) - (A + 1.0) * cw);
+    const double b2 =      A * ((A + 1.0) - (A - 1.0) * cw - tsa);
+    const double a0 =          (A + 1.0) + (A - 1.0) * cw + tsa;
+    const double a1 = -2.0 *   ((A - 1.0) + (A + 1.0) * cw);
+    const double a2 =          (A + 1.0) + (A - 1.0) * cw - tsa;
+    return normalize(b0, b1, b2, a0, a1, a2);
+}
+
+Biquad design_high_shelf(float sr, float f0, float q, float gain_db) {
+    f0 = clamp_freq(sr, f0);
+    if (q <= 0.0f) q = 0.707f;
+    const double A = std::pow(10.0, gain_db / 40.0);
+    const double w0 = 2.0 * kPi * f0 / sr;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * q);
+    const double tsa = 2.0 * std::sqrt(A) * alpha;
+    const double b0 =       A * ((A + 1.0) + (A - 1.0) * cw + tsa);
+    const double b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cw);
+    const double b2 =       A * ((A + 1.0) + (A - 1.0) * cw - tsa);
+    const double a0 =           (A + 1.0) - (A - 1.0) * cw + tsa;
+    const double a1 =  2.0 *    ((A - 1.0) - (A + 1.0) * cw);
+    const double a2 =           (A + 1.0) - (A - 1.0) * cw - tsa;
+    return normalize(b0, b1, b2, a0, a1, a2);
+}
+
+void apply_biquad(std::vector<float>& x, const Biquad& bq) {
+    // Direct-Form-II transposed, double-precision state for numerical headroom.
+    double z1 = 0.0, z2 = 0.0;
+    for (auto& v : x) {
+        const double in = static_cast<double>(v);
+        const double out = bq.b0 * in + z1;
+        z1 = bq.b1 * in - bq.a1 * out + z2;
+        z2 = bq.b2 * in - bq.a2 * out;
+        v = static_cast<float>(out);
+    }
+}
+
+// ─── Acquisition-channel augmentation ──────────────────────────────────────
+
+void apply_random_eq(std::vector<float>& x, int sr, std::mt19937& rng) {
+    if (x.empty()) return;
+    const float sf = static_cast<float>(sr);
+    std::uniform_real_distribution<float> tilt_db(-6.0f, 6.0f);
+    // Broad spectral tilt: low shelf one way, high shelf the other.
+    const float tilt = tilt_db(rng);
+    apply_biquad(x, design_low_shelf (sf, 200.0f, 0.707f,  tilt));
+    apply_biquad(x, design_high_shelf(sf, 4000.0f, 0.707f, -tilt));
+    // A couple of random peaking bands for resonant microphone colouration.
+    std::uniform_int_distribution<int>    n_bands(1, 3);
+    std::uniform_real_distribution<float> band_hz(300.0f, 6000.0f);
+    std::uniform_real_distribution<float> band_q(0.7f, 3.0f);
+    std::uniform_real_distribution<float> band_db(-8.0f, 8.0f);
+    const int nb = n_bands(rng);
+    for (int i = 0; i < nb; ++i) {
+        apply_biquad(x, design_peaking(sf, band_hz(rng), band_q(rng),
+                                       band_db(rng)));
+    }
+}
+
+void apply_proximity_boost(std::vector<float>& x, int sr, std::mt19937& rng) {
+    if (x.empty()) return;
+    std::uniform_real_distribution<float> f0(80.0f, 250.0f);
+    std::uniform_real_distribution<float> gain(2.0f, 10.0f);
+    apply_biquad(x, design_low_shelf(static_cast<float>(sr), f0(rng), 0.707f,
+                                     gain(rng)));
+}
+
+void apply_bandlimit(std::vector<float>& x, int sr, std::mt19937& rng) {
+    if (x.empty()) return;
+    const float sf = static_cast<float>(sr);
+    std::uniform_real_distribution<float> hp_hz(60.0f, 200.0f);
+    std::uniform_real_distribution<float> lp_hz(3400.0f, 7500.0f);
+    apply_biquad(x, design_highpass(sf, hp_hz(rng), 0.707f));
+    apply_biquad(x, design_lowpass (sf, lp_hz(rng), 0.707f));
+}
+
+void apply_drc(std::vector<float>& x, int sr, const CompressorConfig& cfg) {
+    if (x.empty()) return;
+    const float ratio = cfg.ratio > 1.0f ? cfg.ratio : 1.0f;
+    // One-pole attack/release coefficients on the envelope.
+    const float att = std::exp(-1.0f /
+        (std::max(1e-3f, cfg.attack_ms)  * 1e-3f * static_cast<float>(sr)));
+    const float rel = std::exp(-1.0f /
+        (std::max(1e-3f, cfg.release_ms) * 1e-3f * static_cast<float>(sr)));
+    const float makeup = std::pow(10.0f, cfg.makeup_db / 20.0f);
+    float env = 0.0f;   // linear envelope of |x|
+    for (auto& v : x) {
+        const float a = std::fabs(v);
+        // Attack when rising, release when falling.
+        env = (a > env) ? att * env + (1.0f - att) * a
+                        : rel * env + (1.0f - rel) * a;
+        float gain = 1.0f;
+        if (env > 1e-9f) {
+            const float lvl_db = 20.0f * std::log10(env);
+            if (lvl_db > cfg.threshold_db) {
+                // Gain reduction (dB) = (over) * (1 - 1/ratio).
+                const float over = lvl_db - cfg.threshold_db;
+                const float gr_db = -over * (1.0f - 1.0f / ratio);
+                gain = std::pow(10.0f, gr_db / 20.0f);
+            }
+        }
+        v *= gain * makeup;
+    }
+}
+
+std::vector<float> pitch_jitter(const std::vector<float>& x, int sr,
+                                float semitones) {
+    if (x.empty() || sr <= 0) return x;
+    if (std::fabs(semitones) < 1e-3f) return x;
+    const double ratio = std::pow(2.0, semitones / 12.0);   // >1 ⇒ pitch up
+    // Resample to sr/ratio samples (same count it would have at a lower rate),
+    // then keep them as sr samples: content is compressed/stretched in time and
+    // pitch shifts by `ratio`.
+    const int out_rate = std::max(1,
+        static_cast<int>(std::lround(static_cast<double>(sr) / ratio)));
+    if (out_rate == sr) return x;
+    return resample_to(x, sr, out_rate);
+}
+
+std::vector<float> apply_acquisition_channel(const std::vector<float>& x,
+                                             int sr, int target_len,
+                                             std::mt19937& rng,
+                                             const AcquisitionChannel& cfg) {
+    if (x.empty() || target_len <= 0) return x;
+    std::vector<float> y = x;
+
+    // Each enabled stage fires with its own probability so clips get varied
+    // *subsets* of the chain, not all-or-nothing.
+    auto chance = [&](float p) {
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        return u(rng) < p;
+    };
+
+    // 1) Pitch jitter (speaker diversity) — couples duration; re-crop next.
+    if (cfg.do_pitch && chance(0.7f)) {
+        std::uniform_real_distribution<float> st(-2.0f, 2.0f);
+        y = pitch_jitter(y, sr, st(rng));
+    }
+    // Land back on the fixed grid before the rest of the chain.
+    y = crop_or_pad_centered(y, target_len);
+
+    // 2) Room impulse response (reverb) — reuse the existing synthetic RIR.
+    if (cfg.do_rir && chance(0.5f)) {
+        std::uniform_real_distribution<float> t60(0.1f, 0.4f);
+        std::uniform_int_distribution<int>    taps(4, 12);
+        const float t = t60(rng);
+        const int rir_len = std::min(target_len,
+            std::max(1, static_cast<int>(t * static_cast<float>(sr))));
+        const auto rir = gen_rir(sr, rir_len, t, taps(rng), rng);
+        y = convolve_rir(y, rir);
+    }
+    // 3) Microphone colouration EQ.
+    if (cfg.do_eq && chance(0.85f)) apply_random_eq(y, sr, rng);
+    // 4) Proximity LF boost.
+    if (cfg.do_proximity && chance(0.4f)) apply_proximity_boost(y, sr, rng);
+    // 5) Band-limiting.
+    if (cfg.do_bandlimit && chance(0.7f)) apply_bandlimit(y, sr, rng);
+    // 6) Dynamic-range compression.
+    if (cfg.do_drc && chance(0.6f)) {
+        std::uniform_real_distribution<float> thr(-30.0f, -15.0f);
+        std::uniform_real_distribution<float> rat(2.0f, 6.0f);
+        std::uniform_real_distribution<float> mk(0.0f, 6.0f);
+        CompressorConfig cc;
+        cc.threshold_db = thr(rng);
+        cc.ratio        = rat(rng);
+        cc.makeup_db    = mk(rng);
+        apply_drc(y, sr, cc);
+    }
+    return y;
+}
+
 // ─── Clip shaping ──────────────────────────────────────────────────────────
 
 std::vector<float> crop_or_pad_centered(const std::vector<float>& samples,

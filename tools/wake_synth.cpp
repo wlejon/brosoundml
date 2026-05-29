@@ -329,6 +329,54 @@ int main(int argc, char** argv) {
             return brosoundml::crop_or_pad_centered(rs16, target_samples);
         };
 
+        // Acquisition-channel variant of a clean speech clip. This is the
+        // synthetic→real lever: every non-anchor variant passes through a
+        // randomized recording channel (mic colouration / band-limit / room /
+        // proximity / DRC / pitch) before any ambient-noise mix, so training is
+        // no longer dominated by Kokoro's single pristine channel. Channel
+        // params are not recorded in the (fixed-schema) manifest — they ride the
+        // seed, so the dataset stays byte-deterministic per --seed.
+        //
+        //   nv == 0 in full mode → channel-only (no ambient noise): disentangles
+        //   "channel" from "noise" so the model learns channel-invariance even
+        //   on otherwise-clean clips. nv >= 1 → channel + noise at SNR. In
+        //   --small (one variant) we keep the single variant noisy so the smoke
+        //   dataset still exercises the noise path.
+        //
+        // `rng` is the per-variant sub_rng(); the channel draws from it before
+        // the noise generator. On return out_nk/out_snr hold the manifest values
+        // ("" / 0 for channel-only) and out_tag the filename discriminator.
+        auto make_acq_variant = [&](const std::vector<float>& clean, int nv,
+                                    std::mt19937& rng, std::string& out_nk,
+                                    float& out_snr, std::string& out_tag)
+            -> std::vector<float> {
+            auto y = brosoundml::apply_acquisition_channel(
+                clean, 16000, target_samples, rng);
+            const bool chan_only = (nv == 0 && noise_variants_per_clean >= 2);
+            if (chan_only) {
+                brosoundml::peak_normalize(y, 0.99f);
+                out_nk = "";
+                out_snr = 0.0f;
+                out_tag = "chan";
+                return y;
+            }
+            const brosoundml::NoiseKind nk =
+                all_noises[static_cast<std::size_t>(
+                    nv % static_cast<int>(all_noises.size()))];
+            const float snr = snrs[static_cast<std::size_t>(
+                nv % static_cast<int>(snrs.size()))];
+            auto noise = brosoundml::gen_noise(nk, target_samples, 1.0f, rng);
+            auto mixed = brosoundml::mix_at_snr(y, noise, snr);
+            brosoundml::peak_normalize(mixed, 0.99f);
+            out_nk = brosoundml::noise_kind_name(nk);
+            out_snr = snr;
+            char tg[32];
+            std::snprintf(tg, sizeof(tg), "chan_%s_snr%d", out_nk.c_str(),
+                          static_cast<int>(snr));
+            out_tag = tg;
+            return mixed;
+        };
+
         // ─── Positives ─────────────────────────────────────────────────
         std::fprintf(stderr, "synthesizing positives for '%s'...\n",
                      target_word.c_str());
@@ -349,27 +397,20 @@ int main(int argc, char** argv) {
                            voice_names[vi], speed, 0.0f, "", clean_seed);
                 ++positives;
 
-                // Noisy variants.
+                // Acquisition-channel variants (channel-only + channel+noise).
                 for (int nv = 0; nv < noise_variants_per_clean; ++nv) {
                     auto rng = sub_rng();
-                    const brosoundml::NoiseKind nk =
-                        all_noises[static_cast<std::size_t>(
-                            nv % static_cast<int>(all_noises.size()))];
-                    const float snr = snrs[static_cast<std::size_t>(
-                        nv % static_cast<int>(snrs.size()))];
-                    auto noise = brosoundml::gen_noise(
-                        nk, target_samples, 1.0f, rng);
-                    auto mixed = brosoundml::mix_at_snr(clean, noise, snr);
-                    brosoundml::peak_normalize(mixed, 0.99f);
-                    std::snprintf(buf, sizeof(buf),
-                                  "pos_%s_sp%03d_%s_snr%d",
+                    std::string nk_name, tag;
+                    float snr_used = 0.0f;
+                    auto out = make_acq_variant(clean, nv, rng, nk_name,
+                                                snr_used, tag);
+                    std::snprintf(buf, sizeof(buf), "pos_%s_sp%03d_%s",
                                   voice_names[vi].c_str(),
                                   static_cast<int>(speed * 100 + 0.5f),
-                                  brosoundml::noise_kind_name(nk),
-                                  static_cast<int>(snr));
-                    write_clip(mixed, "positives", buf, 1, "positive",
-                               voice_names[vi], speed, snr,
-                               brosoundml::noise_kind_name(nk), clean_seed + nv + 1);
+                                  tag.c_str());
+                    write_clip(out, "positives", buf, 1, "positive",
+                               voice_names[vi], speed, snr_used,
+                               nk_name, clean_seed + nv + 1);
                     ++positives;
                     if (small_positive_cap >= 0 && positives >= small_positive_cap) break;
                 }
@@ -398,26 +439,19 @@ int main(int argc, char** argv) {
                     for (int nv = 0; nv < noise_variants_per_clean; ++nv) {
                         if (small_conf_cap >= 0 && conf_neg >= small_conf_cap) break;
                         auto rng = sub_rng();
-                        const brosoundml::NoiseKind nk =
-                            all_noises[static_cast<std::size_t>(
-                                nv % static_cast<int>(all_noises.size()))];
-                        const float snr = snrs[static_cast<std::size_t>(
-                            nv % static_cast<int>(snrs.size()))];
-                        auto noise = brosoundml::gen_noise(
-                            nk, target_samples, 1.0f, rng);
-                        auto mixed = brosoundml::mix_at_snr(clean, noise, snr);
-                        brosoundml::peak_normalize(mixed, 0.99f);
+                        std::string nk_name, tag;
+                        float snr_used = 0.0f;
+                        auto out = make_acq_variant(clean, nv, rng, nk_name,
+                                                    snr_used, tag);
                         std::snprintf(buf, sizeof(buf),
-                                      "neg_conf_%s_%s_sp%03d_%s_snr%d",
+                                      "neg_conf_%s_%s_sp%03d_%s",
                                       word.c_str(),
                                       voice_names[vi].c_str(),
                                       static_cast<int>(speed * 100 + 0.5f),
-                                      brosoundml::noise_kind_name(nk),
-                                      static_cast<int>(snr));
-                        write_clip(mixed, "negatives", buf, 0, "confusable",
-                                   voice_names[vi], speed, snr,
-                                   brosoundml::noise_kind_name(nk),
-                                   clean_seed + nv + 1);
+                                      tag.c_str());
+                        write_clip(out, "negatives", buf, 0, "confusable",
+                                   voice_names[vi], speed, snr_used,
+                                   nk_name, clean_seed + nv + 1);
                         ++conf_neg;
                     }
                 }
@@ -450,30 +484,23 @@ int main(int argc, char** argv) {
                                voice_names[vi], speed, 0.0f, "", clean_seed);
                     ++sent_neg;
 
-                    // Noisy variants — mirror the positive/confusable path.
+                    // Acquisition-channel variants — mirror positive/confusable.
                     for (int nv = 0; nv < noise_variants_per_clean; ++nv) {
                         if (small_sent_cap >= 0 && sent_neg >= small_sent_cap) break;
                         auto rng = sub_rng();
-                        const brosoundml::NoiseKind nk =
-                            all_noises[static_cast<std::size_t>(
-                                nv % static_cast<int>(all_noises.size()))];
-                        const float snr = snrs[static_cast<std::size_t>(
-                            nv % static_cast<int>(snrs.size()))];
-                        auto noise = brosoundml::gen_noise(
-                            nk, target_samples, 1.0f, rng);
-                        auto mixed = brosoundml::mix_at_snr(clean, noise, snr);
-                        brosoundml::peak_normalize(mixed, 0.99f);
+                        std::string nk_name, tag;
+                        float snr_used = 0.0f;
+                        auto out = make_acq_variant(clean, nv, rng, nk_name,
+                                                    snr_used, tag);
                         std::snprintf(buf, sizeof(buf),
-                                      "neg_sent_%03zu_%s_sp%03d_%s_snr%d",
+                                      "neg_sent_%03zu_%s_sp%03d_%s",
                                       si,
                                       voice_names[vi].c_str(),
                                       static_cast<int>(speed * 100 + 0.5f),
-                                      brosoundml::noise_kind_name(nk),
-                                      static_cast<int>(snr));
-                        write_clip(mixed, "negatives", buf, 0, "sentence",
-                                   voice_names[vi], speed, snr,
-                                   brosoundml::noise_kind_name(nk),
-                                   clean_seed + nv + 1);
+                                      tag.c_str());
+                        write_clip(out, "negatives", buf, 0, "sentence",
+                                   voice_names[vi], speed, snr_used,
+                                   nk_name, clean_seed + nv + 1);
                         ++sent_neg;
                     }
                 }

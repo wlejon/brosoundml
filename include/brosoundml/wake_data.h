@@ -85,6 +85,98 @@ std::vector<float> convolve_rir(const std::vector<float>& signal,
 std::vector<float> resample_to(const std::vector<float>& in,
                                int in_rate, int out_rate);
 
+// ─── Biquad IIR filtering ────────────────────────────────────────────────
+//
+// Second-order section. Coefficients are normalised so a0 == 1 (folded out).
+// All designers below follow the Robert Bristow-Johnson "Audio EQ Cookbook"
+// formulas; `sr` is the sample rate, `f0` the corner/centre frequency in Hz,
+// `q` the quality factor, and `gain_db` the band gain (used by the peaking and
+// shelf types; ignored by low/high-pass). These are the building blocks of the
+// acquisition-channel colouration below — modelling a recording chain as a few
+// cascaded biquads is cheaper and easier to randomise than convolving a literal
+// measured microphone impulse response, and PCEN already absorbs the static
+// part of any channel anyway (so the residual the model must see is exactly
+// this kind of mild, varied spectral shaping plus the dynamics below).
+struct Biquad {
+    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;   // feed-forward
+    float a1 = 0.0f, a2 = 0.0f;              // feed-back (a0 == 1)
+};
+
+Biquad design_lowpass  (float sr, float f0, float q);
+Biquad design_highpass (float sr, float f0, float q);
+Biquad design_peaking  (float sr, float f0, float q, float gain_db);
+Biquad design_low_shelf (float sr, float f0, float q, float gain_db);
+Biquad design_high_shelf(float sr, float f0, float q, float gain_db);
+
+// Apply one biquad in place (Direct-Form-II transposed, zero initial state).
+// Pure FP32 host loop — clips are ~1 s so the O(N) cost is negligible.
+void apply_biquad(std::vector<float>& x, const Biquad& bq);
+
+// ─── Acquisition-channel augmentation ──────────────────────────────────────
+//
+// Waveform-domain DSP that emulates the recording path a real "computer" travels
+// through but a Kokoro TTS clip never does: speaker → room → microphone → ADC.
+// This is the explicit synthetic→real lever. PCEN (the mel front-end) cancels
+// the *static* per-channel gain/tilt, so the job of these blocks is the residual
+// PCEN cannot normalise — nonlinear/dynamic channel variation and (via pitch
+// jitter) speaker diversity beyond Kokoro's handful of voices. All randomness is
+// drawn from the caller's `std::mt19937` so the synth dataset stays byte-
+// deterministic per seed; nothing here records into the (fixed) manifest schema.
+
+// Random parametric EQ: a gentle low/high-shelf spectral tilt plus a few random
+// peaking bands — microphone colouration.
+void apply_random_eq(std::vector<float>& x, int sr, std::mt19937& rng);
+
+// Low-shelf LF boost modelling the close-mic proximity effect.
+void apply_proximity_boost(std::vector<float>& x, int sr, std::mt19937& rng);
+
+// Random band-limiting: a high-pass (~60–200 Hz) and a low-pass (~3.4–7.5 kHz)
+// modelling the limited bandwidth of a cheap or distant microphone.
+void apply_bandlimit(std::vector<float>& x, int sr, std::mt19937& rng);
+
+// Feed-forward dynamic-range compressor. Envelope follower (attack/release) over
+// the instantaneous level, static dB threshold/ratio curve, then makeup gain —
+// emulating mic-preamp / AGC dynamics. Operates in place.
+struct CompressorConfig {
+    float threshold_db = -24.0f;  // gain reduction begins above this level
+    float ratio        = 3.0f;    // > 1
+    float attack_ms    = 5.0f;
+    float release_ms   = 80.0f;
+    float makeup_db     = 0.0f;
+};
+void apply_drc(std::vector<float>& x, int sr, const CompressorConfig& cfg);
+
+// Resample-based pitch jitter: shift pitch by `semitones` (positive = up) by
+// resampling and reinterpreting at the original rate. This couples pitch and
+// duration (a true formant-independent shift needs a phase vocoder and is
+// deliberately deferred); the caller re-crops to the fixed grid, so the coupled
+// duration change is absorbed. Returns a new buffer; `x` is unchanged.
+std::vector<float> pitch_jitter(const std::vector<float>& x, int sr,
+                                float semitones);
+
+// Toggles for the individual stages of apply_acquisition_channel. Each enabled
+// stage additionally fires with an internal probability drawn from `rng`, so a
+// fraction of clips pass through with only some stages active.
+struct AcquisitionChannel {
+    bool do_pitch     = true;
+    bool do_rir       = true;
+    bool do_eq        = true;
+    bool do_proximity = true;
+    bool do_bandlimit = true;
+    bool do_drc       = true;
+};
+
+// Apply a randomized recording channel in physical order:
+//   pitch jitter → crop/pad to target_len → room RIR → EQ + proximity →
+//   band-limit → DRC.
+// `target_len` re-lands the (possibly length-changed) pitch-jittered buffer on
+// the dataset grid before the rest of the chain. The output is NOT peak-
+// normalised — the caller mixes ambient noise and normalises afterwards.
+std::vector<float> apply_acquisition_channel(const std::vector<float>& x,
+                                             int sr, int target_len,
+                                             std::mt19937& rng,
+                                             const AcquisitionChannel& cfg = {});
+
 // ─── Clip shaping ──────────────────────────────────────────────────────────
 //
 // Centre-crop or zero-pad `samples` to exactly `target_len` samples. Used to
