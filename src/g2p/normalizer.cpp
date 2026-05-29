@@ -453,10 +453,19 @@ std::string normalize_text(std::string_view sentence) {
 
         // Negative sign: '-' before a digit, at a word boundary, reads as
         // "minus". Internal hyphens (well-known) are left untouched.
-        if (c == '-' && i + 1 < n && is_digit(s[i + 1])) {
-            const char prev = out.empty() ? '\0' : out.back();
-            if (prev == '\0' || prev == ' ' || prev == '(') {
+        if (c == '-') {
+            const char prevc = (i > 0)     ? s[i - 1] : '\0';
+            const char nextc = (i + 1 < n) ? s[i + 1] : '\0';
+            // Negative sign: '-' that opens a number at a word boundary.
+            if (is_digit(nextc) && !is_alnum(prevc)) {
                 out += " minus ";
+                ++i;
+                continue;
+            }
+            // Compound/range hyphen between word chars (14-line, well-known,
+            // 5-10) reads as a word break, not a spelled-out joined token.
+            if (is_alnum(prevc) && is_alnum(nextc)) {
+                out += ' ';
                 ++i;
                 continue;
             }

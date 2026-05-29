@@ -99,9 +99,15 @@ int main() {
     check_eq("3+4", "three plus four");
     check_eq("2=2", "two equals two");
     check_eq("R&D", "R and D");
-    // Negative sign at a word boundary; internal hyphens are left alone.
+    // Negative sign opens a number at a word boundary.
     check_eq("it's -5 outside", "it's minus five outside");
-    check_eq("well-known", "well-known");
+    // Compound/range hyphens between word chars become word breaks, so the
+    // joined token isn't spelled out.
+    check_eq("14-line poems", "fourteen line poems");
+    check_eq("well-known", "well known");
+    check_eq("twenty-one", "twenty one");
+    check_eq("state-of-the-art", "state of the art");
+    check_eq("5-10", "five ten");
 
     // ── Smart-quote folding ──
     check_eq("don\xE2\x80\x99t", "don't");                 // don’t
