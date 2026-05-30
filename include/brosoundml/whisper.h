@@ -45,8 +45,9 @@ namespace brosoundml {
 // modules — see modules.h), embedding_lookup, sample_logits / argmax. No new
 // brotensor op is required for an FP32 CPU first cut.
 //
-// STATUS: stage 1 — config + safetensors loading. transcribe() throws a
-// staged std::runtime_error naming the stage until the encoder/decoder land.
+// STATUS: complete. load() reads config.json + the safetensors weights onto
+// the requested device; transcribe() runs the full log-mel ▶ encoder ▶
+// autoregressive-decoder forward pass and returns token ids.
 
 // Model hyperparameters. Read from `config.json` by Whisper::load. Zero
 // defaults are placeholders overwritten on a real load; the fixed

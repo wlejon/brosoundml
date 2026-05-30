@@ -33,18 +33,16 @@ namespace brosoundml {
 // configured hop rate. Returns true exactly once per detected event,
 // debounced by `refractory_ms`.
 //
-// STATUS — staged build-out. The public surface below is locked. Each entry
-// point that depends on a not-yet-landed stage throws a std::runtime_error
-// naming the stage. The matching test_wake.cpp checks flip from "throws with
-// stage tag" to "real behaviour" as each chunk lands.
+// STATUS: complete — the full streaming runtime and its training toolchain
+// have landed. load() reads the BC-ResNet weights; feed() runs the streaming
+// log-mel front-end (stft → magnitude → mel → log) ▶ model ▶ 2-of-3 smoothing
+// ▶ refractory debounce, returning true once per detected event.
 //
-//   chunk 1  WakeConfig + WakeWord class surface, contract tests          ← now
-//   chunk 2  streaming log-mel front-end (stft → magnitude → mel → log)
-//   chunk 3  brosoundml_wake_synth — Kokoro-driven dataset builder
-//   chunk 4  brosoundml_wake_inspect — dataset validator
-//   chunk 5  BC-ResNet forward + weight format (load() becomes real)
-//   chunk 6  brosoundml_wake_train  — backward + Adam + BCE-with-logits
-//   chunk 7  WakeWord::feed real + smoothing + brosoundml_wake_test eval
+// Supporting tools (built under tools/):
+//   brosoundml_wake_synth     Kokoro-driven dataset builder
+//   brosoundml_wake_inspect   dataset validator
+//   brosoundml_wake_train     backward + Adam + BCE-with-logits
+//   brosoundml_wake_test      held-out evaluation
 
 // Front-end + model + detector hyperparameters. The defaults match the
 // "computer" recipe: 16 kHz, 10 ms hop, 25 ms window, 40-bin log-mel,

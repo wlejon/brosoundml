@@ -379,9 +379,12 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     const int L_gen = 2 * total;
     debug_stats("09_gen_in", gen_in);
 
-    // 7. Generator. SineGen is not yet implemented — feed a zero har stack so
-    //    the harmonic-source branch contributes nothing. Audio will lack the
-    //    natural breath noise but the phonemic content is intact.
+    // 7. Generator. The harmonic-source branch is driven by HarmonicSource
+    //    (below) — a deterministic F0-driven approximation of upstream's
+    //    SineGen / SourceModuleHnNSF. It carries the harmonic content the
+    //    network was trained on but drops the random initial phase + additive
+    //    gaussian noise, so audio lacks some natural breath noise while the
+    //    phonemic content is intact.
     // har_frames matches the time axis at the Generator's iSTFT input. After
     // L_gen -> ups[0] (×10) -> ups[1] (×6) -> reflection_pad (+1) we hit
     // L_gen * 60 + 1 frames. noise_convs see the same har stack and produce

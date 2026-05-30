@@ -86,10 +86,12 @@ English G2P at `brosoundml::g2p::` to remove that runtime dependency for
 embedded / no-Python deployments. Current state: byte-level Transformer POS
 tagger (`PosTagger`) is implemented and trained (weights in
 [`brosoundml-data`](https://github.com/wlejon/brosoundml-data) under `pos_tagger/`). The lexicon
-loader, morphology fallback, and the Kokoro phoneme-id adapter are in
-build-out. Until they land, callers must still pre-tokenize phonemes
-externally — `Kokoro::synthesize()` continues to accept phoneme ids
-directly.
+loader (`Lexicon`), morphology fallback (`Morphology`), special-case overrides
+(`SpecialCases`), text normalizer (`Normalizer`), and the Kokoro phoneme-id
+adapter (`PhonemeAdapter`) are all in place, tied together by `Phonemizer` — so
+callers can phonemize English text in-tree, with no misaki/Python dependency.
+`Kokoro::synthesize()` still accepts phoneme ids directly for callers that
+supply their own.
 
 ### brotensor op coverage
 

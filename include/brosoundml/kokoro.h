@@ -45,9 +45,10 @@ namespace brosoundml {
 // brosoundml composes the LSTM cell from matmul + sigmoid + tanh per timestep
 // for now — a fused brotensor lstm op is a later performance optimisation.
 //
-// STATUS: the repo is stood up; the Kokoro forward pass is in build-out. See
-// the build-out plan in README.md. Until it lands, load() / synthesize() throw
-// a std::runtime_error that names the stage.
+// STATUS: complete. load() reads config.json + the safetensors weights;
+// synthesize() runs the full plBERT ▶ text-encoder ▶ duration/F0/energy
+// predictors ▶ iSTFTNet decoder forward pass and returns 24 kHz mono PCM. The
+// one approximation is the harmonic-source branch (see the Caveat in README.md).
 
 // iSTFTNet decoder hyperparameters — the Kokoro vocoder branch. Drives the
 // upsampling stack, the AdaIN residual blocks, and the iSTFT head.
