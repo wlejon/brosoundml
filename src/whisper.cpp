@@ -232,7 +232,8 @@ int32_t argmax_last_row(const brotensor::Tensor& logits) {
 
 Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
                                            const std::vector<int32_t>& prompt_ids,
-                                           int max_new_tokens) const {
+                                           int max_new_tokens,
+                                           const CancelCheck& cancel) const {
     if (!impl_->loaded) {
         fail("Whisper::transcribe", "no model loaded; call Whisper::load() first");
     }
@@ -281,6 +282,9 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     std::vector<int32_t> generated;
     generated.reserve(static_cast<std::size_t>(budget));
     for (int step = 0; step < budget; ++step) {
+        // Cooperative cancellation: a barge-in drops the in-flight turn, so
+        // stop decoding and return what we have (the caller discards it).
+        if (cancel && cancel()) break;
         const int32_t next_id = argmax_last_row(logits);
         if (next_id == impl_->config.eos_token_id) break;
         generated.push_back(next_id);

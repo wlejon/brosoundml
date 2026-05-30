@@ -251,6 +251,20 @@ static int run() {
 
         std::vector<int32_t> prompt =
             tok.build_prompt("en", "transcribe", /*with_timestamps=*/false);
+
+        // Cancellation: an always-true cancel breaks the greedy loop on its
+        // first iteration, so the result is exactly the prompt (no content
+        // tokens). This is the real-weights proof that .cancel() stops the
+        // decode rather than letting it run to completion.
+        auto cancelled = real.transcribe(audio, prompt, 0, [] { return true; });
+        if (cancelled.token_ids.size() != prompt.size()) {
+            std::fprintf(stderr,
+                         "FAIL: [%s] real Whisper: cancelled transcribe should "
+                         "return prompt only (got %zu vs %zu)\n",
+                         dev_name, cancelled.token_ids.size(), prompt.size());
+            ++failures;
+        }
+
         auto result = real.transcribe(audio, prompt);
         if (!(result.token_ids.size() > prompt.size())) {
             std::fprintf(stderr,

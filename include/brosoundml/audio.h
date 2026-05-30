@@ -1,10 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace brosoundml {
+
+// ─── CancelCheck ─────────────────────────────────────────────────────────────
+//
+// Cooperative cancellation for the long-running inference calls (Whisper
+// transcribe, Kokoro synthesize). A call invokes it at safe checkpoints
+// (between autoregressive steps / pipeline stages); returning true asks the
+// call to abort early and return whatever it has so far — the caller typically
+// discards a cancelled result. An empty function (the default) never cancels,
+// so existing callers are unaffected. The callback runs on the calling thread
+// only, so an implementation backed by a std::atomic needs no extra
+// synchronisation.
+using CancelCheck = std::function<bool()>;
 
 // ─── AudioBuffer ───────────────────────────────────────────────────────────
 //

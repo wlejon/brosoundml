@@ -330,10 +330,13 @@ struct Generator {
     void load_from(const brotensor::safetensors::File& f, const KokoroConfig& cfg);
     // gen_in: (1, 512*L_in). har: (1, (n_fft+2)*frames). style: (1, style_dim).
     // audio: (1, signal_len) where signal_len = (frames-1) * hop_size for center-true istft.
+    // `cancel` is checked at the top of each upsample stage; when it returns
+    // true the forward aborts early and leaves `audio` empty. Empty = no cancel.
     void forward(const brotensor::Tensor& gen_in, int L_in,
                  const brotensor::Tensor& har, int frames,
                  const brotensor::Tensor& style,
-                 brotensor::Tensor& audio) const;
+                 brotensor::Tensor& audio,
+                 const CancelCheck& cancel = {}) const;
 };
 
 // ─── Per-(N,L) channel-wise LayerNorm on NCL inputs ────────────────────────

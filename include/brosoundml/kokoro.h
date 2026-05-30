@@ -150,10 +150,17 @@ public:
     // sample count is a fixed multiple of the summed frame count, so callers
     // can recover per-phoneme timing as
     // `frame_offset * (samples.size() / sum(pred_dur))`.
+    //
+    // `cancel` is checked between the pipeline stages and inside the iSTFTNet
+    // generator's per-upsample loop (the dominant cost): when it returns true
+    // the call aborts and returns an empty AudioBuffer. There is no internal
+    // autoregressive loop, so cancellation is at stage/upsample-level
+    // granularity rather than per-sample. Empty (the default) = no cancel.
     AudioBuffer synthesize(const std::vector<int32_t>& phoneme_ids,
                            const Voice& voice,
                            float speed = 1.0f,
-                           std::vector<int32_t>* pred_dur_out = nullptr) const;
+                           std::vector<int32_t>* pred_dur_out = nullptr,
+                           const CancelCheck& cancel = {}) const;
 
     const KokoroConfig& config() const;
     bool loaded() const;

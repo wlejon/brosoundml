@@ -291,7 +291,8 @@ Voice Kokoro::load_voice(const std::string& voice_path) const {
 AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                const Voice& voice,
                                float speed,
-                               std::vector<int32_t>* pred_dur_out) const {
+                               std::vector<int32_t>* pred_dur_out,
+                               const CancelCheck& cancel) const {
     if (!impl_->loaded) {
         fail("Kokoro::synthesize", "no model loaded; call Kokoro::load() first");
     }
@@ -346,6 +347,11 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     // output has one entry per wrapped token.
     if (pred_dur_out) *pred_dur_out = po.pred_dur;
 
+    // Cooperative cancellation: the front stages (plBERT / encoders / predictor)
+    // are comparatively cheap; bail before the expensive length-regulate +
+    // decoder + generator back half if the turn was barged in.
+    if (cancel && cancel()) return {};
+
     // 5. Length-regulate t_en into asr. The expansion is an irregular gather
     //    along L (each phoneme is repeated pred_dur[l] times); there's no
     //    brotensor op for this NCL-axis gather, so build the result on host
@@ -372,6 +378,8 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
         impl_->device, asr_host.data(), 1, C_hidden * total);
 
     debug_stats("07_asr", asr);
+
+    if (cancel && cancel()) return {};
 
     // 6. Decoder backbone -> generator input.
     brotensor::Tensor gen_in = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
@@ -418,8 +426,11 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
 
     debug_stats("10_har_stub", har_stub);
 
+    if (cancel && cancel()) return {};
+
     brotensor::Tensor audio_t = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
-    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t);
+    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec,
+                             audio_t, cancel);
     debug_stats("11_audio", audio_t);
 
     // 8. Wrap as AudioBuffer. audio_t lives on impl_->device; round-trip to

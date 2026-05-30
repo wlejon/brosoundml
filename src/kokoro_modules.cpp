@@ -1388,7 +1388,8 @@ static void gdbg(const char* tag, const bt::Tensor& t) {
 void Generator::forward(const bt::Tensor& gen_in, int L_in,
                         const bt::Tensor& har, int frames,
                         const bt::Tensor& style,
-                        bt::Tensor& audio) const {
+                        bt::Tensor& audio,
+                        const CancelCheck& cancel) const {
     bt::Tensor x = gen_in;   // (1, init_C * L_in) NCL
     int L = L_in;
     int C = ups_C_in[0];     // init_C
@@ -1399,6 +1400,10 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
 
     gdbg("gen_in", x);
     for (int i = 0; i < num_upsamples; ++i) {
+        // Cooperative cancellation: a barge-in aborts the in-flight synthesis
+        // here (this upsample loop is the generator's dominant cost). Leave
+        // `audio` empty so the caller emits a cancelled (empty) buffer.
+        if (cancel && cancel()) { audio = bt::Tensor{}; return; }
         // x <- leaky_relu(x, 0.1)
         {
             bt::Tensor tmp = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);

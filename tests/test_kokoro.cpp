@@ -206,6 +206,17 @@ static int run() {
                   tag("real Kokoro voice: shape (510, 256)"));
 
             const std::vector<int32_t> phonemes = {50, 47, 54, 54, 57};
+
+            // Cancellation: an always-true cancel aborts at the first stage
+            // checkpoint and returns an empty buffer — the real-weights proof
+            // that .cancel() stops the forward rather than running to
+            // completion. (Checked before the real synth so a regression here
+            // can't be masked by the buffer being reused.)
+            AudioBuffer cancelled =
+                real.synthesize(phonemes, v, 1.0f, nullptr, [] { return true; });
+            CHECK(cancelled.samples.empty(),
+                  tag("synthesize: cancelled call returns empty buffer"));
+
             AudioBuffer audio = real.synthesize(phonemes, v, 1.0f);
             CHECK(audio.sample_rate == 24000, tag("synthesize: 24 kHz output"));
             CHECK(audio.samples.size() >= 1000,

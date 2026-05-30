@@ -106,9 +106,16 @@ public:
     // brolm::whisper::Tokenizer::build_prompt(lang, task, with_timestamps)).
     // `max_new_tokens` caps the autoregressive loop and defaults to the
     // model's max_target_positions.
+    //
+    // `cancel` is checked once per decoded token (the dominant cost): when it
+    // returns true the greedy loop stops and the call returns the prompt plus
+    // whatever tokens were produced so far. The one-shot encode + prompt
+    // prefill that precede the loop are not interruptible, but they are a small
+    // fraction of a multi-second transcription. Empty (the default) = no cancel.
     Transcription transcribe(const AudioBuffer& audio,
                              const std::vector<int32_t>& prompt_ids,
-                             int max_new_tokens = 0) const;
+                             int max_new_tokens = 0,
+                             const CancelCheck& cancel = {}) const;
 
     const WhisperConfig& config() const;
     bool loaded() const;
