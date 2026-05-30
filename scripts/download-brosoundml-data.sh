@@ -8,17 +8,25 @@
 # wlejon/brosoundml-data.
 #
 # Usage:
-#   scripts/download-brosoundml-data.sh [--out-dir D] [--force]
+#   scripts/download-brosoundml-data.sh [--out-dir D] [--force] [--kokoro]
 #
 #   --out-dir D    where to drop the files (default: <repo>/../brosoundml-data,
 #                  the sibling layout bro's loaders resolve by default — see
 #                  BROSOUNDML_DATA_DIR in the dataset README)
 #   --force        re-download even if a file already exists
+#   --kokoro       also fetch the kokoro/ tree (config + converted synth weights
+#                  + the af_heart voice) a maintainer published via
+#                  scripts/publish-kokoro-data.sh — for dev/CI parity with a
+#                  packaged build's download set
 #
 # Files fetched (what brosoundml needs at runtime):
 #   g2p/lexicon_en_us.bin   ~6.8 MB  brosoundml::g2p::Lexicon::load()
 #   pos_tagger/model.bin    ~7.6 MB  brosoundml::g2p::PosTagger::load()
 #   wake/computer.bw        ~64 KB   brosoundml::WakeWord::load()
+# With --kokoro, additionally:
+#   kokoro/config.json              brosoundml::Kokoro::load() (+ phoneme vocab)
+#   kokoro/model.safetensors ~327MB brosoundml::Kokoro::load()
+#   kokoro/voices/af_heart.bin      Kokoro::load_voice()
 #
 # Provenance/licence files (NOTICE, LICENSE-*) are fetched too — best-effort —
 # because the g2p lexicon (Apache 2.0, derived from misaki) ships an attribution
@@ -33,12 +41,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/../brosoundml-data"
 FORCE=0
+KOKORO=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --out-dir) OUT_DIR="${2:?--out-dir needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --kokoro)  KOKORO=1; shift ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -89,6 +99,13 @@ download() {
 download "g2p/lexicon_en_us.bin"
 download "pos_tagger/model.bin"
 download "wake/computer.bw"
+
+# --- Kokoro synth weights (opt-in: maintainer-published converted artifacts) -
+if [ "$KOKORO" -eq 1 ]; then
+    download "kokoro/config.json"
+    download "kokoro/model.safetensors"
+    download "kokoro/voices/af_heart.bin"
+fi
 
 # --- provenance / licence (best-effort: never block a checkout on these) ----
 for doc in LICENSE README.md \
