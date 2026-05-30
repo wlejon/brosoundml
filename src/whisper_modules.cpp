@@ -59,17 +59,34 @@ void upload(const stf::File& f, const std::string& key,
             const std::string& where) {
     const stf::TensorView* view = f.find(key);
     if (!view) fail(where, "missing safetensors key '" + key + "'");
-    if (view->dtype != stf::Dtype::F32) {
-        fail(where, "tensor '" + key + "' is not F32 (got dtype " +
-                    std::to_string(static_cast<int>(view->dtype)) + ")");
-    }
     const std::int64_t n = view->numel();
     if (n != static_cast<std::int64_t>(rows) * cols) {
         fail(where, "tensor '" + key + "' has " + std::to_string(n) +
                     " elements; expected " +
                     std::to_string(static_cast<std::int64_t>(rows) * cols));
     }
-    stf::upload(*view, rows, cols, dst);
+
+    // brosoundml's Whisper forward is F32 throughout (CPU and CUDA). Upstream
+    // openai/whisper checkpoints ship their weights as F16 (and some other
+    // sources as BF16), so widen those host-side to F32 before uploading rather
+    // than rejecting them — this lets an unmodified upstream model.safetensors
+    // load directly, with no offline FP32 re-cast step.
+    if (view->dtype == stf::Dtype::F32) {
+        stf::upload(*view, rows, cols, dst);
+    } else if (view->dtype == stf::Dtype::F16 || view->dtype == stf::Dtype::BF16) {
+        const bool isF16 = (view->dtype == stf::Dtype::F16);
+        const auto* src = reinterpret_cast<const std::uint16_t*>(view->data);
+        std::vector<float> tmp(static_cast<std::size_t>(n));
+        for (std::int64_t i = 0; i < n; ++i)
+            tmp[static_cast<std::size_t>(i)] =
+                isF16 ? bt::fp16_bits_to_fp32(src[i]) : bt::bf16_bits_to_fp32(src[i]);
+        dst = bt::Tensor::empty_on(bt::Device::CPU, rows, cols, bt::Dtype::FP32);
+        std::memcpy(dst.data, tmp.data(), tmp.size() * sizeof(float));
+    } else {
+        fail(where, "tensor '" + key + "' has unsupported dtype " +
+                    std::to_string(static_cast<int>(view->dtype)) +
+                    " (need F32, F16, or BF16)");
+    }
     // safetensors::upload uses Tensor::from_host which lands on
     // brotensor::default_device() — that's CUDA once init() registers it, not
     // CPU. Migrate unconditionally to g_load_device so weights end up exactly
