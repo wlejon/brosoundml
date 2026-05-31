@@ -296,7 +296,7 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
         }, "speech_tokenizer/model.safetensors");
         // Stage 2: build the codec decoder (codes -> waveform) from these
         // weights. The Talker / Code Predictor follow in later stages.
-        impl_->codec.load(w, impl_->config.codec);
+        impl_->codec.load(w, impl_->config.codec, device);
     }
 
     impl_->loaded = true;

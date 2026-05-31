@@ -110,8 +110,11 @@ struct QwenTtsCodecDecoder {
     brotensor::Tensor dec_final_alpha, dec_final_beta;  // SnakeBeta on output_dim
     brotensor::Tensor dec_out_w, dec_out_b;    // output_dim -> 1, k7
 
-    // Build from the `decoder.*` tensors of speech_tokenizer/model.safetensors.
-    void load(const brotensor::safetensors::File& f, const QwenTtsCodecConfig& cfg);
+    // Build from the `decoder.*` tensors of speech_tokenizer/model.safetensors,
+    // placing weights on `device` (FP32 on every backend; q/k permuted into
+    // brotensor's adjacent-pair RoPE layout).
+    void load(const brotensor::safetensors::File& f, const QwenTtsCodecConfig& cfg,
+              brotensor::Device device = brotensor::Device::CPU);
 
     // Decode `num_frames` frames of `num_quantizers` codes (laid out
     // codes[k*num_frames + t]) to 24 kHz PCM, appended to `wav`.

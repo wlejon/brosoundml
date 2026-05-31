@@ -163,7 +163,7 @@ static int run() {
         // is additionally gated behind BROSOUNDML_RUN_CODEC_FIXTURE to keep the
         // default suite fast — set it to run the numeric validation:
         //   BROSOUNDML_RUN_CODEC_FIXTURE=1 ctest -R qwen_tts -C Release
-        if (dev == brotensor::Device::CPU && std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
+        if (std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
             const fs::path fix_dir = fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures";
             auto check_fixture = [&](const char* fname) {
                 const fs::path path = fix_dir / fname;
@@ -193,12 +193,12 @@ static int run() {
                     sum_abs += d;
                 }
                 const double mean_abs = sum_abs / n;
-                std::printf("    [codec fixture %s] T=%d  max|Δ|=%.2e  mean|Δ|=%.2e\n",
-                            fname, T, max_abs, mean_abs);
-                // FP32 vs FP32 reference; only float reassociation across the
-                // deep (x1920) stack differs.
-                CHECK(max_abs  < 2e-3, "codec decode matches upstream (max abs)");
-                CHECK(mean_abs < 1e-4, "codec decode matches upstream (mean abs)");
+                std::printf("    [%s codec fixture %s] T=%d  max|Δ|=%.2e  mean|Δ|=%.2e\n",
+                            dev_name, fname, T, max_abs, mean_abs);
+                // FP32 vs FP32 reference on both backends; only float
+                // reassociation across the deep (x1920) stack differs.
+                CHECK(max_abs  < 2e-3, tag("codec decode matches upstream (max abs)"));
+                CHECK(mean_abs < 1e-4, tag("codec decode matches upstream (mean abs)"));
             };
             check_fixture("qwen_tts_codec_small.bin");  // T < sliding_window
             check_fixture("qwen_tts_codec.bin");        // T > sliding_window (72)
@@ -532,12 +532,12 @@ static int run() {
                 // fixture, since it runs the full x1920 decode.
                 if (std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
                     QwenTts q2;
-                    q2.load(root.string(), brotensor::Device::CPU);
+                    q2.load(root.string(), dev);   // full pipeline on the active device
                     brosoundml::AudioBuffer wav = q2.synthesize(text, "serena", "english");
                     CHECK(wav.sample_rate == 24000, tag("synthesize() returns 24 kHz"));
                     CHECK(!wav.samples.empty(), tag("synthesize() returns audio"));
-                    std::printf("    [synthesize] %zu samples (%.2fs)\n",
-                                wav.samples.size(), wav.samples.size() / 24000.0);
+                    std::printf("    [%s synthesize] %zu samples (%.2fs)\n",
+                                dev_name, wav.samples.size(), wav.samples.size() / 24000.0);
                 }
             }
         }

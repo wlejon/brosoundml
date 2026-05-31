@@ -148,6 +148,20 @@ inline void to_host(const bt::Tensor& t, float* out) {
                 static_cast<std::size_t>(c.size()) * sizeof(float));
 }
 
+// Transpose a (rows, cols) FP32 tensor to (cols, rows). brotensor has no device
+// transpose op, so this round-trips through host — used only for the codec's
+// NCL<->SEQ layout swaps, which sit on modest pre-upsample tensors.
+inline bt::Tensor transpose2d(const bt::Tensor& x) {
+    const int R = x.rows, C = x.cols;
+    std::vector<float> s(static_cast<std::size_t>(R) * C);
+    to_host(x, s.data());
+    std::vector<float> d(static_cast<std::size_t>(R) * C);
+    for (int r = 0; r < R; ++r)
+        for (int c = 0; c < C; ++c)
+            d[static_cast<std::size_t>(c) * R + r] = s[static_cast<std::size_t>(r) * C + c];
+    return bt::Tensor::from_host_on(x.device, d.data(), C, R);
+}
+
 // Build interleaved-pair RoPE cos/sin tables (n, half) on `dev` for one rotary
 // axis-position grid. pos[i] for table column i is pos_of(i); inv_freq[i] is
 // the pair frequency. Tables are FP32 on every backend (rope_apply requires
