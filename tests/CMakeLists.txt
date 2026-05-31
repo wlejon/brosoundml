@@ -13,6 +13,7 @@ brosoundml_add_test(brosoundml_test_smoke    test_smoke.cpp)
 brosoundml_add_test(brosoundml_test_audio    test_audio.cpp)
 brosoundml_add_test(brosoundml_test_modules  test_modules.cpp)
 brosoundml_add_test(brosoundml_test_kokoro   test_kokoro.cpp)
+brosoundml_add_test(brosoundml_test_qwen_tts test_qwen_tts.cpp)
 brosoundml_add_test(brosoundml_test_kokoro_modules test_kokoro_modules.cpp)
 brosoundml_add_test(brosoundml_test_wake     test_wake.cpp)
 brosoundml_add_test(brosoundml_test_wake_data test_wake_data.cpp)
@@ -69,6 +70,8 @@ else()
 endif()
 
 target_compile_definitions(brosoundml_test_kokoro PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(brosoundml_test_qwen_tts PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")

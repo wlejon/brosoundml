@@ -106,6 +106,7 @@ target_sources(brosoundml PRIVATE
     src/modules.cpp
     src/kokoro_modules.cpp
     src/kokoro.cpp
+    src/qwen_tts.cpp
     src/wake.cpp
     src/wake_data.cpp
     src/bc_resnet.cpp
