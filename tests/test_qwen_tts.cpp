@@ -266,16 +266,11 @@ static int run() {
                                 dev_name, what, max_abs, sum_abs / ref.size());
                     CHECK(max_abs < tol, tag(what));
                 };
-                // CPU runs attention in FP32 (matches upstream to float
-                // round-off). CUDA has no FP32 flash-attention kernel, so
-                // attention is FP16 and the error compounds across 28 layers;
-                // the FP32 ops (projections, RMSNorm, RoPE, codec_head) stay
-                // near-exact. The looser CUDA bound guards against gross
-                // device-dispatch bugs — the decisive GPU check is the AR code
-                // stream / end-to-end audio below.
-                const bool cuda = (dev != brotensor::Device::CPU);
-                cmp("hidden states", hid, ref_h, cuda ? 1.0 : 5e-2);
-                cmp("codec_head logits", log, ref_l, cuda ? 0.5 : 5e-2);
+                // Attention is FP32 on both backends (CPU flash; CUDA via
+                // flash_attention_varlen_forward's FP32 kernel), so CUDA tracks
+                // CPU — and upstream — to float round-off. Same bound for both.
+                cmp("hidden states", hid, ref_h, 5e-2);
+                cmp("codec_head logits", log, ref_l, 5e-2);
 
                 // Embedding helpers.
                 double emax = 0.0;
@@ -325,7 +320,7 @@ static int run() {
                     for (int d = 0; d < H; ++d)
                         cache_max = std::max(cache_max, std::fabs((double)hs[d] - hf[d]));
                     std::printf("    [%s talker kv-cache step] max|Δ|=%.2e\n", dev_name, cache_max);
-                    CHECK(cache_max < (cuda ? 1e-1 : 1e-4),
+                    CHECK(cache_max < 1e-4,
                           tag("talker cached step matches uncached forward"));
                 }
             }
@@ -394,12 +389,9 @@ static int run() {
                     if (got_cp[i] != cp_codes[i]) ++cp_mismatch;
                 std::printf("    [code predictor] %d/%d codes match\n",
                             n_codes - cp_mismatch, n_codes);
-                // Exact discrete-code match is an FP32/CPU-vs-upstream contract.
-                // CUDA attention is FP16 (no FP32 flash kernel), so the greedy
-                // argmax stream diverges — a valid different sample of the same
-                // model. The GPU is validated on end-to-end audio instead.
-                CHECK(dev != brotensor::Device::CPU || cp_mismatch == 0,
-                      tag("code predictor codes match upstream exactly"));
+                // FP32 attention on both backends ⇒ the greedy argmax stream is
+                // bit-identical on CPU and CUDA, so exact-code match holds on both.
+                CHECK(cp_mismatch == 0, tag("code predictor codes match upstream exactly"));
 
                 // Part B — dual-track AR loop.
                 brosoundml::QwenTtsGenParams params;
@@ -418,8 +410,7 @@ static int run() {
                 }
                 std::printf("    [AR loop] F=%d  code mismatches=%d/%d\n",
                             F, fr_mismatch, F * G);
-                CHECK(dev != brotensor::Device::CPU || fr_mismatch == 0,
-                      tag("AR loop frames match upstream exactly"));
+                CHECK(fr_mismatch == 0, tag("AR loop frames match upstream exactly"));
             }
         }
 
@@ -534,8 +525,7 @@ static int run() {
                         if (got_frames[i] != ref_frames[i]) ++sm;
                 std::printf("    [synth AR loop] F=%d  code mismatches=%d/%d\n", F, sm, F * G);
                 CHECK(gotF == F, tag("synth AR loop frame count matches"));
-                CHECK(dev != brotensor::Device::CPU || sm == 0,
-                      tag("synth code stream matches upstream exactly"));
+                CHECK(sm == 0, tag("synth code stream matches upstream exactly"));
 
                 // (4) the public synthesize() path runs end to end (codes ->
                 // 24 kHz). Gated behind the heavy-decode env like the codec

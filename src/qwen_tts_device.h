@@ -94,24 +94,31 @@ inline bt::Tensor expand_kv(const bt::Tensor& K, int n, int n_kv, int n_q,
     return out;
 }
 
-// Fused attention over pre-projected Q (Lq,D), K/V (Lk,D) with `num_heads`
-// heads. CPU runs flash in FP32; CUDA has no FP32 flash kernel, so cast to FP16
-// around it (FP32 accumulation inside) — the whisper/kokoro pattern. `causal`
-// requires Lq == Lk (prefill); a single query over the full valid cache uses
-// causal == false (it legitimately attends every cached key).
+// Fused FP32 attention over pre-projected Q (Lq,D), K/V (Lk,D) with `num_heads`
+// heads of `head_dim`. Both CPU and CUDA run in FP32, so the GPU path matches
+// the CPU path (and upstream) to float round-off:
+//   - CPU: flash_attention_forward (FP32 native).
+//   - CUDA: flash_attention_varlen_forward, which (unlike flash_attention_
+//     forward) has an FP32 GPU kernel; a single batch=1 sequence reproduces
+//     plain attention.
+// `causal` requires Lq == Lk (prefill); a single query over the full valid
+// cache uses causal == false (it legitimately attends every cached key).
 inline void flash_attn(const bt::Tensor& Q, const bt::Tensor& K,
-                       const bt::Tensor& V, int num_heads, bool causal,
-                       bt::Tensor& O) {
+                       const bt::Tensor& V, int num_heads, int head_dim,
+                       bool causal, bt::Tensor& O) {
     if (Q.device == bt::Device::CPU) {
         bt::flash_attention_forward(Q, K, V, nullptr, num_heads, causal, O);
         return;
     }
-    bt::Tensor Qh, Kh, Vh, Oh;
-    bt::cast(Q, Qh, bt::Dtype::FP16);
-    bt::cast(K, Kh, bt::Dtype::FP16);
-    bt::cast(V, Vh, bt::Dtype::FP16);
-    bt::flash_attention_forward(Qh, Kh, Vh, nullptr, num_heads, causal, Oh);
-    bt::cast(Oh, O, bt::Dtype::FP32);
+    const int Lq = Q.rows, Lk = K.rows;
+    const std::int32_t cuq[2] = {0, Lq};
+    const std::int32_t cuk[2] = {0, Lk};
+    bt::Tensor dq = upload_idx(Q.device, cuq, 2);
+    bt::Tensor dk = upload_idx(Q.device, cuk, 2);
+    bt::flash_attention_varlen_forward(
+        Q, K, V, static_cast<const std::int32_t*>(dq.data),
+        static_cast<const std::int32_t*>(dk.data), /*batch_size=*/1,
+        /*max_seqlen_q=*/Lq, /*max_seqlen_k=*/Lk, num_heads, head_dim, causal, O);
 }
 
 // SwiGLU gate: g <- silu(g) * u, in place on g. Both (n, inter).

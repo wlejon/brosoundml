@@ -115,7 +115,7 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
         bt::Tensor Kf = bt::Tensor::view(dev, cache.k[l].data, valid, qd, bt::Dtype::FP32);
         bt::Tensor Vf = bt::Tensor::view(dev, cache.v[l].data, valid, qd, bt::Dtype::FP32);
         bt::Tensor ctx;
-        qtd::flash_attn(qr, Kf, Vf, n_q, /*causal=*/offset == 0, ctx);
+        qtd::flash_attn(qr, Kf, Vf, n_q, head_dim, /*causal=*/offset == 0, ctx);
         bt::Tensor attn;
         qtd::linear(cl.ow, nullptr, ctx, attn);
         bt::add_inplace_batched(hs, attn);

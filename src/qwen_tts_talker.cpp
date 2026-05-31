@@ -202,9 +202,9 @@ void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3
             bt::Tensor Vf = bt::Tensor::view(dev, cache->v[l].data, valid, qd, bt::Dtype::FP32);
             // offset==0: a fresh prefill (Lq==Lk) is causal; a later step has a
             // single query at the latest position attending the whole cache.
-            qtd::flash_attn(qr, Kf, Vf, n_q_heads, /*causal=*/offset == 0, ctx);
+            qtd::flash_attn(qr, Kf, Vf, n_q_heads, head_dim, /*causal=*/offset == 0, ctx);
         } else {
-            qtd::flash_attn(qr, kE, vE, n_q_heads, /*causal=*/true, ctx);
+            qtd::flash_attn(qr, kE, vE, n_q_heads, head_dim, /*causal=*/true, ctx);
         }
         bt::Tensor attn;
         qtd::linear(tl.ow, nullptr, ctx, attn);   // (n, hidden)
