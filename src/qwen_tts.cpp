@@ -264,7 +264,7 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
                 ".input_layernorm.weight",
         }, "model.safetensors");
         // Stages 3-4: build the Talker + Code Predictor (the AR generator).
-        impl_->talker.load(w, impl_->config.talker);
+        impl_->talker.load(w, impl_->config.talker, device);
         impl_->code_pred.load(w, impl_->config.talker.code_predictor);
     }
 

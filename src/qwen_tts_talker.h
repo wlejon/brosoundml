@@ -35,15 +35,20 @@ struct QwenTtsTalkerLayer {
 };
 
 // A growing KV cache for autoregressive stepping: per-layer post-RoPE K and V
-// for every token seen so far (each `len * n_kv_heads * head_dim` floats, row
-// t = token t). The AR loop seeds it with a prefill run() then extends it one
-// frame-token at a time. `len` is the number of tokens currently cached.
+// for every token seen so far, stored as FP32 device tensors (cap, n_q_heads*
+// head_dim) already expanded from the n_kv_heads GQA layout to full per-query
+// heads, so flash attention sees plain MHA. The AR loop seeds it with a prefill
+// run() then extends it one frame-token at a time. `len` is the number of
+// tokens currently cached; `cap` the allocated row capacity (grown
+// geometrically). Lives on whatever device the Talker weights do.
 struct QwenTtsTalkerCache {
     int len = 0;
-    std::vector<std::vector<float>> k;   // [num_layers][len * n_kv_heads * head_dim]
-    std::vector<std::vector<float>> v;
+    int cap = 0;
+    std::vector<brotensor::Tensor> k;   // [num_layers] (cap, n_q_heads*head_dim) FP32
+    std::vector<brotensor::Tensor> v;
     void reset(int num_layers) {
         len = 0;
+        cap = 0;
         k.assign(num_layers, {});
         v.assign(num_layers, {});
     }
@@ -71,8 +76,11 @@ struct QwenTtsTalker {
     brotensor::Tensor final_norm;       // (hidden,1) RMSNorm
     std::vector<QwenTtsTalkerLayer> layers;
 
-    // Build from the talker.* tensors of model.safetensors (BF16 -> host FP32).
-    void load(const brotensor::safetensors::File& f, const QwenTtsTalkerConfig& cfg);
+    // Build from the talker.* tensors of model.safetensors (BF16 -> FP32 on
+    // `device`). q/k projections and q/k_norm are permuted into brotensor's
+    // adjacent-pair RoPE layout at load (see qwen_tts_talker.cpp).
+    void load(const brotensor::safetensors::File& f, const QwenTtsTalkerConfig& cfg,
+              brotensor::Device device = brotensor::Device::CPU);
 
     // Prefill forward. `inputs_embeds` is T*hidden row-major (row t = frame t).
     // `pos3T` is the 3-axis M-RoPE position grid, axis-major: pos3T[a*T + t]

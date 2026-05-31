@@ -212,7 +212,7 @@ static int run() {
         // against the genuine upstream model. Fixture is gitignored and made by
         // tests/ref/gen_talker_fixture (see the codec ref script's header for
         // the transformers==4.57.3 venv recipe); skipped when absent.
-        if (dev == brotensor::Device::CPU) {
+        {
             const fs::path tpath =
                 fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_talker.bin";
             std::ifstream f(tpath.string(), std::ios::binary);
@@ -244,7 +244,7 @@ static int run() {
                 brosoundml::QwenTtsTalker talker;
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
-                    talker.load(w, c.talker);
+                    talker.load(w, c.talker, dev);
                 }
                 CHECK(talker.hidden == H, "talker hidden matches fixture");
                 CHECK(talker.vocab == V, "talker vocab matches fixture");
@@ -255,18 +255,27 @@ static int run() {
                 auto cmp = [&](const char* what, const brotensor::Tensor& got,
                                const std::vector<float>& ref, double tol) {
                     double max_abs = 0.0, sum_abs = 0.0;
-                    const float* g = got.host_f32();
+                    brotensor::Tensor gc = got.to(brotensor::Device::CPU);
+                    const float* g = gc.host_f32();
                     for (std::size_t i = 0; i < ref.size(); ++i) {
                         const double d = std::fabs(static_cast<double>(g[i]) - ref[i]);
                         max_abs = std::max(max_abs, d);
                         sum_abs += d;
                     }
-                    std::printf("    [talker %s] max|Δ|=%.2e  mean|Δ|=%.2e\n",
-                                what, max_abs, sum_abs / ref.size());
-                    CHECK(max_abs < tol, what);
+                    std::printf("    [%s talker %s] max|Δ|=%.2e  mean|Δ|=%.2e\n",
+                                dev_name, what, max_abs, sum_abs / ref.size());
+                    CHECK(max_abs < tol, tag(what));
                 };
-                cmp("hidden states", hid, ref_h, 5e-2);
-                cmp("codec_head logits", log, ref_l, 5e-2);
+                // CPU runs attention in FP32 (matches upstream to float
+                // round-off). CUDA has no FP32 flash-attention kernel, so
+                // attention is FP16 and the error compounds across 28 layers;
+                // the FP32 ops (projections, RMSNorm, RoPE, codec_head) stay
+                // near-exact. The looser CUDA bound guards against gross
+                // device-dispatch bugs — the decisive GPU check is the AR code
+                // stream / end-to-end audio below.
+                const bool cuda = (dev != brotensor::Device::CPU);
+                cmp("hidden states", hid, ref_h, cuda ? 1.0 : 5e-2);
+                cmp("codec_head logits", log, ref_l, cuda ? 0.5 : 5e-2);
 
                 // Embedding helpers.
                 double emax = 0.0;
@@ -276,15 +285,15 @@ static int run() {
                     for (int d = 0; d < H; ++d)
                         emax = std::max(emax, std::fabs((double)buf[d] - ref_tp[i * H + d]));
                 }
-                std::printf("    [talker text_projection] max|Δ|=%.2e\n", emax);
-                CHECK(emax < 5e-3, "talker text_embed_proj matches upstream");
+                std::printf("    [%s talker text_projection] max|Δ|=%.2e\n", dev_name, emax);
+                CHECK(emax < 5e-3, tag("talker text_embed_proj matches upstream"));
                 double cmax = 0.0;
                 for (int i = 0; i < nC; ++i) {
                     talker.codec_embed(codec_ids[i], buf.data());
                     for (int d = 0; d < H; ++d)
                         cmax = std::max(cmax, std::fabs((double)buf[d] - ref_ce[i * H + d]));
                 }
-                CHECK(cmax < 1e-5, "talker codec_embed matches upstream");
+                CHECK(cmax < 1e-5, tag("talker codec_embed matches upstream"));
 
                 // ── KV-cache self-consistency ──────────────────────────────
                 // A cached prefill of T-1 tokens followed by a single-token
@@ -309,12 +318,15 @@ static int run() {
                     talker.run(ie.data() + static_cast<std::size_t>(np) * H, 1,
                                step_pos, &cache, h_step);
                     double cache_max = 0.0;
-                    const float* hs = h_step.host_f32();
-                    const float* hf = hid.host_f32() + static_cast<std::size_t>(T - 1) * H;
+                    brotensor::Tensor h_step_c = h_step.to(brotensor::Device::CPU);
+                    brotensor::Tensor hid_c = hid.to(brotensor::Device::CPU);
+                    const float* hs = h_step_c.host_f32();
+                    const float* hf = hid_c.host_f32() + static_cast<std::size_t>(T - 1) * H;
                     for (int d = 0; d < H; ++d)
                         cache_max = std::max(cache_max, std::fabs((double)hs[d] - hf[d]));
-                    std::printf("    [talker kv-cache step] max|Δ|=%.2e\n", cache_max);
-                    CHECK(cache_max < 1e-4, "talker cached step matches uncached forward");
+                    std::printf("    [%s talker kv-cache step] max|Δ|=%.2e\n", dev_name, cache_max);
+                    CHECK(cache_max < (cuda ? 1e-1 : 1e-4),
+                          tag("talker cached step matches uncached forward"));
                 }
             }
         }
@@ -365,7 +377,7 @@ static int run() {
                 brosoundml::QwenTtsCodePredictor cp;
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
-                    talker.load(w, c.talker);
+                    talker.load(w, c.talker, dev);
                     cp.load(w, c.talker.code_predictor);
                 }
                 CHECK(talker.hidden == H, tag("AR fixture hidden matches"));
@@ -449,7 +461,7 @@ static int run() {
                 brosoundml::QwenTtsCodePredictor cp;
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
-                    talker.load(w, c.talker);
+                    talker.load(w, c.talker, dev);
                     cp.load(w, c.talker.code_predictor);
                 }
                 auto tok = brolm::qwen::Tokenizer::load(
