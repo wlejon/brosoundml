@@ -6,7 +6,10 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,6 +17,19 @@
 namespace brosoundml {
 
 namespace {
+
+// Env-gated internal profiling for predict_dev: splits the 2-token prefill pass
+// from the 14 single-token depth steps, and the per-step argmax read-back.
+struct CpProf {
+    static bool on() {
+        static const bool v = std::getenv("BROSOUNDML_QWEN_PROFILE") != nullptr;
+        return v;
+    }
+    static double& prefill() { static double v = 0; return v; }
+    static double& steps()   { static double v = 0; return v; }
+    static double& argmax()  { static double v = 0; return v; }
+    static long&   calls()   { static long v = 0;   return v; }
+};
 
 namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
@@ -71,16 +87,15 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
     const int half = head_dim / 2;
     const int offset = cache.len;
 
-    // Plain RoPE tables: every pair shares the row position pos_start + t.
-    std::vector<int>   pos_grid(static_cast<std::size_t>(n) * half);
-    std::vector<float> inv_freq(half);
-    for (int i = 0; i < half; ++i)
-        inv_freq[i] = std::pow(cp.rope_theta, -(2.0f * i) / head_dim);
-    for (int t = 0; t < n; ++t)
-        for (int i = 0; i < half; ++i)
-            pos_grid[static_cast<std::size_t>(t) * half + i] = pos_start + t;
-    bt::Tensor cosT, sinT;
-    qtd::build_rope_tables(dev, n, half, pos_grid, inv_freq, cosT, sinT);
+    // Plain RoPE tables for positions [pos_start, pos_start+n): slice the
+    // precomputed (num_code_groups, half) tables — contiguous rows in row-major,
+    // so this is a view, with no per-step host build or host->device upload.
+    bt::Tensor cosT = bt::Tensor::view(
+        dev, static_cast<float*>(cp.rope_cos.data) + static_cast<std::size_t>(pos_start) * half,
+        n, half, bt::Dtype::FP32);
+    bt::Tensor sinT = bt::Tensor::view(
+        dev, static_cast<float*>(cp.rope_sin.data) + static_cast<std::size_t>(pos_start) * half,
+        n, half, bt::Dtype::FP32);
 
     bt::Tensor hs = embeds;   // deep copy; mutated in place by residual adds
 
@@ -182,6 +197,22 @@ void QwenTtsCodePredictor::load(const sf::File& f,
         cl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev);
         cl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev);
     }
+
+    // Precompute the plain-RoPE cos/sin tables for the fixed depth positions
+    // 0..num_code_groups-1 (interleaved-pair layout, matching build_rope_tables).
+    const int half = head_dim / 2;
+    std::vector<float> cb(static_cast<std::size_t>(num_code_groups) * half);
+    std::vector<float> sb(static_cast<std::size_t>(num_code_groups) * half);
+    for (int p = 0; p < num_code_groups; ++p) {
+        for (int i = 0; i < half; ++i) {
+            const float ang = static_cast<float>(p) *
+                std::pow(rope_theta, -(2.0f * i) / head_dim);
+            cb[static_cast<std::size_t>(p) * half + i] = std::cos(ang);
+            sb[static_cast<std::size_t>(p) * half + i] = std::sin(ang);
+        }
+    }
+    rope_cos = bt::Tensor::from_host_on(dev, cb.data(), num_code_groups, half);
+    rope_sin = bt::Tensor::from_host_on(dev, sb.data(), num_code_groups, half);
 }
 
 void QwenTtsCodePredictor::predict(const float* past_hidden,
@@ -210,18 +241,26 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     // vocab. argmax_rows returns the index as a float in a (1,1) tensor; only
     // that scalar comes back to the host (4 bytes), not the whole vocab row.
     // Ties keep the lowest index, matching the greedy host reference.
+    const bool prof = CpProf::on();
+    using clk = std::chrono::steady_clock;
     auto code_from = [&](const bt::Tensor& row, int head_idx) -> int {
         bt::Tensor lg;
         qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
         bt::Tensor idx;
         bt::argmax_rows(lg, idx);                           // (1, 1) FP32
+        clk::time_point t0;
+        if (prof) { bt::sync_all(); t0 = clk::now(); }
         float f = 0.0f;
         qtd::to_host(idx, &f);
+        if (prof) CpProf::argmax() +=
+            std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         return static_cast<int>(f);
     };
 
     // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1,
     //    assembled on-device (no host staging of the two hidden-width rows) ──
+    clk::time_point tpf;
+    if (prof) { bt::sync_all(); tpf = clk::now(); ++CpProf::calls(); }
     bt::Tensor pre_t = bt::Tensor::empty_on(dev, 2, hidden, bt::Dtype::FP32);
     bt::copy_d2d(past_hidden, 0, pre_t, 0,      hidden);
     bt::copy_d2d(c0_embed,    0, pre_t, hidden, hidden);
@@ -232,8 +271,12 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     bt::Tensor row1 = bt::Tensor::view(
         dev, static_cast<float*>(h.data) + hidden, 1, hidden, bt::Dtype::FP32);
     out_codes[0] = code_from(row1, 0);
+    if (prof) { bt::sync_all(); CpProf::prefill() +=
+        std::chrono::duration<double, std::milli>(clk::now() - tpf).count(); }
 
     // ── steps: emit codebooks 2..(num_code_groups-1) ──
+    clk::time_point tst;
+    if (prof) { bt::sync_all(); tst = clk::now(); }
     for (int j = 1; j < n_out; ++j) {
         const int prev_code = out_codes[j - 1];
         bt::Tensor erow = qtd::gather_rows(
@@ -242,6 +285,25 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
         cp_run(*this, erow, 1, /*pos_start=*/1 + j, cache, hstep);
         out_codes[j] = code_from(hstep, j);
     }
+    if (prof) { bt::sync_all(); CpProf::steps() +=
+        std::chrono::duration<double, std::milli>(clk::now() - tst).count(); }
+}
+
+// Print + reset the Code Predictor internal profile (called from generate_codes).
+void qwen_cp_profile_report() {
+    if (!CpProf::on() || CpProf::calls() == 0) return;
+    const double f = static_cast<double>(CpProf::calls());
+    std::fprintf(stderr,
+        "  [code_predictor internals over %ld frames]\n"
+        "    prefill (2-tok, 5L)  %9.1f ms  %7.3f ms/frame\n"
+        "    14 depth steps (5L)  %9.1f ms  %7.3f ms/frame\n"
+        "      of which argmax rb %9.1f ms  %7.3f ms/frame\n",
+        CpProf::calls(),
+        CpProf::prefill(), CpProf::prefill() / f,
+        CpProf::steps(),   CpProf::steps() / f,
+        CpProf::argmax(),  CpProf::argmax() / f);
+    CpProf::prefill() = CpProf::steps() = CpProf::argmax() = 0;
+    CpProf::calls() = 0;
 }
 
 const float* QwenTtsCodePredictor::codec_embedding_row(int table, int id) const {

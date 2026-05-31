@@ -51,6 +51,12 @@ struct QwenTtsCodePredictor {
     brotensor::Tensor final_norm;
     std::vector<QwenTtsCodePredictorLayer> layers;
 
+    // Precomputed plain-RoPE cos/sin tables for the fixed depth positions
+    // 0..num_code_groups-1, (num_code_groups, head_dim/2) FP32 on the model
+    // device. The depth axis positions never change, so a frame's depth steps
+    // slice rows from these instead of rebuilding + re-uploading per step.
+    brotensor::Tensor rope_cos, rope_sin;
+
     // Build from the talker.code_predictor.* tensors (BF16 -> FP32 on `device`;
     // q/k projections + q/k_norm permuted into brotensor's adjacent-pair RoPE
     // layout, mirroring the Talker).

@@ -53,15 +53,26 @@ inline bt::Tensor gather_rows(const bt::Tensor& W,
     return out;
 }
 
-// Y = X @ W^T (+ bias). A null bias adds a zero column on W's device/dtype.
+// A cached all-zero bias for the bias-less linear path. linear_forward_batched
+// requires a bias, but the projections in the transformer loops have none — and
+// the AR loop calls linear ~700×/frame, so allocating + memset-zeroing a fresh
+// bias each time is ~700 needless ops/frame. The zero bias is constant per
+// (device, width, dtype), so it is built once and reused (its device buffer
+// outlives any later cache growth — Tensor move preserves the pointer).
+inline const bt::Tensor& zero_bias(bt::Device dev, int rows, bt::Dtype dt) {
+    struct Entry { bt::Device dev; int rows; bt::Dtype dt; bt::Tensor t; };
+    static thread_local std::vector<Entry> cache;
+    for (Entry& e : cache)
+        if (e.dev == dev && e.rows == rows && e.dt == dt) return e.t;
+    cache.push_back(Entry{dev, rows, dt, bt::Tensor::zeros_on(dev, rows, 1, dt)});
+    return cache.back().t;
+}
+
+// Y = X @ W^T (+ bias). A null bias uses a cached zero bias on W's device/dtype.
 inline void linear(const bt::Tensor& W, const bt::Tensor* bias,
                    const bt::Tensor& X, bt::Tensor& Y) {
-    if (bias) {
-        bt::linear_forward_batched(W, *bias, X, Y);
-        return;
-    }
-    bt::Tensor zero = bt::Tensor::zeros_on(W.device, W.rows, 1, W.dtype);
-    bt::linear_forward_batched(W, zero, X, Y);
+    const bt::Tensor& b = bias ? *bias : zero_bias(W.device, W.rows, W.dtype);
+    bt::linear_forward_batched(W, b, X, Y);
 }
 
 // Per-head RMSNorm over head_dim. X (n, heads*hd) viewed as (n*heads, hd),
@@ -77,48 +88,76 @@ inline void head_rms_norm(const bt::Tensor& X, int n, int heads, int hd,
 // Expand a GQA K/V (n, n_kv*hd) to (n, n_q*hd) by repeating each KV head across
 // its query-head group via a row-gather. Returns a non-owning view when
 // n_kv == n_q (plain MHA), so callers must keep `K` alive while using it.
+//
+// The gather index depends only on the shape (n, n_kv, n_q), not the data, so it
+// is cached per shape — the AR loop expands K and V every layer with a constant
+// index, and rebuilding + re-uploading it each time was a synchronous host->
+// device copy per call. On a cache hit the device index is reused directly.
 inline bt::Tensor expand_kv(const bt::Tensor& K, int n, int n_kv, int n_q,
                             int hd) {
     if (n_kv == n_q) {
         return bt::Tensor::view(K.device, K.data, K.rows, K.cols, K.dtype);
     }
     const int group = n_q / n_kv;
-    std::vector<std::int32_t> idx(static_cast<std::size_t>(n) * n_q);
-    for (int t = 0; t < n; ++t)
-        for (int h = 0; h < n_q; ++h)
-            idx[static_cast<std::size_t>(t) * n_q + h] = t * n_kv + h / group;
+
+    struct IdxEntry {
+        int n, n_kv, n_q;
+        bt::Device dev;
+        std::vector<std::int32_t> host;   // CPU gather index
+        bt::Tensor dev_idx;               // device INT32 copy (CUDA/Metal)
+    };
+    static thread_local std::vector<IdxEntry> cache;
+    IdxEntry* e = nullptr;
+    for (IdxEntry& c : cache)
+        if (c.n == n && c.n_kv == n_kv && c.n_q == n_q && c.dev == K.device) {
+            e = &c;
+            break;
+        }
+    if (!e) {
+        std::vector<std::int32_t> idx(static_cast<std::size_t>(n) * n_q);
+        for (int t = 0; t < n; ++t)
+            for (int h = 0; h < n_q; ++h)
+                idx[static_cast<std::size_t>(t) * n_q + h] = t * n_kv + h / group;
+        bt::Tensor dev_idx = (K.device == bt::Device::CPU)
+            ? bt::Tensor{}
+            : upload_idx(K.device, idx.data(), static_cast<int>(idx.size()));
+        cache.push_back(IdxEntry{n, n_kv, n_q, K.device, std::move(idx),
+                                 std::move(dev_idx)});
+        e = &cache.back();
+    }
+
     bt::Tensor kv = bt::Tensor::view(K.device, K.data, n * n_kv, hd, K.dtype);
-    bt::Tensor out = gather_rows(kv, idx);     // (n*n_q, hd)
+    bt::Tensor out = bt::Tensor::empty_on(K.device, 0, 0, K.dtype);
+    const int rows = n * n_q;
+    if (K.device == bt::Device::CPU) {
+        bt::embedding_lookup_forward(kv, e->host.data(), rows, out);
+    } else {
+        bt::embedding_lookup_forward(
+            kv, static_cast<const std::int32_t*>(e->dev_idx.data), rows, out);
+    }
     out.rows = n;
     out.cols = n_q * hd;
     return out;
 }
 
-// Fused FP32 attention over pre-projected Q (Lq,D), K/V (Lk,D) with `num_heads`
-// heads of `head_dim`. Both CPU and CUDA run in FP32, so the GPU path matches
-// the CPU path (and upstream) to float round-off:
-//   - CPU: flash_attention_forward (FP32 native).
-//   - CUDA: flash_attention_varlen_forward, which (unlike flash_attention_
-//     forward) has an FP32 GPU kernel; a single batch=1 sequence reproduces
-//     plain attention.
-// `causal` requires Lq == Lk (prefill); a single query over the full valid
-// cache uses causal == false (it legitimately attends every cached key).
+// Fused FP32 causal attention over pre-projected Q (Lq,D), K/V (Lk,D) with
+// `num_heads` heads of `head_dim`. Routed through flash_attention_windowed_forward
+// (window <= 0 => unbounded causal) on both backends — FP32 on CPU and CUDA, so
+// the GPU path matches CPU (and upstream) to float round-off. The windowed op
+// places the Lq queries at the last Lq positions of the length-Lk causal
+// sequence, which covers both regimes the AR loop needs with no per-call
+// cu_seqlens upload (the old varlen path's two synchronous host->device copies
+// per attention serialized the pipeline):
+//   - prefill: Lq == Lk, query r attends [0, r].
+//   - decode:  Lq == 1, the single query attends the whole valid cache.
+// `causal` is implied by the windowed op; the parameter is kept for call-site
+// clarity and is unused (Lq < Lk already encodes the decode case).
 inline void flash_attn(const bt::Tensor& Q, const bt::Tensor& K,
                        const bt::Tensor& V, int num_heads, int head_dim,
-                       bool causal, bt::Tensor& O) {
-    if (Q.device == bt::Device::CPU) {
-        bt::flash_attention_forward(Q, K, V, nullptr, num_heads, causal, O);
-        return;
-    }
-    const int Lq = Q.rows, Lk = K.rows;
-    const std::int32_t cuq[2] = {0, Lq};
-    const std::int32_t cuk[2] = {0, Lk};
-    bt::Tensor dq = upload_idx(Q.device, cuq, 2);
-    bt::Tensor dk = upload_idx(Q.device, cuk, 2);
-    bt::flash_attention_varlen_forward(
-        Q, K, V, static_cast<const std::int32_t*>(dq.data),
-        static_cast<const std::int32_t*>(dk.data), /*batch_size=*/1,
-        /*max_seqlen_q=*/Lq, /*max_seqlen_k=*/Lk, num_heads, head_dim, causal, O);
+                       bool /*causal*/, bt::Tensor& O) {
+    (void)head_dim;
+    bt::flash_attention_windowed_forward(Q, K, V, /*d_mask=*/nullptr, num_heads,
+                                         /*window=*/0, O);
 }
 
 // SwiGLU gate: g <- silu(g) * u, in place on g. Both (n, inter).

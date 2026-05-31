@@ -7,10 +7,15 @@
 #include <brotensor/tensor.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
 namespace brosoundml {
+
+void qwen_cp_profile_report();   // defined in qwen_tts_code_predictor.cpp
 
 namespace {
 namespace bt = brotensor;
@@ -23,6 +28,42 @@ int argmax_row(const float* v, int n) {
     }
     return best;
 }
+
+// Env-gated wall-clock profiler for the AR loop. Each region is bracketed by a
+// device sync so the elapsed time reflects that region's GPU work, not async
+// launch latency. Reports ms total + ms/frame when BROSOUNDML_QWEN_PROFILE is set.
+struct ArProfiler {
+    bool on;
+    using clk = std::chrono::steady_clock;
+    double prefill = 0, head = 0, predict = 0, assemble = 0, talker = 0;
+    ArProfiler() : on(std::getenv("BROSOUNDML_QWEN_PROFILE") != nullptr) {}
+    clk::time_point tick() {
+        if (on) bt::sync_all();
+        return clk::now();
+    }
+    void add(double& acc, clk::time_point t0) {
+        if (!on) return;
+        bt::sync_all();
+        acc += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    }
+    void report(int frames) {
+        if (!on || frames <= 0) return;
+        const double f = static_cast<double>(frames);
+        std::fprintf(stderr,
+            "\n[qwen AR profile] %d frames, audio %.2fs @ 12.5Hz\n"
+            "  prefill        %9.1f ms  (one-time)\n"
+            "  codec_head+pol %9.1f ms  %7.3f ms/frame\n"
+            "  code_predictor %9.1f ms  %7.3f ms/frame\n"
+            "  embed assemble %9.1f ms  %7.3f ms/frame\n"
+            "  talker step    %9.1f ms  %7.3f ms/frame\n"
+            "  per-frame total           %7.3f ms/frame\n",
+            frames, f / 12.5, prefill,
+            head, head / f, predict, predict / f,
+            assemble, assemble / f, talker, talker / f,
+            (head + predict + assemble + talker) / f);
+        qwen_cp_profile_report();
+    }
+};
 }  // namespace
 
 int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
@@ -35,12 +76,15 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     const int H = talker.hidden;
     const int G = cp.num_code_groups;     // 16
     out_frames.clear();
+    ArProfiler prof;
 
     // ── Talker prefill: seed the KV cache, keep the last token's hidden ──
     QwenTtsTalkerCache cache;
     cache.reset(talker.num_layers);
     bt::Tensor hidden;
+    auto tp = prof.tick();
     talker.run(prefill_embeds, T, pos3T, &cache, hidden);   // (T, H) device
+    prof.add(prof.prefill, tp);
     bt::Tensor hcur = bt::Tensor::empty_on(dev, 1, H, bt::Dtype::FP32);
     bt::copy_d2d(hidden, (T - 1) * H, hcur, 0, H);           // last row
 
@@ -58,6 +102,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     for (int step = 0; step < params.max_frames; ++step) {
         // codebook 0: codec_head over the current hidden, with the upstream
         // logits processing applied on the host (a single 3072-wide row).
+        auto th = prof.tick();
         bt::Tensor lg;
         qtd::linear(talker.codec_head, nullptr, hcur, lg);   // (1, vocab) device
         qtd::to_host(lg, logits_host.data());
@@ -71,15 +116,18 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
             if (i != params.eos_id) lp[i] = kNegInf;
         if (step < params.min_frames) lp[params.eos_id] = kNegInf;
         const int c0 = argmax_row(lp, talker.vocab);
+        prof.add(prof.head, th);
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
 
         // codebooks 1..15 from the Code Predictor (greedy). Fed device-resident:
         // the Talker hidden (hcur) and the Talker embedding of codebook 0 stay on
         // device, so the depth expansion runs without a host round-trip.
+        auto tpr = prof.tick();
         bt::Tensor c0row = qtd::gather_rows(
             talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H) device
         cp.predict_dev(hcur, c0row, rest);
+        prof.add(prof.predict, tpr);
 
         // emit the frame [c0, c1..c15].
         out_frames.push_back(static_cast<int32_t>(c0));
@@ -87,6 +135,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
 
         // next Talker input = sum of the 16 code embeddings + trailing/pad text,
         // assembled on-device (reusing c0row as the accumulator).
+        auto ta = prof.tick();
         bt::Tensor& e = c0row;
         for (int i = 0; i < G - 1; ++i) {
             bt::Tensor er = qtd::gather_rows(
@@ -101,16 +150,20 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         } else {
             bt::add_inplace_batched(e, pad_dev);
         }
+        prof.add(prof.assemble, ta);
 
         // step the Talker (single token, KV-cached). Generation-phase M-RoPE
         // uses one scalar position on all three axes (T + step + rope_delta).
         const int pos = T + step + params.rope_delta;
         const int32_t pos3[3] = {pos, pos, pos};
+        auto tt = prof.tick();
         bt::Tensor hstep;
         talker.run_dev(e, 1, pos3, &cache, hstep);
         hcur = std::move(hstep);
+        prof.add(prof.talker, tt);
     }
 
+    prof.report(static_cast<int>(out_frames.size()) / G);
     return static_cast<int>(out_frames.size()) / G;
 }
 
