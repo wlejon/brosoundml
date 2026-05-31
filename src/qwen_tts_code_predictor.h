@@ -62,8 +62,17 @@ struct QwenTtsCodePredictor {
     // that produced codebook 0 (hidden floats); `c0_embed` is the Talker's
     // codec_embedding of that codebook-0 code (hidden floats). Writes the
     // (num_code_groups - 1) remaining codes (codebooks 1..15) to `out_codes`.
+    // Host-pointer convenience wrapper over predict_dev (uploads the two rows).
     void predict(const float* past_hidden, const float* c0_embed,
                  std::vector<int>& out_codes) const;
+
+    // Device-resident form used by the AR loop: `past_hidden` and `c0_embed` are
+    // (1, hidden) tensors already on the model's device, so a frame expands with
+    // no host round-trip (argmax runs on-device, only the chosen code id — 4
+    // bytes per head — comes back). Same greedy result as predict().
+    void predict_dev(const brotensor::Tensor& past_hidden,
+                     const brotensor::Tensor& c0_embed,
+                     std::vector<int>& out_codes) const;
 
     // Raw pointer to codec_embedding table `table` row `id` (hidden floats).
     const float* codec_embedding_row(int table, int id) const;

@@ -42,14 +42,6 @@ bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
     return up(f, name, n, 1, dev);
 }
 
-int argmax_row(const std::vector<float>& v) {
-    int best = 0;
-    float bv = v[0];
-    for (std::size_t i = 1; i < v.size(); ++i)
-        if (v[i] > bv) { bv = v[i]; best = static_cast<int>(i); }
-    return best;
-}
-
 // A depth-local KV cache: per-layer post-RoPE K/V for the <=16 depth tokens,
 // stored expanded to full per-query heads (plain MHA for flash). FP32 device
 // tensors, preallocated to the known depth length.
@@ -197,6 +189,16 @@ void QwenTtsCodePredictor::predict(const float* past_hidden,
                                    std::vector<int>& out_codes) const {
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
+    bt::Tensor ph = bt::Tensor::from_host_on(dev, past_hidden, 1, hidden);
+    bt::Tensor ce = bt::Tensor::from_host_on(dev, c0_embed,    1, hidden);
+    predict_dev(ph, ce, out_codes);
+}
+
+void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
+                                       const bt::Tensor& c0_embed,
+                                       std::vector<int>& out_codes) const {
+    const bt::Device dev = final_norm.device;
+    bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
     const int qd    = n_q_heads * head_dim;
     out_codes.assign(n_out, 0);
@@ -204,20 +206,25 @@ void QwenTtsCodePredictor::predict(const float* past_hidden,
     DepthCache cache;
     cache.reset(num_layers, num_code_groups, dev, qd);
 
-    // lm_head[head_idx] over one (1,hidden) device row -> argmax over vocab.
-    std::vector<float> logits_host(vocab);
+    // lm_head[head_idx] over one (1,hidden) device row -> on-device argmax over
+    // vocab. argmax_rows returns the index as a float in a (1,1) tensor; only
+    // that scalar comes back to the host (4 bytes), not the whole vocab row.
+    // Ties keep the lowest index, matching the greedy host reference.
     auto code_from = [&](const bt::Tensor& row, int head_idx) -> int {
         bt::Tensor lg;
         qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
-        qtd::to_host(lg, logits_host.data());
-        return argmax_row(logits_host);
+        bt::Tensor idx;
+        bt::argmax_rows(lg, idx);                           // (1, 1) FP32
+        float f = 0.0f;
+        qtd::to_host(idx, &f);
+        return static_cast<int>(f);
     };
 
-    // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1 ──
-    std::vector<float> prefill(static_cast<std::size_t>(2) * hidden);
-    std::copy(past_hidden, past_hidden + hidden, prefill.data());
-    std::copy(c0_embed,    c0_embed + hidden,    prefill.data() + hidden);
-    bt::Tensor pre_t = bt::Tensor::from_host_on(dev, prefill.data(), 2, hidden);
+    // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1,
+    //    assembled on-device (no host staging of the two hidden-width rows) ──
+    bt::Tensor pre_t = bt::Tensor::empty_on(dev, 2, hidden, bt::Dtype::FP32);
+    bt::copy_d2d(past_hidden, 0, pre_t, 0,      hidden);
+    bt::copy_d2d(c0_embed,    0, pre_t, hidden, hidden);
     bt::Tensor h;
     cp_run(*this, pre_t, 2, /*pos_start=*/0, cache, h);   // (2, hidden)
 

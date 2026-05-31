@@ -53,7 +53,6 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     std::vector<int>     rest;             // codebooks 1..15 from the Code Predictor
     std::vector<int32_t> gen_c0;           // codebook-0 ids emitted so far (rep. penalty)
     std::vector<float>   logits_host(talker.vocab);
-    std::vector<float>   hcur_host(H), c0e_host(H);
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
     for (int step = 0; step < params.max_frames; ++step) {
@@ -75,13 +74,12 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
 
-        // codebooks 1..15 from the Code Predictor (greedy). Its host API takes
-        // the Talker hidden + the Talker embedding of codebook 0.
-        qtd::to_host(hcur, hcur_host.data());
+        // codebooks 1..15 from the Code Predictor (greedy). Fed device-resident:
+        // the Talker hidden (hcur) and the Talker embedding of codebook 0 stay on
+        // device, so the depth expansion runs without a host round-trip.
         bt::Tensor c0row = qtd::gather_rows(
-            talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H)
-        qtd::to_host(c0row, c0e_host.data());
-        cp.predict(hcur_host.data(), c0e_host.data(), rest);
+            talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H) device
+        cp.predict_dev(hcur, c0row, rest);
 
         // emit the frame [c0, c1..c15].
         out_frames.push_back(static_cast<int32_t>(c0));
