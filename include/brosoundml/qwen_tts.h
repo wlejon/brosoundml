@@ -39,9 +39,12 @@ namespace brosoundml {
 // argmax — all already on the op surface. No new kernels (Qwen-TTS adds no op
 // brotensor lacks). See docs/qwen-tts-weights.md for the full tensor map.
 //
-// STATUS: stage 1 (weight loading) — load() parses config.json +
-// speech_tokenizer/config.json and validates both safetensors checkpoints;
-// synthesize() is a staged stub that throws. Forward-pass stages follow.
+// STATUS: stages 1-2 done. Stage 1 (weight loading) — load() parses config.json
+// + speech_tokenizer/config.json and validates both safetensors. Stage 2 (codec
+// decoder) — decode_codes() runs the bundled 12 Hz codec tail (RVQ codes ->
+// 24 kHz waveform), matching the upstream decoder to FP32 round-off; CPU-only
+// for now. synthesize() (Talker / Code Predictor) is still a staged stub that
+// throws — stages 3-5 follow.
 
 // Qwen3-style transformer block hyperparameters. Shared by the Talker, the
 // Code Predictor, and (with layer-scale / windowed-attention variations) the
@@ -164,6 +167,16 @@ public:
     AudioBuffer synthesize(const std::string& text,
                            const std::string& speaker,
                            const std::string& language = "english") const;
+
+    // Decode a precomputed code stream straight through the bundled 12 Hz codec
+    // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
+    // on its own once the Talker / Code Predictor have produced (or a caller
+    // holds) the per-frame RVQ codes. `codes` holds `num_quantizers * num_frames`
+    // entries laid out codes[k * num_frames + t] (codebook-major). Throws if no
+    // model is loaded or the count disagrees. Available from stage 2 on; runs on
+    // the CPU in FP32 regardless of the load device.
+    AudioBuffer decode_codes(const std::vector<int32_t>& codes,
+                             int num_quantizers, int num_frames) const;
 
     // Preset speaker names available in this checkpoint (CustomVoice only;
     // empty for Base / VoiceDesign).

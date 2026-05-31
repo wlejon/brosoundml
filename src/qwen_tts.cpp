@@ -1,5 +1,7 @@
 #include "brosoundml/qwen_tts.h"
 
+#include "qwen_tts_codec.h"
+
 #include "brosoundml/detail/json.h"
 
 #include <brotensor/runtime.h>
@@ -198,9 +200,10 @@ void require_tensors(const brotensor::safetensors::File& f,
 // and weights are uploaded during load(); the safetensors files are only
 // mmap'd for the duration of load().
 struct QwenTts::Impl {
-    QwenTtsConfig     config;
-    brotensor::Device device = brotensor::Device::CPU;
-    bool              loaded = false;
+    QwenTtsConfig         config;
+    brotensor::Device     device = brotensor::Device::CPU;
+    bool                  loaded = false;
+    QwenTtsCodecDecoder   codec;   // built in load(); runs decode_codes()
 };
 
 QwenTts::QwenTts() : impl_(std::make_unique<Impl>()) {}
@@ -261,6 +264,9 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
             "decoder.upsample.0.0.conv.weight",
             "decoder.decoder.0.conv.weight",
         }, "speech_tokenizer/model.safetensors");
+        // Stage 2: build the codec decoder (codes -> waveform) from these
+        // weights. The Talker / Code Predictor follow in later stages.
+        impl_->codec.load(w, impl_->config.codec);
     }
 
     impl_->loaded = true;
@@ -285,6 +291,26 @@ AudioBuffer QwenTts::synthesize(const std::string& /*text*/,
     fail("QwenTts::synthesize",
          "forward pass not yet built (stage 2+: Talker / Code Predictor / "
          "codec decoder)");
+}
+
+AudioBuffer QwenTts::decode_codes(const std::vector<int32_t>& codes,
+                                  int num_quantizers, int num_frames) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::decode_codes", "no model loaded; call QwenTts::load() first");
+    }
+    if (num_quantizers <= 0 || num_frames < 0) {
+        fail("QwenTts::decode_codes", "num_quantizers and num_frames must be positive");
+    }
+    if (codes.size() != static_cast<std::size_t>(num_quantizers) *
+                            static_cast<std::size_t>(num_frames)) {
+        fail("QwenTts::decode_codes",
+             "codes size (" + std::to_string(codes.size()) + ") != num_quantizers*"
+             "num_frames (" + std::to_string(num_quantizers) + "*" +
+             std::to_string(num_frames) + ")");
+    }
+    std::vector<float> wav;
+    impl_->codec.decode(codes.data(), num_quantizers, num_frames, wav);
+    return AudioBuffer(std::move(wav), impl_->config.codec.output_sample_rate);
 }
 
 std::vector<std::string> QwenTts::speakers() const {

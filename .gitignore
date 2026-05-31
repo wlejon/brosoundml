@@ -18,3 +18,4 @@ compile_commands.json
 weights/
 voices/
 .claude/
+.scratch

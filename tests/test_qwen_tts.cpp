@@ -6,8 +6,12 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -143,6 +147,59 @@ static int run() {
         std::printf("    [%s] qwen-tts loader: %zu speakers, codec x%d -> %d Hz\n",
                     dev_name, spk.size(), cd.decode_upsample_rate,
                     cd.output_sample_rate);
+
+        // ─── Codec decode vs ground-truth fixture (opt-in, CPU) ────────────
+        //
+        // decode_codes() runs the codec tail (codes -> 24 kHz) on the CPU in
+        // FP32 regardless of the load device, so this numeric check runs once,
+        // under the CPU invocation. Fixtures are produced by the genuine
+        // upstream decoder — see tests/ref/gen_qwen_tts_codec_fixture.py — and
+        // are gitignored (*.bin); the check skips when they are absent.
+        //
+        // The full x1920 decode is heavy on the CPU FP32 path (minutes), so it
+        // is additionally gated behind BROSOUNDML_RUN_CODEC_FIXTURE to keep the
+        // default suite fast — set it to run the numeric validation:
+        //   BROSOUNDML_RUN_CODEC_FIXTURE=1 ctest -R qwen_tts -C Release
+        if (dev == brotensor::Device::CPU && std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
+            const fs::path fix_dir = fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures";
+            auto check_fixture = [&](const char* fname) {
+                const fs::path path = fix_dir / fname;
+                std::ifstream f(path.string(), std::ios::binary);
+                if (!f) return;  // not generated locally — skip
+                int32_t hdr[3];
+                f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+                const int K = hdr[0], T = hdr[1], n = hdr[2];
+                std::vector<int32_t> codes(static_cast<std::size_t>(K) * T);
+                std::vector<float>   ref(static_cast<std::size_t>(n));
+                f.read(reinterpret_cast<char*>(codes.data()),
+                       static_cast<std::streamsize>(codes.size() * sizeof(int32_t)));
+                f.read(reinterpret_cast<char*>(ref.data()),
+                       static_cast<std::streamsize>(ref.size() * sizeof(float)));
+                CHECK(static_cast<bool>(f), "fixture read complete");
+
+                brosoundml::AudioBuffer out = q.decode_codes(codes, K, T);
+                CHECK(out.sample_rate == 24000, "decode_codes returns 24 kHz");
+                CHECK(static_cast<int>(out.samples.size()) == n,
+                      "decode_codes returns T*1920 samples");
+                if (static_cast<int>(out.samples.size()) != n) return;
+
+                double max_abs = 0.0, sum_abs = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    const double d = std::fabs(static_cast<double>(out.samples[i]) - ref[i]);
+                    max_abs = std::max(max_abs, d);
+                    sum_abs += d;
+                }
+                const double mean_abs = sum_abs / n;
+                std::printf("    [codec fixture %s] T=%d  max|Δ|=%.2e  mean|Δ|=%.2e\n",
+                            fname, T, max_abs, mean_abs);
+                // FP32 vs FP32 reference; only float reassociation across the
+                // deep (x1920) stack differs.
+                CHECK(max_abs  < 2e-3, "codec decode matches upstream (max abs)");
+                CHECK(mean_abs < 1e-4, "codec decode matches upstream (mean abs)");
+            };
+            check_fixture("qwen_tts_codec_small.bin");  // T < sliding_window
+            check_fixture("qwen_tts_codec.bin");        // T > sliding_window (72)
+        }
     };
 
     run_real_smoke(brotensor::Device::CPU, "CPU");
