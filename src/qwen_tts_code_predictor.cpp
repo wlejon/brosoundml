@@ -83,7 +83,7 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
     const bt::Device dev = cp.final_norm.device;
     const int head_dim = cp.head_dim;
     const int n_q = cp.n_q_heads, n_kv = cp.n_kv_heads;
-    const int qd = n_q * head_dim;          // == expanded K/V width
+    const int kd = n_kv * head_dim;          // K/V (GQA) cache width
     const int half = head_dim / 2;
     const int offset = cache.len;
 
@@ -113,14 +113,13 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
         bt::Tensor qr, kr;
         bt::rope_apply(qn, cosT, sinT, head_dim, n_q,  qr);
         bt::rope_apply(kn, cosT, sinT, head_dim, n_kv, kr);
-        bt::Tensor kE = qtd::expand_kv(kr, n, n_kv, n_q, head_dim);
-        bt::Tensor vE = qtd::expand_kv(v,  n, n_kv, n_q, head_dim);
-
-        bt::copy_d2d(kE, 0, cache.k[l], offset * qd, n * qd);
-        bt::copy_d2d(vE, 0, cache.v[l], offset * qd, n * qd);
+        // Cache the n_kv (grouped) heads; the windowed attention op expands to
+        // the n_q query heads internally (GQA) — no per-layer expand_kv gather.
+        bt::copy_d2d(kr, 0, cache.k[l], offset * kd, n * kd);
+        bt::copy_d2d(v,  0, cache.v[l], offset * kd, n * kd);
         const int valid = offset + n;
-        bt::Tensor Kf = bt::Tensor::view(dev, cache.k[l].data, valid, qd, bt::Dtype::FP32);
-        bt::Tensor Vf = bt::Tensor::view(dev, cache.v[l].data, valid, qd, bt::Dtype::FP32);
+        bt::Tensor Kf = bt::Tensor::view(dev, cache.k[l].data, valid, kd, bt::Dtype::FP32);
+        bt::Tensor Vf = bt::Tensor::view(dev, cache.v[l].data, valid, kd, bt::Dtype::FP32);
         bt::Tensor ctx;
         qtd::flash_attn(qr, Kf, Vf, n_q, head_dim, /*causal=*/offset == 0, ctx);
         bt::Tensor attn;
@@ -231,11 +230,11 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
-    const int qd    = n_q_heads * head_dim;
+    const int kd    = n_kv_heads * head_dim;  // GQA K/V cache width
     out_codes.assign(n_out, 0);
 
     DepthCache cache;
-    cache.reset(num_layers, num_code_groups, dev, qd);
+    cache.reset(num_layers, num_code_groups, dev, kd);
 
     // lm_head[head_idx] over one (1,hidden) device row -> on-device argmax over
     // vocab. argmax_rows returns the index as a float in a (1,1) tensor; only

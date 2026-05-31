@@ -128,7 +128,8 @@ void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3
         return;
     }
 
-    const int qd     = n_q_heads * head_dim;   // == expanded K/V width
+    const int qd     = n_q_heads * head_dim;    // query width
+    const int kd     = n_kv_heads * head_dim;   // K/V (GQA) cache width
     const int half   = head_dim / 2;
     const int offset = cache ? cache->len : 0;
 
@@ -159,11 +160,11 @@ void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3
         if (cache->cap < need) {
             const int newcap = std::max(need, std::max(cache->cap * 2, 64));
             for (int l = 0; l < num_layers; ++l) {
-                bt::Tensor nk = bt::Tensor::zeros_on(dev, newcap, qd, bt::Dtype::FP32);
-                bt::Tensor nv = bt::Tensor::zeros_on(dev, newcap, qd, bt::Dtype::FP32);
+                bt::Tensor nk = bt::Tensor::zeros_on(dev, newcap, kd, bt::Dtype::FP32);
+                bt::Tensor nv = bt::Tensor::zeros_on(dev, newcap, kd, bt::Dtype::FP32);
                 if (offset > 0) {
-                    bt::copy_d2d(cache->k[l], 0, nk, 0, offset * qd);
-                    bt::copy_d2d(cache->v[l], 0, nv, 0, offset * qd);
+                    bt::copy_d2d(cache->k[l], 0, nk, 0, offset * kd);
+                    bt::copy_d2d(cache->v[l], 0, nv, 0, offset * kd);
                 }
                 cache->k[l] = std::move(nk);
                 cache->v[l] = std::move(nv);
@@ -190,21 +191,21 @@ void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3
         bt::rope_apply(qn, cosT, sinT, head_dim, n_q_heads,  qr);
         bt::rope_apply(kn, cosT, sinT, head_dim, n_kv_heads, kr);
 
-        bt::Tensor kE = qtd::expand_kv(kr, n, n_kv_heads, n_q_heads, head_dim);  // (n, qd)
-        bt::Tensor vE = qtd::expand_kv(v,  n, n_kv_heads, n_q_heads, head_dim);  // (n, qd)
-
+        // The K/V cache holds the n_kv (grouped) heads; the windowed attention
+        // op expands them to the n_q query heads internally (GQA), so no
+        // per-layer expand_kv gather is needed.
         bt::Tensor ctx;
         if (cache) {
-            bt::copy_d2d(kE, 0, cache->k[l], offset * qd, n * qd);
-            bt::copy_d2d(vE, 0, cache->v[l], offset * qd, n * qd);
+            bt::copy_d2d(kr, 0, cache->k[l], offset * kd, n * kd);
+            bt::copy_d2d(v,  0, cache->v[l], offset * kd, n * kd);
             const int valid = offset + n;
-            bt::Tensor Kf = bt::Tensor::view(dev, cache->k[l].data, valid, qd, bt::Dtype::FP32);
-            bt::Tensor Vf = bt::Tensor::view(dev, cache->v[l].data, valid, qd, bt::Dtype::FP32);
+            bt::Tensor Kf = bt::Tensor::view(dev, cache->k[l].data, valid, kd, bt::Dtype::FP32);
+            bt::Tensor Vf = bt::Tensor::view(dev, cache->v[l].data, valid, kd, bt::Dtype::FP32);
             // offset==0: a fresh prefill (Lq==Lk) is causal; a later step has a
             // single query at the latest position attending the whole cache.
             qtd::flash_attn(qr, Kf, Vf, n_q_heads, head_dim, /*causal=*/offset == 0, ctx);
         } else {
-            qtd::flash_attn(qr, kE, vE, n_q_heads, head_dim, /*causal=*/true, ctx);
+            qtd::flash_attn(qr, kr, v, n_q_heads, head_dim, /*causal=*/true, ctx);
         }
         bt::Tensor attn;
         qtd::linear(tl.ow, nullptr, ctx, attn);   // (n, hidden)

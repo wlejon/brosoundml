@@ -85,60 +85,10 @@ inline void head_rms_norm(const bt::Tensor& X, int n, int heads, int hd,
     Y.cols = heads * hd;                       // same buffer, reshaped
 }
 
-// Expand a GQA K/V (n, n_kv*hd) to (n, n_q*hd) by repeating each KV head across
-// its query-head group via a row-gather. Returns a non-owning view when
-// n_kv == n_q (plain MHA), so callers must keep `K` alive while using it.
-//
-// The gather index depends only on the shape (n, n_kv, n_q), not the data, so it
-// is cached per shape — the AR loop expands K and V every layer with a constant
-// index, and rebuilding + re-uploading it each time was a synchronous host->
-// device copy per call. On a cache hit the device index is reused directly.
-inline bt::Tensor expand_kv(const bt::Tensor& K, int n, int n_kv, int n_q,
-                            int hd) {
-    if (n_kv == n_q) {
-        return bt::Tensor::view(K.device, K.data, K.rows, K.cols, K.dtype);
-    }
-    const int group = n_q / n_kv;
-
-    struct IdxEntry {
-        int n, n_kv, n_q;
-        bt::Device dev;
-        std::vector<std::int32_t> host;   // CPU gather index
-        bt::Tensor dev_idx;               // device INT32 copy (CUDA/Metal)
-    };
-    static thread_local std::vector<IdxEntry> cache;
-    IdxEntry* e = nullptr;
-    for (IdxEntry& c : cache)
-        if (c.n == n && c.n_kv == n_kv && c.n_q == n_q && c.dev == K.device) {
-            e = &c;
-            break;
-        }
-    if (!e) {
-        std::vector<std::int32_t> idx(static_cast<std::size_t>(n) * n_q);
-        for (int t = 0; t < n; ++t)
-            for (int h = 0; h < n_q; ++h)
-                idx[static_cast<std::size_t>(t) * n_q + h] = t * n_kv + h / group;
-        bt::Tensor dev_idx = (K.device == bt::Device::CPU)
-            ? bt::Tensor{}
-            : upload_idx(K.device, idx.data(), static_cast<int>(idx.size()));
-        cache.push_back(IdxEntry{n, n_kv, n_q, K.device, std::move(idx),
-                                 std::move(dev_idx)});
-        e = &cache.back();
-    }
-
-    bt::Tensor kv = bt::Tensor::view(K.device, K.data, n * n_kv, hd, K.dtype);
-    bt::Tensor out = bt::Tensor::empty_on(K.device, 0, 0, K.dtype);
-    const int rows = n * n_q;
-    if (K.device == bt::Device::CPU) {
-        bt::embedding_lookup_forward(kv, e->host.data(), rows, out);
-    } else {
-        bt::embedding_lookup_forward(
-            kv, static_cast<const std::int32_t*>(e->dev_idx.data), rows, out);
-    }
-    out.rows = n;
-    out.cols = n_q * hd;
-    return out;
-}
+// GQA K/V no longer needs a host-side expansion: flash_attention_windowed_forward
+// reads the n_kv (grouped) heads directly and maps each query head to its KV
+// group internally. The cache therefore stores the n_kv heads (half the memory
+// and copy traffic of the expanded form).
 
 // Fused FP32 causal attention over pre-projected Q (Lq,D), K/V (Lk,D) with
 // `num_heads` heads of `head_dim`. Routed through flash_attention_windowed_forward
