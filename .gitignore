@@ -19,3 +19,4 @@ weights/
 voices/
 .claude/
 .scratch
+tests/ref/_cache/

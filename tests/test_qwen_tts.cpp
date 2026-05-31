@@ -1,9 +1,13 @@
+#define _CRT_SECURE_NO_WARNINGS  // std::getenv gate below (MSVC C4996)
 // Qwen3-TTS stage-1 loader contract: config.json + speech_tokenizer/config.json
 // parsing and safetensors validation. The forward pass is still in build-out,
 // so synthesize() must throw a staged std::runtime_error naming the stage.
 #include "brosoundml/qwen_tts.h"
 
+#include "qwen_tts_talker.h"  // internal: white-box Talker forward validation
+
 #include <brotensor/runtime.h>
+#include <brotensor/safetensors.h>
 
 #include <algorithm>
 #include <cmath>
@@ -199,6 +203,90 @@ static int run() {
             };
             check_fixture("qwen_tts_codec_small.bin");  // T < sliding_window
             check_fixture("qwen_tts_codec.bin");        // T > sliding_window (72)
+        }
+
+        // ─── Talker forward vs ground-truth fixture (opt-in, CPU) ──────────
+        //
+        // White-box check of the 28-layer Talker (dual embedding + QK-norm +
+        // interleaved M-RoPE + codec_head). Builds the internal QwenTtsTalker
+        // directly and validates a prefill forward + the embedding helpers
+        // against the genuine upstream model. Fixture is gitignored and made by
+        // tests/ref/gen_talker_fixture (see the codec ref script's header for
+        // the transformers==4.57.3 venv recipe); skipped when absent.
+        if (dev == brotensor::Device::CPU) {
+            const fs::path tpath =
+                fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_talker.bin";
+            std::ifstream f(tpath.string(), std::ios::binary);
+            if (f) {
+                int32_t hdr[5];
+                f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+                const int T = hdr[0], H = hdr[1], V = hdr[2], nT = hdr[3], nC = hdr[4];
+                std::vector<int32_t> pos(static_cast<std::size_t>(3) * T);
+                std::vector<float> ie(static_cast<std::size_t>(T) * H);
+                std::vector<float> ref_h(static_cast<std::size_t>(T) * H);
+                std::vector<float> ref_l(static_cast<std::size_t>(T) * V);
+                std::vector<int32_t> text_ids(nT);
+                std::vector<float> ref_tp(static_cast<std::size_t>(nT) * H);
+                std::vector<int32_t> codec_ids(nC);
+                std::vector<float> ref_ce(static_cast<std::size_t>(nC) * H);
+                auto rd = [&](void* p, std::size_t bytes) {
+                    f.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(bytes));
+                };
+                rd(pos.data(), pos.size() * 4);
+                rd(ie.data(), ie.size() * 4);
+                rd(ref_h.data(), ref_h.size() * 4);
+                rd(ref_l.data(), ref_l.size() * 4);
+                rd(text_ids.data(), text_ids.size() * 4);
+                rd(ref_tp.data(), ref_tp.size() * 4);
+                rd(codec_ids.data(), codec_ids.size() * 4);
+                rd(ref_ce.data(), ref_ce.size() * 4);
+                CHECK(static_cast<bool>(f), "talker fixture read complete");
+
+                brosoundml::QwenTtsTalker talker;
+                {
+                    auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
+                    talker.load(w, c.talker);
+                }
+                CHECK(talker.hidden == H, "talker hidden matches fixture");
+                CHECK(talker.vocab == V, "talker vocab matches fixture");
+
+                brotensor::Tensor hid, log;
+                talker.forward(ie.data(), T, pos.data(), hid, log);
+
+                auto cmp = [&](const char* what, const brotensor::Tensor& got,
+                               const std::vector<float>& ref, double tol) {
+                    double max_abs = 0.0, sum_abs = 0.0;
+                    const float* g = got.host_f32();
+                    for (std::size_t i = 0; i < ref.size(); ++i) {
+                        const double d = std::fabs(static_cast<double>(g[i]) - ref[i]);
+                        max_abs = std::max(max_abs, d);
+                        sum_abs += d;
+                    }
+                    std::printf("    [talker %s] max|Δ|=%.2e  mean|Δ|=%.2e\n",
+                                what, max_abs, sum_abs / ref.size());
+                    CHECK(max_abs < tol, what);
+                };
+                cmp("hidden states", hid, ref_h, 5e-2);
+                cmp("codec_head logits", log, ref_l, 5e-2);
+
+                // Embedding helpers.
+                double emax = 0.0;
+                std::vector<float> buf(H);
+                for (int i = 0; i < nT; ++i) {
+                    talker.text_embed_proj(text_ids[i], buf.data());
+                    for (int d = 0; d < H; ++d)
+                        emax = std::max(emax, std::fabs((double)buf[d] - ref_tp[i * H + d]));
+                }
+                std::printf("    [talker text_projection] max|Δ|=%.2e\n", emax);
+                CHECK(emax < 5e-3, "talker text_embed_proj matches upstream");
+                double cmax = 0.0;
+                for (int i = 0; i < nC; ++i) {
+                    talker.codec_embed(codec_ids[i], buf.data());
+                    for (int d = 0; d < H; ++d)
+                        cmax = std::max(cmax, std::fabs((double)buf[d] - ref_ce[i * H + d]));
+                }
+                CHECK(cmax < 1e-5, "talker codec_embed matches upstream");
+            }
         }
     };
 

@@ -108,6 +108,7 @@ target_sources(brosoundml PRIVATE
     src/kokoro.cpp
     src/qwen_tts.cpp
     src/qwen_tts_codec.cpp
+    src/qwen_tts_talker.cpp
     src/wake.cpp
     src/wake_data.cpp
     src/bc_resnet.cpp

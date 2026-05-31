@@ -73,6 +73,8 @@ target_compile_definitions(brosoundml_test_kokoro PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_qwen_tts PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(brosoundml_test_qwen_tts PRIVATE
+    "${CMAKE_SOURCE_DIR}/src")
 target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_whisper PRIVATE

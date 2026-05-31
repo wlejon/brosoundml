@@ -39,12 +39,15 @@ namespace brosoundml {
 // argmax — all already on the op surface. No new kernels (Qwen-TTS adds no op
 // brotensor lacks). See docs/qwen-tts-weights.md for the full tensor map.
 //
-// STATUS: stages 1-2 done. Stage 1 (weight loading) — load() parses config.json
+// STATUS: stages 1-3 done. Stage 1 (weight loading) — load() parses config.json
 // + speech_tokenizer/config.json and validates both safetensors. Stage 2 (codec
 // decoder) — decode_codes() runs the bundled 12 Hz codec tail (RVQ codes ->
-// 24 kHz waveform), matching the upstream decoder to FP32 round-off; CPU-only
-// for now. synthesize() (Talker / Code Predictor) is still a staged stub that
-// throws — stages 3-5 follow.
+// 24 kHz waveform), matching upstream to FP32 round-off; CPU-only for now.
+// Stage 3 (Talker forward) — the 28-layer Qwen3 decoder backbone (dual
+// text/codec embedding, GQA + QK-norm + interleaved M-RoPE, codec_head) is
+// implemented internally (src/qwen_tts_talker.*) and validated against the
+// upstream model; CPU FP32. synthesize() still throws — the AR generation loop
+// (Talker + Code Predictor) and end-to-end wiring are stages 4-5.
 
 // Qwen3-style transformer block hyperparameters. Shared by the Talker, the
 // Code Predictor, and (with layer-scale / windowed-attention variations) the
