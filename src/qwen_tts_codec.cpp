@@ -69,16 +69,19 @@ bt::Tensor load_codebook(const sf::File& f, const std::string& prefix,
     return (dev == bt::Device::CPU) ? embed : embed.to(dev);
 }
 
-// ── layout converters (device, via host-roundtrip transpose) ─────────────────
-// NCL (1, C*L) viewed channel-major as (C, L) <-> SEQ (L, C).
+// ── layout converters (on-device gather/scatter) ─────────────────────────────
+// NCL (1, C*L) viewed channel-major as (C, L) <-> SEQ (L, C). An NCL buffer is
+// exactly NCHW with N=1, H=1, W=L, so brotensor's nchw_to_sequence /
+// sequence_to_nchw (FP32, CPU+CUDA+Metal) are the transpose — no host round-trip.
 bt::Tensor ncl_to_seq(const bt::Tensor& x, int C, int L) {
-    bt::Tensor cl = bt::Tensor::view(x.device, x.data, C, L, x.dtype);
-    return qtd::transpose2d(cl);   // (L, C)
+    bt::Tensor y;
+    bt::nchw_to_sequence(x, /*N=*/1, C, /*H=*/1, /*W=*/L, y);   // (L, C)
+    return y;
 }
 bt::Tensor seq_to_ncl(const bt::Tensor& x, int L, int C) {
-    bt::Tensor cl = qtd::transpose2d(x);   // (C, L)
-    cl.rows = 1; cl.cols = C * L;
-    return cl;
+    bt::Tensor y;
+    bt::sequence_to_nchw(x, /*N=*/1, C, /*H=*/1, /*W=*/L, y);   // (1, C*L)
+    return y;
 }
 
 // Stride-1 causal conv: left-pad dilation*(k-1), valid conv, Lout == L.
@@ -121,55 +124,17 @@ void add_layerscale(bt::Tensor& hs, const bt::Tensor& delta, const bt::Tensor& s
 }
 
 // Windowed causal self-attention over pre-RoPE Q/K/V (T, num_heads*head_dim).
-// For T <= window it is plain causal (device FP32 flash); beyond the window the
-// per-query left window differs per row (flash has no sliding-window mode), so
-// fall back to a host computation (the heavy long-audio path).
+// brotensor's flash_attention_windowed_forward (FP32, CPU+CUDA) does the whole
+// thing on-device: query i attends keys [max(0, i-window+1), i]. window >= T
+// degenerates to plain causal, so this one call covers both the within-window
+// regime and the long-audio path that used to fall back to the host.
 bt::Tensor codec_attn(const bt::Tensor& q, const bt::Tensor& k, const bt::Tensor& v,
                       int num_heads, int head_dim, int T, int window) {
+    (void)head_dim; (void)T;   // derived inside the op; window bounds the band
     bt::Tensor O;
-    if (T <= window) {
-        qtd::flash_attn(q, k, v, num_heads, head_dim, /*causal=*/true, O);
-        return O;
-    }
-    const int inner = num_heads * head_dim;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    std::vector<float> qh(static_cast<std::size_t>(T) * inner);
-    std::vector<float> kh(static_cast<std::size_t>(T) * inner);
-    std::vector<float> vh(static_cast<std::size_t>(T) * inner);
-    qtd::to_host(q, qh.data());
-    qtd::to_host(k, kh.data());
-    qtd::to_host(v, vh.data());
-    std::vector<float> ctx(static_cast<std::size_t>(T) * inner, 0.0f);
-    std::vector<float> scores(T);
-    for (int h = 0; h < num_heads; ++h) {
-        const int off = h * head_dim;
-        for (int i = 0; i < T; ++i) {
-            const int jlo = (i - window + 1 > 0) ? i - window + 1 : 0;
-            const float* qi = qh.data() + static_cast<std::size_t>(i) * inner + off;
-            float maxs = -1e30f;
-            for (int j = jlo; j <= i; ++j) {
-                const float* kj = kh.data() + static_cast<std::size_t>(j) * inner + off;
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) dot += qi[d] * kj[d];
-                dot *= scale;
-                scores[j] = dot;
-                if (dot > maxs) maxs = dot;
-            }
-            float sum = 0.0f;
-            for (int j = jlo; j <= i; ++j) {
-                const float e = std::exp(scores[j] - maxs);
-                scores[j] = e; sum += e;
-            }
-            const float inv = 1.0f / sum;
-            float* ci = ctx.data() + static_cast<std::size_t>(i) * inner + off;
-            for (int j = jlo; j <= i; ++j) {
-                const float wgt = scores[j] * inv;
-                const float* vj = vh.data() + static_cast<std::size_t>(j) * inner + off;
-                for (int d = 0; d < head_dim; ++d) ci[d] += wgt * vj[d];
-            }
-        }
-    }
-    return bt::Tensor::from_host_on(q.device, ctx.data(), T, inner);
+    bt::flash_attention_windowed_forward(q, k, v, /*d_mask=*/nullptr, num_heads,
+                                         window, O);
+    return O;
 }
 
 }  // namespace
