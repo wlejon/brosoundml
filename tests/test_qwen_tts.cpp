@@ -4,7 +4,9 @@
 // so synthesize() must throw a staged std::runtime_error naming the stage.
 #include "brosoundml/qwen_tts.h"
 
-#include "qwen_tts_talker.h"  // internal: white-box Talker forward validation
+#include "qwen_tts_talker.h"          // internal: white-box Talker forward validation
+#include "qwen_tts_code_predictor.h"  // internal: white-box Code Predictor validation
+#include "qwen_tts_generate.h"        // internal: dual-track AR loop
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
@@ -286,6 +288,120 @@ static int run() {
                         cmax = std::max(cmax, std::fabs((double)buf[d] - ref_ce[i * H + d]));
                 }
                 CHECK(cmax < 1e-5, "talker codec_embed matches upstream");
+
+                // ── KV-cache self-consistency ──────────────────────────────
+                // A cached prefill of T-1 tokens followed by a single-token
+                // step must reproduce the uncached full forward at the last
+                // position — proving run()'s cache path against the verified
+                // (fixture-checked) prefill path. run() reads positions as
+                // pos3n[a*n + t], so repack the fixture grid (a*T + t) for the
+                // n=T-1 prefix and the lone stepped token.
+                if (T >= 2) {
+                    const int np = T - 1;
+                    std::vector<int32_t> pre_pos(static_cast<std::size_t>(3) * np);
+                    int32_t step_pos[3];
+                    for (int a = 0; a < 3; ++a) {
+                        for (int t = 0; t < np; ++t)
+                            pre_pos[a * np + t] = pos[a * T + t];
+                        step_pos[a] = pos[a * T + (T - 1)];
+                    }
+                    brosoundml::QwenTtsTalkerCache cache;
+                    cache.reset(talker.num_layers);
+                    brotensor::Tensor h_pre, h_step;
+                    talker.run(ie.data(), np, pre_pos.data(), &cache, h_pre);
+                    talker.run(ie.data() + static_cast<std::size_t>(np) * H, 1,
+                               step_pos, &cache, h_step);
+                    double cache_max = 0.0;
+                    const float* hs = h_step.host_f32();
+                    const float* hf = hid.host_f32() + static_cast<std::size_t>(T - 1) * H;
+                    for (int d = 0; d < H; ++d)
+                        cache_max = std::max(cache_max, std::fabs((double)hs[d] - hf[d]));
+                    std::printf("    [talker kv-cache step] max|Δ|=%.2e\n", cache_max);
+                    CHECK(cache_max < 1e-4, "talker cached step matches uncached forward");
+                }
+            }
+        }
+
+        // ─── Code Predictor + AR loop vs ground-truth fixture (CPU) ────────
+        //
+        // White-box check of the stage-4 path: the 5-layer Code Predictor
+        // expansion (codebooks 1..15) and the dual-track AR loop (Talker +
+        // Code Predictor → frame stream). Builds QwenTtsTalker + QwenTtsCodePredictor
+        // directly and matches the genuine upstream Qwen3TTSTalkerForConditional-
+        // Generation (do_sample=False). The discrete codes must match EXACTLY.
+        // Fixture by tests/ref/gen_qwen_tts_ar_fixture.py; gitignored, skipped
+        // when absent.
+        if (dev == brotensor::Device::CPU) {
+            const fs::path apath =
+                fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_ar.bin";
+            std::ifstream f(apath.string(), std::ios::binary);
+            if (f) {
+                auto rd = [&](void* p, std::size_t bytes) {
+                    f.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(bytes));
+                };
+                // Part A header
+                int32_t a_hdr[3];
+                rd(a_hdr, sizeof(a_hdr));
+                const int H = a_hdr[0], n_codes = a_hdr[1], c0 = a_hdr[2];
+                std::vector<float>   past_hidden(static_cast<std::size_t>(H));
+                std::vector<int32_t> cp_codes(n_codes);
+                rd(past_hidden.data(), past_hidden.size() * 4);
+                rd(cp_codes.data(), cp_codes.size() * 4);
+                // Part B header
+                int32_t b_hdr[6];
+                rd(b_hdr, sizeof(b_hdr));
+                const int T = b_hdr[0], L = b_hdr[1], F = b_hdr[2], G = b_hdr[3],
+                          eos_id = b_hdr[4], rope_delta = b_hdr[5];
+                std::vector<float>   prefill(static_cast<std::size_t>(T) * H);
+                std::vector<int32_t> pos3(static_cast<std::size_t>(3) * T);
+                std::vector<float>   trailing(static_cast<std::size_t>(L) * H);
+                std::vector<float>   tts_pad(static_cast<std::size_t>(H));
+                std::vector<int32_t> frames(static_cast<std::size_t>(F) * G);
+                rd(prefill.data(), prefill.size() * 4);
+                rd(pos3.data(), pos3.size() * 4);
+                rd(trailing.data(), trailing.size() * 4);
+                rd(tts_pad.data(), tts_pad.size() * 4);
+                rd(frames.data(), frames.size() * 4);
+                CHECK(static_cast<bool>(f), tag("AR fixture read complete"));
+
+                brosoundml::QwenTtsTalker talker;
+                brosoundml::QwenTtsCodePredictor cp;
+                {
+                    auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
+                    talker.load(w, c.talker);
+                    cp.load(w, c.talker.code_predictor);
+                }
+                CHECK(talker.hidden == H, tag("AR fixture hidden matches"));
+                CHECK(cp.num_code_groups == G, tag("code predictor num_code_groups matches"));
+
+                // Part A — standalone Code Predictor (codebooks 1..15).
+                std::vector<int> got_cp;
+                cp.predict(past_hidden.data(), talker.codec_embedding_row(c0), got_cp);
+                int cp_mismatch = 0;
+                for (int i = 0; i < n_codes; ++i)
+                    if (got_cp[i] != cp_codes[i]) ++cp_mismatch;
+                std::printf("    [code predictor] %d/%d codes match\n",
+                            n_codes - cp_mismatch, n_codes);
+                CHECK(cp_mismatch == 0, tag("code predictor codes match upstream exactly"));
+
+                // Part B — dual-track AR loop.
+                brosoundml::QwenTtsGenParams params;
+                params.eos_id = eos_id;
+                params.max_frames = F;
+                params.rope_delta = rope_delta;
+                std::vector<int32_t> got_frames;
+                const int got_F = generate_codes(
+                    talker, cp, prefill.data(), T, pos3.data(),
+                    trailing.data(), L, tts_pad.data(), params, got_frames);
+                CHECK(got_F == F, tag("AR loop emits the expected frame count"));
+                int fr_mismatch = 0;
+                if (got_F == F) {
+                    for (std::size_t i = 0; i < frames.size(); ++i)
+                        if (got_frames[i] != frames[i]) ++fr_mismatch;
+                }
+                std::printf("    [AR loop] F=%d  code mismatches=%d/%d\n",
+                            F, fr_mismatch, F * G);
+                CHECK(fr_mismatch == 0, tag("AR loop frames match upstream exactly"));
             }
         }
     };

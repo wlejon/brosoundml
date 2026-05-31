@@ -34,6 +34,21 @@ struct QwenTtsTalkerLayer {
     brotensor::Tensor gate, up, down;          // SwiGLU MLP, no bias
 };
 
+// A growing KV cache for autoregressive stepping: per-layer post-RoPE K and V
+// for every token seen so far (each `len * n_kv_heads * head_dim` floats, row
+// t = token t). The AR loop seeds it with a prefill run() then extends it one
+// frame-token at a time. `len` is the number of tokens currently cached.
+struct QwenTtsTalkerCache {
+    int len = 0;
+    std::vector<std::vector<float>> k;   // [num_layers][len * n_kv_heads * head_dim]
+    std::vector<std::vector<float>> v;
+    void reset(int num_layers) {
+        len = 0;
+        k.assign(num_layers, {});
+        v.assign(num_layers, {});
+    }
+};
+
 // The Talker. load() widens the talker.* weights to host FP32; forward() runs
 // one prefill pass over a precomputed embedding stream + 3-axis M-RoPE
 // positions, returning the post-final-norm hidden states and codec_head logits.
@@ -67,9 +82,28 @@ struct QwenTtsTalker {
                  brotensor::Tensor& hidden_out,
                  brotensor::Tensor& logits_out) const;
 
+    // Cached decoder pass over `n` new tokens. `embeds` is n*hidden row-major;
+    // `pos3n` the 3-axis M-RoPE positions for the new tokens (axis-major
+    // pos3n[a*n + i]). When `cache` is non-null the new tokens are appended to
+    // it and each new query attends all cached keys (offset = cache->len before
+    // the call) plus the new ones — so a prefill (n=T into an empty cache)
+    // followed by single-token steps reproduce a full causal forward. With
+    // `cache == nullptr` it is a stateless prefill. Writes hidden_out
+    // (n,hidden), post final RMSNorm.
+    void run(const float* embeds, int n, const int32_t* pos3n,
+             QwenTtsTalkerCache* cache, brotensor::Tensor& hidden_out) const;
+
+    // codec_head over `n` hidden rows (n*hidden row-major) -> (n,vocab) logits.
+    void codec_logits(const float* hidden_rows, int n,
+                      brotensor::Tensor& logits_out) const;
+
     // Embedding helpers (the two input streams). Each writes `hidden` floats.
     void codec_embed(int id, float* out) const;        // codec_embedding[id]
     void text_embed_proj(int id, float* out) const;     // text_projection(text_embedding[id])
+
+    // Raw pointer to codec_embedding row `id` (hidden floats); valid for the
+    // Talker's lifetime. Used by the AR loop to build the next-frame embedding.
+    const float* codec_embedding_row(int id) const;
 };
 
 }  // namespace brosoundml
