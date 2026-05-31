@@ -15,10 +15,10 @@
 // / snake / rms_norm / matmul / linear) plus a little hand-rolled glue
 // (rotate-half RoPE, sliding-window attention, exact GELU, channel LayerNorm).
 //
-// CPU FP32 only for now: the glue reads host float buffers, so weights are
-// uploaded to the host regardless of the requested device. The GPU path follows
-// once the hand-rolled steps move onto the brotensor op surface — matching the
-// staged-build convention in CLAUDE.md.
+// Device-neutral (CPU + CUDA): the conv stack, transformer, and upsamplers
+// dispatch through brotensor device ops (FP32 on every backend). NCL<->SEQ
+// layout swaps round-trip through host (no device transpose op), and windowed
+// attention falls back to host only when T exceeds the sliding window.
 
 #include "brosoundml/qwen_tts.h"
 

@@ -52,9 +52,15 @@ namespace brosoundml {
 // prefill assembly + the AR loop (with the upstream codebook-0 logits policy:
 // suppress the top-1024 codec tokens, min_new_tokens, repetition_penalty,
 // greedy) -> decode_codes. Tokenizer ids, prefill, and the full code stream are
-// verified against the genuine upstream model. GPU paths and sampling are
-// future work; the Base-variant zero-shot voice clone (speaker / codec encoder)
-// is a later target.
+// verified against the genuine upstream model.
+//
+// Runs device-neutrally on CPU and CUDA: load(device) places the weights on the
+// chosen backend and the whole pipeline (Talker, Code Predictor, AR loop, codec)
+// dispatches through brotensor device ops. Compute is FP32 on both backends —
+// attention uses flash_attention_varlen_forward's FP32 CUDA kernel — so CUDA
+// reproduces the CPU/upstream discrete-code stream bit-for-bit (the codec tail
+// then matches to ~1e-5). Sampling and the Base-variant zero-shot voice clone
+// (speaker / codec encoder) are later targets.
 
 // Qwen3-style transformer block hyperparameters. Shared by the Talker, the
 // Code Predictor, and (with layer-scale / windowed-attention variations) the
@@ -183,8 +189,8 @@ public:
     // on its own once the Talker / Code Predictor have produced (or a caller
     // holds) the per-frame RVQ codes. `codes` holds `num_quantizers * num_frames`
     // entries laid out codes[k * num_frames + t] (codebook-major). Throws if no
-    // model is loaded or the count disagrees. Available from stage 2 on; runs on
-    // the CPU in FP32 regardless of the load device.
+    // model is loaded or the count disagrees. Runs on the load device (FP32 on
+    // CPU and CUDA alike).
     AudioBuffer decode_codes(const std::vector<int32_t>& codes,
                              int num_quantizers, int num_frames) const;
 

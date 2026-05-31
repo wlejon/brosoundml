@@ -12,8 +12,9 @@
 // hidden width (1024); the upstream small_to_mtp_projection is an identity here
 // (the Code Predictor hidden size equals the Talker's) so it is omitted.
 //
-// Internal to the qwen_tts target. CPU FP32 only, mirroring the Talker: weights
-// are BF16 on disk and widened to host FP32 on load under a DeviceScope(CPU).
+// Internal to the qwen_tts target. Device-neutral (CPU + CUDA), mirroring the
+// Talker: FP32 weights on every backend, brotensor device ops throughout, FP32
+// attention (flash on CPU, varlen on CUDA), q/k permuted at load for rope_apply.
 
 #include "brosoundml/qwen_tts.h"
 

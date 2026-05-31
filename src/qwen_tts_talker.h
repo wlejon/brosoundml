@@ -4,15 +4,15 @@
 // drives synthesis: a dual text/codec embedding stream through a GQA + QK-norm
 // + interleaved-M-RoPE transformer, with a codec_head over acoustic codebook 0.
 //
-// Internal to the qwen_tts target (not in the public include/ surface). Stage 3
-// builds the forward pass (prefill) and the embedding helpers; the AR
-// generation loop + Code Predictor + input assembly follow in stages 4-5.
+// Internal to the qwen_tts target (not in the public include/ surface).
 //
-// CPU FP32 only for now — like the codec decoder, the hand-rolled glue
-// (interleaved M-RoPE, QK-norm, GQA causal attention) reads host buffers, so
-// weights (BF16 on disk) are widened to FP32 on the host and the path is pinned
-// to the CPU via a brotensor DeviceScope. A KV-cached / GPU path follows once
-// the AR loop lands and the steps move onto the brotensor op surface.
+// Device-neutral (CPU + CUDA): the forward pass composes brotensor device ops
+// (rms_norm, rope_apply, flash attention, matmul, silu). Weights upload FP32 on
+// every backend and compute stays FP32, so CUDA matches CPU to float round-off.
+// Two in-library bridges: GQA KV heads are expanded to full per-query heads via
+// an embedding_lookup row-gather (plain MHA for flash), and q/k projections +
+// q/k_norm are permuted at load into brotensor's adjacent-pair RoPE layout so
+// rope_apply reproduces HF rotate-half. See qwen_tts_device.h.
 
 #include "brosoundml/qwen_tts.h"
 
