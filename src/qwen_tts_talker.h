@@ -101,6 +101,11 @@ struct QwenTtsTalker {
     void run(const float* embeds, int n, const int32_t* pos3n,
              QwenTtsTalkerCache* cache, brotensor::Tensor& hidden_out) const;
 
+    // Like run(), but consumes an (n, hidden) device tensor directly instead of
+    // a host buffer — the AR loop assembles each next-frame embedding on-device.
+    void run_dev(const brotensor::Tensor& embeds, int n, const int32_t* pos3n,
+                 QwenTtsTalkerCache* cache, brotensor::Tensor& hidden_out) const;
+
     // codec_head over `n` hidden rows (n*hidden row-major) -> (n,vocab) logits.
     void codec_logits(const float* hidden_rows, int n,
                       brotensor::Tensor& logits_out) const;

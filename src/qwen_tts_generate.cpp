@@ -1,5 +1,8 @@
 #include "qwen_tts_generate.h"
 
+#include "qwen_tts_device.h"
+
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
@@ -27,29 +30,39 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
                    std::vector<int32_t>& out_frames) {
-    bt::DeviceScope cpu(bt::Device::CPU);
+    const bt::Device dev = talker.final_norm.device;
+    bt::DeviceScope scope(dev);
     const int H = talker.hidden;
     const int G = cp.num_code_groups;     // 16
     out_frames.clear();
 
-    // ── Talker prefill: build the KV cache, take the last token's hidden ──
+    // ── Talker prefill: seed the KV cache, keep the last token's hidden ──
     QwenTtsTalkerCache cache;
     cache.reset(talker.num_layers);
     bt::Tensor hidden;
-    talker.run(prefill_embeds, T, pos3T, &cache, hidden);
-    const float* hl = hidden.host_f32() + static_cast<std::size_t>(T - 1) * H;
-    std::vector<float> hcur(hl, hl + H);   // post-final-norm hidden of the last token
+    talker.run(prefill_embeds, T, pos3T, &cache, hidden);   // (T, H) device
+    bt::Tensor hcur = bt::Tensor::empty_on(dev, 1, H, bt::Dtype::FP32);
+    bt::copy_d2d(hidden, (T - 1) * H, hcur, 0, H);           // last row
 
-    std::vector<int> rest;                 // codebooks 1..15 from the Code Predictor
-    std::vector<float> e(H);
+    // Trailing / pad text embeddings on-device (added one per frame).
+    bt::Tensor trailing_dev =
+        (L > 0) ? bt::Tensor::from_host_on(dev, trailing_text_hidden, L, H)
+                : bt::Tensor::empty_on(dev, 0, H, bt::Dtype::FP32);
+    bt::Tensor pad_dev = bt::Tensor::from_host_on(dev, tts_pad_embed, 1, H);
+
+    std::vector<int>     rest;             // codebooks 1..15 from the Code Predictor
     std::vector<int32_t> gen_c0;           // codebook-0 ids emitted so far (rep. penalty)
+    std::vector<float>   logits_host(talker.vocab);
+    std::vector<float>   hcur_host(H), c0e_host(H);
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
     for (int step = 0; step < params.max_frames; ++step) {
-        // codebook 0 from the Talker, with the upstream logits processing.
+        // codebook 0: codec_head over the current hidden, with the upstream
+        // logits processing applied on the host (a single 3072-wide row).
         bt::Tensor lg;
-        talker.codec_logits(hcur.data(), 1, lg);
-        float* lp = lg.host_f32_mut();
+        qtd::linear(talker.codec_head, nullptr, hcur, lg);   // (1, vocab) device
+        qtd::to_host(lg, logits_host.data());
+        float* lp = logits_host.data();
         if (params.repetition_penalty != 1.0f) {
             const float p = params.repetition_penalty;
             for (int id : gen_c0)
@@ -62,32 +75,42 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
 
-        // codebooks 1..15 from the Code Predictor (greedy).
-        cp.predict(hcur.data(), talker.codec_embedding_row(c0), rest);
+        // codebooks 1..15 from the Code Predictor (greedy). Its host API takes
+        // the Talker hidden + the Talker embedding of codebook 0.
+        qtd::to_host(hcur, hcur_host.data());
+        bt::Tensor c0row = qtd::gather_rows(
+            talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H)
+        qtd::to_host(c0row, c0e_host.data());
+        cp.predict(hcur_host.data(), c0e_host.data(), rest);
 
         // emit the frame [c0, c1..c15].
         out_frames.push_back(static_cast<int32_t>(c0));
         for (int x : rest) out_frames.push_back(static_cast<int32_t>(x));
 
-        // next Talker input = sum of the 16 code embeddings + trailing/pad text.
-        const float* c0e = talker.codec_embedding_row(c0);
-        for (int d = 0; d < H; ++d) e[d] = c0e[d];
+        // next Talker input = sum of the 16 code embeddings + trailing/pad text,
+        // assembled on-device (reusing c0row as the accumulator).
+        bt::Tensor& e = c0row;
         for (int i = 0; i < G - 1; ++i) {
-            const float* er = cp.codec_embedding_row(i, rest[i]);
-            for (int d = 0; d < H; ++d) e[d] += er[d];
+            bt::Tensor er = qtd::gather_rows(
+                cp.codec_embedding[i], {static_cast<std::int32_t>(rest[i])});
+            bt::add_inplace_batched(e, er);
         }
-        const float* add = (step < L) ? (trailing_text_hidden + static_cast<std::size_t>(step) * H)
-                                       : tts_pad_embed;
-        for (int d = 0; d < H; ++d) e[d] += add[d];
+        if (step < L) {
+            bt::Tensor trow = bt::Tensor::view(
+                dev, static_cast<float*>(trailing_dev.data) + static_cast<std::size_t>(step) * H,
+                1, H, bt::Dtype::FP32);
+            bt::add_inplace_batched(e, trow);
+        } else {
+            bt::add_inplace_batched(e, pad_dev);
+        }
 
         // step the Talker (single token, KV-cached). Generation-phase M-RoPE
         // uses one scalar position on all three axes (T + step + rope_delta).
         const int pos = T + step + params.rope_delta;
         const int32_t pos3[3] = {pos, pos, pos};
         bt::Tensor hstep;
-        talker.run(e.data(), 1, pos3, &cache, hstep);
-        const float* hs = hstep.host_f32();
-        hcur.assign(hs, hs + H);
+        talker.run_dev(e, 1, pos3, &cache, hstep);
+        hcur = std::move(hstep);
     }
 
     return static_cast<int>(out_frames.size()) / G;
@@ -100,9 +123,14 @@ void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
                                    std::vector<float>& prefill, int& T,
                                    std::vector<float>& trailing, int& L,
                                    std::vector<float>& tts_pad) {
-    bt::DeviceScope cpu(bt::Device::CPU);
     const int H = talker.hidden;
     const QwenTtsTalkerConfig& tk = cfg.talker;
+
+    // codec-embedding row -> host buffer (device-safe; the table may be on GPU).
+    auto codec_row = [&](int id, std::vector<float>& buf) {
+        buf.resize(H);
+        talker.codec_embed(id, buf.data());
+    };
 
     // tts framing embeds: text_projection(text_embedding(id)).
     std::vector<float> tts_bos(H), tts_eos(H), tts_pad_e(H);
@@ -127,16 +155,16 @@ void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
     T = C + 3;
     prefill.assign(static_cast<std::size_t>(T) * H, 0.0f);
 
-    // role: text_projection over the first three prompt tokens
-    // (<|im_start|>, assistant, \n).
+    // role: text_projection over the first three prompt tokens.
     for (int r = 0; r < 3; ++r)
         talker.text_embed_proj(input_ids[r], prefill.data() + static_cast<std::size_t>(r) * H);
 
     // _tie row i (i in 0..C-2): text_side[i] + codec_embedding(codec_input[i]),
     // where text_side = [tts_pad ×(C-2), tts_bos].
+    std::vector<float> ce;
     for (int i = 0; i < C - 1; ++i) {
         float* dst = prefill.data() + static_cast<std::size_t>(3 + i) * H;
-        const float* ce = talker.codec_embedding_row(codec_input[i]);
+        codec_row(codec_input[i], ce);
         const float* txt = (i < C - 2) ? tts_pad_e.data() : tts_bos.data();
         for (int d = 0; d < H; ++d) dst[d] = txt[d] + ce[d];
     }
@@ -146,7 +174,7 @@ void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
         float* dst = prefill.data() + static_cast<std::size_t>(T - 1) * H;
         std::vector<float> tpb(H);
         talker.text_embed_proj(input_ids[3], tpb.data());
-        const float* ce = talker.codec_embedding_row(codec_input[C - 1]);
+        codec_row(codec_input[C - 1], ce);
         for (int d = 0; d < H; ++d) dst[d] = tpb[d] + ce[d];
     }
 

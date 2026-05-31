@@ -50,9 +50,12 @@ struct QwenTtsCodePredictor {
     brotensor::Tensor final_norm;
     std::vector<QwenTtsCodePredictorLayer> layers;
 
-    // Build from the talker.code_predictor.* tensors (BF16 -> host FP32).
+    // Build from the talker.code_predictor.* tensors (BF16 -> FP32 on `device`;
+    // q/k projections + q/k_norm permuted into brotensor's adjacent-pair RoPE
+    // layout, mirroring the Talker).
     void load(const brotensor::safetensors::File& f,
-              const QwenTtsCodePredictorConfig& cfg);
+              const QwenTtsCodePredictorConfig& cfg,
+              brotensor::Device device = brotensor::Device::CPU);
 
     // Greedy expansion of one frame. `past_hidden` is the Talker hidden state
     // that produced codebook 0 (hidden floats); `c0_embed` is the Talker's

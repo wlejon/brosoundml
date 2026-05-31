@@ -1,5 +1,7 @@
 #include "qwen_tts_code_predictor.h"
 
+#include "qwen_tts_device.h"
+
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
@@ -7,6 +9,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brosoundml {
 
@@ -25,46 +28,118 @@ const sf::TensorView& need(const sf::File& f, const std::string& name) {
     return *v;
 }
 
-bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols) {
+bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols,
+              bt::Device dev) {
     bt::Tensor t;
-    sf::upload_compute_checked(need(f, name), rows, cols, t, name);
-    return t;
-}
-bt::Tensor up_vec(const sf::File& f, const std::string& name, int n) {
-    return up(f, name, n, 1);
-}
-
-inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
-
-void linear(const bt::Tensor& W, const bt::Tensor& X, bt::Tensor& Y) {
-    bt::Tensor zero = bt::Tensor::mat(W.rows, 1);
-    bt::linear_forward_batched(W, zero, X, Y);
-}
-
-void head_rmsnorm(float* buf, int rows, int head_dim, const float* gamma,
-                  float eps) {
-    for (int r = 0; r < rows; ++r) {
-        float* v = buf + static_cast<std::size_t>(r) * head_dim;
-        float ss = 0.0f;
-        for (int d = 0; d < head_dim; ++d) ss += v[d] * v[d];
-        const float inv = 1.0f / std::sqrt(ss / head_dim + eps);
-        for (int d = 0; d < head_dim; ++d) v[d] = v[d] * inv * gamma[d];
+    {
+        bt::DeviceScope cpu(bt::Device::CPU);
+        sf::upload_compute_checked(need(f, name), rows, cols, t, name);
     }
+    return (dev == bt::Device::CPU) ? t : t.to(dev);
+}
+bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
+                  bt::Device dev) {
+    return up(f, name, n, 1, dev);
 }
 
-// A depth-local KV cache: per-layer post-RoPE K/V for the ≤16 depth tokens.
+int argmax_row(const std::vector<float>& v) {
+    int best = 0;
+    float bv = v[0];
+    for (std::size_t i = 1; i < v.size(); ++i)
+        if (v[i] > bv) { bv = v[i]; best = static_cast<int>(i); }
+    return best;
+}
+
+// A depth-local KV cache: per-layer post-RoPE K/V for the <=16 depth tokens,
+// stored expanded to full per-query heads (plain MHA for flash). FP32 device
+// tensors, preallocated to the known depth length.
 struct DepthCache {
     int len = 0;
-    std::vector<std::vector<float>> k, v;
-    void reset(int L) { len = 0; k.assign(L, {}); v.assign(L, {}); }
+    std::vector<bt::Tensor> k, v;
+    void reset(int num_layers, int cap, bt::Device dev, int D) {
+        len = 0;
+        k.assign(num_layers, {});
+        v.assign(num_layers, {});
+        for (int l = 0; l < num_layers; ++l) {
+            k[l] = bt::Tensor::zeros_on(dev, cap, D, bt::Dtype::FP32);
+            v[l] = bt::Tensor::zeros_on(dev, cap, D, bt::Dtype::FP32);
+        }
+    }
 };
+
+// One cached decoder pass over `n` new tokens at depth positions
+// [pos_start, pos_start+n). Plain single-axis RoPE, GQA + QK-norm, full causal.
+// `embeds` is an (n, hidden) device tensor; writes hidden_out (n, hidden).
+void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
+            int pos_start, DepthCache& cache, bt::Tensor& hidden_out) {
+    const bt::Device dev = cp.final_norm.device;
+    const int head_dim = cp.head_dim;
+    const int n_q = cp.n_q_heads, n_kv = cp.n_kv_heads;
+    const int qd = n_q * head_dim;          // == expanded K/V width
+    const int half = head_dim / 2;
+    const int offset = cache.len;
+
+    // Plain RoPE tables: every pair shares the row position pos_start + t.
+    std::vector<int>   pos_grid(static_cast<std::size_t>(n) * half);
+    std::vector<float> inv_freq(half);
+    for (int i = 0; i < half; ++i)
+        inv_freq[i] = std::pow(cp.rope_theta, -(2.0f * i) / head_dim);
+    for (int t = 0; t < n; ++t)
+        for (int i = 0; i < half; ++i)
+            pos_grid[static_cast<std::size_t>(t) * half + i] = pos_start + t;
+    bt::Tensor cosT, sinT;
+    qtd::build_rope_tables(dev, n, half, pos_grid, inv_freq, cosT, sinT);
+
+    bt::Tensor hs = embeds;   // deep copy; mutated in place by residual adds
+
+    for (int l = 0; l < cp.num_layers; ++l) {
+        const QwenTtsCodePredictorLayer& cl = cp.layers[l];
+        bt::Tensor normed;
+        bt::rms_norm_forward(hs, cl.in_ln, cp.rms_eps, normed);
+        bt::Tensor q, k, v;
+        qtd::linear(cl.qw, nullptr, normed, q);
+        qtd::linear(cl.kw, nullptr, normed, k);
+        qtd::linear(cl.vw, nullptr, normed, v);
+        bt::Tensor qn, kn;
+        qtd::head_rms_norm(q, n, n_q,  head_dim, cl.q_norm, cp.rms_eps, qn);
+        qtd::head_rms_norm(k, n, n_kv, head_dim, cl.k_norm, cp.rms_eps, kn);
+        bt::Tensor qr, kr;
+        bt::rope_apply(qn, cosT, sinT, head_dim, n_q,  qr);
+        bt::rope_apply(kn, cosT, sinT, head_dim, n_kv, kr);
+        bt::Tensor kE = qtd::expand_kv(kr, n, n_kv, n_q, head_dim);
+        bt::Tensor vE = qtd::expand_kv(v,  n, n_kv, n_q, head_dim);
+
+        bt::copy_d2d(kE, 0, cache.k[l], offset * qd, n * qd);
+        bt::copy_d2d(vE, 0, cache.v[l], offset * qd, n * qd);
+        const int valid = offset + n;
+        bt::Tensor Kf = bt::Tensor::view(dev, cache.k[l].data, valid, qd, bt::Dtype::FP32);
+        bt::Tensor Vf = bt::Tensor::view(dev, cache.v[l].data, valid, qd, bt::Dtype::FP32);
+        bt::Tensor ctx;
+        qtd::flash_attn(qr, Kf, Vf, n_q, /*causal=*/offset == 0, ctx);
+        bt::Tensor attn;
+        qtd::linear(cl.ow, nullptr, ctx, attn);
+        bt::add_inplace_batched(hs, attn);
+
+        bt::Tensor n2;
+        bt::rms_norm_forward(hs, cl.post_ln, cp.rms_eps, n2);
+        bt::Tensor g, u;
+        qtd::linear(cl.gate, nullptr, n2, g);
+        qtd::linear(cl.up,   nullptr, n2, u);
+        qtd::swiglu(g, u);
+        bt::Tensor dn;
+        qtd::linear(cl.down, nullptr, g, dn);
+        bt::add_inplace_batched(hs, dn);
+    }
+
+    cache.len = offset + n;
+    bt::rms_norm_forward(hs, cp.final_norm, cp.rms_eps, hidden_out);
+}
 
 }  // namespace
 
 void QwenTtsCodePredictor::load(const sf::File& f,
-                                const QwenTtsCodePredictorConfig& cfg) {
-    bt::DeviceScope cpu(bt::Device::CPU);
-
+                                const QwenTtsCodePredictorConfig& cfg,
+                                bt::Device dev) {
     num_layers      = cfg.transformer.num_hidden_layers;
     hidden          = cfg.transformer.hidden_size;
     intermediate    = cfg.transformer.intermediate_size;
@@ -78,16 +153,23 @@ void QwenTtsCodePredictor::load(const sf::File& f,
 
     const int n_tables = num_code_groups - 1;   // 15
     const std::string P = "talker.code_predictor.";
-    final_norm = up_vec(f, P + "model.norm.weight", hidden);
+    final_norm = up_vec(f, P + "model.norm.weight", hidden, dev);
 
     codec_embedding.clear();
     lm_head.clear();
     for (int j = 0; j < n_tables; ++j) {
         codec_embedding.push_back(
-            up(f, P + "model.codec_embedding." + std::to_string(j) + ".weight", vocab, hidden));
+            up(f, P + "model.codec_embedding." + std::to_string(j) + ".weight", vocab, hidden, dev));
         lm_head.push_back(
-            up(f, P + "lm_head." + std::to_string(j) + ".weight", vocab, hidden));
+            up(f, P + "lm_head." + std::to_string(j) + ".weight", vocab, hidden, dev));
     }
+
+    // Same HF rotate-half -> adjacent-pair RoPE permutation as the Talker.
+    const std::vector<std::int32_t> hd_perm = qtd::rotate_half_perm(head_dim);
+    const std::vector<std::int32_t> q_perm =
+        qtd::per_head_perm_rows(hd_perm, n_q_heads, head_dim);
+    const std::vector<std::int32_t> k_perm =
+        qtd::per_head_perm_rows(hd_perm, n_kv_heads, head_dim);
 
     const int qd = n_q_heads * head_dim;
     const int kd = n_kv_heads * head_dim;
@@ -96,194 +178,67 @@ void QwenTtsCodePredictor::load(const sf::File& f,
     for (int i = 0; i < num_layers; ++i) {
         const std::string L = P + "model.layers." + std::to_string(i) + ".";
         QwenTtsCodePredictorLayer& cl = layers[i];
-        cl.in_ln   = up_vec(f, L + "input_layernorm.weight", hidden);
-        cl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", hidden);
-        cl.qw      = up(f, L + "self_attn.q_proj.weight", qd, hidden);
-        cl.kw      = up(f, L + "self_attn.k_proj.weight", kd, hidden);
-        cl.vw      = up(f, L + "self_attn.v_proj.weight", kd, hidden);
-        cl.ow      = up(f, L + "self_attn.o_proj.weight", hidden, qd);
-        cl.q_norm  = up_vec(f, L + "self_attn.q_norm.weight", head_dim);
-        cl.k_norm  = up_vec(f, L + "self_attn.k_norm.weight", head_dim);
-        cl.gate    = up(f, L + "mlp.gate_proj.weight", intermediate, hidden);
-        cl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden);
-        cl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate);
+        cl.in_ln   = up_vec(f, L + "input_layernorm.weight", hidden, dev);
+        cl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", hidden, dev);
+        cl.qw      = qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm);
+        cl.kw      = qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm);
+        cl.vw      = up(f, L + "self_attn.v_proj.weight", kd, hidden, dev);
+        cl.ow      = up(f, L + "self_attn.o_proj.weight", hidden, qd, dev);
+        cl.q_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.q_norm.weight", head_dim, dev), hd_perm);
+        cl.k_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.k_norm.weight", head_dim, dev), hd_perm);
+        cl.gate    = up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev);
+        cl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev);
+        cl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev);
     }
 }
-
-namespace {
-
-// One cached decoder pass over `n` new tokens at global positions
-// [pos_start, pos_start+n). Plain single-axis rotate-half RoPE, full causal,
-// GQA + QK-norm. Appends K/V to `cache` and writes hidden_out (n,hidden).
-void cp_run(const QwenTtsCodePredictor& cp, const float* embeds, int n,
-            int pos_start, DepthCache& cache, bt::Tensor& hidden_out) {
-    const int hidden = cp.hidden, head_dim = cp.head_dim;
-    const int n_q = cp.n_q_heads, n_kv = cp.n_kv_heads;
-    const int qd = n_q * head_dim, kd = n_kv * head_dim;
-    const int group = n_q / n_kv, half = head_dim / 2;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-    std::vector<float> inv_freq(half);
-    for (int i = 0; i < half; ++i)
-        inv_freq[i] = std::pow(cp.rope_theta, -(2.0f * i) / head_dim);
-
-    const int offset = cache.len;
-    const int total  = offset + n;
-
-    bt::Tensor hs = bt::Tensor::mat(n, hidden);
-    std::copy(embeds, embeds + static_cast<std::size_t>(n) * hidden, hs.host_f32_mut());
-
-    auto apply_rope = [&](float* buf, int n_heads) {
-        for (int t = 0; t < n; ++t) {
-            const int pos = pos_start + t;
-            for (int h = 0; h < n_heads; ++h) {
-                float* base = buf + (static_cast<std::size_t>(t) * n_heads + h) * head_dim;
-                for (int i = 0; i < half; ++i) {
-                    const float ang = pos * inv_freq[i];
-                    const float c = std::cos(ang), s = std::sin(ang);
-                    const float x0 = base[i], x1 = base[i + half];
-                    base[i]        = x0 * c - x1 * s;
-                    base[i + half] = x1 * c + x0 * s;
-                }
-            }
-        }
-    };
-
-    std::vector<float> scores(total);
-    const std::size_t row_kv = static_cast<std::size_t>(kd);
-    for (int l = 0; l < cp.num_layers; ++l) {
-        const QwenTtsCodePredictorLayer& cl = cp.layers[l];
-        bt::Tensor normed;
-        bt::rms_norm_forward(hs, cl.in_ln, cp.rms_eps, normed);
-        bt::Tensor q, k, v;
-        linear(cl.qw, normed, q);
-        linear(cl.kw, normed, k);
-        linear(cl.vw, normed, v);
-        head_rmsnorm(q.host_f32_mut(), n * n_q,  head_dim, cl.q_norm.host_f32(), cp.rms_eps);
-        head_rmsnorm(k.host_f32_mut(), n * n_kv, head_dim, cl.k_norm.host_f32(), cp.rms_eps);
-        apply_rope(q.host_f32_mut(), n_q);
-        apply_rope(k.host_f32_mut(), n_kv);
-
-        std::vector<float>& ck = cache.k[l];
-        std::vector<float>& cv = cache.v[l];
-        ck.insert(ck.end(), k.host_f32(), k.host_f32() + static_cast<std::size_t>(n) * kd);
-        cv.insert(cv.end(), v.host_f32(), v.host_f32() + static_cast<std::size_t>(n) * kd);
-        const float* kp = ck.data();
-        const float* vp = cv.data();
-        const float* qp = q.host_f32();
-
-        bt::Tensor ctx = bt::Tensor::mat(n, qd);
-        float* cptr = ctx.host_f32_mut();
-        for (int h = 0; h < n_q; ++h) {
-            const int kvh = h / group;
-            for (int t = 0; t < n; ++t) {
-                const int g = offset + t;
-                const float* qi = qp + (static_cast<std::size_t>(t) * n_q + h) * head_dim;
-                float maxs = -1e30f;
-                for (int jj = 0; jj <= g; ++jj) {
-                    const float* kj = kp + static_cast<std::size_t>(jj) * row_kv + static_cast<std::size_t>(kvh) * head_dim;
-                    float dot = 0.0f;
-                    for (int d = 0; d < head_dim; ++d) dot += qi[d] * kj[d];
-                    dot *= scale;
-                    scores[jj] = dot;
-                    if (dot > maxs) maxs = dot;
-                }
-                float sum = 0.0f;
-                for (int jj = 0; jj <= g; ++jj) {
-                    const float e = std::exp(scores[jj] - maxs);
-                    scores[jj] = e; sum += e;
-                }
-                const float inv = 1.0f / sum;
-                float* ci = cptr + (static_cast<std::size_t>(t) * n_q + h) * head_dim;
-                for (int d = 0; d < head_dim; ++d) ci[d] = 0.0f;
-                for (int jj = 0; jj <= g; ++jj) {
-                    const float w = scores[jj] * inv;
-                    const float* vj = vp + static_cast<std::size_t>(jj) * row_kv + static_cast<std::size_t>(kvh) * head_dim;
-                    for (int d = 0; d < head_dim; ++d) ci[d] += w * vj[d];
-                }
-            }
-        }
-        bt::Tensor attn;
-        linear(cl.ow, ctx, attn);
-        {
-            float* hp = hs.host_f32_mut();
-            const float* ap = attn.host_f32();
-            for (int i = 0; i < n * hidden; ++i) hp[i] += ap[i];
-        }
-
-        bt::Tensor n2;
-        bt::rms_norm_forward(hs, cl.post_ln, cp.rms_eps, n2);
-        bt::Tensor gg, uu;
-        linear(cl.gate, n2, gg);
-        linear(cl.up, n2, uu);
-        float* gp = gg.host_f32_mut();
-        const float* upp = uu.host_f32();
-        for (int i = 0; i < gg.size(); ++i) gp[i] = silu(gp[i]) * upp[i];
-        bt::Tensor dn;
-        linear(cl.down, gg, dn);
-        {
-            float* hp = hs.host_f32_mut();
-            const float* dp = dn.host_f32();
-            for (int i = 0; i < n * hidden; ++i) hp[i] += dp[i];
-        }
-    }
-
-    cache.len = total;
-    bt::rms_norm_forward(hs, cp.final_norm, cp.rms_eps, hidden_out);
-}
-
-// argmax over a single logit row (vocab entries).
-int argmax_row(const float* logits, int vocab) {
-    int best = 0;
-    float bv = logits[0];
-    for (int i = 1; i < vocab; ++i) {
-        if (logits[i] > bv) { bv = logits[i]; best = i; }
-    }
-    return best;
-}
-
-}  // namespace
 
 void QwenTtsCodePredictor::predict(const float* past_hidden,
                                    const float* c0_embed,
                                    std::vector<int>& out_codes) const {
-    bt::DeviceScope cpu(bt::Device::CPU);
+    const bt::Device dev = final_norm.device;
+    bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
+    const int qd    = n_q_heads * head_dim;
     out_codes.assign(n_out, 0);
 
     DepthCache cache;
-    cache.reset(num_layers);
+    cache.reset(num_layers, num_code_groups, dev, qd);
 
-    // ── prefill: two tokens [past_hidden, c0_embed] at positions 0, 1 ──
+    // lm_head[head_idx] over one (1,hidden) device row -> argmax over vocab.
+    std::vector<float> logits_host(vocab);
+    auto code_from = [&](const bt::Tensor& row, int head_idx) -> int {
+        bt::Tensor lg;
+        qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
+        qtd::to_host(lg, logits_host.data());
+        return argmax_row(logits_host);
+    };
+
+    // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1 ──
     std::vector<float> prefill(static_cast<std::size_t>(2) * hidden);
     std::copy(past_hidden, past_hidden + hidden, prefill.data());
     std::copy(c0_embed,    c0_embed + hidden,    prefill.data() + hidden);
+    bt::Tensor pre_t = bt::Tensor::from_host_on(dev, prefill.data(), 2, hidden);
     bt::Tensor h;
-    cp_run(*this, prefill.data(), 2, /*pos_start=*/0, cache, h);
+    cp_run(*this, pre_t, 2, /*pos_start=*/0, cache, h);   // (2, hidden)
 
-    // codebook 1 from lm_head[0] applied to the last prefill row.
-    auto code_from = [&](const float* hidden_row, int head_idx) {
-        bt::Tensor hr = bt::Tensor::mat(1, hidden);
-        std::copy(hidden_row, hidden_row + hidden, hr.host_f32_mut());
-        bt::Tensor lg;
-        linear(lm_head[head_idx], hr, lg);   // (1, vocab)
-        return argmax_row(lg.host_f32(), vocab);
-    };
-    out_codes[0] = code_from(h.host_f32() + static_cast<std::size_t>(hidden), 0);
+    // codebook 1 from lm_head[0] applied to the last prefill row (row 1).
+    bt::Tensor row1 = bt::Tensor::view(
+        dev, static_cast<float*>(h.data) + hidden, 1, hidden, bt::Dtype::FP32);
+    out_codes[0] = code_from(row1, 0);
 
     // ── steps: emit codebooks 2..(num_code_groups-1) ──
-    // step j (j=1..n_out-1): embed code_j via codec_embedding[j-1] at the next
-    // depth position, then lm_head[j] predicts code_{j+1}.
     for (int j = 1; j < n_out; ++j) {
         const int prev_code = out_codes[j - 1];
-        const float* erow = codec_embedding_row(j - 1, prev_code);
+        bt::Tensor erow = qtd::gather_rows(
+            codec_embedding[j - 1], {static_cast<std::int32_t>(prev_code)});  // (1, hidden)
         bt::Tensor hstep;
         cp_run(*this, erow, 1, /*pos_start=*/1 + j, cache, hstep);
-        out_codes[j] = code_from(hstep.host_f32(), j);
+        out_codes[j] = code_from(hstep, j);
     }
 }
 
 const float* QwenTtsCodePredictor::codec_embedding_row(int table, int id) const {
+    // Host pointer into the table — valid only when CPU-resident (host AR path).
     return codec_embedding[table].host_f32() + static_cast<std::size_t>(id) * hidden;
 }
 

@@ -340,7 +340,7 @@ static int run() {
         // Generation (do_sample=False). The discrete codes must match EXACTLY.
         // Fixture by tests/ref/gen_qwen_tts_ar_fixture.py; gitignored, skipped
         // when absent.
-        if (dev == brotensor::Device::CPU) {
+        {
             const fs::path apath =
                 fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_ar.bin";
             std::ifstream f(apath.string(), std::ios::binary);
@@ -378,20 +378,28 @@ static int run() {
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
                     talker.load(w, c.talker, dev);
-                    cp.load(w, c.talker.code_predictor);
+                    cp.load(w, c.talker.code_predictor, dev);
                 }
                 CHECK(talker.hidden == H, tag("AR fixture hidden matches"));
                 CHECK(cp.num_code_groups == G, tag("code predictor num_code_groups matches"));
 
-                // Part A — standalone Code Predictor (codebooks 1..15).
+                // Part A — standalone Code Predictor (codebooks 1..15). Source
+                // the codebook-0 embedding device-safely (the table may be on GPU).
+                std::vector<float> c0_embed(static_cast<std::size_t>(H));
+                talker.codec_embed(c0, c0_embed.data());
                 std::vector<int> got_cp;
-                cp.predict(past_hidden.data(), talker.codec_embedding_row(c0), got_cp);
+                cp.predict(past_hidden.data(), c0_embed.data(), got_cp);
                 int cp_mismatch = 0;
                 for (int i = 0; i < n_codes; ++i)
                     if (got_cp[i] != cp_codes[i]) ++cp_mismatch;
                 std::printf("    [code predictor] %d/%d codes match\n",
                             n_codes - cp_mismatch, n_codes);
-                CHECK(cp_mismatch == 0, tag("code predictor codes match upstream exactly"));
+                // Exact discrete-code match is an FP32/CPU-vs-upstream contract.
+                // CUDA attention is FP16 (no FP32 flash kernel), so the greedy
+                // argmax stream diverges — a valid different sample of the same
+                // model. The GPU is validated on end-to-end audio instead.
+                CHECK(dev != brotensor::Device::CPU || cp_mismatch == 0,
+                      tag("code predictor codes match upstream exactly"));
 
                 // Part B — dual-track AR loop.
                 brosoundml::QwenTtsGenParams params;
@@ -410,7 +418,8 @@ static int run() {
                 }
                 std::printf("    [AR loop] F=%d  code mismatches=%d/%d\n",
                             F, fr_mismatch, F * G);
-                CHECK(fr_mismatch == 0, tag("AR loop frames match upstream exactly"));
+                CHECK(dev != brotensor::Device::CPU || fr_mismatch == 0,
+                      tag("AR loop frames match upstream exactly"));
             }
         }
 
@@ -423,7 +432,7 @@ static int run() {
         // generation; the code stream must match exactly. Codec decode (codes
         // -> waveform) is stage 2, already verified, so this compares codes.
         // Fixture by tests/ref/gen_qwen_tts_synth_fixture.py; skipped if absent.
-        if (dev == brotensor::Device::CPU) {
+        {
             const fs::path spath =
                 fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_synth.bin";
             std::ifstream f(spath.string(), std::ios::binary);
@@ -462,7 +471,7 @@ static int run() {
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
                     talker.load(w, c.talker, dev);
-                    cp.load(w, c.talker.code_predictor);
+                    cp.load(w, c.talker.code_predictor, dev);
                 }
                 auto tok = brolm::qwen::Tokenizer::load(
                     (root / "vocab.json").string(), (root / "merges.txt").string());
@@ -524,7 +533,9 @@ static int run() {
                     for (std::size_t i = 0; i < ref_frames.size(); ++i)
                         if (got_frames[i] != ref_frames[i]) ++sm;
                 std::printf("    [synth AR loop] F=%d  code mismatches=%d/%d\n", F, sm, F * G);
-                CHECK(gotF == F && sm == 0, tag("synth code stream matches upstream exactly"));
+                CHECK(gotF == F, tag("synth AR loop frame count matches"));
+                CHECK(dev != brotensor::Device::CPU || sm == 0,
+                      tag("synth code stream matches upstream exactly"));
 
                 // (4) the public synthesize() path runs end to end (codes ->
                 // 24 kHz). Gated behind the heavy-decode env like the codec

@@ -115,6 +115,18 @@ void QwenTtsTalker::run(const float* embeds, int n, const int32_t* pos3n,
         hidden_out = bt::Tensor::zeros_on(dev, 0, hidden, bt::Dtype::FP32);
         return;
     }
+    bt::Tensor e = bt::Tensor::from_host_on(dev, embeds, n, hidden);
+    run_dev(e, n, pos3n, cache, hidden_out);
+}
+
+void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3n,
+                            QwenTtsTalkerCache* cache, bt::Tensor& hidden_out) const {
+    const bt::Device dev = final_norm.device;
+    bt::DeviceScope scope(dev);
+    if (n <= 0) {
+        hidden_out = bt::Tensor::zeros_on(dev, 0, hidden, bt::Dtype::FP32);
+        return;
+    }
 
     const int qd     = n_q_heads * head_dim;   // == expanded K/V width
     const int half   = head_dim / 2;
@@ -138,8 +150,8 @@ void QwenTtsTalker::run(const float* embeds, int n, const int32_t* pos3n,
     bt::Tensor cosT, sinT;
     qtd::build_rope_tables(dev, n, half, pos_grid, inv_freq, cosT, sinT);
 
-    // ── input embeddings (FP32) onto the device ──
-    bt::Tensor hs = bt::Tensor::from_host_on(dev, embeds, n, hidden);
+    // ── input embeddings (owning copy; mutated in place by residual adds) ──
+    bt::Tensor hs = embeds;
 
     // ── ensure the KV cache has room for the new tokens ──
     if (cache) {
