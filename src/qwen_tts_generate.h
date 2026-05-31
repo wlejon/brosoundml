@@ -27,6 +27,12 @@ struct QwenTtsGenParams {
     int eos_id     = 0;   // codec EOS in the Talker vocab; stops the loop
     int max_frames = 0;   // hard cap on emitted frames
     int rope_delta = 0;   // M-RoPE position offset for the generation phase
+
+    // Codebook-0 logits processing, matching the upstream talker generate. All
+    // default to no-ops so the bare AR loop (stage-4 fixture) is unaffected.
+    int   suppress_lo = 0, suppress_hi = 0;  // force logits[lo,hi) (except eos) to -inf
+    int   min_frames  = 0;   // suppress eos until this many frames are emitted
+    float repetition_penalty = 1.0f;  // penalize already-emitted codebook-0 ids
 };
 
 // Run the AR loop. `prefill_embeds` is T*hidden row-major; `pos3T` the 3-axis
@@ -41,5 +47,23 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
                    std::vector<int32_t>& out_frames);
+
+// Assemble the CustomVoice prefill embedding stream + trailing-text embeddings,
+// mirroring the upstream Qwen3TTS generate() (streaming, speaker preset, no
+// voice clone). `input_ids` are the tokenized chat prompt
+// (<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n);
+// `spk_id` is the codec speaker token (>=0), `language_id` the codec language
+// token (>=0), or -1 for "auto" (no language tag). Writes the prefill (T*hidden
+// row-major), the per-frame trailing-text hidden (L*hidden), and the tts_pad
+// embedding (hidden). The prefill positions are a plain 0..T-1 ramp (the
+// Talker's get_rope_index is cumsum of an all-ones mask), so the caller pairs
+// this with rope_delta = 0.
+void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
+                                   const QwenTtsConfig& cfg,
+                                   const std::vector<int32_t>& input_ids,
+                                   int spk_id, int language_id,
+                                   std::vector<float>& prefill, int& T,
+                                   std::vector<float>& trailing, int& L,
+                                   std::vector<float>& tts_pad);
 
 }  // namespace brosoundml

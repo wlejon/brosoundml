@@ -39,19 +39,22 @@ namespace brosoundml {
 // argmax — all already on the op surface. No new kernels (Qwen-TTS adds no op
 // brotensor lacks). See docs/qwen-tts-weights.md for the full tensor map.
 //
-// STATUS: stages 1-4 done. Stage 1 (weight loading) — load() parses config.json
-// + speech_tokenizer/config.json and validates both safetensors. Stage 2 (codec
-// decoder) — decode_codes() runs the bundled 12 Hz codec tail (RVQ codes ->
-// 24 kHz waveform), matching upstream to FP32 round-off; CPU-only for now.
-// Stage 3 (Talker forward) — the 28-layer Qwen3 decoder backbone (dual
-// text/codec embedding, GQA + QK-norm + interleaved M-RoPE, codec_head) is
-// implemented internally (src/qwen_tts_talker.*) and validated against the
-// upstream model; CPU FP32. Stage 4 (Code Predictor + AR loop) — the 5-layer
-// depth transformer (src/qwen_tts_code_predictor.*) and the dual-track
-// generation loop (src/qwen_tts_generate.*, Talker KV cache + Code Predictor ->
-// per-frame RVQ codes) reproduce the upstream code stream exactly. synthesize()
-// still throws — assembling the prefill (chat template + get_rope_index) and
-// wiring generate_codes -> decode_codes is stage 5.
+// STATUS: complete (CPU FP32). Stage 1 (weight loading) — load() parses
+// config.json + speech_tokenizer/config.json and validates both safetensors.
+// Stage 2 (codec decoder) — decode_codes() runs the bundled 12 Hz codec tail
+// (RVQ codes -> 24 kHz waveform), matching upstream to FP32 round-off. Stage 3
+// (Talker forward) — the 28-layer Qwen3 decoder backbone (dual text/codec
+// embedding, GQA + QK-norm + interleaved M-RoPE, codec_head; src/qwen_tts_talker.*).
+// Stage 4 (Code Predictor + AR loop) — the 5-layer depth transformer
+// (src/qwen_tts_code_predictor.*) and the dual-track generation loop
+// (src/qwen_tts_generate.*, Talker KV cache + Code Predictor -> per-frame RVQ
+// codes). Stage 5 (synthesize) — the Qwen BPE tokenizer + CustomVoice chat
+// prefill assembly + the AR loop (with the upstream codebook-0 logits policy:
+// suppress the top-1024 codec tokens, min_new_tokens, repetition_penalty,
+// greedy) -> decode_codes. Tokenizer ids, prefill, and the full code stream are
+// verified against the genuine upstream model. GPU paths and sampling are
+// future work; the Base-variant zero-shot voice clone (speaker / codec encoder)
+// is a later target.
 
 // Qwen3-style transformer block hyperparameters. Shared by the Talker, the
 // Code Predictor, and (with layer-scale / windowed-attention variations) the

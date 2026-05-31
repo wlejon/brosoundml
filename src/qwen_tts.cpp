@@ -1,14 +1,20 @@
 #include "brosoundml/qwen_tts.h"
 
 #include "qwen_tts_codec.h"
+#include "qwen_tts_code_predictor.h"
+#include "qwen_tts_generate.h"
+#include "qwen_tts_talker.h"
 
 #include "brosoundml/detail/json.h"
+
+#include <brolm/qwen_tokenizer.h>
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -203,7 +209,10 @@ struct QwenTts::Impl {
     QwenTtsConfig         config;
     brotensor::Device     device = brotensor::Device::CPU;
     bool                  loaded = false;
-    QwenTtsCodecDecoder   codec;   // built in load(); runs decode_codes()
+    QwenTtsCodecDecoder   codec;       // built in load(); runs decode_codes()
+    QwenTtsTalker         talker;      // 28-layer Qwen3 decoder backbone
+    QwenTtsCodePredictor  code_pred;   // 5-layer depth transformer
+    std::unique_ptr<brolm::qwen::Tokenizer> tokenizer;  // text -> Qwen BPE ids
 };
 
 QwenTts::QwenTts() : impl_(std::make_unique<Impl>()) {}
@@ -254,6 +263,27 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
             "talker.code_predictor.model.layers." + std::to_string(last_cp) +
                 ".input_layernorm.weight",
         }, "model.safetensors");
+        // Stages 3-4: build the Talker + Code Predictor (the AR generator).
+        impl_->talker.load(w, impl_->config.talker);
+        impl_->code_pred.load(w, impl_->config.talker.code_predictor);
+    }
+
+    // Text tokenizer (Qwen byte-level BPE). The chat prompt uses the
+    // <|im_start|> / <|im_end|> specials, which the tokenizer auto-registers
+    // from vocab.json.
+    {
+        const fs::path vocab  = dir / "vocab.json";
+        const fs::path merges = dir / "merges.txt";
+        if (!fs::exists(vocab) || !fs::exists(merges))
+            fail("QwenTts::load",
+                 "no vocab.json / merges.txt under '" + model_dir + "'");
+        impl_->tokenizer = std::make_unique<brolm::qwen::Tokenizer>(
+            brolm::qwen::Tokenizer::load(vocab.string(), merges.string()));
+        // The ChatML control tokens live in tokenizer_config.json's added
+        // tokens (ids above vocab.json's range), so register them explicitly
+        // from the config — the prompt is built from <|im_start|> / <|im_end|>.
+        impl_->tokenizer->register_special_token("<|im_start|>", impl_->config.im_start_id);
+        impl_->tokenizer->register_special_token("<|im_end|>",   impl_->config.im_end_id);
     }
     {
         auto w = brotensor::safetensors::File::open(codec_weight.string());
@@ -272,25 +302,82 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
     impl_->loaded = true;
 }
 
-AudioBuffer QwenTts::synthesize(const std::string& /*text*/,
+AudioBuffer QwenTts::synthesize(const std::string& text,
                                 const std::string& speaker,
                                 const std::string& language) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
     }
-    // Surface the obvious caller errors before the staged stub so they're
-    // reported as soon as the forward pass lands.
-    const QwenTtsTalkerConfig& tk = impl_->config.talker;
-    if (!tk.spk_id.empty() && tk.spk_id.find(speaker) == tk.spk_id.end()) {
-        fail("QwenTts::synthesize", "unknown speaker '" + speaker + "'");
+    const QwenTtsConfig&       cfg = impl_->config;
+    const QwenTtsTalkerConfig& tk  = cfg.talker;
+
+    // Resolve speaker / language to codec tokens (and apply the dialect
+    // override the upstream pipeline does for dialect speakers).
+    int spk_id = -1;
+    if (!tk.spk_id.empty()) {
+        auto it = tk.spk_id.find(speaker);
+        if (it == tk.spk_id.end()) fail("QwenTts::synthesize", "unknown speaker '" + speaker + "'");
+        spk_id = it->second;
     }
-    if (!tk.codec_language_id.empty() &&
-        tk.codec_language_id.find(language) == tk.codec_language_id.end()) {
-        fail("QwenTts::synthesize", "unsupported language '" + language + "'");
+    int language_id = -1;
+    const bool is_auto = (language == "auto");
+    if (!is_auto) {
+        auto it = tk.codec_language_id.find(language);
+        if (it == tk.codec_language_id.end())
+            fail("QwenTts::synthesize", "unsupported language '" + language + "'");
+        language_id = it->second;
     }
-    fail("QwenTts::synthesize",
-         "forward pass not yet built (stage 2+: Talker / Code Predictor / "
-         "codec decoder)");
+    if (is_auto || language == "chinese") {
+        auto dit = tk.spk_dialect.find(speaker);
+        if (dit != tk.spk_dialect.end() && !dit->second.empty()) {
+            auto lit = tk.codec_language_id.find(dit->second);
+            if (lit != tk.codec_language_id.end()) language_id = lit->second;
+        }
+    }
+
+    // Tokenize the CustomVoice chat prompt.
+    const std::string prompt =
+        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9) {  // role(3) + >=1 body + trailing(5)
+        fail("QwenTts::synthesize", "prompt tokenized to too few tokens");
+    }
+
+    // Assemble the prefill embedding stream + trailing-text embeddings.
+    std::vector<float> prefill, trailing, tts_pad;
+    int T = 0, L = 0;
+    assemble_custom_voice_prefill(impl_->talker, cfg, input_ids, spk_id,
+                                  language_id, prefill, T, trailing, L, tts_pad);
+
+    // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's
+    // get_rope_index is cumsum of an all-ones mask), rope_delta 0.
+    std::vector<int32_t> pos3(static_cast<std::size_t>(3) * T);
+    for (int a = 0; a < 3; ++a)
+        for (int t = 0; t < T; ++t) pos3[a * T + t] = t;
+
+    // Run the dual-track AR loop with the upstream codebook-0 logits policy.
+    QwenTtsGenParams gp;
+    gp.eos_id      = tk.codec_eos_id;
+    gp.max_frames  = 4096;
+    gp.rope_delta  = 0;
+    gp.suppress_lo = tk.vocab_size - 1024;
+    gp.suppress_hi = tk.vocab_size;
+    gp.min_frames  = 2;
+    gp.repetition_penalty = 1.05f;
+    std::vector<int32_t> frames;
+    const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
+                                 T, pos3.data(), trailing.data(), L, tts_pad.data(),
+                                 gp, frames);
+    const int G = tk.num_code_groups;
+
+    // Transpose frame-major [F][G] to the codebook-major layout decode_codes
+    // expects: codes[k * F + t].
+    std::vector<int32_t> codes(static_cast<std::size_t>(G) * F);
+    for (int t = 0; t < F; ++t)
+        for (int k = 0; k < G; ++k)
+            codes[static_cast<std::size_t>(k) * F + t] = frames[static_cast<std::size_t>(t) * G + k];
+
+    return decode_codes(codes, G, F);
 }
 
 AudioBuffer QwenTts::decode_codes(const std::vector<int32_t>& codes,

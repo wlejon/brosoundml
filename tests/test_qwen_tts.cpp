@@ -6,7 +6,9 @@
 
 #include "qwen_tts_talker.h"          // internal: white-box Talker forward validation
 #include "qwen_tts_code_predictor.h"  // internal: white-box Code Predictor validation
-#include "qwen_tts_generate.h"        // internal: dual-track AR loop
+#include "qwen_tts_generate.h"        // internal: dual-track AR loop + prefill assembly
+
+#include <brolm/qwen_tokenizer.h>     // text -> Qwen BPE ids (stage-5 tokenizer check)
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
@@ -136,19 +138,14 @@ static int run() {
         CHECK(tk.spk_dialect.at("dylan") == "beijing_dialect",
               tag("dylan tagged beijing_dialect"));
 
-        // Forward pass is staged out: synthesize() throws, but only after the
-        // obvious caller errors (unknown speaker / language) are reported.
+        // synthesize() now runs the full pipeline; it still rejects the obvious
+        // caller errors (unknown speaker / language) before any heavy work. The
+        // full end-to-end run is exercised by the stage-5 fixture block below
+        // (and gated behind the heavy-decode env), not here.
         CHECK(throws_runtime_error([&] { q.synthesize("hello", "no_such_speaker"); }),
               tag("synthesize() rejects an unknown speaker"));
         CHECK(throws_runtime_error([&] { q.synthesize("hello", "serena", "klingon"); }),
               tag("synthesize() rejects an unsupported language"));
-        bool staged = false;
-        std::string msg;
-        try { q.synthesize("hello", "serena", "english"); }
-        catch (const std::runtime_error& e) { staged = true; msg = e.what(); }
-        CHECK(staged, tag("synthesize() throws the staged stub for valid input"));
-        CHECK(msg.find("not yet built") != std::string::npos,
-              tag("staged stub names the build-out stage"));
 
         std::printf("    [%s] qwen-tts loader: %zu speakers, codec x%d -> %d Hz\n",
                     dev_name, spk.size(), cd.decode_upsample_rate,
@@ -402,6 +399,133 @@ static int run() {
                 std::printf("    [AR loop] F=%d  code mismatches=%d/%d\n",
                             F, fr_mismatch, F * G);
                 CHECK(fr_mismatch == 0, tag("AR loop frames match upstream exactly"));
+            }
+        }
+
+        // ─── End-to-end synthesis vs ground-truth fixture (CPU) ────────────
+        //
+        // Stage-5 white-box check: the tokenizer, the CustomVoice prefill
+        // assembly, and the AR loop with the upstream codebook-0 logits policy
+        // (suppress top-1024 codec tokens, min_new_tokens=2, repetition_penalty
+        // 1.05, greedy). Matches the genuine upstream assembly + talker
+        // generation; the code stream must match exactly. Codec decode (codes
+        // -> waveform) is stage 2, already verified, so this compares codes.
+        // Fixture by tests/ref/gen_qwen_tts_synth_fixture.py; skipped if absent.
+        if (dev == brotensor::Device::CPU) {
+            const fs::path spath =
+                fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures" / "qwen_tts_synth.bin";
+            std::ifstream f(spath.string(), std::ios::binary);
+            if (f) {
+                auto rd = [&](void* p, std::size_t bytes) {
+                    f.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(bytes));
+                };
+                int32_t text_len = 0;
+                rd(&text_len, 4);
+                std::string text(static_cast<std::size_t>(text_len), '\0');
+                rd(text.data(), static_cast<std::size_t>(text_len));
+                int32_t h2[2];
+                rd(h2, sizeof(h2));
+                const int H = h2[0], n_ids = h2[1];
+                std::vector<int32_t> ref_ids(n_ids);
+                rd(ref_ids.data(), ref_ids.size() * 4);
+                int32_t sl[2];
+                rd(sl, sizeof(sl));
+                const int spk_id = sl[0], language_id = sl[1];
+                int32_t T = 0; rd(&T, 4);
+                std::vector<float> ref_prefill(static_cast<std::size_t>(T) * H);
+                rd(ref_prefill.data(), ref_prefill.size() * 4);
+                int32_t L = 0; rd(&L, 4);
+                std::vector<float> ref_trailing(static_cast<std::size_t>(L) * H);
+                rd(ref_trailing.data(), ref_trailing.size() * 4);
+                std::vector<float> ref_pad(static_cast<std::size_t>(H));
+                rd(ref_pad.data(), ref_pad.size() * 4);
+                int32_t fg[2]; rd(fg, sizeof(fg));
+                const int F = fg[0], G = fg[1];
+                std::vector<int32_t> ref_frames(static_cast<std::size_t>(F) * G);
+                rd(ref_frames.data(), ref_frames.size() * 4);
+                CHECK(static_cast<bool>(f), tag("synth fixture read complete"));
+
+                brosoundml::QwenTtsTalker talker;
+                brosoundml::QwenTtsCodePredictor cp;
+                {
+                    auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
+                    talker.load(w, c.talker);
+                    cp.load(w, c.talker.code_predictor);
+                }
+                auto tok = brolm::qwen::Tokenizer::load(
+                    (root / "vocab.json").string(), (root / "merges.txt").string());
+                tok.register_special_token("<|im_start|>", c.im_start_id);
+                tok.register_special_token("<|im_end|>",   c.im_end_id);
+
+                // (1) tokenizer: the chat prompt must reproduce the upstream ids.
+                const std::string prompt =
+                    "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+                std::vector<int32_t> ids = tok.encode(prompt);
+                bool ids_match = (ids.size() == ref_ids.size());
+                if (ids_match)
+                    for (std::size_t i = 0; i < ids.size(); ++i)
+                        if (ids[i] != ref_ids[i]) { ids_match = false; break; }
+                std::printf("    [synth tokenizer] %zu ids, match=%d\n", ids.size(), (int)ids_match);
+                CHECK(ids_match, tag("tokenizer reproduces upstream chat-prompt ids"));
+                if (!ids_match) ids = ref_ids;  // fall back so the rest still exercises
+
+                // (2) prefill assembly: numeric match vs upstream.
+                brosoundml::QwenTtsConfig cfg = c;
+                std::vector<float> prefill, trailing, tts_pad;
+                int gotT = 0, gotL = 0;
+                brosoundml::assemble_custom_voice_prefill(
+                    talker, cfg, ids, spk_id, language_id, prefill, gotT, trailing, gotL, tts_pad);
+                CHECK(gotT == T, tag("assembled prefill length matches"));
+                CHECK(gotL == L, tag("assembled trailing length matches"));
+                auto cmpv = [&](const char* what, const std::vector<float>& got,
+                                const std::vector<float>& ref, double tol) {
+                    if (got.size() != ref.size()) { CHECK(false, what); return; }
+                    double mx = 0.0;
+                    for (std::size_t i = 0; i < ref.size(); ++i)
+                        mx = std::max(mx, std::fabs((double)got[i] - ref[i]));
+                    std::printf("    [synth %s] max|Δ|=%.2e\n", what, mx);
+                    CHECK(mx < tol, what);
+                };
+                if (gotT == T) cmpv("prefill", prefill, ref_prefill, 5e-3);
+                if (gotL == L) cmpv("trailing", trailing, ref_trailing, 5e-3);
+                cmpv("tts_pad", tts_pad, ref_pad, 5e-3);
+
+                // (3) AR loop with the upstream codebook-0 logits policy.
+                std::vector<int32_t> pos3(static_cast<std::size_t>(3) * gotT);
+                for (int a = 0; a < 3; ++a)
+                    for (int t = 0; t < gotT; ++t) pos3[a * gotT + t] = t;
+                brosoundml::QwenTtsGenParams gp;
+                gp.eos_id      = c.talker.codec_eos_id;
+                gp.max_frames  = F;
+                gp.rope_delta  = 0;
+                gp.suppress_lo = c.talker.vocab_size - 1024;
+                gp.suppress_hi = c.talker.vocab_size;
+                gp.min_frames  = 2;
+                gp.repetition_penalty = 1.05f;
+                std::vector<int32_t> got_frames;
+                const int gotF = brosoundml::generate_codes(
+                    talker, cp, prefill.data(), gotT, pos3.data(),
+                    trailing.data(), gotL, tts_pad.data(), gp, got_frames);
+                CHECK(gotF == F, tag("synth AR loop emits the expected frame count"));
+                int sm = 0;
+                if (gotF == F)
+                    for (std::size_t i = 0; i < ref_frames.size(); ++i)
+                        if (got_frames[i] != ref_frames[i]) ++sm;
+                std::printf("    [synth AR loop] F=%d  code mismatches=%d/%d\n", F, sm, F * G);
+                CHECK(gotF == F && sm == 0, tag("synth code stream matches upstream exactly"));
+
+                // (4) the public synthesize() path runs end to end (codes ->
+                // 24 kHz). Gated behind the heavy-decode env like the codec
+                // fixture, since it runs the full x1920 decode.
+                if (std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
+                    QwenTts q2;
+                    q2.load(root.string(), brotensor::Device::CPU);
+                    brosoundml::AudioBuffer wav = q2.synthesize(text, "serena", "english");
+                    CHECK(wav.sample_rate == 24000, tag("synthesize() returns 24 kHz"));
+                    CHECK(!wav.samples.empty(), tag("synthesize() returns audio"));
+                    std::printf("    [synthesize] %zu samples (%.2fs)\n",
+                                wav.samples.size(), wav.samples.size() / 24000.0);
+                }
             }
         }
     };
