@@ -181,6 +181,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_qwen_tts_roundtrip tools/qwen_tts_roundtrip.cpp)
     target_link_libraries(brosoundml_qwen_tts_roundtrip PRIVATE brosoundml)
+
+    add_executable(brosoundml_qwen_tts_clone tools/qwen_tts_clone.cpp)
+    target_link_libraries(brosoundml_qwen_tts_clone PRIVATE brosoundml)
 endif()
 
 # --- Tests ---
