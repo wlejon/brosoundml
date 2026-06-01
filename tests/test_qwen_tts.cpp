@@ -202,6 +202,61 @@ static int run() {
             };
             check_fixture("qwen_tts_codec_small.bin");  // T < sliding_window
             check_fixture("qwen_tts_codec.bin");        // T > sliding_window (72)
+
+            // ─── Codec ENCODE vs ground-truth fixture ──────────────────────
+            // encode_audio() is the analysis path (waveform -> RVQ codes), the
+            // inverse of decode_codes(). Fixtures (waveform + codes) come from
+            // the genuine upstream encoder — see .scratch/gen_encode_fixture.py.
+            //
+            // Codes are discrete, so unlike the continuous decode check there is
+            // an inherent floor: an argmin over the codebook flips on the rare
+            // frame that is near-equidistant between two codewords once FP32
+            // reassociation differs from PyTorch's. That floor is small (~1-2
+            // frames per codebook) and uniform across codebooks — the semantic
+            // codebook (a direct argmin on the front-end features, no residual
+            // cascade) stays exact, which is the real "front-end is faithful"
+            // signal; CPU and CUDA agree bit-for-bit. >=97% also cleanly catches
+            // structural regressions (e.g. a wrong attention window read ~93%).
+            auto check_encode = [&](const char* fname) {
+                const fs::path path = fix_dir / fname;
+                std::ifstream f(path.string(), std::ios::binary);
+                if (!f) return;  // not generated locally — skip
+                int32_t hdr[3];
+                f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+                const int K = hdr[0], T = hdr[1], n = hdr[2];
+                std::vector<int32_t> ref(static_cast<std::size_t>(K) * T);
+                std::vector<float>   wav(static_cast<std::size_t>(n));
+                f.read(reinterpret_cast<char*>(ref.data()),
+                       static_cast<std::streamsize>(ref.size() * sizeof(int32_t)));
+                f.read(reinterpret_cast<char*>(wav.data()),
+                       static_cast<std::streamsize>(wav.size() * sizeof(float)));
+                CHECK(static_cast<bool>(f), "encode fixture read complete");
+
+                int Tout = 0;
+                brosoundml::AudioBuffer in(std::move(wav), 24000);
+                std::vector<int32_t> got = q.encode_audio(in, &Tout);
+                CHECK(Tout == T, tag("encode_audio frame count matches upstream"));
+                CHECK(static_cast<int>(got.size()) == K * T,
+                      tag("encode_audio returns K*T codes"));
+                if (Tout != T || static_cast<int>(got.size()) != K * T) return;
+
+                int mism = 0;
+                std::vector<int> per_cb(K, 0);
+                for (int k = 0; k < K; ++k)
+                    for (int t = 0; t < T; ++t) {
+                        const std::size_t i = static_cast<std::size_t>(k) * T + t;
+                        if (got[i] != ref[i]) { ++mism; ++per_cb[k]; }
+                    }
+                const double rate = 1.0 - static_cast<double>(mism) / (K * T);
+                std::printf("    [%s encode fixture %s] T=%d  codes match=%.4f  per-codebook mism:",
+                            dev_name, fname, T, rate);
+                for (int k = 0; k < K; ++k) std::printf(" %d", per_cb[k]);
+                std::printf("\n");
+                CHECK(per_cb[0] == 0, tag("encode semantic codebook exact"));
+                CHECK(rate >= 0.97, tag("encode matches upstream codes (>=97%)"));
+            };
+            check_encode("qwen_tts_encode_small.bin");  // T < sliding_window (250)
+            check_encode("qwen_tts_encode.bin");        // T > sliding_window
         }
 
         // ─── Talker forward vs ground-truth fixture (opt-in, CPU) ──────────

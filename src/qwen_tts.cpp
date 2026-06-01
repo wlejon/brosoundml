@@ -1,6 +1,7 @@
 #include "brosoundml/qwen_tts.h"
 
 #include "qwen_tts_codec.h"
+#include "qwen_tts_codec_encoder.h"
 #include "qwen_tts_code_predictor.h"
 #include "qwen_tts_generate.h"
 #include "qwen_tts_talker.h"
@@ -9,9 +10,11 @@
 
 #include <brolm/qwen_tokenizer.h>
 
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -162,8 +165,9 @@ void parse_codec_config(const std::string& path, QwenTtsCodecConfig& c) {
     }
     const std::string where = "QwenTts::load (codec)";
 
-    c.output_sample_rate   = root.get_int("output_sample_rate", 24000);
-    c.decode_upsample_rate = root.get_int("decode_upsample_rate", 0);
+    c.output_sample_rate     = root.get_int("output_sample_rate", 24000);
+    c.decode_upsample_rate   = root.get_int("decode_upsample_rate", 0);
+    c.encode_downsample_rate = root.get_int("encode_downsample_rate", 0);
 
     const j::Value& dc = obj_at(root, "decoder_config", where);
     c.latent_dim              = int_at(dc, "latent_dim",      where);
@@ -182,6 +186,24 @@ void parse_codec_config(const std::string& path, QwenTtsCodecConfig& c) {
 
     c.upsample_rates    = dc.get_int_array("upsample_rates",    {});
     c.upsampling_ratios = dc.get_int_array("upsampling_ratios", {});
+
+    // ── encoder (the HF-Mimi analysis stack: waveform -> codes) ──
+    const j::Value& ec = obj_at(root, "encoder_config", where);
+    QwenTtsCodecEncoderConfig& e = c.encoder;
+    e.num_filters          = int_at(ec, "num_filters",          where);
+    e.kernel_size          = int_at(ec, "kernel_size",          where);
+    e.last_kernel_size     = int_at(ec, "last_kernel_size",     where);
+    e.residual_kernel_size = int_at(ec, "residual_kernel_size", where);
+    e.compress             = int_at(ec, "compress",             where);
+    e.codebook_dim         = int_at(ec, "codebook_dim",         where);
+    e.ratios               = ec.get_int_array("upsampling_ratios", {});
+    e.sliding_window       = ec.get_int("sliding_window", 0);
+    e.valid_num_quantizers = root.get_int("encoder_valid_num_quantizers",
+                                          c.num_quantizers);
+    parse_transformer(ec, e.transformer, where);
+    // encoder_transformer norms are LayerNorm (eps "norm_eps"); reuse the field.
+    e.transformer.rms_norm_eps = ec.get_float("norm_eps", 1e-5f);
+    e.transformer.rope_theta   = ec.get_float("rope_theta", 10000.0f);
 }
 
 // Confirm a representative set of tensors is present so a wrong / truncated
@@ -210,6 +232,7 @@ struct QwenTts::Impl {
     brotensor::Device     device = brotensor::Device::CPU;
     bool                  loaded = false;
     QwenTtsCodecDecoder   codec;       // built in load(); runs decode_codes()
+    QwenTtsCodecEncoder   codec_enc;   // built in load(); runs encode_audio()
     QwenTtsTalker         talker;      // 28-layer Qwen3 decoder backbone
     QwenTtsCodePredictor  code_pred;   // 5-layer depth transformer
     std::unique_ptr<brolm::qwen::Tokenizer> tokenizer;  // text -> Qwen BPE ids
@@ -294,10 +317,16 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
             "decoder.pre_transformer.norm.weight",
             "decoder.upsample.0.0.conv.weight",
             "decoder.decoder.0.conv.weight",
+            "encoder.encoder.layers.0.conv.weight",
+            "encoder.encoder_transformer.layers.0.self_attn.q_proj.weight",
+            "encoder.downsample.conv.weight",
+            "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight",
+            "encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight",
         }, "speech_tokenizer/model.safetensors");
-        // Stage 2: build the codec decoder (codes -> waveform) from these
-        // weights. The Talker / Code Predictor follow in later stages.
+        // Build the codec decoder (codes -> waveform) and encoder (waveform ->
+        // codes) from these weights. The Talker / Code Predictor follow below.
         impl_->codec.load(w, impl_->config.codec, device);
+        impl_->codec_enc.load(w, impl_->config.codec, device);
     }
 
     impl_->loaded = true;
@@ -417,6 +446,40 @@ AudioBuffer QwenTts::decode_codes(const std::vector<int32_t>& codes,
     std::vector<float> wav;
     impl_->codec.decode(codes.data(), num_quantizers, num_frames, wav);
     return AudioBuffer(std::move(wav), impl_->config.codec.output_sample_rate);
+}
+
+std::vector<int32_t> QwenTts::encode_audio(const AudioBuffer& ref,
+                                           int* num_frames_out) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::encode_audio", "no model loaded; call QwenTts::load() first");
+    }
+    if (ref.samples.empty()) {
+        fail("QwenTts::encode_audio", "reference audio is empty");
+    }
+    const int target = impl_->config.codec.output_sample_rate;
+
+    // Resample to the codec rate if needed (linear; the reference clip is
+    // preprocessing, outside the bit-exact code path). Mono already — AudioBuffer
+    // is single-channel.
+    const float* wav = ref.samples.data();
+    int n = static_cast<int>(ref.samples.size());
+    std::vector<float> resampled;
+    if (ref.sample_rate != target && ref.sample_rate > 0) {
+        const int n_out = static_cast<int>(
+            std::llround(static_cast<double>(n) * target / ref.sample_rate));
+        brotensor::Tensor x =
+            brotensor::Tensor::from_host_on(brotensor::Device::CPU, wav, 1, n);
+        brotensor::Tensor y;
+        brotensor::resample1d_forward(x, /*N=*/1, /*C=*/1, n, n_out, /*mode=*/1, y);
+        resampled.assign(y.host_f32(), y.host_f32() + n_out);
+        wav = resampled.data();
+        n = n_out;
+    }
+
+    std::vector<int32_t> codes;
+    const int T = impl_->codec_enc.encode(wav, n, codes);
+    if (num_frames_out) *num_frames_out = T;
+    return codes;
 }
 
 std::vector<std::string> QwenTts::speakers() const {

@@ -116,6 +116,26 @@ struct QwenTtsTalkerConfig {
     QwenTtsCodePredictorConfig code_predictor;
 };
 
+// The codec ENCODER (speech_tokenizer/ `encoder.*`) — 24 kHz waveform -> RVQ
+// codes, the analysis path and inverse of the decoder. An HF-Mimi stack: a
+// SEANet down-sampler (ELU + causal convs), a causal sliding-window transformer
+// (LayerNorm + GELU), a /N downsample conv, and a split-RVQ that emits
+// `valid_num_quantizers` euclidean codes per 12.5 Hz frame.
+struct QwenTtsCodecEncoderConfig {
+    int num_filters          = 0;   // SEANet base width (64)
+    int kernel_size          = 0;   // SEANet conv kernel (7)
+    int last_kernel_size     = 0;   // final conv kernel (3)
+    int residual_kernel_size = 0;   // residual-unit dilated conv kernel (3)
+    int compress             = 0;   // residual-unit channel divisor (2)
+    int codebook_dim         = 0;   // VQ space dim the input_proj maps into (256)
+    std::vector<int> ratios;        // SEANet strides in decode order ([8, 6, 5, 4]);
+                                    // applied reversed, so the encoder downsamples 4·5·6·8
+
+    QwenTtsTransformerConfig transformer;  // encoder_transformer (LayerNorm + GELU MLP)
+    int sliding_window = 0;         // (250)
+    int valid_num_quantizers = 0;   // codes kept per frame (16: 1 semantic + 15 acoustic)
+};
+
 // The bundled 12 Hz codec decoder (speech_tokenizer/) — 16 RVQ codes -> 24 kHz.
 struct QwenTtsCodecConfig {
     // RVQ quantizers (codebooks stored as EMA embedding_sum / cluster_usage).
@@ -137,7 +157,10 @@ struct QwenTtsCodecConfig {
     std::vector<int> upsampling_ratios;
     std::vector<int> upsample_rates;
     int decode_upsample_rate = 0;      // prod(both) = 1920
+    int encode_downsample_rate = 0;    // SEANet ratios · downsample stride = 1920
     int output_sample_rate   = 24000;
+
+    QwenTtsCodecEncoderConfig encoder;  // the `encoder.*` analysis stack
 };
 
 enum class QwenTtsVariant { Base, CustomVoice, VoiceDesign };
@@ -202,6 +225,19 @@ public:
     // CPU and CUDA alike).
     AudioBuffer decode_codes(const std::vector<int32_t>& codes,
                              int num_quantizers, int num_frames) const;
+
+    // Encode a reference waveform into the bundled 12 Hz codec's RVQ codes — the
+    // analysis path (the inverse of decode_codes), and the acoustic conditioning
+    // a zero-shot voice clone consumes. `ref` is downmixed/resampled to 24 kHz
+    // mono and right-padded to a whole frame as needed. Returns
+    // `num_quantizers * num_frames` codes laid out codes[k*num_frames + t]
+    // (codebook-major — the same layout decode_codes accepts, so encode ▸ decode
+    // round-trips), with num_quantizers == config().codec.encoder.valid_num_quantizers
+    // (16: one semantic + fifteen acoustic). *num_frames_out, when non-null,
+    // receives num_frames. Throws if no model is loaded or `ref` is empty. Runs
+    // on the load device (FP32 on CPU and CUDA alike).
+    std::vector<int32_t> encode_audio(const AudioBuffer& ref,
+                                      int* num_frames_out = nullptr) const;
 
     // Preset speaker names available in this checkpoint (CustomVoice only;
     // empty for Base / VoiceDesign).
