@@ -7,6 +7,7 @@
 #include "qwen_tts_talker.h"          // internal: white-box Talker forward validation
 #include "qwen_tts_code_predictor.h"  // internal: white-box Code Predictor validation
 #include "qwen_tts_generate.h"        // internal: dual-track AR loop + prefill assembly
+#include "qwen_tts_speaker_encoder.h" // internal: Base ECAPA-TDNN x-vector encoder
 
 #include <brolm/qwen_tokenizer.h>     // text -> Qwen BPE ids (stage-5 tokenizer check)
 
@@ -605,6 +606,74 @@ static int run() {
     }
     if (brotensor::is_available(brotensor::Device::Metal)) {
         run_real_smoke(brotensor::Device::Metal, "Metal");
+    }
+
+    // ─── Base speaker encoder (ECAPA-TDNN x-vector) vs ground-truth fixture ──
+    //
+    // White-box check of the zero-shot voice clone's enrollment front end: the
+    // mel frontend + the ECAPA-TDNN speaker encoder, built directly from the
+    // Base checkpoint and compared to the genuine upstream extract_speaker_embedding
+    // (.scratch/gen_speaker_fixture.py). The mel must match tightly (STFT +
+    // librosa slaney basis are deterministic); the embedding, after a deep
+    // conv/pooling net, is checked by cosine similarity (the x-vector is used as
+    // a direction in the Talker prefill). Opt-in + skipped when absent.
+    if (std::getenv("BROSOUNDML_RUN_CODEC_FIXTURE")) {
+        const fs::path base = fs::path(BROSOUNDML_REPO_DIR) / "weights" /
+                              "qwen-tts" / "0.6B-Base";
+        const fs::path fix_dir = fs::path(BROSOUNDML_REPO_DIR) / "tests" / "fixtures";
+        if (fs::exists(base / "model.safetensors")) {
+            brosoundml::QwenTtsSpeakerEncoderConfig sc;
+            sc.present = true;
+            sc.enc_channels     = {512, 512, 512, 512, 1536};
+            sc.enc_kernel_sizes = {5, 3, 3, 3, 1};
+            sc.enc_dilations    = {1, 2, 3, 4, 1};
+            auto w = brotensor::safetensors::File::open((base / "model.safetensors").string());
+            brosoundml::QwenTtsSpeakerEncoder enc;
+            enc.load(w, sc);
+
+            auto check_speaker = [&](const char* fname) {
+                std::ifstream f((fix_dir / fname).string(), std::ios::binary);
+                if (!f) return;  // not generated locally — skip
+                int32_t hdr[4];
+                f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+                const int n = hdr[0], M = hdr[1], F = hdr[2], D = hdr[3];
+                std::vector<float> wav(n), mel(static_cast<std::size_t>(M) * F),
+                                   emb(D);
+                f.read(reinterpret_cast<char*>(wav.data()), n * 4);
+                f.read(reinterpret_cast<char*>(mel.data()),
+                       static_cast<std::streamsize>(mel.size()) * 4);
+                f.read(reinterpret_cast<char*>(emb.data()), D * 4);
+                CHECK(static_cast<bool>(f), "speaker fixture read complete");
+
+                // mel front-end
+                std::vector<float> got_mel; int gf = 0;
+                enc.mel(wav.data(), n, got_mel, gf);
+                CHECK(gf == F, "speaker mel frame count matches upstream");
+                double mel_max = 0.0;
+                if (gf == F)
+                    for (std::size_t i = 0; i < mel.size(); ++i)
+                        mel_max = std::max(mel_max, std::fabs(double(got_mel[i]) - mel[i]));
+
+                // embedding (cosine similarity + max abs diff)
+                std::vector<float> got = enc.embed(wav.data(), n);
+                CHECK(static_cast<int>(got.size()) == D, "speaker embedding width matches");
+                double dot = 0, na = 0, nb = 0, emax = 0;
+                if (static_cast<int>(got.size()) == D)
+                    for (int i = 0; i < D; ++i) {
+                        dot += double(got[i]) * emb[i];
+                        na  += double(got[i]) * got[i];
+                        nb  += double(emb[i]) * emb[i];
+                        emax = std::max(emax, std::fabs(double(got[i]) - emb[i]));
+                    }
+                const double cos = dot / (std::sqrt(na * nb) + 1e-12);
+                std::printf("    [speaker fixture %s] mel=(%d,%d) mel_max|d|=%.2e  "
+                            "emb cos=%.6f max|d|=%.3e\n", fname, M, F, mel_max, cos, emax);
+                CHECK(mel_max < 1e-3, "speaker mel matches upstream front end");
+                CHECK(cos > 0.999, "speaker embedding matches upstream (cosine)");
+            };
+            check_speaker("qwen_tts_speaker_small.bin");
+            check_speaker("qwen_tts_speaker.bin");
+        }
     }
 
     if (failures == 0) {

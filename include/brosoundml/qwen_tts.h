@@ -136,6 +136,31 @@ struct QwenTtsCodecEncoderConfig {
     int valid_num_quantizers = 0;   // codes kept per frame (16: 1 semantic + 15 acoustic)
 };
 
+// The Base-variant speaker encoder (`speaker_encoder.*`) — an ECAPA-TDNN
+// x-vector extractor. A reference clip's log-mel (128-band, 24 kHz) -> a single
+// `enc_dim` speaker embedding, which the zero-shot voice clone splices into the
+// Talker codec prefill where a CustomVoice preset speaker token would sit. Only
+// the Base checkpoint ships one (`present == false` otherwise). The channel /
+// kernel / dilation lists and the mel-frontend params are upstream defaults
+// (config.json carries only enc_dim + sample_rate).
+struct QwenTtsSpeakerEncoderConfig {
+    bool present     = false;   // true only for the Base variant
+    int  mel_dim     = 128;     // log-mel bands (encoder input channels)
+    int  enc_dim     = 1024;    // output x-vector width
+    int  sample_rate = 24000;   // required input rate
+
+    std::vector<int> enc_channels;       // [512, 512, 512, 512, 1536]
+    std::vector<int> enc_kernel_sizes;   // [5, 3, 3, 3, 1]
+    std::vector<int> enc_dilations;      // [1, 2, 3, 4, 1]
+    int res2net_scale      = 8;
+    int se_channels        = 128;
+    int attention_channels = 128;
+
+    // Mel frontend (librosa slaney basis + log compression): STFT n_fft / hop /
+    // win, and the mel band edges.
+    int n_fft = 1024, hop_size = 256, win_size = 1024, fmin = 0, fmax = 12000;
+};
+
 // The bundled 12 Hz codec decoder (speech_tokenizer/) — 16 RVQ codes -> 24 kHz.
 struct QwenTtsCodecConfig {
     // RVQ quantizers (codebooks stored as EMA embedding_sum / cluster_usage).
@@ -175,8 +200,9 @@ struct QwenTtsConfig {
     int tts_bos_id  = 0, tts_eos_id = 0, tts_pad_id   = 0;
     int im_start_id = 0, im_end_id  = 0, assistant_id = 0;
 
-    QwenTtsTalkerConfig talker;
-    QwenTtsCodecConfig  codec;
+    QwenTtsTalkerConfig       talker;
+    QwenTtsCodecConfig        codec;
+    QwenTtsSpeakerEncoderConfig speaker_encoder;  // Base only (present == true)
 };
 
 // The Qwen3-TTS pipeline. Construct, load() a model directory, then

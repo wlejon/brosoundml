@@ -2,6 +2,7 @@
 
 #include "qwen_tts_codec.h"
 #include "qwen_tts_codec_encoder.h"
+#include "qwen_tts_speaker_encoder.h"
 #include "qwen_tts_code_predictor.h"
 #include "qwen_tts_generate.h"
 #include "qwen_tts_talker.h"
@@ -154,6 +155,24 @@ QwenTtsConfig parse_model_config(const std::string& path) {
     c.assistant_id = root.get_int("assistant_token_id", 0);
 
     parse_talker(obj_at(root, "talker_config", where), c.talker, where);
+
+    // Base ships an ECAPA-TDNN speaker encoder (config.json carries only enc_dim
+    // + sample_rate; the channel/kernel/dilation lists and mel params are the
+    // upstream defaults). Absent on CustomVoice / VoiceDesign.
+    if (const j::Value* se = root.find("speaker_encoder_config");
+        se && se->is_object()) {
+        QwenTtsSpeakerEncoderConfig& s = c.speaker_encoder;
+        s.present     = true;
+        s.mel_dim     = se->get_int("mel_dim", 128);
+        s.enc_dim     = se->get_int("enc_dim", 1024);
+        s.sample_rate = se->get_int("sample_rate", 24000);
+        s.enc_channels     = se->get_int_array("enc_channels", {512, 512, 512, 512, 1536});
+        s.enc_kernel_sizes = se->get_int_array("enc_kernel_sizes", {5, 3, 3, 3, 1});
+        s.enc_dilations    = se->get_int_array("enc_dilations", {1, 2, 3, 4, 1});
+        s.res2net_scale       = se->get_int("enc_res2net_scale", 8);
+        s.se_channels         = se->get_int("enc_se_channels", 128);
+        s.attention_channels  = se->get_int("enc_attention_channels", 128);
+    }
     return c;
 }
 
@@ -233,6 +252,7 @@ struct QwenTts::Impl {
     bool                  loaded = false;
     QwenTtsCodecDecoder   codec;       // built in load(); runs decode_codes()
     QwenTtsCodecEncoder   codec_enc;   // built in load(); runs encode_audio()
+    QwenTtsSpeakerEncoder spk_enc;     // Base only: ref clip -> x-vector
     QwenTtsTalker         talker;      // 28-layer Qwen3 decoder backbone
     QwenTtsCodePredictor  code_pred;   // 5-layer depth transformer
     std::unique_ptr<brolm::qwen::Tokenizer> tokenizer;  // text -> Qwen BPE ids
@@ -290,6 +310,17 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
         impl_->talker.load(w, impl_->config.talker, device);
         impl_->code_pred.load(w, impl_->config.talker.code_predictor,
                               impl_->config.talker.transformer.hidden_size, device);
+
+        // Base ships an ECAPA-TDNN speaker encoder (in this same checkpoint) for
+        // the zero-shot voice clone. Loaded host-side (enrollment is one-shot).
+        if (impl_->config.speaker_encoder.present) {
+            require_tensors(w, {
+                "speaker_encoder.blocks.0.conv.weight",
+                "speaker_encoder.asp.tdnn.conv.weight",
+                "speaker_encoder.fc.weight",
+            }, "model.safetensors");
+            impl_->spk_enc.load(w, impl_->config.speaker_encoder);
+        }
     }
 
     // Text tokenizer (Qwen byte-level BPE). The chat prompt uses the
