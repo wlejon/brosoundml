@@ -304,7 +304,8 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
 
 AudioBuffer QwenTts::synthesize(const std::string& text,
                                 const std::string& speaker,
-                                const std::string& language) const {
+                                const std::string& language,
+                                const CancelCheck& cancel) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
     }
@@ -367,7 +368,9 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     std::vector<int32_t> frames;
     const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
                                  T, pos3.data(), trailing.data(), L, tts_pad.data(),
-                                 gp, frames);
+                                 gp, frames, cancel);
+    // Cancelled mid-loop: discard the partial code stream and return silence.
+    if (cancel && cancel()) return AudioBuffer{};
     const int G = tk.num_code_groups;
 
     // Transpose frame-major [F][G] to the codebook-major layout decode_codes

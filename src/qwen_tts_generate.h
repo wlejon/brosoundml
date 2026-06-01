@@ -18,6 +18,8 @@
 #include "qwen_tts_code_predictor.h"
 #include "qwen_tts_talker.h"
 
+#include "brosoundml/audio.h"   // CancelCheck
+
 #include <cstdint>
 #include <vector>
 
@@ -42,11 +44,16 @@ struct QwenTtsGenParams {
 // Emitted frames are appended to `out_frames` as num_code_groups ints each,
 // frame-major then codebook-within-frame: [c0..c15, c0..c15, ...]. Returns the
 // number of frames.
+//
+// `cancel` is polled once per frame; when it returns true the loop stops early
+// and returns the frames emitted so far (the caller discards them). Empty (the
+// default) never cancels, so existing callers are unaffected.
 int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* prefill_embeds, int T, const int32_t* pos3T,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
-                   std::vector<int32_t>& out_frames);
+                   std::vector<int32_t>& out_frames,
+                   const CancelCheck& cancel = {});
 
 // Assemble the CustomVoice prefill embedding stream + trailing-text embeddings,
 // mirroring the upstream Qwen3TTS generate() (streaming, speaker preset, no

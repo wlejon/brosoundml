@@ -178,11 +178,14 @@ public:
     // Synthesize speech for `text` in `language`, voiced by the preset speaker
     // `speaker` (CustomVoice). Returns mono 24 kHz PCM.
     //
-    // STAGED STUB: throws std::runtime_error naming the build-out stage until
-    // the Talker / Code Predictor / codec forward pass lands.
+    // `cancel` is polled once per generated frame in the autoregressive loop
+    // (the dominant cost — Talker step + Code Predictor per 12.5 Hz frame); when
+    // it returns true the loop aborts and synthesize() returns an empty buffer
+    // (the partial code stream is discarded). Empty (the default) = no cancel.
     AudioBuffer synthesize(const std::string& text,
                            const std::string& speaker,
-                           const std::string& language = "english") const;
+                           const std::string& language = "english",
+                           const CancelCheck& cancel = {}) const;
 
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable

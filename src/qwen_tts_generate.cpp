@@ -70,7 +70,8 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* prefill_embeds, int T, const int32_t* pos3T,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
-                   std::vector<int32_t>& out_frames) {
+                   std::vector<int32_t>& out_frames,
+                   const CancelCheck& cancel) {
     const bt::Device dev = talker.final_norm.device;
     bt::DeviceScope scope(dev);
     const int H = talker.hidden;
@@ -100,6 +101,11 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
     for (int step = 0; step < params.max_frames; ++step) {
+        // Cooperative cancellation: poll once per frame (the dominant cost) and
+        // bail with whatever's emitted so far — the caller discards a cancelled
+        // result.
+        if (cancel && cancel()) break;
+
         // codebook 0: codec_head over the current hidden, with the upstream
         // logits processing applied on the host (a single 3072-wide row).
         auto th = prof.tick();
