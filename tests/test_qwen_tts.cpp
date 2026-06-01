@@ -542,7 +542,8 @@ static int run() {
                 std::vector<float> prefill, trailing, tts_pad;
                 int gotT = 0, gotL = 0;
                 brosoundml::assemble_talker_prefill(
-                    talker, cfg, ids, /*instruct_ids=*/{}, spk_id, language_id,
+                    talker, cfg, ids, /*instruct_ids=*/{}, spk_id,
+                    /*spk_embed=*/nullptr, language_id,
                     prefill, gotT, trailing, gotL, tts_pad);
                 CHECK(gotT == T, tag("assembled prefill length matches"));
                 CHECK(gotL == L, tag("assembled trailing length matches"));
@@ -673,6 +674,131 @@ static int run() {
             };
             check_speaker("qwen_tts_speaker_small.bin");
             check_speaker("qwen_tts_speaker.bin");
+
+            // ─── Base zero-shot voice clone (x-vector) vs ground-truth ──────
+            //
+            // End-to-end check of synthesize_clone()'s deterministic core: the
+            // x-vector splice into the Talker prefill + the greedy AR loop, vs
+            // the genuine upstream Base clone (tests/ref/gen_qwen_tts_clone_fixture.py).
+            // The reference clip is encoded by the C++ ECAPA encoder (above), so
+            // this exercises the whole enroll -> prefill -> generate path. Builds
+            // the Talker / Code Predictor white-box on CPU (the greedy stream is
+            // CPU==CUDA identical, as the synth fixture establishes).
+            std::ifstream cf((fix_dir / "qwen_tts_clone.bin").string(), std::ios::binary);
+            if (cf) {
+                auto rd = [&](void* p, std::size_t b) {
+                    cf.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(b));
+                };
+                int32_t tlen = 0; rd(&tlen, 4);
+                std::string text(tlen, '\0'); rd(text.data(), tlen);
+                int32_t hh[2]; rd(hh, sizeof(hh));
+                const int H = hh[0], n_ids = hh[1];
+                std::vector<int32_t> ref_ids(n_ids); rd(ref_ids.data(), n_ids * 4);
+                int32_t language_id = 0; rd(&language_id, 4);
+                int32_t enc_dim = 0; rd(&enc_dim, 4);
+                std::vector<float> ref_xvec(enc_dim); rd(ref_xvec.data(), enc_dim * 4);
+                int32_t n_ref = 0; rd(&n_ref, 4);
+                std::vector<float> ref_wav(n_ref); rd(ref_wav.data(), n_ref * 4);
+                int32_t T = 0; rd(&T, 4);
+                std::vector<float> ref_prefill(static_cast<std::size_t>(T) * H);
+                rd(ref_prefill.data(), ref_prefill.size() * 4);
+                int32_t L = 0; rd(&L, 4);
+                std::vector<float> ref_trailing(static_cast<std::size_t>(L) * H);
+                rd(ref_trailing.data(), ref_trailing.size() * 4);
+                std::vector<float> ref_pad(H); rd(ref_pad.data(), H * 4);
+                int32_t fg[2]; rd(fg, sizeof(fg));
+                const int F = fg[0], G = fg[1];
+                std::vector<int32_t> ref_frames(static_cast<std::size_t>(F) * G);
+                rd(ref_frames.data(), ref_frames.size() * 4);
+                CHECK(static_cast<bool>(cf), "clone fixture read complete");
+
+                // Config via a real Base load (also exercises the Base load path).
+                QwenTts qb;
+                qb.load(base.string(), brotensor::Device::CPU);
+                const auto& c = qb.config();
+                CHECK(c.variant == QwenTtsVariant::Base, "clone: variant == Base");
+                CHECK(c.speaker_encoder.present, "clone: Base ships a speaker encoder");
+
+                brosoundml::QwenTtsTalker talker;
+                brosoundml::QwenTtsCodePredictor cp;
+                talker.load(w, c.talker, brotensor::Device::CPU);
+                cp.load(w, c.talker.code_predictor, c.talker.transformer.hidden_size,
+                        brotensor::Device::CPU);
+                auto tok = brolm::qwen::Tokenizer::load(
+                    (base / "vocab.json").string(), (base / "merges.txt").string());
+                tok.register_special_token("<|im_start|>", c.im_start_id);
+                tok.register_special_token("<|im_end|>",   c.im_end_id);
+                std::vector<int32_t> ids = tok.encode(
+                    "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n");
+                bool ids_match = (ids.size() == ref_ids.size());
+                for (std::size_t i = 0; ids_match && i < ids.size(); ++i)
+                    ids_match = (ids[i] == ref_ids[i]);
+                CHECK(ids_match, "clone: tokenizer reproduces upstream ids");
+                if (!ids_match) ids = ref_ids;
+
+                // my x-vector from the reference clip (cosine vs upstream)
+                std::vector<float> xv = enc.embed(ref_wav.data(), n_ref);
+                double dot = 0, na = 0, nb = 0;
+                for (int i = 0; i < enc_dim; ++i) {
+                    dot += double(xv[i]) * ref_xvec[i];
+                    na += double(xv[i]) * xv[i]; nb += double(ref_xvec[i]) * ref_xvec[i];
+                }
+                CHECK(dot / (std::sqrt(na * nb) + 1e-12) > 0.999,
+                      "clone: x-vector matches upstream (cosine)");
+
+                // prefill assembly with the x-vector spliced into the speaker slot
+                brosoundml::QwenTtsConfig cfg = c;
+                std::vector<float> prefill, trailing, tts_pad;
+                int gotT = 0, gotL = 0;
+                brosoundml::assemble_talker_prefill(
+                    talker, cfg, ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+                    xv.data(), language_id, prefill, gotT, trailing, gotL, tts_pad);
+                CHECK(gotT == T, "clone: prefill length matches");
+                CHECK(gotL == L, "clone: trailing length matches");
+                auto cmpc = [&](const char* what, const std::vector<float>& got,
+                                const std::vector<float>& ref, double tol) {
+                    if (got.size() != ref.size()) { CHECK(false, what); return; }
+                    double mx = 0.0;
+                    for (std::size_t i = 0; i < ref.size(); ++i)
+                        mx = std::max(mx, std::fabs(double(got[i]) - ref[i]));
+                    std::printf("    [clone %s] max|d|=%.2e\n", what, mx);
+                    CHECK(mx < tol, what);
+                };
+                if (gotT == T) cmpc("prefill", prefill, ref_prefill, 5e-3);
+                if (gotL == L) cmpc("trailing", trailing, ref_trailing, 5e-3);
+
+                // greedy AR loop -> frames must match upstream exactly
+                std::vector<int32_t> pos3(static_cast<std::size_t>(3) * gotT);
+                for (int a = 0; a < 3; ++a)
+                    for (int t = 0; t < gotT; ++t) pos3[a * gotT + t] = t;
+                brosoundml::QwenTtsGenParams gp;
+                gp.eos_id = c.talker.codec_eos_id;
+                gp.max_frames = F;
+                gp.suppress_lo = c.talker.vocab_size - 1024;
+                gp.suppress_hi = c.talker.vocab_size;
+                gp.min_frames = 2;
+                gp.repetition_penalty = 1.05f;
+                std::vector<int32_t> got_frames;
+                const int gotF = brosoundml::generate_codes(
+                    talker, cp, prefill.data(), gotT, pos3.data(),
+                    trailing.data(), gotL, tts_pad.data(), gp, got_frames);
+                int sm = 0;
+                if (gotF == F)
+                    for (std::size_t i = 0; i < ref_frames.size(); ++i)
+                        if (got_frames[i] != ref_frames[i]) ++sm;
+                std::printf("    [clone AR loop] F=%d code mismatches=%d/%d\n", F, sm, F * G);
+                CHECK(gotF == F, "clone: AR frame count matches upstream");
+                CHECK(sm == 0, "clone: code stream matches upstream exactly");
+
+                // public synthesize_clone() runs end to end (codes -> 24 kHz)
+                brosoundml::AudioBuffer rwav(std::vector<float>(
+                    ref_wav.begin(), ref_wav.end()), 24000);
+                brosoundml::AudioBuffer out = qb.synthesize_clone(text, rwav, "english");
+                CHECK(out.sample_rate == 24000, "clone: synthesize_clone returns 24 kHz");
+                CHECK(!out.samples.empty(), "clone: synthesize_clone returns audio");
+                std::printf("    [synthesize_clone] %zu samples (%.2fs)\n",
+                            out.samples.size(), out.samples.size() / 24000.0);
+            }
         }
     }
 

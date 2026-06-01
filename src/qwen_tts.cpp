@@ -420,11 +420,79 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
         instruct_ids = impl_->tokenizer->encode(ins_prompt);
     }
 
+    return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
+                      language_id, cancel);
+}
+
+AudioBuffer QwenTts::synthesize_clone(const std::string& text,
+                                      const AudioBuffer& ref,
+                                      const std::string& language,
+                                      const CancelCheck& cancel) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::synthesize_clone", "no model loaded; call QwenTts::load() first");
+    }
+    if (!impl_->config.speaker_encoder.present) {
+        fail("QwenTts::synthesize_clone",
+             "loaded checkpoint has no speaker encoder; the zero-shot clone "
+             "needs a Base-variant model");
+    }
+    if (ref.samples.empty()) {
+        fail("QwenTts::synthesize_clone", "reference audio is empty");
+    }
+    const QwenTtsConfig&       cfg = impl_->config;
+    const QwenTtsTalkerConfig& tk  = cfg.talker;
+
+    // Resolve language (Base has no preset speakers / dialects).
+    int language_id = -1;
+    if (language != "auto") {
+        auto it = tk.codec_language_id.find(language);
+        if (it == tk.codec_language_id.end())
+            fail("QwenTts::synthesize_clone", "unsupported language '" + language + "'");
+        language_id = it->second;
+    }
+
+    // Enroll: reference clip -> 24 kHz mono -> ECAPA-TDNN x-vector (host floats).
+    const int sr = cfg.speaker_encoder.sample_rate;
+    const float* wav = ref.samples.data();
+    int n = static_cast<int>(ref.samples.size());
+    std::vector<float> resampled;
+    if (ref.sample_rate != sr && ref.sample_rate > 0) {
+        const int n_out = static_cast<int>(
+            std::llround(static_cast<double>(n) * sr / ref.sample_rate));
+        brotensor::Tensor x =
+            brotensor::Tensor::from_host_on(brotensor::Device::CPU, wav, 1, n);
+        brotensor::Tensor y;
+        brotensor::resample1d_forward(x, /*N=*/1, /*C=*/1, n, n_out, /*mode=*/1, y);
+        resampled.assign(y.host_f32(), y.host_f32() + n_out);
+        wav = resampled.data();
+        n = n_out;
+    }
+    const std::vector<float> spk_embed = impl_->spk_enc.embed(wav, n);
+
+    // Tokenize the body chat prompt (the text to speak).
+    const std::string prompt =
+        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9) {
+        fail("QwenTts::synthesize_clone", "prompt tokenized to too few tokens");
+    }
+
+    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+                      spk_embed.data(), language_id, cancel);
+}
+
+AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
+                                const std::vector<int32_t>& instruct_ids,
+                                int spk_id, const float* spk_embed,
+                                int language_id, const CancelCheck& cancel) const {
+    const QwenTtsConfig&       cfg = impl_->config;
+    const QwenTtsTalkerConfig& tk  = cfg.talker;
+
     // Assemble the prefill embedding stream + trailing-text embeddings.
     std::vector<float> prefill, trailing, tts_pad;
     int T = 0, L = 0;
     assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id,
-                            language_id, prefill, T, trailing, L, tts_pad);
+                            spk_embed, language_id, prefill, T, trailing, L, tts_pad);
 
     // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's
     // get_rope_index is cumsum of an all-ones mask), rope_delta 0.

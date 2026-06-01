@@ -177,7 +177,7 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const QwenTtsConfig& cfg,
                              const std::vector<int32_t>& input_ids,
                              const std::vector<int32_t>& instruct_ids,
-                             int spk_id, int language_id,
+                             int spk_id, const float* spk_embed, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
                              std::vector<float>& tts_pad) {
@@ -204,7 +204,17 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
     } else {
         codec_input = {tk.codec_think_id, tk.codec_think_bos_id, language_id, tk.codec_think_eos_id};
     }
-    if (spk_id >= 0) codec_input.push_back(spk_id);
+    // The speaker sits between the think tag and the pad/bos. CustomVoice uses a
+    // preset speaker token (looked up in codec_embedding); the Base zero-shot
+    // clone instead splices a raw x-vector at that position (spk_pos), so push a
+    // placeholder token there and override the row below.
+    int spk_pos = -1;
+    if (spk_embed) {
+        spk_pos = static_cast<int>(codec_input.size());
+        codec_input.push_back(tk.codec_pad_id);
+    } else if (spk_id >= 0) {
+        codec_input.push_back(spk_id);
+    }
     codec_input.push_back(tk.codec_pad_id);
     codec_input.push_back(tk.codec_bos_id);
     const int C = static_cast<int>(codec_input.size());
@@ -234,9 +244,10 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
     std::vector<float> ce;
     for (int i = 0; i < C - 1; ++i) {
         float* dst = prefill.data() + static_cast<std::size_t>(I + 3 + i) * H;
-        codec_row(codec_input[i], ce);
         const float* txt = (i < C - 2) ? tts_pad_e.data() : tts_bos.data();
-        for (int d = 0; d < H; ++d) dst[d] = txt[d] + ce[d];
+        const float* codec = spk_embed;             // raw x-vector at spk_pos
+        if (i != spk_pos) { codec_row(codec_input[i], ce); codec = ce.data(); }
+        for (int d = 0; d < H; ++d) dst[d] = txt[d] + codec[d];
     }
 
     // last prefill row: text_projection(first body token) + codec_embedding(codec_bos).

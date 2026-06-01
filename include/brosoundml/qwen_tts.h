@@ -242,6 +242,19 @@ public:
                            const std::string& instruct = "",
                            const CancelCheck& cancel = {}) const;
 
+    // Zero-shot voice clone (Base variant only): synthesize `text` in the voice
+    // of a reference clip `ref`. The clip is encoded to a speaker x-vector by the
+    // ECAPA-TDNN speaker encoder and spliced into the Talker prefill where a
+    // CustomVoice preset speaker token would sit — "x-vector-only" enrollment, no
+    // reference transcript. `ref` is downmixed/resampled to 24 kHz internally.
+    // `cancel` is polled once per generated frame (see synthesize()). Throws if no
+    // model is loaded, the loaded checkpoint is not a Base variant (no speaker
+    // encoder), or `ref` is empty. Returns mono 24 kHz PCM.
+    AudioBuffer synthesize_clone(const std::string& text,
+                                 const AudioBuffer& ref,
+                                 const std::string& language = "english",
+                                 const CancelCheck& cancel = {}) const;
+
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
     // on its own once the Talker / Code Predictor have produced (or a caller
@@ -283,6 +296,16 @@ public:
     bool loaded() const;
 
 private:
+    // Shared synthesis tail: tokenize-resolved inputs -> prefill -> AR loop ->
+    // codec decode. `spk_embed` (hidden floats, or null) is the Base clone's
+    // x-vector spliced into the prefill speaker slot; `spk_id` the CustomVoice
+    // preset token (or -1). Both callers (synthesize / synthesize_clone) resolve
+    // language + speaker then delegate here.
+    AudioBuffer synth_core(const std::vector<int32_t>& input_ids,
+                           const std::vector<int32_t>& instruct_ids,
+                           int spk_id, const float* spk_embed, int language_id,
+                           const CancelCheck& cancel) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

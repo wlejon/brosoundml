@@ -69,6 +69,12 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
 //                    instruct path). Pure text rows — no codec component.
 //   `spk_id`       — the codec speaker token (>=0), or -1 for none (VoiceDesign,
 //                    or a model with no speaker presets).
+//   `spk_embed`    — a raw speaker embedding (hidden floats), spliced into the
+//                    codec prefix in the slot a preset speaker token would
+//                    occupy. This is the Base zero-shot clone's x-vector
+//                    (QwenTtsSpeakerEncoder::embed), used directly rather than
+//                    looked up in the codec_embedding table. nullptr = none; not
+//                    combined with spk_id (a model uses one or the other).
 //   `language_id`  — the codec language token (>=0), or -1 for "auto".
 //
 // Writes the prefill (T*hidden row-major), the per-frame trailing-text hidden
@@ -80,7 +86,7 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const QwenTtsConfig& cfg,
                              const std::vector<int32_t>& input_ids,
                              const std::vector<int32_t>& instruct_ids,
-                             int spk_id, int language_id,
+                             int spk_id, const float* spk_embed, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
                              std::vector<float>& tts_pad);
