@@ -175,8 +175,13 @@ public:
     void load(const std::string& model_dir,
               brotensor::Device device = brotensor::Device::CPU);
 
-    // Synthesize speech for `text` in `language`, voiced by the preset speaker
-    // `speaker` (CustomVoice). Returns mono 24 kHz PCM.
+    // Synthesize speech for `text` in `language`. The voice is chosen by variant:
+    //   CustomVoice — pass a preset `speaker` name (see speakers()); `instruct`
+    //                 is ignored on the 0.6B checkpoint, honoured on 1.7B.
+    //   VoiceDesign — pass a natural-language `instruct` describing the voice
+    //                 (e.g. "a warm, low-pitched elderly storyteller"); `speaker`
+    //                 is unused (the model has no presets).
+    // Returns mono 24 kHz PCM.
     //
     // `cancel` is polled once per generated frame in the autoregressive loop
     // (the dominant cost — Talker step + Code Predictor per 12.5 Hz frame); when
@@ -185,6 +190,7 @@ public:
     AudioBuffer synthesize(const std::string& text,
                            const std::string& speaker,
                            const std::string& language = "english",
+                           const std::string& instruct = "",
                            const CancelCheck& cancel = {}) const;
 
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
@@ -200,6 +206,16 @@ public:
     // Preset speaker names available in this checkpoint (CustomVoice only;
     // empty for Base / VoiceDesign).
     std::vector<std::string> speakers() const;
+
+    // Selectable language names for synthesize() (the codec_language_id keys,
+    // excluding the dialect tags, which are reached via their dialect speaker).
+    // "auto" is always valid (no language tag) but is not included here.
+    std::vector<std::string> languages() const;
+
+    // The dialect tag for a preset speaker ("sichuan_dialect" / "beijing_dialect"),
+    // or "" if the speaker is not a dialect voice / is unknown. Lets a UI badge
+    // the dialect speakers without hard-coding the speaker list.
+    std::string speaker_dialect(const std::string& speaker) const;
 
     const QwenTtsConfig& config() const;
     bool loaded() const;

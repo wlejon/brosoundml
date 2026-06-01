@@ -55,22 +55,34 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    std::vector<int32_t>& out_frames,
                    const CancelCheck& cancel = {});
 
-// Assemble the CustomVoice prefill embedding stream + trailing-text embeddings,
-// mirroring the upstream Qwen3TTS generate() (streaming, speaker preset, no
-// voice clone). `input_ids` are the tokenized chat prompt
-// (<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n);
-// `spk_id` is the codec speaker token (>=0), `language_id` the codec language
-// token (>=0), or -1 for "auto" (no language tag). Writes the prefill (T*hidden
-// row-major), the per-frame trailing-text hidden (L*hidden), and the tts_pad
-// embedding (hidden). The prefill positions are a plain 0..T-1 ramp (the
-// Talker's get_rope_index is cumsum of an all-ones mask), so the caller pairs
+// Assemble the Talker prefill embedding stream + trailing-text embeddings,
+// mirroring the upstream Qwen3TTS generate() (streaming, no voice clone). Covers
+// both the CustomVoice and VoiceDesign variants:
+//
+//   `input_ids`    — the tokenized body chat prompt
+//                    (<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n).
+//   `instruct_ids` — the tokenized natural-language voice instruction
+//                    (<|im_start|>user\n{instruct}<|im_end|>\n), or empty for no
+//                    instruction. When present its text_projection embeddings are
+//                    prepended to the prefill, exactly as upstream prepends the
+//                    instruct turn (VoiceDesign; also the 1.7B CustomVoice
+//                    instruct path). Pure text rows — no codec component.
+//   `spk_id`       — the codec speaker token (>=0), or -1 for none (VoiceDesign,
+//                    or a model with no speaker presets).
+//   `language_id`  — the codec language token (>=0), or -1 for "auto".
+//
+// Writes the prefill (T*hidden row-major), the per-frame trailing-text hidden
+// (L*hidden), and the tts_pad embedding (hidden). The prefill positions are a
+// plain 0..T-1 ramp (the Talker's get_rope_index is cumsum of an all-ones mask,
+// and the prepended instruct rows are ordinary text tokens), so the caller pairs
 // this with rope_delta = 0.
-void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
-                                   const QwenTtsConfig& cfg,
-                                   const std::vector<int32_t>& input_ids,
-                                   int spk_id, int language_id,
-                                   std::vector<float>& prefill, int& T,
-                                   std::vector<float>& trailing, int& L,
-                                   std::vector<float>& tts_pad);
+void assemble_talker_prefill(const QwenTtsTalker& talker,
+                             const QwenTtsConfig& cfg,
+                             const std::vector<int32_t>& input_ids,
+                             const std::vector<int32_t>& instruct_ids,
+                             int spk_id, int language_id,
+                             std::vector<float>& prefill, int& T,
+                             std::vector<float>& trailing, int& L,
+                             std::vector<float>& tts_pad);
 
 }  // namespace brosoundml

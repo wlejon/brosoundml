@@ -265,7 +265,8 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
         }, "model.safetensors");
         // Stages 3-4: build the Talker + Code Predictor (the AR generator).
         impl_->talker.load(w, impl_->config.talker, device);
-        impl_->code_pred.load(w, impl_->config.talker.code_predictor, device);
+        impl_->code_pred.load(w, impl_->config.talker.code_predictor,
+                              impl_->config.talker.transformer.hidden_size, device);
     }
 
     // Text tokenizer (Qwen byte-level BPE). The chat prompt uses the
@@ -305,6 +306,7 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
 AudioBuffer QwenTts::synthesize(const std::string& text,
                                 const std::string& speaker,
                                 const std::string& language,
+                                const std::string& instruct,
                                 const CancelCheck& cancel) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
@@ -313,7 +315,9 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
     // Resolve speaker / language to codec tokens (and apply the dialect
-    // override the upstream pipeline does for dialect speakers).
+    // override the upstream pipeline does for dialect speakers). A model with no
+    // speaker presets (VoiceDesign) has an empty spk_id table — leave spk_id -1.
+    // The speaker name is then only consulted for the dialect override below.
     int spk_id = -1;
     if (!tk.spk_id.empty()) {
         auto it = tk.spk_id.find(speaker);
@@ -336,7 +340,7 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
         }
     }
 
-    // Tokenize the CustomVoice chat prompt.
+    // Tokenize the body chat prompt (the text to speak).
     const std::string prompt =
         "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
     const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
@@ -344,11 +348,23 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
         fail("QwenTts::synthesize", "prompt tokenized to too few tokens");
     }
 
+    // VoiceDesign (and 1.7B CustomVoice) take a natural-language voice
+    // instruction, tokenized as its own user turn and prepended to the prefill.
+    // Empty = no instruction (the only mode the 0.6B CustomVoice checkpoint
+    // supports). The 0.6B CustomVoice ignores any instruct, matching upstream.
+    std::vector<int32_t> instruct_ids;
+    const bool ignore_instruct =
+        (cfg.variant == QwenTtsVariant::CustomVoice && cfg.model_size == "0b6");
+    if (!instruct.empty() && !ignore_instruct) {
+        const std::string ins_prompt = "<|im_start|>user\n" + instruct + "<|im_end|>\n";
+        instruct_ids = impl_->tokenizer->encode(ins_prompt);
+    }
+
     // Assemble the prefill embedding stream + trailing-text embeddings.
     std::vector<float> prefill, trailing, tts_pad;
     int T = 0, L = 0;
-    assemble_custom_voice_prefill(impl_->talker, cfg, input_ids, spk_id,
-                                  language_id, prefill, T, trailing, L, tts_pad);
+    assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id,
+                            language_id, prefill, T, trailing, L, tts_pad);
 
     // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's
     // get_rope_index is cumsum of an all-ones mask), rope_delta 0.
@@ -408,6 +424,18 @@ std::vector<std::string> QwenTts::speakers() const {
     out.reserve(impl_->config.talker.spk_id.size());
     for (const auto& kv : impl_->config.talker.spk_id) out.push_back(kv.first);
     return out;
+}
+
+std::vector<std::string> QwenTts::languages() const {
+    std::vector<std::string> out;
+    for (const auto& kv : impl_->config.talker.codec_language_id)
+        if (kv.first.find("dialect") == std::string::npos) out.push_back(kv.first);
+    return out;
+}
+
+std::string QwenTts::speaker_dialect(const std::string& speaker) const {
+    auto it = impl_->config.talker.spk_dialect.find(speaker);
+    return it != impl_->config.talker.spk_dialect.end() ? it->second : std::string();
 }
 
 const QwenTtsConfig& QwenTts::config() const { return impl_->config; }

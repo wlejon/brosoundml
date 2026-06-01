@@ -141,13 +141,23 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
     bt::rms_norm_forward(hs, cp.final_norm, cp.rms_eps, hidden_out);
 }
 
+// Project an (n, talker_hidden) input batch down to the depth-transformer hidden
+// via small_to_mtp_projection. Identity (returns the input) when widths match.
+bt::Tensor cp_project_in(const QwenTtsCodePredictor& cp, const bt::Tensor& in) {
+    if (!cp.has_mtp_proj) return in;
+    bt::Tensor out;
+    qtd::linear(cp.mtp_proj_w, &cp.mtp_proj_b, in, out);
+    return out;
+}
+
 }  // namespace
 
 void QwenTtsCodePredictor::load(const sf::File& f,
                                 const QwenTtsCodePredictorConfig& cfg,
-                                bt::Device dev) {
+                                int talker_hidden_, bt::Device dev) {
     num_layers      = cfg.transformer.num_hidden_layers;
     hidden          = cfg.transformer.hidden_size;
+    talker_hidden   = talker_hidden_;
     intermediate    = cfg.transformer.intermediate_size;
     n_q_heads       = cfg.transformer.num_attention_heads;
     n_kv_heads      = cfg.transformer.num_key_value_heads;
@@ -161,13 +171,23 @@ void QwenTtsCodePredictor::load(const sf::File& f,
     const std::string P = "talker.code_predictor.";
     final_norm = up_vec(f, P + "model.norm.weight", hidden, dev);
 
+    // The code embeddings live in the Talker hidden width; lm_head projects from
+    // the depth-transformer hidden width to the per-codebook vocab.
     codec_embedding.clear();
     lm_head.clear();
     for (int j = 0; j < n_tables; ++j) {
         codec_embedding.push_back(
-            up(f, P + "model.codec_embedding." + std::to_string(j) + ".weight", vocab, hidden, dev));
+            up(f, P + "model.codec_embedding." + std::to_string(j) + ".weight", vocab, talker_hidden, dev));
         lm_head.push_back(
             up(f, P + "lm_head." + std::to_string(j) + ".weight", vocab, hidden, dev));
+    }
+
+    // small_to_mtp_projection (Linear talker_hidden -> hidden + bias). Present
+    // only when the widths differ (1.7B); an identity is omitted upstream (0.6B).
+    has_mtp_proj = (talker_hidden != hidden);
+    if (has_mtp_proj) {
+        mtp_proj_w = up(f, P + "small_to_mtp_projection.weight", hidden, talker_hidden, dev);
+        mtp_proj_b = up_vec(f, P + "small_to_mtp_projection.bias", hidden, dev);
     }
 
     // Same HF rotate-half -> adjacent-pair RoPE permutation as the Talker.
@@ -219,8 +239,8 @@ void QwenTtsCodePredictor::predict(const float* past_hidden,
                                    std::vector<int>& out_codes) const {
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
-    bt::Tensor ph = bt::Tensor::from_host_on(dev, past_hidden, 1, hidden);
-    bt::Tensor ce = bt::Tensor::from_host_on(dev, c0_embed,    1, hidden);
+    bt::Tensor ph = bt::Tensor::from_host_on(dev, past_hidden, 1, talker_hidden);
+    bt::Tensor ce = bt::Tensor::from_host_on(dev, c0_embed,    1, talker_hidden);
     predict_dev(ph, ce, out_codes);
 }
 
@@ -260,11 +280,13 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     //    assembled on-device (no host staging of the two hidden-width rows) ──
     clk::time_point tpf;
     if (prof) { bt::sync_all(); tpf = clk::now(); ++CpProf::calls(); }
-    bt::Tensor pre_t = bt::Tensor::empty_on(dev, 2, hidden, bt::Dtype::FP32);
-    bt::copy_d2d(past_hidden, 0, pre_t, 0,      hidden);
-    bt::copy_d2d(c0_embed,    0, pre_t, hidden, hidden);
+    // The two conditioning rows arrive in the Talker hidden width; stage them,
+    // then project to the depth-transformer width (identity when widths match).
+    bt::Tensor pre_t = bt::Tensor::empty_on(dev, 2, talker_hidden, bt::Dtype::FP32);
+    bt::copy_d2d(past_hidden, 0, pre_t, 0,             talker_hidden);
+    bt::copy_d2d(c0_embed,    0, pre_t, talker_hidden, talker_hidden);
     bt::Tensor h;
-    cp_run(*this, pre_t, 2, /*pos_start=*/0, cache, h);   // (2, hidden)
+    cp_run(*this, cp_project_in(*this, pre_t), 2, /*pos_start=*/0, cache, h);  // (2, hidden)
 
     // codebook 1 from lm_head[0] applied to the last prefill row (row 1).
     bt::Tensor row1 = bt::Tensor::view(
@@ -279,9 +301,9 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     for (int j = 1; j < n_out; ++j) {
         const int prev_code = out_codes[j - 1];
         bt::Tensor erow = qtd::gather_rows(
-            codec_embedding[j - 1], {static_cast<std::int32_t>(prev_code)});  // (1, hidden)
+            codec_embedding[j - 1], {static_cast<std::int32_t>(prev_code)});  // (1, talker_hidden)
         bt::Tensor hstep;
-        cp_run(*this, erow, 1, /*pos_start=*/1 + j, cache, hstep);
+        cp_run(*this, cp_project_in(*this, erow), 1, /*pos_start=*/1 + j, cache, hstep);
         out_codes[j] = code_from(hstep, j);
     }
     if (prof) { bt::sync_all(); CpProf::steps() +=
@@ -307,7 +329,8 @@ void qwen_cp_profile_report() {
 
 const float* QwenTtsCodePredictor::codec_embedding_row(int table, int id) const {
     // Host pointer into the table — valid only when CPU-resident (host AR path).
-    return codec_embedding[table].host_f32() + static_cast<std::size_t>(id) * hidden;
+    // The code embeddings are talker_hidden-wide (the Talker hidden space).
+    return codec_embedding[table].host_f32() + static_cast<std::size_t>(id) * talker_hidden;
 }
 
 }  // namespace brosoundml

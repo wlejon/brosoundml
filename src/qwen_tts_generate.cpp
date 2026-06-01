@@ -173,13 +173,14 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     return static_cast<int>(out_frames.size()) / G;
 }
 
-void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
-                                   const QwenTtsConfig& cfg,
-                                   const std::vector<int32_t>& input_ids,
-                                   int spk_id, int language_id,
-                                   std::vector<float>& prefill, int& T,
-                                   std::vector<float>& trailing, int& L,
-                                   std::vector<float>& tts_pad) {
+void assemble_talker_prefill(const QwenTtsTalker& talker,
+                             const QwenTtsConfig& cfg,
+                             const std::vector<int32_t>& input_ids,
+                             const std::vector<int32_t>& instruct_ids,
+                             int spk_id, int language_id,
+                             std::vector<float>& prefill, int& T,
+                             std::vector<float>& trailing, int& L,
+                             std::vector<float>& tts_pad) {
     const int H = talker.hidden;
     const QwenTtsTalkerConfig& tk = cfg.talker;
 
@@ -208,19 +209,31 @@ void assemble_custom_voice_prefill(const QwenTtsTalker& talker,
     codec_input.push_back(tk.codec_bos_id);
     const int C = static_cast<int>(codec_input.size());
 
-    // prefill = role(3) + _tie(C-1) + first-text-token(1)  →  C+3 rows.
-    T = C + 3;
+    // VoiceDesign (and 1.7B CustomVoice) prepend a natural-language instruction
+    // turn before the role/body: each instruct token contributes one pure
+    // text_projection row (no codec component), exactly as upstream prepends
+    // text_projection(text_embedding(instruct_ids)). Empty = no instruction.
+    const int I = static_cast<int>(instruct_ids.size());
+
+    // prefill = instruct(I) + role(3) + _tie(C-1) + first-text-token(1).
+    T = I + C + 3;
     prefill.assign(static_cast<std::size_t>(T) * H, 0.0f);
 
-    // role: text_projection over the first three prompt tokens.
+    // instruction rows: text_projection over each instruction token.
+    for (int i = 0; i < I; ++i)
+        talker.text_embed_proj(instruct_ids[i],
+                               prefill.data() + static_cast<std::size_t>(i) * H);
+
+    // role: text_projection over the first three body prompt tokens.
     for (int r = 0; r < 3; ++r)
-        talker.text_embed_proj(input_ids[r], prefill.data() + static_cast<std::size_t>(r) * H);
+        talker.text_embed_proj(input_ids[r],
+                               prefill.data() + static_cast<std::size_t>(I + r) * H);
 
     // _tie row i (i in 0..C-2): text_side[i] + codec_embedding(codec_input[i]),
     // where text_side = [tts_pad ×(C-2), tts_bos].
     std::vector<float> ce;
     for (int i = 0; i < C - 1; ++i) {
-        float* dst = prefill.data() + static_cast<std::size_t>(3 + i) * H;
+        float* dst = prefill.data() + static_cast<std::size_t>(I + 3 + i) * H;
         codec_row(codec_input[i], ce);
         const float* txt = (i < C - 2) ? tts_pad_e.data() : tts_bos.data();
         for (int d = 0; d < H; ++d) dst[d] = txt[d] + ce[d];

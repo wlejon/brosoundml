@@ -8,9 +8,13 @@
 //
 // It reuses the Qwen3 decoder layer (RMSNorm, GQA + per-head QK-norm, SwiGLU)
 // but with *plain* single-axis RoPE — the depth axis has no M-RoPE — and full
-// causal attention (no sliding window). Inputs/outputs live in the Talker
-// hidden width (1024); the upstream small_to_mtp_projection is an identity here
-// (the Code Predictor hidden size equals the Talker's) so it is omitted.
+// causal attention (no sliding window). Its *inputs* (the Talker hidden + the
+// code embeddings) live in the Talker hidden width; the depth transformer itself
+// runs at the Code Predictor hidden width. When the two differ (the 1.7B model:
+// Talker 2048, Code Predictor 1024) the upstream small_to_mtp_projection
+// (Linear talker_hidden -> cp_hidden + bias) maps every input row down before
+// the transformer. When they are equal (the 0.6B model) the projection is an
+// identity and is absent from the checkpoint, so it is skipped.
 //
 // Internal to the qwen_tts target. Device-neutral (CPU + CUDA), mirroring the
 // Talker: FP32 weights on every backend, brotensor device ops throughout, FP32
@@ -37,19 +41,27 @@ struct QwenTtsCodePredictorLayer {
 struct QwenTtsCodePredictor {
     // ── dims ──
     int num_layers = 0;
-    int hidden = 0, intermediate = 0;
+    int hidden = 0, intermediate = 0;   // depth-transformer hidden width
+    int talker_hidden = 0;              // input/embedding width (Talker hidden)
     int n_q_heads = 0, n_kv_heads = 0, head_dim = 0;
     int vocab = 0;            // per-codebook code vocab (2048)
     int num_code_groups = 0;  // codebooks per frame incl. codebook 0 (16)
     float rms_eps = 1e-6f, rope_theta = 1e6f;
 
     // ── weights ──
-    // codec_embedding[j] embeds codebook (j+1); lm_head[j] predicts codebook
-    // (j+1). There are (num_code_groups - 1) of each.
+    // codec_embedding[j] embeds codebook (j+1) in the *Talker* hidden width;
+    // lm_head[j] predicts codebook (j+1) from the depth-transformer hidden.
+    // There are (num_code_groups - 1) of each.
     std::vector<brotensor::Tensor> codec_embedding;
     std::vector<brotensor::Tensor> lm_head;
     brotensor::Tensor final_norm;
     std::vector<QwenTtsCodePredictorLayer> layers;
+
+    // small_to_mtp_projection: Linear(talker_hidden -> hidden) + bias, applied to
+    // every input row (the Talker hidden and the code embeddings) before the
+    // depth transformer. Empty when talker_hidden == hidden (identity; 0.6B).
+    brotensor::Tensor mtp_proj_w, mtp_proj_b;
+    bool has_mtp_proj = false;
 
     // Precomputed plain-RoPE cos/sin tables for the fixed depth positions
     // 0..num_code_groups-1, (num_code_groups, head_dim/2) FP32 on the model
@@ -59,9 +71,12 @@ struct QwenTtsCodePredictor {
 
     // Build from the talker.code_predictor.* tensors (BF16 -> FP32 on `device`;
     // q/k projections + q/k_norm permuted into brotensor's adjacent-pair RoPE
-    // layout, mirroring the Talker).
+    // layout, mirroring the Talker). `talker_hidden` is the Talker's hidden width
+    // — the width of the code embeddings and the conditioning hidden, which the
+    // small_to_mtp_projection maps to the depth-transformer width when they
+    // differ.
     void load(const brotensor::safetensors::File& f,
-              const QwenTtsCodePredictorConfig& cfg,
+              const QwenTtsCodePredictorConfig& cfg, int talker_hidden,
               brotensor::Device device = brotensor::Device::CPU);
 
     // Greedy expansion of one frame. `past_hidden` is the Talker hidden state

@@ -373,7 +373,7 @@ static int run() {
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
                     talker.load(w, c.talker, dev);
-                    cp.load(w, c.talker.code_predictor, dev);
+                    cp.load(w, c.talker.code_predictor, c.talker.transformer.hidden_size, dev);
                 }
                 CHECK(talker.hidden == H, tag("AR fixture hidden matches"));
                 CHECK(cp.num_code_groups == G, tag("code predictor num_code_groups matches"));
@@ -462,7 +462,7 @@ static int run() {
                 {
                     auto w = brotensor::safetensors::File::open((root / "model.safetensors").string());
                     talker.load(w, c.talker, dev);
-                    cp.load(w, c.talker.code_predictor, dev);
+                    cp.load(w, c.talker.code_predictor, c.talker.transformer.hidden_size, dev);
                 }
                 auto tok = brolm::qwen::Tokenizer::load(
                     (root / "vocab.json").string(), (root / "merges.txt").string());
@@ -485,8 +485,9 @@ static int run() {
                 brosoundml::QwenTtsConfig cfg = c;
                 std::vector<float> prefill, trailing, tts_pad;
                 int gotT = 0, gotL = 0;
-                brosoundml::assemble_custom_voice_prefill(
-                    talker, cfg, ids, spk_id, language_id, prefill, gotT, trailing, gotL, tts_pad);
+                brosoundml::assemble_talker_prefill(
+                    talker, cfg, ids, /*instruct_ids=*/{}, spk_id, language_id,
+                    prefill, gotT, trailing, gotL, tts_pad);
                 CHECK(gotT == T, tag("assembled prefill length matches"));
                 CHECK(gotL == L, tag("assembled trailing length matches"));
                 auto cmpv = [&](const char* what, const std::vector<float>& got,
