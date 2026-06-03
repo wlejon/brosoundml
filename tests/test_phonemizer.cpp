@@ -272,6 +272,21 @@ int main() {
                         nasa_ipa.c_str(), kzqx_ipa.c_str());
         }
 
+        // ─── Test 6b: Compound-word fallback ────────────────────────────
+        {
+            // "heightfield" is not in the lexicon, but "height" and "field"
+            // are — it should be glued from its parts, not spelled out.
+            const auto hf_ipa = phon.phonemize_to_ipa("heightfield");
+            const std::string height = std::string(lex.lookup("height"));
+            CHECK(!height.empty(), "lex has 'height'");
+            CHECK(contains(hf_ipa, height),
+                  "'heightfield' contains the IPA for 'height' (compound split)");
+            const std::string spelled = sc.spell_letter_by_letter("heightfield");
+            CHECK(hf_ipa != spelled && hf_ipa.size() < spelled.size(),
+                  "'heightfield' is glued from parts, not spelled letter by letter");
+            std::printf("  heightfield: %s\n", hf_ipa.c_str());
+        }
+
         // ─── Test 7: Punctuation passthrough ────────────────────────────
         {
             const auto a = phon.phonemize("hi!");

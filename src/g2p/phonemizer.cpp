@@ -256,6 +256,56 @@ std::string ascii_tolower(std::string_view s) {
     return r;
 }
 
+// ─── Compound-word splitting ─────────────────────────────────────────────
+//
+// A single out-of-vocabulary word that is the concatenation of two known
+// dictionary words (e.g. "heightfield" = "height" + "field") is far better
+// pronounced as its parts glued together than spelled letter by letter. This
+// runs only as a fallback — after the lexicon and morphology have both missed
+// — so it can never override a genuine entry, only improve an otherwise
+// letter-spelled OOV word.
+
+bool is_ascii_alpha_word(std::string_view w) {
+    if (w.empty()) return false;
+    for (char c : w) {
+        const bool lower = c >= 'a' && c <= 'z';
+        const bool upper = c >= 'A' && c <= 'Z';
+        if (!lower && !upper) return false;
+    }
+    return true;
+}
+
+// ˈ (U+02C8, primary stress) → ˌ (U+02CC, secondary), first occurrence only.
+// English compounds carry their main stress on the first element, so the
+// second element's primary stress is demoted when the two are glued.
+std::string demote_primary_stress(std::string ipa) {
+    static const std::string kPrimary   = "\xCB\x88";
+    static const std::string kSecondary = "\xCB\x8C";
+    const auto pos = ipa.find(kPrimary);
+    if (pos != std::string::npos) ipa.replace(pos, kPrimary.size(), kSecondary);
+    return ipa;
+}
+
+// Try to split `word` into exactly two dictionary words. Returns the glued IPA,
+// or "" if no split where both halves (each ≥ 3 letters) resolve in the
+// lexicon. Scans left-to-right, so the first (longest-leading) valid split
+// wins — "heightfield" splits at "height|field", not "hei|ghtfield".
+std::string try_compound(std::string_view word, const Lexicon& lex) {
+    if (!is_ascii_alpha_word(word) || word.size() < 6) return {};
+    const std::string lw = ascii_tolower(word);
+    constexpr std::size_t kMinPart = 3;
+    for (std::size_t i = kMinPart; i + kMinPart <= lw.size(); ++i) {
+        const std::string_view a(lw.data(), i);
+        const std::string_view b(lw.data() + i, lw.size() - i);
+        const std::string_view pa = lex.lookup(a, "");
+        if (pa.empty()) continue;
+        const std::string_view pb = lex.lookup(b, "");
+        if (pb.empty()) continue;
+        return std::string(pa) + demote_primary_stress(std::string(pb));
+    }
+    return {};
+}
+
 // ─── Per-word phonemisation ──────────────────────────────────────────────
 
 std::string phonemize_word(std::string_view     word,
@@ -286,7 +336,12 @@ std::string phonemize_word(std::string_view     word,
         if (!out.empty()) return out;
     }
 
-    // 5. NNP fallback: spell letter by letter. Returns "" if the word has no
+    // 5. Compound fallback: split an OOV word into two known dictionary words
+    //    (e.g. "heightfield" → "height" + "field") before spelling it out.
+    out = try_compound(word, lex);
+    if (!out.empty()) return out;
+
+    // 6. NNP fallback: spell letter by letter. Returns "" if the word has no
     //    spellable letters at all.
     return sc.spell_letter_by_letter(word);
 }
