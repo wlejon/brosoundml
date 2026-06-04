@@ -288,6 +288,45 @@ Voice Kokoro::load_voice(const std::string& voice_path) const {
     return voice;
 }
 
+Voice Kokoro::make_voice(const std::vector<float>& style,
+                         const std::string& name) const {
+    if (!impl_) fail("Kokoro::make_voice", "no model loaded; call Kokoro::load() first");
+    const int voice_dim = 2 * impl_->config.style_dim;
+    if (voice_dim <= 0)
+        fail("Kokoro::make_voice", "style_dim is 0 in the loaded config");
+    if (style.empty() ||
+        style.size() % static_cast<std::size_t>(voice_dim) != 0) {
+        fail("Kokoro::make_voice",
+             "style length " + std::to_string(style.size()) +
+             " is not a positive multiple of voice_dim (" +
+             std::to_string(voice_dim) + ")");
+    }
+
+    // A single style point is broadcast across the upstream pack height (510
+    // rows, one style per utterance length) so it renders for any phoneme
+    // count; a full table is taken verbatim.
+    constexpr int kBroadcastRows = 510;
+    std::vector<float> buf;
+    int rows;
+    if (style.size() == static_cast<std::size_t>(voice_dim)) {
+        rows = kBroadcastRows;
+        buf.resize(static_cast<std::size_t>(rows) * voice_dim);
+        for (int r = 0; r < rows; ++r) {
+            std::memcpy(buf.data() + static_cast<std::size_t>(r) * voice_dim,
+                        style.data(), voice_dim * sizeof(float));
+        }
+    } else {
+        rows = static_cast<int>(style.size() / voice_dim);
+        buf  = style;
+    }
+
+    Voice voice;
+    voice.name  = name;
+    voice.packs = brotensor::Tensor::from_host_on(brotensor::Device::CPU,
+                                                  buf.data(), rows, voice_dim);
+    return voice;
+}
+
 AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                const Voice& voice,
                                float speed,

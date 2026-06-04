@@ -178,6 +178,19 @@ public:
     // row selected at synthesize() time is uploaded to the model's device.
     Voice load_voice(const std::string& voice_path) const;
 
+    // Build a Voice from raw style data instead of a file — for authoring,
+    // blending, or otherwise synthesizing a voice the app constructs in memory.
+    // `style` is either:
+    //   - exactly `voice_dim` (= 2*style_dim) floats: a single style point,
+    //     broadcast across all length rows so it works for any utterance, or
+    //   - a whole multiple of `voice_dim`: a full rows*voice_dim table, as-is.
+    // The returned Voice's `packs` tensor lives on Device::CPU, matching
+    // load_voice(); the row selected at synthesize() time is uploaded to the
+    // model's device. Throws if no model is loaded or the length is not a
+    // multiple of voice_dim.
+    Voice make_voice(const std::vector<float>& style,
+                     const std::string& name = "custom") const;
+
     // Run the full pipeline: phoneme token ids (see the misaki G2P note above)
     // + a voice -> a mono 24 kHz waveform. `speed` scales the predicted
     // durations: > 1 speaks faster, < 1 slower.
