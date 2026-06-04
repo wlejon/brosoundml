@@ -17,6 +17,7 @@
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,7 @@ std::vector<int32_t> parse_ids(const std::string& line) {
 int main(int argc, char** argv) {
     std::string model_dir, voice_path, out_path, out_dir, ids_file, ids_inline, device_str = "cpu";
     float speed = 1.0f;
+    bool trace = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -73,6 +75,7 @@ int main(int argc, char** argv) {
         else if (a == "--ids-file")  ids_file   = next("--ids-file");
         else if (a == "--speed")     speed      = std::stof(next("--speed"));
         else if (a == "--device")    device_str = next("--device");
+        else if (a == "--trace")     trace      = true;
         else if (a == "-h" || a == "--help") {
             std::printf("Usage: synth --model DIR --voice voice.bin "
                         "(--out file.wav PHONEMEIDS | --out-dir DIR --ids-file FILE)\n");
@@ -107,9 +110,24 @@ int main(int argc, char** argv) {
             const auto ids = parse_ids(ids_inline);
             std::fprintf(stderr, "synthesizing %zu phonemes -> %s\n",
                          ids.size(), out_path.c_str());
-            auto audio = k.synthesize(ids, voice, speed);
+            brosoundml::KokoroTrace tr;
+            auto audio = k.synthesize(ids, voice, speed, nullptr, {},
+                                      trace ? &tr : nullptr);
             audio.write_wav(out_path);
             std::fprintf(stderr, "  wrote %zu samples\n", audio.samples.size());
+            if (trace) {
+                std::fprintf(stderr, "  trace: %zu stages\n", tr.stages.size());
+                for (const auto& s : tr.stages) {
+                    double mn = 0, mx = 0, sum = 0;
+                    if (!s.data.empty()) {
+                        mn = mx = s.data[0];
+                        for (float v : s.data) { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); sum += v; }
+                    }
+                    std::fprintf(stderr, "    %-10s  %4d x %-7d  (%zu)  min=%.3f max=%.3f mean=%.3f\n",
+                                 s.name.c_str(), s.h, s.w, s.data.size(),
+                                 mn, mx, s.data.empty() ? 0.0 : sum / s.data.size());
+                }
+            }
             return 0;
         }
 

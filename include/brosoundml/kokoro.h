@@ -110,6 +110,44 @@ struct Voice {
     brotensor::Tensor pick_for(int n_phonemes) const;
 };
 
+// ─── KokoroTrace ─────────────────────────────────────────────────────────
+//
+// Optional per-stage capture of the synthesis pipeline's intermediate tensors,
+// for introspection / visualization. Pass a KokoroTrace* to synthesize() and
+// each named stage is copied to host as a row-major (h x w) FP32 grid, in
+// pipeline order:
+//
+//   phonemes   (1 x L)          BOS/EOS-wrapped input ids (as floats)
+//   bert_dur   (L x 768)        plBERT contextual phoneme features
+//   d_en       (hidden x L)     predictor conditioning stream (NCL)
+//   t_en       (hidden x L)     text-encoder content features (NCL)
+//   pred_dur   (1 x L)          per-phoneme frame counts (the alignment)
+//   F0_pred    (1 x 2T)         pitch contour at frame rate
+//   N_pred     (1 x 2T)         energy contour at frame rate
+//   asr        (hidden x T)     duration-aligned content (NCL)
+//   gen_in     (hidden x 2T)    decoder-backbone output (NCL)
+//   har        ((n_fft+2) x F)  harmonic-source excitation stack
+//   audio      (1 x N)          final 24 kHz waveform
+//
+// h/w are logical dims chosen for visualization; `data` is row-major h*w. The
+// capture is a host copy per stage and only happens when a trace is requested,
+// so a normal synthesize() pays nothing.
+struct KokoroTrace {
+    struct Stage {
+        std::string        name;
+        int                h = 0;
+        int                w = 0;
+        std::vector<float> data;   // h*w, row-major (row r = channel/feature r)
+    };
+    std::vector<Stage> stages;
+
+    // Copy a tensor to host and record it as an (h x w) stage. If h*w doesn't
+    // match the element count, falls back to a (1 x size) row.
+    void add(std::string name, int h, int w, const brotensor::Tensor& t);
+    // Record an integer vector (e.g. pred_dur) as a (1 x n) float stage.
+    void add_ints(std::string name, const std::vector<int32_t>& v);
+};
+
 // The Kokoro TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -156,11 +194,15 @@ public:
     // the call aborts and returns an empty AudioBuffer. There is no internal
     // autoregressive loop, so cancellation is at stage/upsample-level
     // granularity rather than per-sample. Empty (the default) = no cancel.
+    //
+    // When `trace_out` is non-null it is filled with a per-stage host copy of
+    // the pipeline's intermediate tensors (see KokoroTrace) for visualization.
     AudioBuffer synthesize(const std::vector<int32_t>& phoneme_ids,
                            const Voice& voice,
                            float speed = 1.0f,
                            std::vector<int32_t>* pred_dur_out = nullptr,
-                           const CancelCheck& cancel = {}) const;
+                           const CancelCheck& cancel = {},
+                           KokoroTrace* trace_out = nullptr) const;
 
     const KokoroConfig& config() const;
     bool loaded() const;

@@ -292,7 +292,8 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                const Voice& voice,
                                float speed,
                                std::vector<int32_t>* pred_dur_out,
-                               const CancelCheck& cancel) const {
+                               const CancelCheck& cancel,
+                               KokoroTrace* trace_out) const {
     if (!impl_->loaded) {
         fail("Kokoro::synthesize", "no model loaded; call Kokoro::load() first");
     }
@@ -310,6 +311,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     ids.insert(ids.end(), phoneme_ids.begin(), phoneme_ids.end());
     ids.push_back(0);
     const int L = static_cast<int>(ids.size());
+    if (trace_out) trace_out->add_ints("phonemes", ids);
 
     // Style row: upstream picks ref_s = voice[len(input_ids) - 1]. Voice packs
     // are loaded on CPU (raw host data on disk); upload the selected row to
@@ -324,16 +326,19 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     brotensor::Tensor bert_dur = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
     debug_stats("01_bert_dur", bert_dur);
+    if (trace_out) trace_out->add("bert_dur", L, impl_->config.plbert.hidden_size, bert_dur);
 
     // 2. bert_encoder.
     brotensor::Tensor d_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert_encoder.forward(bert_dur, d_en);
     debug_stats("02_d_en", d_en);
+    if (trace_out) trace_out->add("d_en", impl_->config.hidden_dim, L, d_en);
 
     // 3. text_encoder (StyleTTS2 phoneme CNN+BiLSTM).
     brotensor::Tensor t_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
     debug_stats("06_t_en", t_en);
+    if (trace_out) trace_out->add("t_en", impl_->config.hidden_dim, L, t_en);
 
     // 4. Predictor: duration + F0 + N.
     Predictor::Output po;
@@ -341,6 +346,11 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     debug_stats("05_F0_pred", po.F0_pred);
     debug_stats("05_N_pred",  po.N_pred);
     debug_vec  ("03_pred_dur", po.pred_dur);
+    if (trace_out) {
+        trace_out->add_ints("pred_dur", po.pred_dur);
+        trace_out->add("F0_pred", 1, static_cast<int>(po.F0_pred.size()), po.F0_pred);
+        trace_out->add("N_pred",  1, static_cast<int>(po.N_pred.size()),  po.N_pred);
+    }
 
     // Surface the per-phoneme frame counts when the caller asked for them.
     // po.pred_dur is indexed over the BOS/EOS-wrapped `ids` (length L), so the
@@ -378,6 +388,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
         impl_->device, asr_host.data(), 1, C_hidden * total);
 
     debug_stats("07_asr", asr);
+    if (trace_out) trace_out->add("asr", C_hidden, total, asr);
 
     if (cancel && cancel()) return {};
 
@@ -386,6 +397,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     impl_->decoder.forward(asr, po.F0_pred, po.N_pred, ref_s, total, gen_in);
     const int L_gen = 2 * total;
     debug_stats("09_gen_in", gen_in);
+    if (trace_out) trace_out->add("gen_in", impl_->config.hidden_dim, L_gen, gen_in);
 
     // 7. Generator. The harmonic-source branch is driven by HarmonicSource
     //    (below) — a deterministic F0-driven approximation of upstream's
@@ -425,6 +437,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     brotensor::copy_d2d(ref_s, 0, style_dec, 0, impl_->config.style_dim);
 
     debug_stats("10_har_stub", har_stub);
+    if (trace_out) trace_out->add("har", har_channels, hframes, har_stub);
 
     if (cancel && cancel()) return {};
 
@@ -432,6 +445,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec,
                              audio_t, cancel);
     debug_stats("11_audio", audio_t);
+    if (trace_out) trace_out->add("audio", 1, static_cast<int>(audio_t.size()), audio_t);
 
     // 8. Wrap as AudioBuffer. audio_t lives on impl_->device; round-trip to
     //    host via to_host_vector so AudioBuffer can own a std::vector<float>.
@@ -443,6 +457,21 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
 
 const KokoroConfig& Kokoro::config() const { return impl_->config; }
 bool Kokoro::loaded() const { return impl_->loaded; }
+
+// ─── KokoroTrace ─────────────────────────────────────────────────────────────
+
+void KokoroTrace::add(std::string name, int h, int w, const brotensor::Tensor& t) {
+    std::vector<float> host = t.to_host_vector();
+    const int n = static_cast<int>(host.size());
+    if (h <= 0 || w <= 0 || static_cast<long long>(h) * w != n) { h = 1; w = n; }
+    stages.push_back(Stage{std::move(name), h, w, std::move(host)});
+}
+
+void KokoroTrace::add_ints(std::string name, const std::vector<int32_t>& v) {
+    std::vector<float> host(v.begin(), v.end());
+    const int w = static_cast<int>(host.size());
+    stages.push_back(Stage{std::move(name), 1, w, std::move(host)});
+}
 
 // ─── Voice ─────────────────────────────────────────────────────────────────
 
