@@ -255,6 +255,16 @@ public:
                                  const std::string& language = "english",
                                  const CancelCheck& cancel = {}) const;
 
+    // Encode a reference clip into the ECAPA-TDNN speaker x-vector — exactly the
+    // enrollment step synthesize_clone runs, exposed on its own. `ref` is
+    // resampled to the encoder's rate (24 kHz) as needed and treated as mono.
+    // Returns `enc_dim` (1024) host floats — a speaker-identity embedding. The
+    // honest audio->identity front-end for training an adapter that maps a voice
+    // into another model's style space (e.g. Kokoro's). Base variant only;
+    // throws if no model is loaded, the checkpoint has no speaker encoder, or
+    // `ref` is empty.
+    std::vector<float> embed_speaker(const AudioBuffer& ref) const;
+
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
     // on its own once the Talker / Code Predictor have produced (or a caller

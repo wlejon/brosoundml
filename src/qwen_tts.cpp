@@ -452,7 +452,34 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
     }
 
     // Enroll: reference clip -> 24 kHz mono -> ECAPA-TDNN x-vector (host floats).
-    const int sr = cfg.speaker_encoder.sample_rate;
+    const std::vector<float> spk_embed = embed_speaker(ref);
+
+    // Tokenize the body chat prompt (the text to speak).
+    const std::string prompt =
+        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9) {
+        fail("QwenTts::synthesize_clone", "prompt tokenized to too few tokens");
+    }
+
+    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+                      spk_embed.data(), language_id, cancel);
+}
+
+std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::embed_speaker", "no model loaded; call QwenTts::load() first");
+    }
+    if (!impl_->config.speaker_encoder.present) {
+        fail("QwenTts::embed_speaker",
+             "loaded checkpoint has no speaker encoder; needs a Base-variant model");
+    }
+    if (ref.samples.empty()) {
+        fail("QwenTts::embed_speaker", "reference audio is empty");
+    }
+
+    // Reference clip -> the encoder's rate (24 kHz) mono -> ECAPA-TDNN x-vector.
+    const int sr = impl_->config.speaker_encoder.sample_rate;
     const float* wav = ref.samples.data();
     int n = static_cast<int>(ref.samples.size());
     std::vector<float> resampled;
@@ -467,18 +494,7 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
         wav = resampled.data();
         n = n_out;
     }
-    const std::vector<float> spk_embed = impl_->spk_enc.embed(wav, n);
-
-    // Tokenize the body chat prompt (the text to speak).
-    const std::string prompt =
-        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
-    if (input_ids.size() < 9) {
-        fail("QwenTts::synthesize_clone", "prompt tokenized to too few tokens");
-    }
-
-    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
-                      spk_embed.data(), language_id, cancel);
+    return impl_->spk_enc.embed(wav, n);
 }
 
 AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
