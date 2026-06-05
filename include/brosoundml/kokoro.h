@@ -217,6 +217,35 @@ public:
                            const CancelCheck& cancel = {},
                            KokoroTrace* trace_out = nullptr) const;
 
+    // Re-run only the decoder back half (decoder ▶ harmonic source ▶ generator)
+    // from edited intermediates — for prosody editing. The four inputs all come
+    // from a prior synthesize() trace (the 'asr', 'F0_pred', 'N_pred' stages and
+    // the 'phonemes' stage length); the caller edits any of them and re-decodes,
+    // skipping plBERT / the encoders / the predictor entirely.
+    //
+    //   asr      duration-aligned content, `hidden_dim * total` floats, row-major
+    //            channel-major (the 'asr' stage: data[c*total + t]).
+    //   total    frame count = asr width = sum of the per-phoneme durations.
+    //   F0_pred  pitch contour, `2 * total` floats ('F0_pred' stage).
+    //   N_pred   energy contour, `2 * total` floats ('N_pred' stage).
+    //   n_phonemes_wrapped  the BOS/EOS-wrapped phoneme count (= the 'phonemes'
+    //            stage length), used to pick the voice's style row. Editing F0/N
+    //            or durations never changes the phoneme count, so it's unchanged
+    //            from the originating synthesize().
+    //
+    // Editing F0/N only: pass the original asr unchanged. Editing durations:
+    // rebuild asr (re-expand the text-encoder features) and resample F0/N to the
+    // new frame count before calling. Throws on shape mismatch. `cancel` /
+    // `trace_out` behave as in synthesize().
+    AudioBuffer decode_from(const Voice& voice,
+                            int n_phonemes_wrapped,
+                            const std::vector<float>& asr,
+                            int total,
+                            const std::vector<float>& F0_pred,
+                            const std::vector<float>& N_pred,
+                            const CancelCheck& cancel = {},
+                            KokoroTrace* trace_out = nullptr) const;
+
     const KokoroConfig& config() const;
     bool loaded() const;
 

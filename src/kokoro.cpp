@@ -196,6 +196,16 @@ struct Kokoro::Impl {
     DecoderBackbone             decoder;
     HarmonicSource              hsource;
     Generator                   generator;
+
+    // The decoder back half (decoder ▶ harmonic source ▶ generator ▶ PCM),
+    // shared by synthesize() and decode_from(). Defined out-of-line below.
+    AudioBuffer decode_back_half(const brotensor::Tensor& ref_s,
+                                 const brotensor::Tensor& asr,
+                                 const brotensor::Tensor& F0_pred,
+                                 const brotensor::Tensor& N_pred,
+                                 int total,
+                                 const CancelCheck& cancel,
+                                 KokoroTrace* trace_out);
 };
 
 Kokoro::Kokoro() : impl_(std::make_unique<Impl>()) {}
@@ -327,6 +337,65 @@ Voice Kokoro::make_voice(const std::vector<float>& style,
     return voice;
 }
 
+// The decoder back half: decoder backbone ▶ harmonic source ▶ generator ▶ PCM.
+// Shared by synthesize() (fresh predictor output) and decode_from() (edited
+// intermediates). `asr` (1 × hidden*total), `F0_pred`/`N_pred` (1 × 2*total),
+// and `ref_s` (1 × 2*style_dim) all live on impl.device; `total` is the frame
+// count (= asr width). Mirrors the upstream order; the only approximation is
+// the harmonic-source branch (see the synthesize() comment / README caveat).
+AudioBuffer Kokoro::Impl::decode_back_half(const brotensor::Tensor& ref_s,
+                                           const brotensor::Tensor& asr,
+                                           const brotensor::Tensor& F0_pred,
+                                           const brotensor::Tensor& N_pred,
+                                           int total,
+                                           const CancelCheck& cancel,
+                                           KokoroTrace* trace_out) {
+    const brotensor::Device dev = device;
+
+    // Decoder backbone -> generator input.
+    brotensor::Tensor gen_in = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    decoder.forward(asr, F0_pred, N_pred, ref_s, total, gen_in);
+    const int L_gen = 2 * total;
+    debug_stats("09_gen_in", gen_in);
+    if (trace_out) trace_out->add("gen_in", config.hidden_dim, L_gen, gen_in);
+
+    // Generator. har_frames matches the time axis at the Generator's iSTFT input:
+    // L_gen -> ×∏(upsample_rates) -> reflection_pad (+1).
+    int upsample_prod = 1;
+    for (int r : config.decoder.upsample_rates) upsample_prod *= r;
+    const int har_frames = L_gen * upsample_prod + 1;
+    const int har_channels = config.decoder.gen_istft_n_fft + 2;
+    brotensor::Tensor har_stub = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    int sig_len = 0, hframes = 0;
+    hsource.forward(F0_pred, /*frame_count=*/2 * total, sig_len, hframes, har_stub);
+    if (hframes != har_frames) {
+        fail("Kokoro::decode",
+             "har_frames mismatch: hsource=" + std::to_string(hframes) +
+             " vs expected=" + std::to_string(har_frames));
+    }
+    (void)har_channels;
+
+    // The decoder style is ref_s[:, :style_dim]; slice it via copy_d2d.
+    brotensor::Tensor style_dec = brotensor::Tensor::zeros_on(
+        dev, 1, config.style_dim, brotensor::Dtype::FP32);
+    brotensor::copy_d2d(ref_s, 0, style_dec, 0, config.style_dim);
+
+    debug_stats("10_har_stub", har_stub);
+    if (trace_out) trace_out->add("har", har_channels, hframes, har_stub);
+
+    if (cancel && cancel()) return {};
+
+    brotensor::Tensor audio_t = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t, cancel);
+    debug_stats("11_audio", audio_t);
+    if (trace_out) trace_out->add("audio", 1, static_cast<int>(audio_t.size()), audio_t);
+
+    AudioBuffer out;
+    out.sample_rate = config.sample_rate;
+    out.samples = audio_t.to_host_vector();
+    return out;
+}
+
 AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                const Voice& voice,
                                float speed,
@@ -431,67 +500,51 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
 
     if (cancel && cancel()) return {};
 
-    // 6. Decoder backbone -> generator input.
-    brotensor::Tensor gen_in = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
-    impl_->decoder.forward(asr, po.F0_pred, po.N_pred, ref_s, total, gen_in);
-    const int L_gen = 2 * total;
-    debug_stats("09_gen_in", gen_in);
-    if (trace_out) trace_out->add("gen_in", impl_->config.hidden_dim, L_gen, gen_in);
+    // 6. Decoder ▶ harmonic source ▶ generator. Factored so decode_from() can
+    //    re-run exactly this back half from edited intermediates.
+    return impl_->decode_back_half(ref_s, asr, po.F0_pred, po.N_pred, total,
+                                   cancel, trace_out);
+}
 
-    // 7. Generator. The harmonic-source branch is driven by HarmonicSource
-    //    (below) — a deterministic F0-driven approximation of upstream's
-    //    SineGen / SourceModuleHnNSF. It carries the harmonic content the
-    //    network was trained on but drops the random initial phase + additive
-    //    gaussian noise, so audio lacks some natural breath noise while the
-    //    phonemic content is intact.
-    // har_frames matches the time axis at the Generator's iSTFT input. After
-    // L_gen -> ups[0] (×10) -> ups[1] (×6) -> reflection_pad (+1) we hit
-    // L_gen * 60 + 1 frames. noise_convs see the same har stack and produce
-    // outputs that align with the ups stack length at every stage.
-    int upsample_prod = 1;
-    for (int r : impl_->config.decoder.upsample_rates) upsample_prod *= r;
-    const int har_frames = L_gen * upsample_prod + 1;
-    const int har_channels = impl_->config.decoder.gen_istft_n_fft + 2;
-    // HarmonicSource builds the (n_fft+2) × stft_frames `har` stack the
-    // Generator's noise branch consumes. It's a deterministic approximation
-    // of the upstream SineGen / SourceModuleHnNSF path — the random initial
-    // phase + additive gaussian noise are dropped, so the audio won't match
-    // upstream sample-for-sample, but it carries the F0-driven harmonic
-    // content the network was trained to consume.
-    brotensor::Tensor har_stub = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
-    int sig_len = 0, hframes = 0;
-    impl_->hsource.forward(po.F0_pred, /*frame_count=*/2 * total,
-                           sig_len, hframes, har_stub);
-    if (hframes != har_frames) {
-        fail("Kokoro::synthesize",
-             "har_frames mismatch: hsource=" + std::to_string(hframes) +
-             " vs expected=" + std::to_string(har_frames));
+AudioBuffer Kokoro::decode_from(const Voice& voice,
+                                int n_phonemes_wrapped,
+                                const std::vector<float>& asr_host,
+                                int total,
+                                const std::vector<float>& F0_host,
+                                const std::vector<float>& N_host,
+                                const CancelCheck& cancel,
+                                KokoroTrace* trace_out) const {
+    if (!impl_->loaded) {
+        fail("Kokoro::decode_from", "no model loaded; call Kokoro::load() first");
     }
-    (void)har_channels;
+    if (voice.packs.rows <= 0 || voice.packs.cols != 2 * impl_->config.style_dim) {
+        fail("Kokoro::decode_from", "voice pack shape does not match 2*style_dim");
+    }
+    const int C_hidden = impl_->config.hidden_dim;
+    if (total <= 0) fail("Kokoro::decode_from", "total must be > 0");
+    if (static_cast<long long>(asr_host.size()) !=
+        static_cast<long long>(C_hidden) * total) {
+        fail("Kokoro::decode_from",
+             "asr size " + std::to_string(asr_host.size()) + " != hidden_dim*total (" +
+             std::to_string(C_hidden) + "*" + std::to_string(total) + ")");
+    }
+    if (static_cast<int>(F0_host.size()) != 2 * total ||
+        static_cast<int>(N_host.size())  != 2 * total) {
+        fail("Kokoro::decode_from",
+             "F0_pred/N_pred size must be 2*total (" + std::to_string(2 * total) + ")");
+    }
 
-    // The decoder style (ref_s[:, :style_dim]) is what Generator wants. ref_s
-    // lives on impl_->device; slice the first style_dim elements via copy_d2d.
-    brotensor::Tensor style_dec = brotensor::Tensor::zeros_on(
-        impl_->device, 1, impl_->config.style_dim, brotensor::Dtype::FP32);
-    brotensor::copy_d2d(ref_s, 0, style_dec, 0, impl_->config.style_dim);
+    // Pick the same style row the originating synthesize() used (the phoneme
+    // count is invariant under prosody edits) and upload the edited grids.
+    brotensor::Tensor ref_s = voice.pick_for(n_phonemes_wrapped).to(impl_->device);
+    brotensor::Tensor asr = brotensor::Tensor::from_host_on(
+        impl_->device, asr_host.data(), 1, C_hidden * total);
+    brotensor::Tensor F0 = brotensor::Tensor::from_host_on(
+        impl_->device, F0_host.data(), 1, 2 * total);
+    brotensor::Tensor N = brotensor::Tensor::from_host_on(
+        impl_->device, N_host.data(), 1, 2 * total);
 
-    debug_stats("10_har_stub", har_stub);
-    if (trace_out) trace_out->add("har", har_channels, hframes, har_stub);
-
-    if (cancel && cancel()) return {};
-
-    brotensor::Tensor audio_t = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
-    impl_->generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec,
-                             audio_t, cancel);
-    debug_stats("11_audio", audio_t);
-    if (trace_out) trace_out->add("audio", 1, static_cast<int>(audio_t.size()), audio_t);
-
-    // 8. Wrap as AudioBuffer. audio_t lives on impl_->device; round-trip to
-    //    host via to_host_vector so AudioBuffer can own a std::vector<float>.
-    AudioBuffer out;
-    out.sample_rate = impl_->config.sample_rate;
-    out.samples = audio_t.to_host_vector();
-    return out;
+    return impl_->decode_back_half(ref_s, asr, F0, N, total, cancel, trace_out);
 }
 
 const KokoroConfig& Kokoro::config() const { return impl_->config; }
