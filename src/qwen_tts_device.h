@@ -13,6 +13,7 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <utility>
