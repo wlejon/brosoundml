@@ -106,6 +106,8 @@ target_sources(brosoundml PRIVATE
     src/modules.cpp
     src/kokoro_modules.cpp
     src/kokoro.cpp
+    src/decoder_lora.cpp
+    src/kokoro_decoder_backward.cpp
     src/qwen_tts.cpp
     src/qwen_tts_codec.cpp
     src/qwen_tts_codec_encoder.cpp

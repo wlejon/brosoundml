@@ -547,6 +547,136 @@ AudioBuffer Kokoro::decode_from(const Voice& voice,
     return impl_->decode_back_half(ref_s, asr, F0, N, total, cancel, trace_out);
 }
 
+DecoderLoraContext KokoroDecodePrep::context() const {
+    DecoderLoraContext ctx;
+    ctx.asr     = &asr;
+    ctx.F0_pred = &F0_pred;
+    ctx.N_pred  = &N_pred;
+    ctx.ref_s   = &ref_s;
+    ctx.har     = &har;
+    ctx.total   = total;
+    ctx.frames  = frames;
+    return ctx;
+}
+
+// Front half + harmonic source, packaged for the decoder-LoRA trainer. Mirrors
+// the synthesize() front half (plBERT ▶ encoders ▶ predictor ▶ length-regulate)
+// and the decode_back_half har/frames block — but stops before the decoder
+// backbone and generator, which the DecoderLora runs itself (cached, with the
+// LoRA affines). Deliberately a parallel copy of the inference front half so
+// synthesize()/decode_from() stay untouched.
+KokoroDecodePrep Kokoro::prepare_decode_context(
+    const std::vector<int32_t>& phoneme_ids,
+    const Voice& voice,
+    float speed,
+    const std::vector<float>* F0_override,
+    const std::vector<float>* N_override) const {
+    if (!impl_->loaded) {
+        fail("Kokoro::prepare_decode_context",
+             "no model loaded; call Kokoro::load() first");
+    }
+    if (phoneme_ids.empty()) {
+        fail("Kokoro::prepare_decode_context", "phoneme_ids is empty");
+    }
+    if (voice.packs.rows <= 0 ||
+        voice.packs.cols != 2 * impl_->config.style_dim) {
+        fail("Kokoro::prepare_decode_context",
+             "voice pack shape does not match 2*style_dim");
+    }
+
+    const brotensor::Device dev = impl_->device;
+
+    // BOS/EOS wrap, matching synthesize().
+    std::vector<int32_t> ids;
+    ids.reserve(phoneme_ids.size() + 2);
+    ids.push_back(0);
+    ids.insert(ids.end(), phoneme_ids.begin(), phoneme_ids.end());
+    ids.push_back(0);
+    const int L = static_cast<int>(ids.size());
+
+    brotensor::Tensor ref_s = voice.pick_for(L).to(dev);
+
+    // 1. plBERT ▶ 2. bert_encoder.
+    brotensor::Tensor bert_dur = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
+    brotensor::Tensor d_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    impl_->bert_encoder.forward(bert_dur, d_en);
+
+    // 3. text_encoder.
+    brotensor::Tensor t_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
+
+    // 4. predictor: durations + F0 + N.
+    Predictor::Output po;
+    impl_->predictor.forward(d_en, ref_s, L, speed, po);
+
+    // 5. length-regulate t_en → asr (irregular per-phoneme gather, host-side —
+    //    identical to synthesize()).
+    const int total = std::accumulate(po.pred_dur.begin(), po.pred_dur.end(), 0);
+    if (total <= 0) {
+        fail("Kokoro::prepare_decode_context",
+             "predicted total frame count is 0");
+    }
+    const int C_hidden = impl_->config.hidden_dim;
+    std::vector<float> asr_host(static_cast<std::size_t>(C_hidden) * total);
+    {
+        const std::vector<float> te_host = t_en.to_host_vector();
+        int t = 0;
+        for (int l = 0; l < L; ++l) {
+            const int reps = po.pred_dur[l];
+            for (int r = 0; r < reps; ++r) {
+                for (int c = 0; c < C_hidden; ++c) {
+                    asr_host[static_cast<std::size_t>(c) * total + t] =
+                        te_host[static_cast<std::size_t>(c) * L + l];
+                }
+                ++t;
+            }
+        }
+    }
+
+    KokoroDecodePrep prep;
+    prep.total     = total;
+    prep.ref_s     = std::move(ref_s);
+    prep.asr       = brotensor::Tensor::from_host_on(dev, asr_host.data(), 1,
+                                                     C_hidden * total);
+    prep.backbone  = &impl_->decoder;
+    prep.generator = &impl_->generator;
+
+    // F0 / N: predicted, or caller-supplied prosody (each 2*total floats).
+    auto take_grid = [&](const std::vector<float>* ov, brotensor::Tensor pred,
+                         const char* which) -> brotensor::Tensor {
+        if (!ov) return pred;
+        if (static_cast<int>(ov->size()) != 2 * total) {
+            fail("Kokoro::prepare_decode_context",
+                 std::string(which) + " override size must be 2*total (" +
+                 std::to_string(2 * total) + ")");
+        }
+        return brotensor::Tensor::from_host_on(dev, ov->data(), 1, 2 * total);
+    };
+    prep.F0_pred = take_grid(F0_override, std::move(po.F0_pred), "F0");
+    prep.N_pred  = take_grid(N_override,  std::move(po.N_pred),  "N");
+
+    // Harmonic source — mirrors decode_back_half (kokoro.cpp:362-375). frames is
+    // the iSTFT-input time axis: L_gen ▸ ×∏(upsample_rates) ▸ reflect-pad (+1).
+    int upsample_prod = 1;
+    for (int r : impl_->config.decoder.upsample_rates) upsample_prod *= r;
+    const int L_gen = 2 * total;
+    const int har_frames = L_gen * upsample_prod + 1;
+    brotensor::Tensor har_stub = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
+    int sig_len = 0, hframes = 0;
+    impl_->hsource.forward(prep.F0_pred, /*frame_count=*/2 * total, sig_len, hframes,
+                           har_stub);
+    if (hframes != har_frames) {
+        fail("Kokoro::prepare_decode_context",
+             "har_frames mismatch: hsource=" + std::to_string(hframes) +
+             " vs expected=" + std::to_string(har_frames));
+    }
+    prep.frames = hframes;
+    prep.har    = std::move(har_stub);
+
+    return prep;
+}
+
 const KokoroConfig& Kokoro::config() const { return impl_->config; }
 bool Kokoro::loaded() const { return impl_->loaded; }
 

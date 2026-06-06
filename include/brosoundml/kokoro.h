@@ -1,6 +1,7 @@
 #pragma once
 
 #include "brosoundml/audio.h"
+#include "brosoundml/decoder_lora.h"   // DecoderLoraContext
 
 #include <brotensor/tensor.h>
 
@@ -11,6 +12,11 @@
 #include <vector>
 
 namespace brosoundml {
+
+// Decoder back-half modules — defined in kokoro_modules.h, referenced here only
+// as borrowed handles in KokoroDecodePrep (the DecoderLora trains against them).
+struct DecoderBackbone;
+struct Generator;
 
 // ─── Kokoro-82M ────────────────────────────────────────────────────────────
 //
@@ -108,6 +114,32 @@ struct Voice {
 
     // Select the style row for an utterance of `n_phonemes` phonemes.
     brotensor::Tensor pick_for(int n_phonemes) const;
+};
+
+// ─── KokoroDecodePrep ──────────────────────────────────────────────────────
+//
+// The device-resident pre-decoder intermediates the decoder LoRA trains over,
+// produced by Kokoro::prepare_decode_context — exactly the inputs the decoder
+// back half (decoder backbone ▶ harmonic source ▶ generator) consumes, plus
+// borrowed references to the frozen backbone + generator the DecoderLora is
+// built against. Owning the tensors keeps them alive while the LoRA forward
+// borrows into them via context(); the prep must outlive any DecoderLora call
+// that reads its context. The backbone/generator pointers alias the loaded
+// Kokoro's modules, so the source Kokoro must outlive this prep.
+struct KokoroDecodePrep {
+    brotensor::Tensor ref_s;     // (1, 2*style_dim) — style = first style_dim cols
+    brotensor::Tensor asr;       // (1, hidden_dim*total)
+    brotensor::Tensor F0_pred;   // (1, 2*total)
+    brotensor::Tensor N_pred;    // (1, 2*total)
+    brotensor::Tensor har;       // (1, (n_fft+2)*frames) — harmonic source stack
+    int total  = 0;              // asr frame count T
+    int frames = 0;              // harmonic-source frame count
+    const DecoderBackbone* backbone  = nullptr;   // frozen, aliases Kokoro::Impl
+    const Generator*       generator = nullptr;   // frozen, aliases Kokoro::Impl
+
+    // A borrowing DecoderLoraContext view over the owned tensors. Valid only
+    // while this prep is alive (and unmoved).
+    DecoderLoraContext context() const;
 };
 
 // ─── KokoroTrace ─────────────────────────────────────────────────────────
@@ -245,6 +277,26 @@ public:
                             const std::vector<float>& N_pred,
                             const CancelCheck& cancel = {},
                             KokoroTrace* trace_out = nullptr) const;
+
+    // Training hook for the decoder LoRA: run the front half
+    // (plBERT ▶ encoders ▶ predictor ▶ length-regulate) plus the harmonic
+    // source, and return the device-resident decoder-back-half inputs —
+    // asr / F0_pred / N_pred / ref_s / har with their frame counts — alongside
+    // borrowed handles to the frozen decoder backbone + generator. This is the
+    // pre-decoder context an DecoderLora::forward consumes; the decoder + the
+    // generator are skipped here (the LoRA runs its own cached versions).
+    //
+    // `phoneme_ids` and `voice` match synthesize(); `speed` scales durations.
+    // When `F0_override` / `N_override` are non-null they replace the predicted
+    // pitch / energy contours (each must be exactly 2*total floats, matching the
+    // frame count the predictor's durations produced) — the prosody-editing seam
+    // mirrored from decode_from. The result owns its tensors; see KokoroDecodePrep.
+    KokoroDecodePrep prepare_decode_context(
+        const std::vector<int32_t>& phoneme_ids,
+        const Voice& voice,
+        float speed = 1.0f,
+        const std::vector<float>* F0_override = nullptr,
+        const std::vector<float>* N_override  = nullptr) const;
 
     const KokoroConfig& config() const;
     bool loaded() const;
