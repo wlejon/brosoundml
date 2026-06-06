@@ -115,6 +115,7 @@ target_sources(brosoundml PRIVATE
     src/qwen_tts_talker.cpp
     src/qwen_tts_code_predictor.cpp
     src/qwen_tts_generate.cpp
+    src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp
     src/bc_resnet.cpp
@@ -186,6 +187,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_qwen_tts_clone tools/qwen_tts_clone.cpp)
     target_link_libraries(brosoundml_qwen_tts_clone PRIVATE brosoundml)
+
+    add_executable(brosoundml_build_speaker_encoder tools/build_speaker_encoder.cpp)
+    target_link_libraries(brosoundml_build_speaker_encoder PRIVATE brosoundml)
 endif()
 
 # --- Tests ---
