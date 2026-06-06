@@ -14,10 +14,13 @@
 // final 1x1 projection to enc_dim. The mel frontend is a reflect-padded STFT
 // (periodic Hann) -> magnitude -> librosa slaney mel basis -> log.
 //
-// Enrollment is one-shot and offline (not in the realtime synthesis loop), so
-// this runs host-side (CPU) for clarity: brotensor conv1d for the convolutions,
-// plain loops for the channel chunking / pooling reductions. The resulting
-// embedding is uploaded to the Talker device by the caller.
+// Enrollment is one-shot and offline (not in the realtime synthesis loop). The
+// convolution stack (the GFLOP-heavy part) runs on brotensor's default device —
+// GPU when one is available, CPU otherwise — in FP32, so the embedding is
+// numerically identical to the CPU reference (the voice-clone bridge/PCA basis
+// were fit against FP32 x-vectors). The mel frontend and the cheap channel
+// chunking / pooling reductions stay host-side. The resulting embedding is
+// returned as host floats and uploaded to the Talker device by the caller.
 
 #include "brosoundml/qwen_tts.h"
 
@@ -44,6 +47,7 @@ struct QwenTtsSpkSERes2 {
 
 struct QwenTtsSpeakerEncoder {
     QwenTtsSpeakerEncoderConfig cfg;
+    brotensor::Device device = brotensor::Device::CPU;  // conv weights live here
 
     QwenTtsSpkConv             block0;     // initial TDNN: mel_dim -> ch[0], k5
     std::vector<QwenTtsSpkSERes2> blocks;  // the three SE-Res2Net blocks
@@ -55,8 +59,9 @@ struct QwenTtsSpeakerEncoder {
     brotensor::Tensor mel_basis;           // (mel_dim, n_fft/2+1) librosa slaney
     brotensor::Tensor hann;                // (1, win_size) periodic Hann
 
-    // Build from the `speaker_encoder.*` tensors of model.safetensors. Weights
-    // stay on CPU (enrollment runs host-side); `cfg` is the parsed config.
+    // Build from the `speaker_encoder.*` tensors of model.safetensors. Conv
+    // weights are placed on brotensor's default device (GPU when available) in
+    // FP32; the mel frontend tensors stay on CPU. `cfg` is the parsed config.
     void load(const brotensor::safetensors::File& f,
               const QwenTtsSpeakerEncoderConfig& cfg);
 

@@ -27,17 +27,26 @@ const sf::TensorView& need(const sf::File& f, const std::string& name) {
     return *v;
 }
 
-// Load a Conv1d (`prefix`.weight / `prefix`.bias) to host FP32. Speaker-encoder
-// weights are BF16 on disk (like the talker) — upload_compute_checked widens.
+// Load a Conv1d (`prefix`.weight / `prefix`.bias). Speaker-encoder weights are
+// BF16 on disk (like the talker); upload_compute_checked widens to the CPU
+// compute dtype (FP32). The FP32 weights are then moved to `dev` — keeping
+// FP32 on the GPU (conv2d_forward has an FP32 path) so the convolutions match
+// the CPU reference bit-for-bit rather than narrowing to FP16.
 QwenTtsSpkConv load_conv(const sf::File& f, const std::string& prefix,
-                         int cin, int cout, int k, int dilation) {
+                         int cin, int cout, int k, int dilation, bt::Device dev) {
     QwenTtsSpkConv c;
     c.cin = cin; c.cout = cout; c.k = k; c.dilation = dilation;
-    bt::DeviceScope cpu(bt::Device::CPU);
-    sf::upload_compute_checked(need(f, prefix + ".weight"), cout, cin * k, c.w,
-                               prefix + ".weight");
-    sf::upload_compute_checked(need(f, prefix + ".bias"), cout, 1, c.b,
-                               prefix + ".bias");
+    {
+        bt::DeviceScope cpu(bt::Device::CPU);
+        sf::upload_compute_checked(need(f, prefix + ".weight"), cout, cin * k, c.w,
+                                   prefix + ".weight");
+        sf::upload_compute_checked(need(f, prefix + ".bias"), cout, 1, c.b,
+                                   prefix + ".bias");
+    }
+    if (dev != bt::Device::CPU) {
+        c.w = c.w.to(dev);
+        c.b = c.b.to(dev);
+    }
     return c;
 }
 
@@ -46,10 +55,10 @@ QwenTtsSpkConv load_conv(const sf::File& f, const std::string& prefix,
 // are channel-major host buffers (C*L). Returns the output (cout * L).
 std::vector<float> conv_same(const QwenTtsSpkConv& c, const std::vector<float>& x,
                              int L) {
-    bt::DeviceScope cpu(bt::Device::CPU);
+    const bt::Device dev = c.w.device;   // weights pin the compute device
+    bt::DeviceScope scope(dev);
     const int p = c.dilation * (c.k - 1) / 2;
-    bt::Tensor X = bt::Tensor::from_host_on(bt::Device::CPU, x.data(), 1,
-                                            c.cin * L);
+    bt::Tensor X = bt::Tensor::from_host_on(dev, x.data(), 1, c.cin * L);
     bt::Tensor Xp;
     if (p > 0) bt::pad1d_forward(X, 1, c.cin, L, p, p, /*mode=*/1, Xp);  // reflect
     const bt::Tensor& in = (p > 0) ? Xp : X;
@@ -58,7 +67,9 @@ std::vector<float> conv_same(const QwenTtsSpkConv& c, const std::vector<float>& 
     bt::conv1d(in, c.w, &c.b, /*N=*/1, c.cin, Lp, c.cout, c.k, /*stride=*/1,
                /*padding=*/0, c.dilation, Y);
     const int Lout = Lp - c.dilation * (c.k - 1);   // == L
-    const float* yp = Y.host_f32();
+    bt::Tensor Yh = (Y.device == bt::Device::CPU) ? std::move(Y)
+                                                  : Y.to(bt::Device::CPU);
+    const float* yp = Yh.host_f32();
     return std::vector<float>(yp, yp + static_cast<std::size_t>(c.cout) * Lout);
 }
 
@@ -124,6 +135,11 @@ std::vector<float> se_block(const QwenTtsSpkSERes2& blk, const std::vector<float
 void QwenTtsSpeakerEncoder::load(const sf::File& f,
                                  const QwenTtsSpeakerEncoderConfig& c) {
     cfg = c;
+    // Run the convolution stack on the default device (GPU when available); the
+    // mel frontend tensors below stay on CPU. brotensor::init() has already run
+    // (SpeakerEncoder::load calls it), so default_device() is resolved.
+    device = bt::default_device();
+    const bt::Device dev = device;
     const std::string P = "speaker_encoder.";
     const std::vector<int>& ch  = cfg.enc_channels;       // [512,512,512,512,1536]
     const std::vector<int>& ks  = cfg.enc_kernel_sizes;   // [5,3,3,3,1]
@@ -133,30 +149,30 @@ void QwenTtsSpeakerEncoder::load(const sf::File& f,
     const int scale = cfg.res2net_scale;
 
     // Initial TDNN: mel_dim -> ch[0], k = ks[0].
-    block0 = load_conv(f, P + "blocks.0.conv", cfg.mel_dim, ch[0], ks[0], dil[0]);
+    block0 = load_conv(f, P + "blocks.0.conv", cfg.mel_dim, ch[0], ks[0], dil[0], dev);
 
     // Three SE-Res2Net blocks (indices 1 .. nblk-2 == 1,2,3).
     blocks.clear();
     for (int i = 1; i < nblk - 1; ++i) {
         const std::string b = P + "blocks." + std::to_string(i) + ".";
         QwenTtsSpkSERes2 s;
-        s.tdnn1 = load_conv(f, b + "tdnn1.conv", ch[i - 1], ch[i], 1, 1);
+        s.tdnn1 = load_conv(f, b + "tdnn1.conv", ch[i - 1], ch[i], 1, 1, dev);
         const int hc = ch[i] / scale;
         for (int r = 0; r < scale - 1; ++r)
             s.res2net.push_back(load_conv(
                 f, b + "res2net_block.blocks." + std::to_string(r) + ".conv",
-                hc, hc, ks[i], dil[i]));
-        s.tdnn2 = load_conv(f, b + "tdnn2.conv", ch[i], ch[i], 1, 1);
-        s.se1 = load_conv(f, b + "se_block.conv1", ch[i], cfg.se_channels, 1, 1);
-        s.se2 = load_conv(f, b + "se_block.conv2", cfg.se_channels, ch[i], 1, 1);
+                hc, hc, ks[i], dil[i], dev));
+        s.tdnn2 = load_conv(f, b + "tdnn2.conv", ch[i], ch[i], 1, 1, dev);
+        s.se1 = load_conv(f, b + "se_block.conv1", ch[i], cfg.se_channels, 1, 1, dev);
+        s.se2 = load_conv(f, b + "se_block.conv2", cfg.se_channels, ch[i], 1, 1, dev);
         blocks.push_back(std::move(s));
     }
 
     // Aggregation, attentive stats pooling, final projection.
-    mfa      = load_conv(f, P + "mfa.conv", agg, agg, ks.back(), dil.back());
-    asp_tdnn = load_conv(f, P + "asp.tdnn.conv", agg * 3, cfg.attention_channels, 1, 1);
-    asp_conv = load_conv(f, P + "asp.conv", cfg.attention_channels, agg, 1, 1);
-    fc       = load_conv(f, P + "fc", agg * 2, cfg.enc_dim, 1, 1);
+    mfa      = load_conv(f, P + "mfa.conv", agg, agg, ks.back(), dil.back(), dev);
+    asp_tdnn = load_conv(f, P + "asp.tdnn.conv", agg * 3, cfg.attention_channels, 1, 1, dev);
+    asp_conv = load_conv(f, P + "asp.conv", cfg.attention_channels, agg, 1, 1, dev);
+    fc       = load_conv(f, P + "fc", agg * 2, cfg.enc_dim, 1, 1, dev);
 
     // ── mel frontend constants ──
     bt::DeviceScope cpu(bt::Device::CPU);
