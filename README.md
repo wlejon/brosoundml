@@ -45,7 +45,7 @@ brosoundml ships **code only** — no trained weights, no packed data, no
 voice packs are checked into this repo. Anything that gets built (POS tagger
 weights, the packed English lexicon, Kokoro voice packs, wake-word
 checkpoints, …) lives in the sibling
-[`brosoundml-data`](../brosoundml-data) repo. Loaders take file paths;
+[`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) repo. Loaders take file paths;
 the application (or the CLI tools in this repo) is responsible for resolving
 them — conventionally caller-supplied path > `BROSOUNDML_DATA_DIR` env var
 > `../brosoundml-data`. See `brosoundml-data/README.md` for the artifact
@@ -101,7 +101,7 @@ text ──▶ [G2P]──▶ phonemes ──▶ [token ids]
 (Apache 2.0) grapheme-to-phoneme frontend. brosoundml ships an in-tree English
 G2P at `brosoundml::g2p::` that removes that runtime dependency for embedded /
 no-Python deployments. The byte-level Transformer POS tagger (`PosTagger`,
-weights in [`brosoundml-data`](https://github.com/wlejon/brosoundml-data) under
+weights in [`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) under
 `pos_tagger/`), the lexicon loader (`Lexicon`), morphology fallback
 (`Morphology`), special-case overrides (`SpecialCases`), text normalizer
 (`Normalizer`), and the Kokoro phoneme-id adapter (`PhonemeAdapter`) are tied

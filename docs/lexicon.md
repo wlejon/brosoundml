@@ -15,7 +15,7 @@ mapping is the adapter's job, not the lexicon's.
 
 The C++ loader, the Python builder, and the unit tests live here in
 `brosoundml`. The packed binary itself (`lexicon_en_us.bin`) lives in the
-sibling [`brosoundml-data`](../../brosoundml-data) repo under `g2p/`. brosoundml
+sibling [`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) repo under `g2p/`. brosoundml
 ships no fetch logic, no manifest, no network code. `Lexicon::load(path)`
 takes a file path; the caller materialises the file.
 
