@@ -126,18 +126,43 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
             for (int id : gen_c0)
                 lp[id] = (lp[id] < 0.0f) ? lp[id] * p : lp[id] / p;
         }
+        // Additive logit bias on specific codebook-0 ids (after rep. penalty, before
+        // suppression) — favor / forbid chosen codes. Ignore out-of-range ids.
+        for (const auto& [id, delta] : params.logit_bias)
+            if (id >= 0 && id < talker.vocab) lp[id] += delta;
         for (int i = params.suppress_lo; i < params.suppress_hi; ++i)
             if (i != params.eos_id) lp[i] = kNegInf;
         if (step < params.min_frames) lp[params.eos_id] = kNegInf;
+
+        // top-1 softmax probability of the (edited) codebook-0 distribution:
+        // exp(0)/Σexp(v-max) = 1/Σexp(v-max). Suppressed -inf entries -> 0. Needed
+        // for the trace and to drive confidence-adaptive temperature.
+        const bool need_conf = trace || (sampling && params.adaptive > 0.0f);
+        float conf_f = 0.0f;
+        if (need_conf) {
+            float mx = lp[0];
+            for (int i = 1; i < talker.vocab; ++i) if (lp[i] > mx) mx = lp[i];
+            double den = 0.0;
+            for (int i = 0; i < talker.vocab; ++i) den += std::exp(lp[i] - mx);
+            conf_f = den > 0.0 ? static_cast<float>(1.0 / den) : 0.0f;
+        }
+
         int c0;
         if (!sampling) {
             c0 = argmax_row(lp, talker.vocab);
         } else {
+            // Confidence-adaptive temperature scales only codebook 0 (the Talker's
+            // semantic driver, where "hedging" is meaningful and what the
+            // c0_confidence trace shows): hotter where conf is low, near base where
+            // high. The Code Predictor's acoustic codebooks keep the base temp.
+            float eff_temp = params.temperature;
+            if (params.adaptive > 0.0f)
+                eff_temp *= 1.0f + params.adaptive * (1.0f - conf_f);
             // Draw codebook 0 from the edited logits via brotensor's seeded
             // sampler (the suppress/min_frames -inf entries softmax to 0).
             bt::Tensor lgs = bt::Tensor::from_host_on(dev, lp, 1, talker.vocab);
             bt::Tensor idx;
-            bt::sample_logits(lgs, params.temperature, params.top_k, params.top_p,
+            bt::sample_logits(lgs, eff_temp, params.top_k, params.top_p,
                               params.seed, rng_counter, idx);
             ++rng_counter;
             bt::Tensor cidx = idx.to(bt::Device::CPU);
@@ -147,15 +172,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
 
-        if (trace) {
-            // top-1 softmax probability of the (edited) codebook-0 distribution:
-            // exp(0)/Σexp(v-max) = 1/Σexp(v-max). Suppressed -inf entries -> 0.
-            float mx = lp[0];
-            for (int i = 1; i < talker.vocab; ++i) if (lp[i] > mx) mx = lp[i];
-            double den = 0.0;
-            for (int i = 0; i < talker.vocab; ++i) den += std::exp(lp[i] - mx);
-            conf.push_back(den > 0.0 ? static_cast<float>(1.0 / den) : 0.0f);
-        }
+        if (trace) conf.push_back(conf_f);
 
         // codebooks 1..15 from the Code Predictor (greedy). Fed device-resident:
         // the Talker hidden (hcur) and the Talker embedding of codebook 0 stay on

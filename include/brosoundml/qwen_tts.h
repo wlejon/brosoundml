@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace brosoundml {
@@ -203,6 +204,27 @@ struct QwenTtsSampling {
     int           top_k       = 0;     // 0 = no top-k cap
     float         top_p       = 1.0f;  // 1 = no nucleus cap
     std::uint64_t seed        = 0;     // RNG seed for reproducible draws
+
+    // ── Talker (codebook-0) logit steering ──────────────────────────────────
+    // repetition_penalty divides (logit>0) / multiplies (logit<0) the logit of
+    // every codebook-0 id already emitted this utterance — > 1 discourages the
+    // droning / looping the AR Talker falls into, 1 disables it. The default
+    // matches the upstream policy (1.05); callers can dial it without touching
+    // the suppress / min-frames machinery.
+    float repetition_penalty = 1.05f;
+    // Additive bias on specific codebook-0 logits, applied before suppression and
+    // sampling: each {id, delta} shifts logits[id] by delta (>0 favors, <0 / -inf
+    // forbids). Opaque RVQ ids, so this is a power-user / experimentation seam.
+    std::vector<std::pair<int, float>> logit_bias;
+
+    // ── Confidence-targeted (adaptive) temperature ──────────────────────────
+    // When adaptive > 0 the per-frame codebook-0 temperature is scaled by how
+    // unsure the Talker is that frame: eff = temperature * (1 + adaptive*(1-conf)),
+    // where conf is the top-1 softmax probability of the (edited) distribution.
+    // The model stays near-greedy where it is confident and samples hotter only
+    // where it hedged — the same frames the c0_confidence trace lights up. 0
+    // disables it (flat temperature, the default).
+    float adaptive = 0.0f;
 };
 
 // Streaming sink: receives `n` finalized 24 kHz mono samples as the codec decodes

@@ -642,7 +642,9 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     gp.suppress_lo = tk.vocab_size - 1024;
     gp.suppress_hi = tk.vocab_size;
     gp.min_frames  = 2;
-    gp.repetition_penalty = 1.05f;
+    gp.repetition_penalty = sampling.repetition_penalty;
+    gp.logit_bias  = sampling.logit_bias;
+    gp.adaptive    = sampling.adaptive;
     gp.temperature = sampling.temperature;
     gp.top_k       = sampling.top_k;
     gp.top_p       = sampling.top_p;

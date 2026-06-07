@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
 
 namespace brosoundml {
@@ -36,6 +37,14 @@ struct QwenTtsGenParams {
     int   suppress_lo = 0, suppress_hi = 0;  // force logits[lo,hi) (except eos) to -inf
     int   min_frames  = 0;   // suppress eos until this many frames are emitted
     float repetition_penalty = 1.0f;  // penalize already-emitted codebook-0 ids
+    // Additive codebook-0 logit bias ({id, delta}), applied after the repetition
+    // penalty and before suppression. Empty = no-op (the default).
+    std::vector<std::pair<int, float>> logit_bias;
+    // Confidence-adaptive temperature: when > 0, the codebook-0 temperature each
+    // frame is scaled to temperature*(1 + adaptive*(1-conf)), conf being the
+    // top-1 softmax prob of the edited distribution that frame — hotter only where
+    // the model hedged. 0 = flat temperature (default). Inert on the greedy path.
+    float adaptive = 0.0f;
 
     // Sampling. temperature == 0 keeps the greedy argmax (deterministic, the
     // bit-exact upstream policy and the default). temperature > 0 draws every
