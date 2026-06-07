@@ -190,6 +190,20 @@ struct QwenTtsCodecConfig {
 
 enum class QwenTtsVariant { Base, CustomVoice, VoiceDesign };
 
+// Optional sampling controls for synthesize(). The default (temperature == 0)
+// is the greedy, deterministic policy that reproduces the upstream code stream
+// bit-for-bit. temperature > 0 turns the autoregressive loop stochastic: every
+// code — codebook 0 and the Code Predictor's codebooks 1..15 — is drawn through
+// brotensor::sample_logits (temperature -> softmax -> top_k -> top_p ->
+// inverse-CDF), seeded by `seed` so a fixed seed gives a repeatable utterance
+// and different seeds give natural take-to-take variation.
+struct QwenTtsSampling {
+    float         temperature = 0.0f;  // 0 = greedy (deterministic, default)
+    int           top_k       = 0;     // 0 = no top-k cap
+    float         top_p       = 1.0f;  // 1 = no nucleus cap
+    std::uint64_t seed        = 0;     // RNG seed for reproducible draws
+};
+
 // Top-level Qwen3-TTS config, read from config.json by QwenTts::load.
 struct QwenTtsConfig {
     QwenTtsVariant variant     = QwenTtsVariant::Base;
@@ -240,7 +254,8 @@ public:
                            const std::string& speaker,
                            const std::string& language = "english",
                            const std::string& instruct = "",
-                           const CancelCheck& cancel = {}) const;
+                           const CancelCheck& cancel = {},
+                           const QwenTtsSampling& sampling = {}) const;
 
     // Zero-shot voice clone (Base variant only): synthesize `text` in the voice
     // of a reference clip `ref`. The clip is encoded to a speaker x-vector by the
@@ -253,7 +268,8 @@ public:
     AudioBuffer synthesize_clone(const std::string& text,
                                  const AudioBuffer& ref,
                                  const std::string& language = "english",
-                                 const CancelCheck& cancel = {}) const;
+                                 const CancelCheck& cancel = {},
+                                 const QwenTtsSampling& sampling = {}) const;
 
     // Encode a reference clip into the ECAPA-TDNN speaker x-vector — exactly the
     // enrollment step synthesize_clone runs, exposed on its own. `ref` is
@@ -314,7 +330,8 @@ private:
     AudioBuffer synth_core(const std::vector<int32_t>& input_ids,
                            const std::vector<int32_t>& instruct_ids,
                            int spk_id, const float* spk_embed, int language_id,
-                           const CancelCheck& cancel) const;
+                           const CancelCheck& cancel,
+                           const QwenTtsSampling& sampling) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

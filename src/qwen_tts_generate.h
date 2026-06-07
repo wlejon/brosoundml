@@ -35,6 +35,17 @@ struct QwenTtsGenParams {
     int   suppress_lo = 0, suppress_hi = 0;  // force logits[lo,hi) (except eos) to -inf
     int   min_frames  = 0;   // suppress eos until this many frames are emitted
     float repetition_penalty = 1.0f;  // penalize already-emitted codebook-0 ids
+
+    // Sampling. temperature == 0 keeps the greedy argmax (deterministic, the
+    // bit-exact upstream policy and the default). temperature > 0 draws every
+    // code — codebook 0 AND the Code Predictor's codebooks 1..15 — through
+    // brotensor::sample_logits (temperature -> softmax -> top_k -> top_p ->
+    // inverse-CDF), seeded by `seed` via a counter that advances one step per
+    // code so the whole utterance is reproducible for a fixed seed.
+    float    temperature = 0.0f;   // 0 = greedy (default); >0 = sample
+    int      top_k       = 0;      // 0 = no top-k cap
+    float    top_p       = 1.0f;   // 1 = no nucleus cap
+    std::uint64_t seed   = 0;      // Philox key for reproducible sampling
 };
 
 // Run the AR loop. `prefill_embeds` is T*hidden row-major; `pos3T` the 3-axis

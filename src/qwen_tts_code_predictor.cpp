@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -246,7 +247,10 @@ void QwenTtsCodePredictor::predict(const float* past_hidden,
 
 void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
                                        const bt::Tensor& c0_embed,
-                                       std::vector<int>& out_codes) const {
+                                       std::vector<int>& out_codes,
+                                       float temperature, int top_k, float top_p,
+                                       std::uint64_t key,
+                                       std::uint64_t* counter) const {
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
@@ -261,10 +265,20 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     // that scalar comes back to the host (4 bytes), not the whole vocab row.
     // Ties keep the lowest index, matching the greedy host reference.
     const bool prof = CpProf::on();
+    const bool sampling = temperature > 0.0f && counter != nullptr;
     using clk = std::chrono::steady_clock;
     auto code_from = [&](const bt::Tensor& row, int head_idx) -> int {
         bt::Tensor lg;
         qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
+        if (sampling) {
+            // Draw this codebook from the seeded sampler, advancing the shared
+            // counter so each code consumes a distinct Philox substream.
+            bt::Tensor idx;
+            bt::sample_logits(lg, temperature, top_k, top_p, key, *counter, idx);
+            ++(*counter);
+            bt::Tensor cidx = idx.to(bt::Device::CPU);      // (1, 1) INT32
+            return *static_cast<const std::int32_t*>(cidx.host_raw());
+        }
         bt::Tensor idx;
         bt::argmax_rows(lg, idx);                           // (1, 1) FP32
         clk::time_point t0;

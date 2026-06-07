@@ -91,9 +91,18 @@ struct QwenTtsCodePredictor {
     // (1, hidden) tensors already on the model's device, so a frame expands with
     // no host round-trip (argmax runs on-device, only the chosen code id — 4
     // bytes per head — comes back). Same greedy result as predict().
+    //
+    // Sampling: with temperature == 0 (or counter == nullptr) every codebook is
+    // the greedy argmax — the default, bit-exact with predict(). With
+    // temperature > 0 each codebook 1..15 is drawn through
+    // brotensor::sample_logits seeded by (key, *counter); *counter is advanced
+    // one step per code so the draws compose with the Talker's codebook-0 stream.
     void predict_dev(const brotensor::Tensor& past_hidden,
                      const brotensor::Tensor& c0_embed,
-                     std::vector<int>& out_codes) const;
+                     std::vector<int>& out_codes,
+                     float temperature = 0.0f, int top_k = 0, float top_p = 1.0f,
+                     std::uint64_t key = 0,
+                     std::uint64_t* counter = nullptr) const;
 
     // Raw pointer to codec_embedding table `table` row `id` (hidden floats).
     const float* codec_embedding_row(int table, int id) const;

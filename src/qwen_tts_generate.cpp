@@ -100,6 +100,12 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     std::vector<float>   logits_host(talker.vocab);
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
+    // Philox counter for sampling: advances one step per code drawn (codebook 0
+    // here, codebooks 1..15 inside predict_dev), so a fixed seed reproduces the
+    // whole utterance. Unused on the greedy path (temperature == 0).
+    const bool     sampling = params.temperature > 0.0f;
+    std::uint64_t  rng_counter = 0;
+
     for (int step = 0; step < params.max_frames; ++step) {
         // Cooperative cancellation: poll once per frame (the dominant cost) and
         // bail with whatever's emitted so far — the caller discards a cancelled
@@ -121,7 +127,20 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         for (int i = params.suppress_lo; i < params.suppress_hi; ++i)
             if (i != params.eos_id) lp[i] = kNegInf;
         if (step < params.min_frames) lp[params.eos_id] = kNegInf;
-        const int c0 = argmax_row(lp, talker.vocab);
+        int c0;
+        if (!sampling) {
+            c0 = argmax_row(lp, talker.vocab);
+        } else {
+            // Draw codebook 0 from the edited logits via brotensor's seeded
+            // sampler (the suppress/min_frames -inf entries softmax to 0).
+            bt::Tensor lgs = bt::Tensor::from_host_on(dev, lp, 1, talker.vocab);
+            bt::Tensor idx;
+            bt::sample_logits(lgs, params.temperature, params.top_k, params.top_p,
+                              params.seed, rng_counter, idx);
+            ++rng_counter;
+            bt::Tensor cidx = idx.to(bt::Device::CPU);
+            c0 = *static_cast<const std::int32_t*>(cidx.host_raw());
+        }
         prof.add(prof.head, th);
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
@@ -132,7 +151,8 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         auto tpr = prof.tick();
         bt::Tensor c0row = qtd::gather_rows(
             talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H) device
-        cp.predict_dev(hcur, c0row, rest);
+        cp.predict_dev(hcur, c0row, rest, params.temperature, params.top_k,
+                       params.top_p, params.seed, sampling ? &rng_counter : nullptr);
         prof.add(prof.predict, tpr);
 
         // emit the frame [c0, c1..c15].

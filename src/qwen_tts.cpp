@@ -367,7 +367,8 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
                                 const std::string& speaker,
                                 const std::string& language,
                                 const std::string& instruct,
-                                const CancelCheck& cancel) const {
+                                const CancelCheck& cancel,
+                                const QwenTtsSampling& sampling) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
     }
@@ -421,13 +422,14 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     }
 
     return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
-                      language_id, cancel);
+                      language_id, cancel, sampling);
 }
 
 AudioBuffer QwenTts::synthesize_clone(const std::string& text,
                                       const AudioBuffer& ref,
                                       const std::string& language,
-                                      const CancelCheck& cancel) const {
+                                      const CancelCheck& cancel,
+                                      const QwenTtsSampling& sampling) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize_clone", "no model loaded; call QwenTts::load() first");
     }
@@ -463,7 +465,7 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
     }
 
     return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
-                      spk_embed.data(), language_id, cancel);
+                      spk_embed.data(), language_id, cancel, sampling);
 }
 
 std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
@@ -500,7 +502,8 @@ std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
 AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& instruct_ids,
                                 int spk_id, const float* spk_embed,
-                                int language_id, const CancelCheck& cancel) const {
+                                int language_id, const CancelCheck& cancel,
+                                const QwenTtsSampling& sampling) const {
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
@@ -525,6 +528,10 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     gp.suppress_hi = tk.vocab_size;
     gp.min_frames  = 2;
     gp.repetition_penalty = 1.05f;
+    gp.temperature = sampling.temperature;
+    gp.top_k       = sampling.top_k;
+    gp.top_p       = sampling.top_p;
+    gp.seed        = sampling.seed;
     std::vector<int32_t> frames;
     const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
                                  T, pos3.data(), trailing.data(), L, tts_pad.data(),
