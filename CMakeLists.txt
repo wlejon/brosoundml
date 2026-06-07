@@ -115,6 +115,7 @@ target_sources(brosoundml PRIVATE
     src/qwen_tts_talker.cpp
     src/qwen_tts_code_predictor.cpp
     src/qwen_tts_generate.cpp
+    src/rave.cpp
     src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp

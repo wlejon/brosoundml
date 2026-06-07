@@ -14,6 +14,7 @@ brosoundml_add_test(brosoundml_test_audio    test_audio.cpp)
 brosoundml_add_test(brosoundml_test_modules  test_modules.cpp)
 brosoundml_add_test(brosoundml_test_kokoro   test_kokoro.cpp)
 brosoundml_add_test(brosoundml_test_qwen_tts test_qwen_tts.cpp)
+brosoundml_add_test(brosoundml_test_rave     test_rave.cpp)
 brosoundml_add_test(brosoundml_test_speaker_encoder test_speaker_encoder.cpp)
 target_compile_definitions(brosoundml_test_speaker_encoder PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")

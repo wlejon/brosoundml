@@ -235,9 +235,46 @@ def selftest(ref, ts_path):
     return det_ok and noise_ok
 
 
+def dump_fixtures(ref, out_dir):
+    """Write raw little-endian float32 fixtures + meta.json for the C++ test:
+    a fixed deterministic input, its deterministic encode latent, and the
+    deterministic (no-noise) decode waveform. The C++ Rave port must reproduce
+    the latent and waveform from these within tolerance."""
+    torch.set_grad_enabled(False)
+    torch.manual_seed(0)
+    ratio = 2048
+    x = (torch.randn(1, 1, ratio * 8) * 0.1).float()
+    z, _, _ = ref.encode(x)
+    y = ref.decode(z, add_noise=False)
+
+    os.makedirs(out_dir, exist_ok=True)
+    def save_bin(name, t):
+        t.detach().contiguous().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
+    save_bin("input.bin", x)
+    save_bin("latent.bin", z)
+    save_bin("decode_det.bin", y)
+    meta = {
+        "input_len":    int(x.shape[-1]),
+        "n_latent":     int(z.shape[1]),
+        "frames":       int(z.shape[2]),
+        "output_len":   int(y.shape[-1]),
+        "latent_mean":  float(z.mean()), "latent_std": float(z.std()),
+        "output_rms":   float(y.pow(2).mean().sqrt()),
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"wrote C++ fixtures to {out_dir}")
+    print(json.dumps(meta, indent=2))
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+    if sys.argv[1] == "--dump":
+        # rave_reference.py --dump <converted_dir> <fixture_out_dir>
+        ref = RaveReference(sys.argv[2])
+        dump_fixtures(ref, sys.argv[3])
+        return
     ref = RaveReference(sys.argv[1])
     print("config:", json.dumps(ref.cfg, indent=2))
     if len(sys.argv) >= 3:
