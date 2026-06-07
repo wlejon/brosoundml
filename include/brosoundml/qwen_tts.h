@@ -210,6 +210,23 @@ struct QwenTtsSampling {
 // it never change. See QwenTts::synthesize_stream.
 using QwenTtsStreamChunkFn = std::function<void(const float* samples, int n)>;
 
+// Optional trace of the autoregressive run, for visualization ("watch it take
+// shape"). Each stage is a row-major (h x w) float grid:
+//   "codes"         — the G x F multi-codebook RVQ raster (row k = codebook k,
+//                     column t = frame t), code ids as floats.
+//   "c0_confidence" — 1 x F, the per-frame top-1 softmax probability of codebook 0
+//                     (how peaked the model's distribution was that frame).
+// Populated only when a QwenTtsTrace* is passed to synthesize(); zero cost (one
+// null-pointer branch per frame) otherwise. Mirrors KokoroTrace's {name,h,w,data}
+// shape so a UI can render Qwen and Kokoro stages the same way.
+struct QwenTtsTrace {
+    struct Stage { std::string name; int h = 0, w = 0; std::vector<float> data; };
+    std::vector<Stage> stages;
+    void add(std::string name, int h, int w, std::vector<float> data) {
+        stages.push_back(Stage{std::move(name), h, w, std::move(data)});
+    }
+};
+
 // Top-level Qwen3-TTS config, read from config.json by QwenTts::load.
 struct QwenTtsConfig {
     QwenTtsVariant variant     = QwenTtsVariant::Base;
@@ -261,7 +278,8 @@ public:
                            const std::string& language = "english",
                            const std::string& instruct = "",
                            const CancelCheck& cancel = {},
-                           const QwenTtsSampling& sampling = {}) const;
+                           const QwenTtsSampling& sampling = {},
+                           QwenTtsTrace* trace = nullptr) const;
 
     // Streaming synthesis: like synthesize(), but the audio is delivered in chunks
     // as the autoregressive loop produces it instead of one buffer at the end. Each
@@ -317,7 +335,8 @@ public:
                                         const std::vector<float>& xvector,
                                         const std::string& language = "english",
                                         const CancelCheck& cancel = {},
-                                        const QwenTtsSampling& sampling = {}) const;
+                                        const QwenTtsSampling& sampling = {},
+                                        QwenTtsTrace* trace = nullptr) const;
 
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
@@ -371,7 +390,8 @@ private:
                            const CancelCheck& cancel,
                            const QwenTtsSampling& sampling,
                            int chunk_frames = 0,
-                           const QwenTtsStreamChunkFn& on_chunk = {}) const;
+                           const QwenTtsStreamChunkFn& on_chunk = {},
+                           QwenTtsTrace* trace = nullptr) const;
 
     // Resolve a CustomVoice/VoiceDesign request to the synth_core inputs shared by
     // synthesize() and synthesize_stream(): tokenized body + instruct turns, the

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -71,7 +72,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
                    std::vector<int32_t>& out_frames,
-                   const CancelCheck& cancel) {
+                   const CancelCheck& cancel, QwenTtsTrace* trace) {
     const bt::Device dev = talker.final_norm.device;
     bt::DeviceScope scope(dev);
     const int H = talker.hidden;
@@ -98,6 +99,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     std::vector<int>     rest;             // codebooks 1..15 from the Code Predictor
     std::vector<int32_t> gen_c0;           // codebook-0 ids emitted so far (rep. penalty)
     std::vector<float>   logits_host(talker.vocab);
+    std::vector<float>   conf;             // per-frame codebook-0 top-1 prob (trace)
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
     // Philox counter for sampling: advances one step per code drawn (codebook 0
@@ -144,6 +146,16 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         prof.add(prof.head, th);
         if (c0 == params.eos_id) break;
         gen_c0.push_back(static_cast<int32_t>(c0));
+
+        if (trace) {
+            // top-1 softmax probability of the (edited) codebook-0 distribution:
+            // exp(0)/Σexp(v-max) = 1/Σexp(v-max). Suppressed -inf entries -> 0.
+            float mx = lp[0];
+            for (int i = 1; i < talker.vocab; ++i) if (lp[i] > mx) mx = lp[i];
+            double den = 0.0;
+            for (int i = 0; i < talker.vocab; ++i) den += std::exp(lp[i] - mx);
+            conf.push_back(den > 0.0 ? static_cast<float>(1.0 / den) : 0.0f);
+        }
 
         // codebooks 1..15 from the Code Predictor (greedy). Fed device-resident:
         // the Talker hidden (hcur) and the Talker embedding of codebook 0 stay on
@@ -192,8 +204,22 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         prof.add(prof.talker, tt);
     }
 
-    prof.report(static_cast<int>(out_frames.size()) / G);
-    return static_cast<int>(out_frames.size()) / G;
+    const int nf = static_cast<int>(out_frames.size()) / G;
+
+    if (trace) {
+        // code raster: G rows x nf cols, codebook-major (row k = codebook k).
+        std::vector<float> raster(static_cast<std::size_t>(G) * nf);
+        for (int t = 0; t < nf; ++t)
+            for (int k = 0; k < G; ++k)
+                raster[static_cast<std::size_t>(k) * nf + t] =
+                    static_cast<float>(out_frames[static_cast<std::size_t>(t) * G + k]);
+        trace->add("codes", G, nf, std::move(raster));
+        const int cw = static_cast<int>(conf.size());   // read before the move (arg-eval order)
+        trace->add("c0_confidence", 1, cw, std::move(conf));
+    }
+
+    prof.report(nf);
+    return nf;
 }
 
 void assemble_talker_prefill(const QwenTtsTalker& talker,

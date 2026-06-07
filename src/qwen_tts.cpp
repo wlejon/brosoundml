@@ -423,7 +423,8 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
                                 const std::string& language,
                                 const std::string& instruct,
                                 const CancelCheck& cancel,
-                                const QwenTtsSampling& sampling) const {
+                                const QwenTtsSampling& sampling,
+                                QwenTtsTrace* trace) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
     }
@@ -432,7 +433,8 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     resolve_inputs("QwenTts::synthesize", text, speaker, language, instruct,
                    input_ids, instruct_ids, spk_id, language_id);
     return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
-                      language_id, cancel, sampling);
+                      language_id, cancel, sampling, /*chunk_frames=*/0,
+                      /*on_chunk=*/{}, trace);
 }
 
 AudioBuffer QwenTts::synthesize_stream(const std::string& text,
@@ -502,7 +504,8 @@ AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
                                              const std::vector<float>& xvector,
                                              const std::string& language,
                                              const CancelCheck& cancel,
-                                             const QwenTtsSampling& sampling) const {
+                                             const QwenTtsSampling& sampling,
+                                             QwenTtsTrace* trace) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize_with_xvector", "no model loaded; call QwenTts::load() first");
     }
@@ -538,7 +541,8 @@ AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
     }
 
     return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
-                      xvector.data(), language_id, cancel, sampling);
+                      xvector.data(), language_id, cancel, sampling,
+                      /*chunk_frames=*/0, /*on_chunk=*/{}, trace);
 }
 
 std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
@@ -578,7 +582,8 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
                                 int language_id, const CancelCheck& cancel,
                                 const QwenTtsSampling& sampling,
                                 int chunk_frames,
-                                const QwenTtsStreamChunkFn& on_chunk) const {
+                                const QwenTtsStreamChunkFn& on_chunk,
+                                QwenTtsTrace* trace) const {
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
@@ -652,7 +657,7 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     std::vector<int32_t> frames;
     const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
                                  T, pos3.data(), trailing.data(), L, tts_pad.data(),
-                                 gp, frames, cancel);
+                                 gp, frames, cancel, trace);
     // Cancelled mid-loop: discard the partial code stream and return silence
     // (chunks already handed to on_chunk stay delivered).
     if (cancel && cancel()) return AudioBuffer{};

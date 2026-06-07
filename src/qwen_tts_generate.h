@@ -71,7 +71,8 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
                    std::vector<int32_t>& out_frames,
-                   const CancelCheck& cancel = {});
+                   const CancelCheck& cancel = {},
+                   QwenTtsTrace* trace = nullptr);
 
 // Assemble the Talker prefill embedding stream + trailing-text embeddings,
 // mirroring the upstream Qwen3TTS generate() (streaming, no voice clone). Covers
