@@ -468,6 +468,49 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
                       spk_embed.data(), language_id, cancel, sampling);
 }
 
+AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
+                                             const std::vector<float>& xvector,
+                                             const std::string& language,
+                                             const CancelCheck& cancel,
+                                             const QwenTtsSampling& sampling) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::synthesize_with_xvector", "no model loaded; call QwenTts::load() first");
+    }
+    if (!impl_->config.speaker_encoder.present) {
+        fail("QwenTts::synthesize_with_xvector",
+             "loaded checkpoint has no speaker encoder; the x-vector splice needs "
+             "a Base-variant model");
+    }
+    const int want = impl_->config.speaker_encoder.enc_dim;
+    if (static_cast<int>(xvector.size()) != want) {
+        fail("QwenTts::synthesize_with_xvector",
+             "x-vector must be " + std::to_string(want) + " floats (got " +
+             std::to_string(xvector.size()) + ")");
+    }
+    const QwenTtsTalkerConfig& tk = impl_->config.talker;
+
+    // Resolve language (Base has no preset speakers / dialects) — mirrors
+    // synthesize_clone.
+    int language_id = -1;
+    if (language != "auto") {
+        auto it = tk.codec_language_id.find(language);
+        if (it == tk.codec_language_id.end())
+            fail("QwenTts::synthesize_with_xvector", "unsupported language '" + language + "'");
+        language_id = it->second;
+    }
+
+    // Tokenize the body chat prompt (the text to speak).
+    const std::string prompt =
+        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9) {
+        fail("QwenTts::synthesize_with_xvector", "prompt tokenized to too few tokens");
+    }
+
+    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+                      xvector.data(), language_id, cancel, sampling);
+}
+
 std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
     if (!impl_->loaded) {
         fail("QwenTts::embed_speaker", "no model loaded; call QwenTts::load() first");

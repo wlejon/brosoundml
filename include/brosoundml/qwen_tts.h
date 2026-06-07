@@ -281,6 +281,21 @@ public:
     // `ref` is empty.
     std::vector<float> embed_speaker(const AudioBuffer& ref) const;
 
+    // Synthesize `text` from a caller-supplied speaker x-vector directly —
+    // synthesize_clone without the WAV->ECAPA enrollment step. `xvector` must be
+    // exactly `enc_dim` (config().speaker_encoder.enc_dim, 1024) floats, the same
+    // width embed_speaker() returns; it is spliced into the Talker prefill in the
+    // slot a preset speaker token would occupy. This is the seam a voice designer
+    // drives: enroll real voices to x-vectors, then interpolate / morph / steer in
+    // that space and render the designed point — no reference clip per render.
+    // Base variant only (needs the speaker encoder's width); throws if no model is
+    // loaded, the checkpoint is not Base, or the vector length is wrong.
+    AudioBuffer synthesize_with_xvector(const std::string& text,
+                                        const std::vector<float>& xvector,
+                                        const std::string& language = "english",
+                                        const CancelCheck& cancel = {},
+                                        const QwenTtsSampling& sampling = {}) const;
+
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
     // on its own once the Talker / Code Predictor have produced (or a caller
