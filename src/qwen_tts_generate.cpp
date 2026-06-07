@@ -159,6 +159,9 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         out_frames.push_back(static_cast<int32_t>(c0));
         for (int x : rest) out_frames.push_back(static_cast<int32_t>(x));
 
+        // Streaming hook: let the caller decode + emit the new tail mid-loop.
+        if (params.on_frame) params.on_frame(out_frames);
+
         // next Talker input = sum of the 16 code embeddings + trailing/pad text,
         // assembled on-device (reusing c0row as the accumulator).
         auto ta = prof.tick();

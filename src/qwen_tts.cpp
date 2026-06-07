@@ -363,34 +363,31 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
     impl_->loaded = true;
 }
 
-AudioBuffer QwenTts::synthesize(const std::string& text,
-                                const std::string& speaker,
-                                const std::string& language,
-                                const std::string& instruct,
-                                const CancelCheck& cancel,
-                                const QwenTtsSampling& sampling) const {
-    if (!impl_->loaded) {
-        fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
-    }
+void QwenTts::resolve_inputs(const char* who, const std::string& text,
+                             const std::string& speaker, const std::string& language,
+                             const std::string& instruct,
+                             std::vector<int32_t>& input_ids,
+                             std::vector<int32_t>& instruct_ids,
+                             int& spk_id, int& language_id) const {
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
-    // Resolve speaker / language to codec tokens (and apply the dialect
-    // override the upstream pipeline does for dialect speakers). A model with no
-    // speaker presets (VoiceDesign) has an empty spk_id table — leave spk_id -1.
-    // The speaker name is then only consulted for the dialect override below.
-    int spk_id = -1;
+    // Resolve speaker / language to codec tokens (and apply the dialect override
+    // the upstream pipeline does for dialect speakers). A model with no speaker
+    // presets (VoiceDesign) has an empty spk_id table — leave spk_id -1. The
+    // speaker name is then only consulted for the dialect override below.
+    spk_id = -1;
     if (!tk.spk_id.empty()) {
         auto it = tk.spk_id.find(speaker);
-        if (it == tk.spk_id.end()) fail("QwenTts::synthesize", "unknown speaker '" + speaker + "'");
+        if (it == tk.spk_id.end()) fail(who, "unknown speaker '" + speaker + "'");
         spk_id = it->second;
     }
-    int language_id = -1;
+    language_id = -1;
     const bool is_auto = (language == "auto");
     if (!is_auto) {
         auto it = tk.codec_language_id.find(language);
         if (it == tk.codec_language_id.end())
-            fail("QwenTts::synthesize", "unsupported language '" + language + "'");
+            fail(who, "unsupported language '" + language + "'");
         language_id = it->second;
     }
     if (is_auto || language == "chinese") {
@@ -404,25 +401,58 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     // Tokenize the body chat prompt (the text to speak).
     const std::string prompt =
         "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
-    if (input_ids.size() < 9) {  // role(3) + >=1 body + trailing(5)
-        fail("QwenTts::synthesize", "prompt tokenized to too few tokens");
-    }
+    input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9)   // role(3) + >=1 body + trailing(5)
+        fail(who, "prompt tokenized to too few tokens");
 
-    // VoiceDesign (and 1.7B CustomVoice) take a natural-language voice
-    // instruction, tokenized as its own user turn and prepended to the prefill.
-    // Empty = no instruction (the only mode the 0.6B CustomVoice checkpoint
-    // supports). The 0.6B CustomVoice ignores any instruct, matching upstream.
-    std::vector<int32_t> instruct_ids;
+    // VoiceDesign (and 1.7B CustomVoice) take a natural-language voice instruction,
+    // tokenized as its own user turn and prepended to the prefill. Empty = no
+    // instruction (the only mode the 0.6B CustomVoice checkpoint supports); the
+    // 0.6B CustomVoice ignores any instruct, matching upstream.
+    instruct_ids.clear();
     const bool ignore_instruct =
         (cfg.variant == QwenTtsVariant::CustomVoice && cfg.model_size == "0b6");
     if (!instruct.empty() && !ignore_instruct) {
         const std::string ins_prompt = "<|im_start|>user\n" + instruct + "<|im_end|>\n";
         instruct_ids = impl_->tokenizer->encode(ins_prompt);
     }
+}
 
+AudioBuffer QwenTts::synthesize(const std::string& text,
+                                const std::string& speaker,
+                                const std::string& language,
+                                const std::string& instruct,
+                                const CancelCheck& cancel,
+                                const QwenTtsSampling& sampling) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
+    }
+    std::vector<int32_t> input_ids, instruct_ids;
+    int spk_id = -1, language_id = -1;
+    resolve_inputs("QwenTts::synthesize", text, speaker, language, instruct,
+                   input_ids, instruct_ids, spk_id, language_id);
     return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
                       language_id, cancel, sampling);
+}
+
+AudioBuffer QwenTts::synthesize_stream(const std::string& text,
+                                       const std::string& speaker,
+                                       int chunk_frames,
+                                       const QwenTtsStreamChunkFn& on_chunk,
+                                       const std::string& language,
+                                       const std::string& instruct,
+                                       const CancelCheck& cancel,
+                                       const QwenTtsSampling& sampling) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::synthesize_stream", "no model loaded; call QwenTts::load() first");
+    }
+    std::vector<int32_t> input_ids, instruct_ids;
+    int spk_id = -1, language_id = -1;
+    resolve_inputs("QwenTts::synthesize_stream", text, speaker, language, instruct,
+                   input_ids, instruct_ids, spk_id, language_id);
+    const int cf = chunk_frames > 0 ? chunk_frames : 25;
+    return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
+                      language_id, cancel, sampling, cf, on_chunk);
 }
 
 AudioBuffer QwenTts::synthesize_clone(const std::string& text,
@@ -546,7 +576,9 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& instruct_ids,
                                 int spk_id, const float* spk_embed,
                                 int language_id, const CancelCheck& cancel,
-                                const QwenTtsSampling& sampling) const {
+                                const QwenTtsSampling& sampling,
+                                int chunk_frames,
+                                const QwenTtsStreamChunkFn& on_chunk) const {
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
@@ -562,6 +594,41 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     for (int a = 0; a < 3; ++a)
         for (int t = 0; t < T; ++t) pos3[a * T + t] = t;
 
+    const int G   = tk.num_code_groups;
+    const int spf = cfg.codec.decode_upsample_rate;   // 24 kHz samples per 12.5 Hz frame
+    const bool streaming = chunk_frames > 0 && static_cast<bool>(on_chunk);
+
+    // Transpose frame-major [n][G] -> codebook-major codes[k*n + t] (decode_codes layout).
+    auto transpose = [G](const std::vector<int32_t>& fr, int n) {
+        std::vector<int32_t> codes(static_cast<std::size_t>(G) * n);
+        for (int t = 0; t < n; ++t)
+            for (int k = 0; k < G; ++k)
+                codes[static_cast<std::size_t>(k) * n + t] =
+                    fr[static_cast<std::size_t>(t) * G + k];
+        return codes;
+    };
+
+    // Streaming emit: decode the whole code prefix [0..F) and hand the newly
+    // finalized tail to on_chunk (also concatenating it into `streamed`). The codec
+    // is causal, so the first emitted_frames*spf samples are identical across
+    // decodes — re-decoding the prefix is redundant codec work but keeps every
+    // emitted sample final, and is dwarfed by the autoregressive loop's cost.
+    AudioBuffer streamed;
+    int emitted_frames = 0;
+    auto emit = [&](const std::vector<int32_t>& fr, int F) {
+        AudioBuffer wav = decode_codes(transpose(fr, F), G, F);
+        std::size_t from = static_cast<std::size_t>(emitted_frames) * spf;
+        std::size_t to   = static_cast<std::size_t>(F) * spf;
+        if (to > wav.samples.size()) to = wav.samples.size();
+        if (to > from) {
+            on_chunk(wav.samples.data() + from, static_cast<int>(to - from));
+            streamed.samples.insert(streamed.samples.end(),
+                                    wav.samples.begin() + from, wav.samples.begin() + to);
+        }
+        streamed.sample_rate = wav.sample_rate;
+        emitted_frames = F;
+    };
+
     // Run the dual-track AR loop with the upstream codebook-0 logits policy.
     QwenTtsGenParams gp;
     gp.eos_id      = tk.codec_eos_id;
@@ -575,22 +642,28 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     gp.top_k       = sampling.top_k;
     gp.top_p       = sampling.top_p;
     gp.seed        = sampling.seed;
+    if (streaming) {
+        gp.on_frame = [&](const std::vector<int32_t>& fr) {
+            const int F = static_cast<int>(fr.size()) / G;
+            if (F - emitted_frames >= chunk_frames) emit(fr, F);
+        };
+    }
+
     std::vector<int32_t> frames;
     const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
                                  T, pos3.data(), trailing.data(), L, tts_pad.data(),
                                  gp, frames, cancel);
-    // Cancelled mid-loop: discard the partial code stream and return silence.
+    // Cancelled mid-loop: discard the partial code stream and return silence
+    // (chunks already handed to on_chunk stay delivered).
     if (cancel && cancel()) return AudioBuffer{};
-    const int G = tk.num_code_groups;
 
-    // Transpose frame-major [F][G] to the codebook-major layout decode_codes
-    // expects: codes[k * F + t].
-    std::vector<int32_t> codes(static_cast<std::size_t>(G) * F);
-    for (int t = 0; t < F; ++t)
-        for (int k = 0; k < G; ++k)
-            codes[static_cast<std::size_t>(k) * F + t] = frames[static_cast<std::size_t>(t) * G + k];
+    if (streaming) {
+        if (F > emitted_frames) emit(frames, F);   // flush the final partial chunk
+        if (streamed.sample_rate == 0) streamed.sample_rate = cfg.sample_rate;
+        return streamed;
+    }
 
-    return decode_codes(codes, G, F);
+    return decode_codes(transpose(frames, F), G, F);
 }
 
 AudioBuffer QwenTts::decode_codes(const std::vector<int32_t>& codes,

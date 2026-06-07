@@ -21,6 +21,7 @@
 #include "brosoundml/audio.h"   // CancelCheck
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace brosoundml {
@@ -46,6 +47,12 @@ struct QwenTtsGenParams {
     int      top_k       = 0;      // 0 = no top-k cap
     float    top_p       = 1.0f;   // 1 = no nucleus cap
     std::uint64_t seed   = 0;      // Philox key for reproducible sampling
+
+    // Optional per-frame hook: invoked after each frame's G codes are appended to
+    // out_frames, receiving the full accumulator (frame-major, length frames*G).
+    // Lets a streaming caller decode + emit the new tail mid-loop. Empty = no-op
+    // (the default; just one branch per frame).
+    std::function<void(const std::vector<int32_t>&)> on_frame;
 };
 
 // Run the AR loop. `prefill_embeds` is T*hidden row-major; `pos3T` the 3-axis

@@ -5,6 +5,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -204,6 +205,11 @@ struct QwenTtsSampling {
     std::uint64_t seed        = 0;     // RNG seed for reproducible draws
 };
 
+// Streaming sink: receives `n` finalized 24 kHz mono samples as the codec decodes
+// the growing code stream mid-synthesis. The codec is causal, so samples handed to
+// it never change. See QwenTts::synthesize_stream.
+using QwenTtsStreamChunkFn = std::function<void(const float* samples, int n)>;
+
 // Top-level Qwen3-TTS config, read from config.json by QwenTts::load.
 struct QwenTtsConfig {
     QwenTtsVariant variant     = QwenTtsVariant::Base;
@@ -256,6 +262,23 @@ public:
                            const std::string& instruct = "",
                            const CancelCheck& cancel = {},
                            const QwenTtsSampling& sampling = {}) const;
+
+    // Streaming synthesis: like synthesize(), but the audio is delivered in chunks
+    // as the autoregressive loop produces it instead of one buffer at the end. Each
+    // time `chunk_frames` (<=0 => a 25-frame ≈ 2 s default) new 12.5 Hz frames have
+    // accumulated, the codec decodes the stream so far and `on_chunk` receives the
+    // newly finalized samples (the codec is causal, so emitted samples never
+    // change). The complete waveform is also returned. `cancel` is polled once per
+    // frame (barge-in): on cancel the remaining frames are dropped and an empty
+    // buffer is returned, while chunks already handed to `on_chunk` stay delivered.
+    AudioBuffer synthesize_stream(const std::string& text,
+                                  const std::string& speaker,
+                                  int chunk_frames,
+                                  const QwenTtsStreamChunkFn& on_chunk,
+                                  const std::string& language = "english",
+                                  const std::string& instruct = "",
+                                  const CancelCheck& cancel = {},
+                                  const QwenTtsSampling& sampling = {}) const;
 
     // Zero-shot voice clone (Base variant only): synthesize `text` in the voice
     // of a reference clip `ref`. The clip is encoded to a speaker x-vector by the
@@ -346,7 +369,20 @@ private:
                            const std::vector<int32_t>& instruct_ids,
                            int spk_id, const float* spk_embed, int language_id,
                            const CancelCheck& cancel,
-                           const QwenTtsSampling& sampling) const;
+                           const QwenTtsSampling& sampling,
+                           int chunk_frames = 0,
+                           const QwenTtsStreamChunkFn& on_chunk = {}) const;
+
+    // Resolve a CustomVoice/VoiceDesign request to the synth_core inputs shared by
+    // synthesize() and synthesize_stream(): tokenized body + instruct turns, the
+    // preset speaker token (or -1), and the language token (incl. dialect override).
+    // `who` names the caller in error messages.
+    void resolve_inputs(const char* who, const std::string& text,
+                        const std::string& speaker, const std::string& language,
+                        const std::string& instruct,
+                        std::vector<int32_t>& input_ids,
+                        std::vector<int32_t>& instruct_ids,
+                        int& spk_id, int& language_id) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
