@@ -242,6 +242,63 @@ static int run() {
                 std::printf("    synthesize: wrote %s\n",
                             out_wav.string().c_str());
             }
+
+            // ── Streaming: chunked synthesis == per-chunk synthesize ─────────
+            // Two chunks streamed back-to-back must (a) emit one on_chunk per
+            // non-empty chunk with that chunk's exact sample count and (b)
+            // concatenate to bit-exactly the same audio as synthesizing each
+            // chunk on its own and joining — i.e. streaming reorders nothing.
+            {
+                const std::vector<int32_t> c0 = {50, 47, 54, 54, 57};   // "hello"
+                const std::vector<int32_t> c1 = {54, 50, 50, 47};       // a 2nd clause
+                AudioBuffer s0 = real.synthesize(c0, v, 1.0f);
+                AudioBuffer s1 = real.synthesize(c1, v, 1.0f);
+
+                std::vector<int> chunk_sizes;
+                AudioBuffer joined;
+                AudioBuffer streamed = real.synthesize_stream(
+                    {c0, c1}, v,
+                    [&](const float* p, int n) {
+                        chunk_sizes.push_back(n);
+                        joined.samples.insert(joined.samples.end(), p, p + n);
+                    },
+                    1.0f);
+
+                CHECK(streamed.sample_rate == 24000,
+                      tag("synthesize_stream: 24 kHz output"));
+                CHECK(chunk_sizes.size() == 2,
+                      tag("synthesize_stream: one on_chunk per non-empty chunk"));
+                CHECK(chunk_sizes.size() == 2 &&
+                      chunk_sizes[0] == static_cast<int>(s0.samples.size()) &&
+                      chunk_sizes[1] == static_cast<int>(s1.samples.size()),
+                      tag("synthesize_stream: chunk sample counts match per-chunk synthesize"));
+                CHECK(streamed.samples.size() ==
+                          s0.samples.size() + s1.samples.size(),
+                      tag("synthesize_stream: total length == sum of chunks"));
+                CHECK(streamed.samples == joined.samples,
+                      tag("synthesize_stream: returned buffer == on_chunk stream"));
+                bool seam_exact = streamed.samples.size() ==
+                                      s0.samples.size() + s1.samples.size();
+                for (std::size_t i = 0; seam_exact && i < s0.samples.size(); ++i)
+                    if (streamed.samples[i] != s0.samples[i]) seam_exact = false;
+                for (std::size_t i = 0; seam_exact && i < s1.samples.size(); ++i)
+                    if (streamed.samples[s0.samples.size() + i] != s1.samples[i])
+                        seam_exact = false;
+                CHECK(seam_exact,
+                      tag("synthesize_stream: chunks are independent (bit-exact vs per-chunk)"));
+
+                // Cancellation drops remaining chunks and returns the partial.
+                int seen = 0;
+                AudioBuffer partial = real.synthesize_stream(
+                    {c0, c1}, v,
+                    [&](const float*, int) { ++seen; },
+                    1.0f,
+                    [&] { return seen >= 1; });   // cancel after the 1st chunk
+                CHECK(seen == 1,
+                      tag("synthesize_stream: cancel stops after the current chunk"));
+                CHECK(partial.samples.size() == s0.samples.size(),
+                      tag("synthesize_stream: cancelled run returns delivered chunks only"));
+            }
         }
     }
     };  // run_real_smoke

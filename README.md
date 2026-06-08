@@ -109,6 +109,14 @@ together by `Phonemizer` — so callers can phonemize English text in-tree with 
 misaki/Python dependency. `Kokoro::synthesize()` still accepts phoneme ids
 directly for callers that supply their own.
 
+Kokoro is a single non-autoregressive forward pass, so there is no growing token
+prefix to stream the way Qwen3-TTS does. `synthesize_stream()` instead chunks the
+*input*: the caller passes phoneme chunks split at sentence/clause boundaries,
+each is synthesized independently and its 24 kHz audio is handed to an `on_chunk`
+sink the moment it finishes (first-chunk latency for a long script), with the
+full concatenation also returned. The `synth --stream` CLI drives this, one
+`--ids-file` line per chunk.
+
 ### brotensor op coverage
 
 Most of Kokoro maps straight onto the existing op surface:
@@ -208,6 +216,16 @@ takes already-tokenized prompts and emits token ids.
                          autoregressive greedy decode.
    4. Tokenizer          brolm::whisper::Tokenizer (external) maps id ─▶ text.
 ```
+
+`transcribe()` has a `TranscribeOptions` overload for realtime use:
+`on_token` fires per decoded id so a caller can emit partial text mid-utterance
+instead of waiting for the whole clip, and `timestamp_begin_id` opts into
+sequential long-form decode — audio past the fixed 30 s log-mel window is split
+into 30 s segments and advanced by each segment's last emitted timestamp
+(falling back to full-30 s hops) instead of being truncated. Only that single
+int crosses the tokenizer boundary; the caller still owns `build_prompt`/`decode`
+(`brolm::whisper::Tokenizer::first_timestamp_id()` supplies it). The CLI's
+`--stream` flag and its automatic long-form for >30 s clips drive both.
 
 ### brotensor op coverage
 

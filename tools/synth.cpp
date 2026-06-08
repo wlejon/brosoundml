@@ -9,6 +9,13 @@
 //   synth --model <model_dir> --voice <voice.bin> --out <out.wav> "1,2,3,..."
 //   synth --model <model_dir> --voice <voice.bin> --out-dir <dir> \
 //         --ids-file lines.txt --speed 1.0
+//   synth --model <model_dir> --voice <voice.bin> --out <out.wav> \
+//         --ids-file lines.txt --stream      # one WAV, each line a chunk
+//
+// With --stream, the --ids-file lines are treated as phoneme chunks
+// (one sentence/clause per line) and fed to Kokoro::synthesize_stream: each
+// chunk's audio is emitted as it finishes (first-chunk latency) and the
+// concatenation is written to --out.
 //
 // Use scripts/phonemize.py to convert English text -> id sequence.
 
@@ -61,6 +68,7 @@ int main(int argc, char** argv) {
     std::string model_dir, voice_path, out_path, out_dir, ids_file, ids_inline, device_str = "cpu";
     float speed = 1.0f;
     bool trace = false;
+    bool stream = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -76,6 +84,7 @@ int main(int argc, char** argv) {
         else if (a == "--speed")     speed      = std::stof(next("--speed"));
         else if (a == "--device")    device_str = next("--device");
         else if (a == "--trace")     trace      = true;
+        else if (a == "--stream")    stream     = true;
         else if (a == "-h" || a == "--help") {
             std::printf("Usage: synth --model DIR --voice voice.bin "
                         "(--out file.wav PHONEMEIDS | --out-dir DIR --ids-file FILE)\n");
@@ -104,6 +113,35 @@ int main(int argc, char** argv) {
         brosoundml::Voice voice = k.load_voice(voice_path);
         std::fprintf(stderr, "loaded voice %s (%dx%d)\n",
                      voice.name.c_str(), voice.packs.rows, voice.packs.cols);
+
+        // Streaming: --ids-file lines are phoneme chunks, emitted as each one
+        // finishes and concatenated into a single --out WAV.
+        if (stream) {
+            if (ids_file.empty()) die("--stream requires --ids-file (one chunk per line)");
+            if (out_path.empty()) die("--stream requires --out (the concatenated WAV)");
+            std::ifstream f(ids_file);
+            if (!f) die("cannot open --ids-file '" + ids_file + "'");
+            std::vector<std::vector<int32_t>> chunks;
+            std::string line;
+            while (std::getline(f, line)) {
+                if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+                chunks.push_back(parse_ids(line));
+            }
+            std::fprintf(stderr, "streaming %zu chunk(s) -> %s\n",
+                         chunks.size(), out_path.c_str());
+            int idx = 0;
+            auto audio = k.synthesize_stream(
+                chunks, voice,
+                [&](const float*, int n) {
+                    std::fprintf(stderr, "  chunk %d: %d samples (%.2fs)\n",
+                                 idx++, n, n / 24000.0);
+                },
+                speed);
+            audio.write_wav(out_path);
+            std::fprintf(stderr, "  wrote %zu samples total\n",
+                         audio.samples.size());
+            return 0;
+        }
 
         if (!ids_inline.empty()) {
             if (out_path.empty()) die("--out is required when phoneme ids are inline");

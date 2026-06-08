@@ -506,6 +506,40 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
                                    cancel, trace_out);
 }
 
+AudioBuffer Kokoro::synthesize_stream(
+    const std::vector<std::vector<int32_t>>& phoneme_chunks,
+    const Voice& voice,
+    const KokoroStreamChunkFn& on_chunk,
+    float speed,
+    const CancelCheck& cancel) const {
+    if (!impl_->loaded) {
+        fail("Kokoro::synthesize_stream",
+             "no model loaded; call Kokoro::load() first");
+    }
+
+    AudioBuffer out;
+    out.sample_rate = impl_->config.sample_rate;
+
+    for (const std::vector<int32_t>& chunk : phoneme_chunks) {
+        if (cancel && cancel()) break;   // barge-in: drop remaining chunks
+        if (chunk.empty()) continue;     // nothing to synthesize for this chunk
+
+        // Each chunk is a self-contained utterance — synthesize() applies the
+        // BOS/EOS wrap, duration prediction, and length-aware voice row. It
+        // returns an empty buffer if cancelled mid-chunk.
+        AudioBuffer seg = synthesize(chunk, voice, speed,
+                                     /*pred_dur_out=*/nullptr, cancel,
+                                     /*trace_out=*/nullptr);
+        if (seg.samples.empty()) continue;
+
+        if (on_chunk) on_chunk(seg.samples.data(),
+                               static_cast<int>(seg.samples.size()));
+        out.samples.insert(out.samples.end(),
+                           seg.samples.begin(), seg.samples.end());
+    }
+    return out;
+}
+
 AudioBuffer Kokoro::decode_from(const Voice& voice,
                                 int n_phonemes_wrapped,
                                 const std::vector<float>& asr_host,

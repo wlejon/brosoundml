@@ -6,6 +6,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -180,6 +181,16 @@ struct KokoroTrace {
     void add_ints(std::string name, const std::vector<int32_t>& v);
 };
 
+// Streaming sink: receives `n` finalized 24 kHz mono samples each time a
+// phoneme chunk finishes synthesizing. See Kokoro::synthesize_stream. Unlike
+// Qwen3-TTS (autoregressive, so its codec streams the growing token tail),
+// Kokoro is a single non-autoregressive forward pass — the whole utterance is
+// length-regulated and decoded at once, with no internal point at which a
+// prefix is final. Streaming therefore chunks the *input*: each phoneme chunk
+// is synthesized independently and its audio is emitted as it completes, which
+// is what gets first-audio latency down for a long script.
+using KokoroStreamChunkFn = std::function<void(const float* samples, int n)>;
+
 // The Kokoro TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -248,6 +259,30 @@ public:
                            std::vector<int32_t>* pred_dur_out = nullptr,
                            const CancelCheck& cancel = {},
                            KokoroTrace* trace_out = nullptr) const;
+
+    // Streaming synthesis: synthesize each phoneme chunk in `phoneme_chunks` in
+    // order and hand its 24 kHz samples to `on_chunk` the moment that chunk is
+    // done, instead of returning one buffer at the end. The complete waveform
+    // (every chunk concatenated) is also returned, so a caller can ignore
+    // `on_chunk` and treat this like synthesize() over the joined phonemes.
+    //
+    // The caller owns segmentation — split the phoneme stream at sentence /
+    // clause boundaries (where the G2P front-end already knows them) so chunk
+    // seams fall on natural pauses; each chunk is an independent forward pass
+    // (its own BOS/EOS wrap, duration prediction, and voice style row chosen by
+    // the chunk's own length), exactly like calling synthesize() per sentence.
+    // Empty chunks are skipped. `speed` and `voice` apply to every chunk.
+    //
+    // `cancel` is polled between chunks and inside each chunk's generator (as in
+    // synthesize()): on cancel the remaining chunks are dropped and the partial
+    // waveform produced so far is returned, while chunks already handed to
+    // `on_chunk` stay delivered. Throws if no model is loaded.
+    AudioBuffer synthesize_stream(
+        const std::vector<std::vector<int32_t>>& phoneme_chunks,
+        const Voice& voice,
+        const KokoroStreamChunkFn& on_chunk,
+        float speed = 1.0f,
+        const CancelCheck& cancel = {}) const;
 
     // Re-run only the decoder back half (decoder ▶ harmonic source ▶ generator)
     // from edited intermediates — for prosody editing. The four inputs all come
