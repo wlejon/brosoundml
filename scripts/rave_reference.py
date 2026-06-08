@@ -203,11 +203,16 @@ class RaveReference:
 
 
 def _fresh(ts_path):
-    """Load the .ts with all streaming caches zeroed -> offline causal behavior."""
+    """Load the .ts with all streaming caches zeroed -> offline causal behavior.
+    Zero every buffer ending in `.pad` (covers `.cache.pad`, the standalone
+    CachedPadding `.pad` used before UpsampleLayer convTs, and
+    `.downsampling_delay.pad`) or `.cache`. Missing the bare `.pad` buffers leaves
+    nonzero warmup in the cached convTs and corrupts the offline comparison."""
+    torch.set_grad_enabled(False)
     m = torch.jit.load(ts_path, map_location="cpu")
     m.eval()
     for name, buf in m.named_buffers():
-        if name.endswith((".cache.pad", ".cache", ".downsampling_delay.pad")):
+        if name.endswith((".pad", ".cache")):
             buf.zero_()
     return m
 
@@ -319,13 +324,201 @@ def dump_fixtures(ref, out_dir):
     print(json.dumps(meta, indent=2))
 
 
+# ─────────────────────── FLAT topology executor ─────────────────────────────
+#
+# The newer (flat-layout) RAVE exports span several architectures (residual
+# encoders, Snake, gimbal, amplitude-modulation synth). Rather than hardcode a
+# topology, convert-rave.py emits an op-list walked straight off the scripted
+# module graph; this class replays it. Op kinds: conv / convT / leaky / snake /
+# push / add (push+…+add = a residual block). The deterministic encode (posterior
+# mean) and the decoder NETWORK reproduce the `.ts` bit-for-bit; latent-pad
+# completion is zero-pad (we don't run RAVE's optional autoregressive prior, the
+# same simplification used for the legacy magnets path).
+
+class TopoRave:
+    def __init__(self, converted_dir):
+        self.W = load_file(os.path.join(converted_dir, "model.safetensors"))
+        with open(os.path.join(converted_dir, "config.json")) as f:
+            self.cfg = json.load(f)
+        self.nb = self.cfg["n_band"]
+        self.full = self.cfg["full_latent_size"]
+        self.crop = self.cfg["cropped_latent_size"]
+
+    def w(self, k):
+        return self.W[k]
+
+    def _conv(self, x, op):
+        w = self.W[op["w"]]
+        b = self.W.get(op["b"]) if op["b"] else None
+        g = x.shape[1] // w.shape[1]
+        return F.conv1d(F.pad(x, (op["left_pad"], 0)), w, b,
+                        stride=op["stride"], dilation=op["dil"], groups=g)
+
+    def _convt(self, x, op):
+        # Offline-causal upsample: prepend the UpsampleLayer's CachedPadding
+        # (cpad), conv_transpose1d with the graph's padding, then trim the output
+        # to exactly L*stride (drops the causal convT's trailing context). Handles
+        # both the CachedPadding+convT(pad>0) and bare convT(pad=0) conventions.
+        w = self.W[op["w"]]
+        b = self.W.get(op["b"]) if op["b"] else None
+        L0 = x.shape[-1]
+        xp = F.pad(x, (op.get("cpad", 0), 0))
+        y = F.conv_transpose1d(xp, w, b, stride=op["stride"], padding=op.get("pad", 0))
+        return y[..., :L0 * op["stride"]]
+
+    def run(self, ops, x):
+        stack = []
+        for op in ops:
+            k = op["kind"]
+            if k == "conv":    x = self._conv(x, op)
+            elif k == "convT": x = self._convt(x, op)
+            elif k == "lpad":  x = F.pad(x, (op["n"], 0))
+            elif k == "leaky": x = leaky(x)
+            elif k == "snake":
+                a = self.W[op["alpha"]]; x = x + torch.sin(a * x) ** 2 / (a + 1e-9)
+            elif k == "push":  stack.append(x)
+            elif k == "add":   x = x + stack.pop()
+            else: raise RuntimeError("unknown op " + k)
+        return x
+
+    def pqmf_forward(self, x):
+        return reverse_half(self._conv(x, self.cfg["pqmf"]["forward"]))
+
+    def pqmf_inverse(self, x):
+        nb = self.nb
+        y = self._conv(reverse_half(x), self.cfg["pqmf"]["inverse"]) * nb
+        y = torch.flip(y, [1]).permute(0, 2, 1)
+        y = y.reshape(y.shape[0], y.shape[1], -1, nb).permute(0, 2, 1, 3)
+        return y.reshape(y.shape[0], y.shape[1], -1)
+
+    def encode(self, x):
+        h = self.run(self.cfg["encoder_ops"], self.pqmf_forward(x))   # (1, 2*full, T)
+        mean = h[:, :self.full]
+        if self.cfg.get("has_gimbal"):
+            mean = mean * torch.exp(self.w("gimbal.log_a")) + self.w("gimbal.b")
+        z = F.conv1d(mean - self.w("latent_mean").view(1, -1, 1),
+                     self.w("latent_pca").unsqueeze(-1))
+        return z[:, :self.crop]
+
+    def _synth(self, h):
+        if self.cfg["synth_type"] == "amp_mod":
+            wave, amp = torch.split(h, h.shape[1] // 2, 1)
+            return torch.tanh(wave * torch.sigmoid(amp))
+        # "rave": tanh(wave) * mod_sigmoid(repeat(loud, loud_stride))  (noise off)
+        s = self.cfg["synth"]
+        wave = self._conv(h, s["wave"])
+        loud = self._conv(h, s["loud"])
+        ls = s.get("loud_stride", 1)
+        if ls > 1:
+            loud = torch.repeat_interleave(loud, ls, dim=-1)
+        return torch.tanh(wave) * mod_sigmoid(loud.reshape(1, 1, -1))
+
+    def decode_from_full(self, z_full):
+        """Decode a FULL (full_latent_size) latent through the decoder network +
+        synth + PQMF — the parity target (matches scripted decoder.forward)."""
+        return self.pqmf_inverse(self._synth(self.run(self.cfg["decoder_ops"], z_full)))
+
+    def decode(self, z):
+        """Decode a cropped latent: zero-pad to full, then the decoder network."""
+        pad = torch.zeros(z.shape[0], self.full - z.shape[1], z.shape[2])
+        return self.decode_from_full(torch.cat([z, pad], 1))
+
+
+def selftest_flat(topo, ts_path):
+    torch.set_grad_enabled(False)
+    err = lambda a, b: float((a - b).abs().max())
+    m = _fresh(ts_path)
+    M = dict(m.named_modules())
+    torch.manual_seed(0)
+    x = (torch.randn(1, 1, 2048 * 8) * 0.1).float()
+
+    # PQMF analysis
+    pq = topo.pqmf_forward(x)
+    e = {"pqmf.forward": err(pq, M["pqmf"].forward(x))}
+
+    # Encoder (+gimbal+PCA+crop) vs scripted deterministic path (same pq).
+    enc = M["encoder"]
+    try: eo = enc.forward(pq, False)
+    except Exception: eo = enc.forward(pq)
+    full = topo.full
+    mean = eo[:, :full]
+    if topo.cfg.get("has_gimbal"):
+        mean = M["gimbal"].forward(mean, eo[:, full:])[0]
+    zr = F.conv1d(mean - topo.w("latent_mean").view(1, -1, 1),
+                  topo.w("latent_pca").unsqueeze(-1))[:, :topo.crop]
+    zmine = topo.run(topo.cfg["encoder_ops"], pq)[:, :full]
+    if topo.cfg.get("has_gimbal"):
+        zmine = zmine * torch.exp(topo.w("gimbal.log_a")) + topo.w("gimbal.b")
+    zmine = F.conv1d(zmine - topo.w("latent_mean").view(1, -1, 1),
+                     topo.w("latent_pca").unsqueeze(-1))[:, :topo.crop]
+    e["encode"] = err(zmine, zr)
+
+    # Decoder network: a known full latent through our decode vs scripted
+    # decoder.forward -> pqmf.inverse (bypasses the AR prior + reparametrisation).
+    T = pq.shape[-1]
+    z5 = torch.randn(1, full, T)
+    try: dref = M["decoder"].forward(z5, False)
+    except Exception: dref = M["decoder"].forward(z5)
+    yr = M["pqmf"].inverse(dref)
+    ymine = topo.decode_from_full(z5)
+    e["decode.net"] = err(ymine, yr)
+
+    print("  flat stage max-errors:")
+    for k, v in e.items():
+        print(f"    {k:16s} {v:.2e}")
+    ok = all(v < 2e-4 for v in e.values())
+    print("  RESULT:", "PASS" if ok else "FAIL")
+    return ok
+
+
+def dump_fixtures_flat(topo, out_dir):
+    """C++ fixtures for a flat model: input, deterministic encode latent, and the
+    zero-pad deterministic decode the C++ port must reproduce."""
+    torch.set_grad_enabled(False)
+    torch.manual_seed(0)
+    x = (torch.randn(1, 1, 2048 * 8) * 0.1).float()
+    z = topo.encode(x)
+    y = topo.decode(z)
+    os.makedirs(out_dir, exist_ok=True)
+    def save_bin(name, t):
+        t.detach().contiguous().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
+    save_bin("input.bin", x)
+    save_bin("latent.bin", z)
+    save_bin("decode_det.bin", y)
+    meta = {"format": "flat", "input_len": int(x.shape[-1]),
+            "n_latent": int(z.shape[1]), "frames": int(z.shape[2]),
+            "output_len": int(y.shape[-1]),
+            "output_rms": float(y.pow(2).mean().sqrt())}
+    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"wrote flat C++ fixtures to {out_dir}")
+    print(json.dumps(meta, indent=2))
+
+
+def _is_flat(converted_dir):
+    with open(os.path.join(converted_dir, "config.json")) as f:
+        return json.load(f).get("format") == "flat"
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     if sys.argv[1] == "--dump":
         # rave_reference.py --dump <converted_dir> <fixture_out_dir>
-        ref = RaveReference(sys.argv[2])
-        dump_fixtures(ref, sys.argv[3])
+        cdir = sys.argv[2]
+        if _is_flat(cdir):
+            dump_fixtures_flat(TopoRave(cdir), sys.argv[3])
+        else:
+            dump_fixtures(RaveReference(cdir), sys.argv[3])
+        return
+    if _is_flat(sys.argv[1]):
+        topo = TopoRave(sys.argv[1])
+        print("config: flat", topo.cfg.get("synth_type"), "z", topo.crop,
+              "snake", topo.cfg.get("has_snake"), "gimbal", topo.cfg.get("has_gimbal"))
+        if len(sys.argv) >= 3:
+            selftest_flat(topo, sys.argv[2])
+        else:
+            print("(pass the original .ts as arg 2 to run the parity self-test)")
         return
     ref = RaveReference(sys.argv[1])
     print("config:", json.dumps(ref.cfg, indent=2))
