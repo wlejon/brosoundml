@@ -20,3 +20,4 @@ voices/
 .claude/
 .scratch
 tests/ref/_cache/
+*.pyc
