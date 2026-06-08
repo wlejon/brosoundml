@@ -7,6 +7,7 @@
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -323,7 +324,22 @@ struct Rave::Impl {
     int                 loud_stride = 1;
     bool                has_gimbal  = false;
     bt::Tensor          gim_a, gim_b;     // per-channel (full,1): mean = mean*a + b
+    bt::Tensor          gim_inv_a;        // exp(-log_a) = 1/a, for the gimbal inverse
     bt::Tensor          gim_zero, gim_one;// batch_norm running_mean/var to fold the affine
+
+    // Latent-completion scheme (how the discarded latent dims are filled at decode):
+    //   "noise_pca" — Family B: fill with N(0,1), inverse-PCA, decode. No gimbal,
+    //                 no prior. (pre_process_latent in the .ts.)
+    //   "prior_pca" / "prior_kld" — Family A: an autoregressive prior generates the
+    //                 discarded dims frame by frame; the result is inverse-PCA'd
+    //                 (use_pca) or scattered back via argsort(kld_idxs), then the
+    //                 gimbal affine is inverted before the decoder.
+    std::string         latent_mode = "noise_pca";
+    bool                use_pca     = true;
+    std::vector<int>    kld_idxs;          // (full) channel permutation (Family A)
+    std::vector<int>    kld_perm;          // argsort(kld_idxs) — the decode scatter
+    std::vector<FlatOp> prior_ops;         // autoregressive prior op-list (Family A)
+    int                 prior_window = 1;  // receptive field (frames) for the windowed AR loop
 
     ConvW pqmf_fwd;        // 1 -> n_band, stride n_band
     ConvW pqmf_inv;        // n_band -> n_band, stride 1
@@ -356,6 +372,10 @@ struct Rave::Impl {
     // Replay a flat op-list over h (1, Cin*Lin); returns h (1, Cout*Lout).
     bt::Tensor run_ops(const std::vector<FlatOp>& ops, bt::Tensor h,
                        int Cin, int Lin, int& Cout, int& Lout) const;
+    // Family A latent completion: run the autoregressive prior frame-by-frame to
+    // fill the discarded dims, then scatter (kld) / inverse-PCA (pca) back to
+    // encoder space and invert the gimbal. Returns the (1, full*T) decoder input.
+    bt::Tensor build_prior_latent(const float* latent, int n_latent, int T) const;
     RaveLatent encode(const float* audio, int n) const;
     // Decode one channel to its mono waveform (frames * total_ratio samples).
     // `channel` selects this channel's latent pad (injected slice, or a seeded
@@ -609,6 +629,26 @@ void Rave::Impl::load_flat(const sf::File& f, const j::Value& root) {
     parse_ops("encoder_ops", enc_ops);
     parse_ops("decoder_ops", dec_ops);
 
+    // Latent-completion scheme + autoregressive prior (Family A).
+    latent_mode = root.get_string("latent_mode", "noise_pca");
+    use_pca     = root.get_bool("use_pca", true);
+    kld_idxs    = root.get_int_array("kld_idxs", {});
+    if (latent_mode.rfind("prior", 0) == 0) {
+        if (kld_idxs.empty()) fail("config: prior latent_mode requires kld_idxs");
+        parse_ops("prior_ops", prior_ops);
+        // Decode scatter = argsort(kld_idxs): kld_perm[j] is the source channel in
+        // the prior-ordered latent for output channel j.
+        const int full = cfg.full_latent_size;
+        kld_perm.assign(full, 0);
+        for (int i = 0; i < full; ++i) kld_perm[i] = i;
+        std::sort(kld_perm.begin(), kld_perm.end(),
+                  [&](int a, int b) { return kld_idxs[a] < kld_idxs[b]; });
+        // Receptive field of the (causal, stride-1) prior = 1 + sum of conv left-pads.
+        prior_window = 1;
+        for (const FlatOp& op : prior_ops)
+            if (op.kind == F_CONV) prior_window += op.left_pad;
+    }
+
     // total_ratio: config carries it; else recompute from the encoder strides.
     cfg.total_ratio = root.get_int("total_ratio", 0);
     if (cfg.total_ratio <= 0) {
@@ -624,6 +664,8 @@ void Rave::Impl::load_flat(const sf::File& f, const j::Value& root) {
         const int full = cfg.full_latent_size;
         bt::Tensor log_a = up_vec(f, "gimbal.log_a", full, dev);
         bt::exp_forward(log_a, gim_a);
+        bt::scale_inplace(log_a, -1.0f);     // reuse log_a (done with it) for the inverse
+        bt::exp_forward(log_a, gim_inv_a);   // exp(-log_a) = 1/a
         gim_b    = up_vec(f, "gimbal.b", full, dev);
         gim_zero = bt::Tensor::zeros_on(dev, full, 1, bt::Dtype::FP32);
         std::vector<float> ones(static_cast<std::size_t>(full), 1.0f);
@@ -681,6 +723,70 @@ bt::Tensor Rave::Impl::run_ops(const std::vector<FlatOp>& ops, bt::Tensor h,
     return h;
 }
 
+// Family A latent completion (deterministic): generate the discarded latent dims
+// with the autoregressive prior, then map back to the decoder's input space.
+bt::Tensor Rave::Impl::build_prior_latent(const float* latent, int n_latent, int T) const {
+    const int full = cfg.full_latent_size;
+    const int crop = n_latent;
+    const int win  = prior_window;
+
+    // z6: the assembled full latent in crop-space (channel-major, full x T). hist
+    // holds the prior's input frames; hist[t] is the previous full latent frame
+    // (z5[t-1], zeros at t=0). Output frame t depends only on the last `win` input
+    // frames (causal, stride-1), so the prior runs over that trailing window.
+    std::vector<float> z6(static_cast<std::size_t>(full) * T, 0.0f);
+    std::vector<std::vector<float>> hist;
+    hist.reserve(static_cast<std::size_t>(T) + 1);
+    hist.emplace_back(full, 0.0f);
+    std::vector<float> in;
+    for (int t = 0; t < T; ++t) {
+        const int len = static_cast<int>(hist.size());
+        const int w0  = std::max(0, len - win);
+        const int Lw  = len - w0;
+        in.assign(static_cast<std::size_t>(full) * Lw, 0.0f);
+        for (int j = 0; j < Lw; ++j) {
+            const std::vector<float>& fr = hist[static_cast<std::size_t>(w0) + j];
+            for (int c = 0; c < full; ++c)
+                in[static_cast<std::size_t>(c) * Lw + j] = fr[c];
+        }
+        bt::Tensor inT = bt::Tensor::from_host_on(dev, in.data(), 1, full * Lw);
+        int Co, Lo;
+        bt::Tensor pr = run_ops(prior_ops, inT, full, Lw, Co, Lo);  // (1, 2*full*Lo)
+        const std::vector<float> prh = pr.to_host_vector();         // prh[c*Lo + s]
+        // Kept dims from the encoded crop; the rest from the prior MEAN (first
+        // `full` of the 2*full output) at the last time step, gathered at
+        // kld_idxs[crop:]. Deterministic — the prior mean, no reparameterisation.
+        std::vector<float> frame(full);
+        for (int c = 0; c < crop; ++c)
+            frame[c] = latent[static_cast<std::size_t>(c) * T + t];
+        for (int c = crop; c < full; ++c)
+            frame[c] = prh[static_cast<std::size_t>(kld_idxs[c]) * Lo + (Lo - 1)];
+        for (int c = 0; c < full; ++c)
+            z6[static_cast<std::size_t>(c) * T + t] = frame[c];
+        hist.push_back(std::move(frame));
+    }
+    bt::Tensor z6T = bt::Tensor::from_host_on(dev, z6.data(), 1, full * T);
+
+    // Back to encoder space: inverse-PCA (use_pca) or scatter argsort(kld_idxs).
+    bt::Tensor z7;
+    if (use_pca) {
+        int Lz;
+        z7 = cconv(z6T, full, T, dec_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
+    } else {
+        z7 = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
+        for (int j = 0; j < full; ++j)
+            bt::copy_d2d(z6T, static_cast<std::size_t>(kld_perm[j]) * T,
+                         z7, static_cast<std::size_t>(j) * T, T);
+    }
+
+    // Invert the gimbal affine: z10 = (z7 - b) / a, via batch_norm (running_mean=b,
+    // running_var=1, eps=0, weight=1/a, beta=0).
+    bt::Tensor z10;
+    bt::batch_norm_inference(z7, gim_inv_a, gim_zero, gim_b, gim_one,
+                             /*N=*/1, full, /*H=*/1, /*W=*/T, /*eps=*/0.0f, z10);
+    return z10;
+}
+
 RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     if (!is_loaded) fail("model not loaded");
     bt::DeviceScope scope(dev);
@@ -730,14 +836,21 @@ RaveLatent Rave::Impl::encode(const float* audio, int n) const {
         mean = std::move(y);
     }
 
-    // z = pca @ (mean - latent_mean)  (folded into the 1x1 conv bias).
-    int Lz;
-    bt::Tensor z = cconv(mean, full, T, enc_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
-
-    // Crop to the kept latent dims.
+    // Crop to the kept latent dims. Two schemes (see latent_mode): kld-gather
+    // (prior_kld — keep encoder-space channels kld_idxs[:nl], no PCA) or PCA
+    // projection then slice (prior_pca / noise_pca / legacy).
     const int nl = cfg.cropped_latent_size;
     bt::Tensor zc = bt::Tensor::zeros_on(dev, 1, nl * T, bt::Dtype::FP32);
-    bt::copy_d2d(z, 0, zc, 0, nl * T);
+    if (flat && latent_mode == "prior_kld") {
+        for (int c = 0; c < nl; ++c)
+            bt::copy_d2d(mean, static_cast<std::size_t>(kld_idxs[c]) * T,
+                         zc, static_cast<std::size_t>(c) * T, T);
+    } else {
+        // z = pca @ (mean - latent_mean)  (folded into the 1x1 conv bias).
+        int Lz;
+        bt::Tensor z = cconv(mean, full, T, enc_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
+        bt::copy_d2d(z, 0, zc, 0, nl * T);
+    }
 
     RaveLatent out;
     out.n_latent = nl;
@@ -757,42 +870,48 @@ std::vector<float> Rave::Impl::decode_core(const float* latent, int n_latent, in
     const int full = cfg.full_latent_size;
     const int T    = frames;
 
-    // Unproject: pad nl -> full latents, then x = pca^T @ z + latent_mean. The
-    // discarded dims [n_latent, full) carry the per-channel pad — zero by default
-    // (deterministic mono), or an independent N(0,1) draw for stereo width. This
-    // pad is the only thing that differs between stereo channels.
-    bt::Tensor zf = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
-    bt::Tensor zsrc = bt::Tensor::from_host_on(dev, latent, 1, n_latent * T);
-    bt::copy_d2d(zsrc, 0, zf, 0, n_latent * T);
-
-    const int padDims = full - n_latent;
-    if (padDims > 0 && (opts.latent_pad || opts.latent_pad_std > 0.0f)) {
-        bt::Tensor padT;
-        if (opts.latent_pad) {
-            const std::size_t blk = static_cast<std::size_t>(padDims) * T;
-            if (opts.latent_pad_len < static_cast<int>((static_cast<std::size_t>(channel) + 1) * blk))
-                fail("decode: injected latent_pad too small for channel " + std::to_string(channel));
-            padT = bt::Tensor::from_host_on(dev, opts.latent_pad + static_cast<std::size_t>(channel) * blk,
-                                            padDims, T);
-        } else {
-            // Independent per-channel draw: key derived from seed (so it never
-            // collides with the noise stream), counter = channel.
-            padT = bt::Tensor::zeros_on(dev, padDims, T, bt::Dtype::FP32);
-            bt::randn(opts.seed ^ 0x52415645ull, static_cast<std::uint64_t>(channel), padT);
-            bt::scale_inplace(padT, opts.latent_pad_std);
-        }
-        bt::copy_d2d(padT, 0, zf, static_cast<std::size_t>(n_latent) * T,
-                     static_cast<std::size_t>(padDims) * T);
-    }
-    // ── FLAT decode: decoder.net consumes the full (zero-padded) latent DIRECTLY.
-    //    Flat exports fold NO inverse-PCA into decode (the latent_pca rotation is
-    //    applied only at encode; the decoder is trained in that rotated space) —
-    //    unlike the legacy path's dec_pca unprojection below. Replay the decoder
-    //    op-list, then the flat synth + PQMF. Deterministic (no noise branch). ──
+    // ── FLAT decode: build the decoder-network input from the cropped latent.
+    //    Two latent-completion schemes (latent_mode):
+    //      prior_*   — an autoregressive prior fills the discarded dims frame by
+    //                  frame, then the full latent is scattered (kld) / inverse-PCA'd
+    //                  (pca) back to encoder space and the gimbal affine is inverted.
+    //      noise_pca — fill the discarded dims with N(0,1) (or an injected pad),
+    //                  then inverse-PCA (the .ts pre_process_latent). No prior, no
+    //                  gimbal. The N(0,1) fill is the model's behaviour, NOT a
+    //                  simplification — zero-padding here is what made decode silent.
+    //    The result feeds the decoder op-list, then the flat synth + PQMF. ──
     if (flat) {
         const int nb = cfg.n_band;
+        bt::Tensor z10;
+        if (latent_mode.rfind("prior", 0) == 0) {
+            z10 = build_prior_latent(latent, n_latent, T);
+        } else {
+            const int padDims = full - n_latent;
+            bt::Tensor zf = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
+            bt::Tensor zsrc = bt::Tensor::from_host_on(dev, latent, 1, n_latent * T);
+            bt::copy_d2d(zsrc, 0, zf, 0, n_latent * T);
+            if (padDims > 0) {
+                bt::Tensor padT;
+                if (opts.latent_pad) {     // injected pad (parity / explicit per-channel)
+                    const std::size_t blk = static_cast<std::size_t>(padDims) * T;
+                    if (opts.latent_pad_len < static_cast<int>((static_cast<std::size_t>(channel) + 1) * blk))
+                        fail("decode: injected latent_pad too small for channel " + std::to_string(channel));
+                    padT = bt::Tensor::from_host_on(dev, opts.latent_pad + static_cast<std::size_t>(channel) * blk,
+                                                    padDims, T);
+                } else {                   // N(0,1) draw (per-channel counter for stereo)
+                    padT = bt::Tensor::zeros_on(dev, padDims, T, bt::Dtype::FP32);
+                    bt::randn(opts.seed ^ 0x52415645ull, static_cast<std::uint64_t>(channel), padT);
+                    const float pad_std = opts.latent_pad_std > 0.0f ? opts.latent_pad_std : 1.0f;
+                    bt::scale_inplace(padT, pad_std);
+                }
+                bt::copy_d2d(padT, 0, zf, static_cast<std::size_t>(n_latent) * T,
+                             static_cast<std::size_t>(padDims) * T);
+            }
+            int Lz;
+            z10 = cconv(zf, full, T, dec_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
+        }
         int C, Lc;
-        bt::Tensor hh = run_ops(dec_ops, zf, full, T, C, Lc);
+        bt::Tensor hh = run_ops(dec_ops, z10, full, T, C, Lc);
 
         bt::Tensor tw;   // multiband waveform (1, nb*Lc)
         if (synth_type == "amp_mod") {
@@ -834,6 +953,33 @@ std::vector<float> Rave::Impl::decode_core(const float* latent, int n_latent, in
                 wav[static_cast<std::size_t>(t) * nb + c] =
                     static_cast<float>(nb) * Y[static_cast<std::size_t>(nb - 1 - c) * Lc + t];
         return wav;
+    }
+
+    // Legacy unprojection: pad nl -> full latents, then x = pca^T @ zf + latent_mean.
+    // The discarded dims [n_latent, full) carry the per-channel pad — zero by default
+    // (deterministic mono), or an independent N(0,1) draw for stereo width (the only
+    // thing that differs between stereo channels).
+    bt::Tensor zf = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
+    {
+        bt::Tensor zsrc = bt::Tensor::from_host_on(dev, latent, 1, n_latent * T);
+        bt::copy_d2d(zsrc, 0, zf, 0, n_latent * T);
+        const int padDims = full - n_latent;
+        if (padDims > 0 && (opts.latent_pad || opts.latent_pad_std > 0.0f)) {
+            bt::Tensor padT;
+            if (opts.latent_pad) {
+                const std::size_t blk = static_cast<std::size_t>(padDims) * T;
+                if (opts.latent_pad_len < static_cast<int>((static_cast<std::size_t>(channel) + 1) * blk))
+                    fail("decode: injected latent_pad too small for channel " + std::to_string(channel));
+                padT = bt::Tensor::from_host_on(dev, opts.latent_pad + static_cast<std::size_t>(channel) * blk,
+                                                padDims, T);
+            } else {
+                padT = bt::Tensor::zeros_on(dev, padDims, T, bt::Dtype::FP32);
+                bt::randn(opts.seed ^ 0x52415645ull, static_cast<std::uint64_t>(channel), padT);
+                bt::scale_inplace(padT, opts.latent_pad_std);
+            }
+            bt::copy_d2d(padT, 0, zf, static_cast<std::size_t>(n_latent) * T,
+                         static_cast<std::size_t>(padDims) * T);
+        }
     }
 
     // Legacy unprojection: x = pca^T @ zf + latent_mean (inverse PCA before decode).

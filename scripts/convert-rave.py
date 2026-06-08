@@ -166,7 +166,7 @@ def _alpha_keys_present(tensors):
     return any(k.endswith(".alpha") for k in tensors)
 
 
-def extract(ts_path):
+def extract(ts_path, sr_override=None):
     m = torch.jit.load(ts_path, map_location="cpu")
     m.eval()
     legacy = hasattr(m, "_rave")
@@ -176,7 +176,7 @@ def extract(ts_path):
     # Weights: keep encoder/decoder/pqmf/latent_*/gimbal; drop prior, streaming
     # buffers, params blobs. (For FLAT we additionally need gimbal + snake alpha.)
     sd = m.state_dict()
-    keep_prefixes = ("encoder.", "decoder.", "pqmf.", "gimbal.")
+    keep_prefixes = ("encoder.", "decoder.", "pqmf.", "gimbal.", "prior_net.")
     keep_exact = ("latent_pca", "latent_mean")
     tensors = {}
     for k, v in sd.items():
@@ -195,10 +195,24 @@ def extract(ts_path):
     n_band = int(tensors["pqmf.hk"].shape[0]) if "pqmf.hk" in tensors else \
         int(_scalar(rave, "n_band", 16))
 
+    # Output sampling rate. Models with a `resample` module carry a sampling_rate
+    # attribute (the resampler's target). Models without one run at their native
+    # rate, which they DON'T store — recover it from the `_r<NNNNN>` filename token
+    # (or an explicit --sampling-rate). Mis-tagging a 44.1 kHz model as 48 kHz
+    # plays it ~8.8 % sharp, so this matters.
+    sr = sr_override if sr_override else _scalar(rave, "sampling_rate", None)
+    if sr is None:
+        sr = _scalar(m, "sampling_rate", None)
+    if sr is None:
+        mt = re.search(r"_r(\d{4,6})", os.path.basename(ts_path))
+        sr = int(mt.group(1)) if mt else 48000
+        print(f"  (no sampling_rate attr; using {sr} "
+              f"{'from filename' if mt else 'as default'})")
+
     cfg = {
         "model": "rave_v2",
         "format": "rave" if legacy else "flat",
-        "sampling_rate": int(_scalar(rave, "sampling_rate", 48000)),
+        "sampling_rate": int(sr),
         "full_latent_size": full,
         "cropped_latent_size": crop,
         "n_band": n_band,
@@ -254,6 +268,36 @@ def extract(ts_path):
     if cfg["has_gimbal"]:
         cfg["gimbal"] = {"log_a": "gimbal.log_a", "b": "gimbal.b"}
 
+    # ── latent-completion scheme (how the discarded dims are filled at decode) ──
+    # Family A (kld_idxs buffer present): decode runs an autoregressive `prior_net`
+    # frame-by-frame to generate ALL latent dims, keeps the encoded crop, takes the
+    # prior's output for the rest, then either scatters back via argsort(kld_idxs)
+    # (use_pca=False) or inverse-PCAs (use_pca=True), and finally inverts the gimbal
+    # before the decoder. Encode crops by kld-gather (use_pca=False) or PCA
+    # (use_pca=True). Family B (no kld_idxs): decode is `pre_process_latent` — fill
+    # the discarded dims with N(0,1), inverse-PCA, decode. No prior, no gimbal.
+    def _get_attr(name):
+        for src in (rave, m):
+            try:
+                return getattr(src, name)
+            except Exception:
+                pass
+        return None
+    kld = _get_attr("kld_idxs")
+    use_pca = bool(_scalar(rave, "use_pca", _scalar(m, "use_pca", False)))
+    if kld is not None:
+        cfg["kld_idxs"] = [int(v) for v in kld.tolist()]
+        cfg["use_pca"] = use_pca
+        cfg["latent_mode"] = "prior_pca" if use_pca else "prior_kld"
+        # Autoregressive prior network: input = previous full latent frame, output
+        # = 2*full (mean | log-scale). Walked into the same op-list the encoder/
+        # decoder use; the interpreter chunks the output and runs it windowed over
+        # the prior's receptive field, frame by frame.
+        cfg["prior_ops"] = walker.emit(mods["prior_net"], [], "flat")
+    else:
+        cfg["latent_mode"] = "noise_pca"
+        cfg["use_pca"] = True
+
     # Two synthesis types:
     #  * "rave"   (A/B): decoder.net -> h; wave=tanh(conv0(h)), loud=mod_sigmoid(
     #               conv1(h)), noise=noise_branch(conv2(h)); out = wave*loud[+noise].
@@ -294,13 +338,16 @@ def main():
     ap.add_argument("ts_path")
     ap.add_argument("out_dir")
     ap.add_argument("--parity", action="store_true")
+    ap.add_argument("--sampling-rate", type=int, default=None,
+                    help="override output sampling rate (for models that store none "
+                         "and have no _r<rate> filename token, e.g. crozzoli)")
     args = ap.parse_args()
 
     if not os.path.isfile(args.ts_path):
         sys.exit(f"no such file: {args.ts_path}")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    tensors, cfg, m = extract(args.ts_path)
+    tensors, cfg, m = extract(args.ts_path, sr_override=args.sampling_rate)
 
     st_path = os.path.join(args.out_dir, "model.safetensors")
     save_file(tensors, st_path)
@@ -310,7 +357,8 @@ def main():
     print(f"wrote {st_path}  ({len(tensors)} tensors)")
     print(f"wrote {os.path.join(args.out_dir, 'config.json')}  format={cfg['format']} "
           f"z={cfg['cropped_latent_size']} sr={cfg['sampling_rate']} "
-          f"snake={cfg.get('has_snake')} gimbal={cfg.get('has_gimbal')} noise={cfg.get('has_noise')}")
+          f"snake={cfg.get('has_snake')} gimbal={cfg.get('has_gimbal')} noise={cfg.get('has_noise')} "
+          f"latent_mode={cfg.get('latent_mode')}")
 
     from safetensors.torch import load_file
     back = load_file(st_path)

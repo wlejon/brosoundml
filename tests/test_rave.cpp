@@ -95,7 +95,16 @@ int main() {
     CHECK(enc_err < 2.0e-3f, "encode latent matches reference");
 
     // ── decode parity (decode the REFERENCE latent to isolate the decoder) ──
-    brosoundml::AudioBuffer y = rave.decode(ref_latent.data(), nl, frames);
+    // Family B (noise_pca) fills the discarded dims with N(0,1); the fixture pins
+    // that draw in latent_noise.bin, so inject it verbatim for a bit-exact compare.
+    // Family A (prior_*) is deterministic, so no injection is needed.
+    const std::vector<float> ref_lnoise = read_bin(dir + "/latent_noise.bin");
+    brosoundml::RaveDecodeOptions dopts;
+    if (!ref_lnoise.empty()) {
+        dopts.latent_pad     = ref_lnoise.data();
+        dopts.latent_pad_len = static_cast<int>(ref_lnoise.size());
+    }
+    brosoundml::AudioBuffer y = rave.decode(ref_latent.data(), nl, frames, dopts);
     CHECK(static_cast<int>(y.samples.size()) == frames * cfg.total_ratio, "decode length");
     CHECK(y.sample_rate == cfg.sampling_rate, "decode sample rate");
     const float dec_err = max_abs_err(y.samples, ref_decode);

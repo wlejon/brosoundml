@@ -391,14 +391,68 @@ class TopoRave:
         y = y.reshape(y.shape[0], y.shape[1], -1, nb).permute(0, 2, 1, 3)
         return y.reshape(y.shape[0], y.shape[1], -1)
 
+    # latent-completion scheme (see convert-rave.py): "prior_pca"/"prior_kld" are
+    # Family A (gimbal + autoregressive prior fill); "noise_pca" is Family B
+    # (N(0,1) fill, no gimbal). Default to noise_pca for older configs.
+    @property
+    def mode(self):
+        return self.cfg.get("latent_mode", "noise_pca")
+
+    def _kld(self):
+        return torch.tensor(self.cfg["kld_idxs"], dtype=torch.long)
+
+    def _gimbal_fwd(self, mean):       # mean*exp(log_a) + b
+        return mean * torch.exp(self.w("gimbal.log_a").view(1, -1, 1)) \
+            + self.w("gimbal.b").view(1, -1, 1)
+
+    def _gimbal_inv(self, z):          # (z - b) / exp(log_a)
+        return (z - self.w("gimbal.b").view(1, -1, 1)) \
+            / torch.exp(self.w("gimbal.log_a").view(1, -1, 1))
+
+    def _pca_proj(self, mean):         # encode: pca @ (mean - latent_mean)
+        return F.conv1d(mean - self.w("latent_mean").view(1, -1, 1),
+                        self.w("latent_pca").unsqueeze(-1))
+
+    def _pca_unproj(self, zfull):      # decode: pca^T @ z + latent_mean
+        return F.conv1d(zfull, self.w("latent_pca").t().unsqueeze(-1)) \
+            + self.w("latent_mean").view(1, -1, 1)
+
     def encode(self, x):
         h = self.run(self.cfg["encoder_ops"], self.pqmf_forward(x))   # (1, 2*full, T)
         mean = h[:, :self.full]
-        if self.cfg.get("has_gimbal"):
-            mean = mean * torch.exp(self.w("gimbal.log_a")) + self.w("gimbal.b")
-        z = F.conv1d(mean - self.w("latent_mean").view(1, -1, 1),
-                     self.w("latent_pca").unsqueeze(-1))
-        return z[:, :self.crop]
+        if self.mode.startswith("prior"):       # Family A: gimbal, then crop
+            mean = self._gimbal_fwd(mean)
+            if self.mode == "prior_pca":
+                return self._pca_proj(mean)[:, :self.crop]
+            return mean[:, self._kld()[:self.crop]]              # prior_kld: gather
+        return self._pca_proj(mean)[:, :self.crop]              # noise_pca: PCA crop
+
+    def _ar_prior_fill(self, z, deterministic=True, gen=None):
+        """Family A latent completion: run the autoregressive `prior_net` frame by
+        frame to generate the discarded dims. Each step feeds the previous full
+        latent frame (z5) into the prior; the kept dims come from the encoded crop
+        `z`, the rest from the prior (mean if deterministic, else reparametrised).
+        The prior is causal stride-1, so a trailing window of its receptive field
+        reproduces each output frame exactly — O(T) instead of O(T^2)."""
+        full, crop, T = self.full, self.crop, z.shape[-1]
+        kld = self._kld()
+        win = 1 + sum(op.get("left_pad", 0)
+                      for op in self.cfg["prior_ops"] if op["kind"] == "conv")
+        z6 = torch.zeros(1, full, T)
+        hist = [torch.zeros(full)]              # hist[t] = last_z fed at frame t (0 init)
+        for t in range(T):
+            inp = torch.stack(hist[max(0, len(hist) - win):], -1).unsqueeze(0)
+            pr = self.run(self.cfg["prior_ops"], inp)           # (1, 2*full, Lw)
+            pm = pr[:, :full, -1:]
+            if deterministic:
+                pad = pm
+            else:
+                ps = torch.exp(pr[:, full:, -1:])
+                pad = pm + torch.randn(pm.shape, generator=gen) * ps
+            frame = torch.cat([z[:, :, t:t + 1], pad[:, kld[crop:]]], 1)   # (1, full, 1)
+            z6[:, :, t:t + 1] = frame
+            hist.append(frame[0, :, 0])
+        return z6
 
     def _synth(self, h):
         if self.cfg["synth_type"] == "amp_mod":
@@ -418,54 +472,113 @@ class TopoRave:
         synth + PQMF — the parity target (matches scripted decoder.forward)."""
         return self.pqmf_inverse(self._synth(self.run(self.cfg["decoder_ops"], z_full)))
 
-    def decode(self, z):
-        """Decode a cropped latent: zero-pad to full, then the decoder network."""
-        pad = torch.zeros(z.shape[0], self.full - z.shape[1], z.shape[2])
-        return self.decode_from_full(torch.cat([z, pad], 1))
+    def decode(self, z, deterministic=True, gen=None, latent_noise=None):
+        """Decode a cropped latent back to audio. Family A (prior_*): autoregressive
+        prior fills the discarded dims, then scatter (kld) or inverse-PCA (pca) back
+        to encoder space and invert the gimbal. Family B (noise_pca): fill with
+        N(0,1) (or an injected `latent_noise` for reproducible parity) and
+        inverse-PCA. The result feeds the decoder network unchanged."""
+        if self.mode.startswith("prior"):
+            z6 = self._ar_prior_fill(z, deterministic, gen)
+            if self.mode == "prior_pca":
+                z7 = self._pca_unproj(z6)
+            else:                                       # prior_kld: scatter back
+                z7 = z6[:, torch.argsort(self._kld())]
+            z10 = self._gimbal_inv(z7)
+        else:                                           # noise_pca (Family B)
+            if latent_noise is None:
+                latent_noise = torch.randn(z.shape[0], self.full - z.shape[1],
+                                           z.shape[-1], generator=gen)
+            z10 = self._pca_unproj(torch.cat([z, latent_noise], 1))
+        return self.decode_from_full(z10)
+
+
+# ── scripted-deterministic reference (ground truth) ──────────────────────────
+# Reproduce the .ts encode/decode with the streaming caches zeroed and ALL
+# randomness removed: encode takes the posterior mean; decode takes the AR
+# prior's mean (Family A) or an injected noise buffer (Family B); the decoder's
+# own noise branch is off. This is the exact, deterministic target for both the
+# Python TopoRave and the C++ port.
+
+def _scripted_encode(M, m, topo, x):
+    full = topo.full
+    pq = M["pqmf"].forward(x)
+    try: eo = M["encoder"].forward(pq, False)
+    except Exception: eo = M["encoder"].forward(pq)
+    mean = eo[:, :full]
+    if topo.mode.startswith("prior"):
+        mean = M["gimbal"].forward(mean, eo[:, full:])[0]
+        if topo.mode == "prior_pca":
+            return topo._pca_proj(mean)[:, :topo.crop]
+        return mean[:, topo._kld()[:topo.crop]]
+    return topo._pca_proj(mean)[:, :topo.crop]
+
+
+def _scripted_decode(M, m, topo, z, latent_noise=None):
+    full, crop, T = topo.full, topo.crop, z.shape[-1]
+    if topo.mode.startswith("prior"):
+        kld = topo._kld()
+        for n, b in m.named_buffers():                  # streaming prior, caches zeroed
+            if n.startswith("prior_net") and n.endswith((".pad", ".cache")):
+                b.zero_()
+        last_z = torch.zeros(1, full, 1)
+        frames = []
+        for t in range(T):
+            pm = torch.chunk(M["prior_net"].forward(last_z), 2, 1)[0]   # (1,full,1)
+            z5 = torch.cat([z[:, :, t:t + 1], pm[:, kld[crop:]]], 1)
+            frames.append(z5); last_z = z5
+        z6 = torch.cat(frames, -1)
+        z7 = topo._pca_unproj(z6) if topo.mode == "prior_pca" else z6[:, torch.argsort(kld)]
+        z10 = M["gimbal"].inv(z7)
+    else:
+        z10 = topo._pca_unproj(torch.cat([z, latent_noise], 1))
+    try: d = M["decoder"].forward(z10, False)
+    except Exception: d = M["decoder"].forward(z10)
+    return M["pqmf"].inverse(d)
 
 
 def selftest_flat(topo, ts_path):
+    """End-to-end gate: the TopoRave deterministic encode→decode must reproduce the
+    scripted model's own modules run deterministically (prior mean / injected noise,
+    decoder noise off). This is the correct target — NOT a self-authored latent
+    reformulation, the mistake that let near-silent output pass earlier."""
     torch.set_grad_enabled(False)
     err = lambda a, b: float((a - b).abs().max())
-    m = _fresh(ts_path)
-    M = dict(m.named_modules())
     torch.manual_seed(0)
     x = (torch.randn(1, 1, 2048 * 8) * 0.1).float()
-
-    # PQMF analysis
-    pq = topo.pqmf_forward(x)
-    e = {"pqmf.forward": err(pq, M["pqmf"].forward(x))}
-
-    # Encoder (+gimbal+PCA+crop) vs scripted deterministic path (same pq).
-    enc = M["encoder"]
-    try: eo = enc.forward(pq, False)
-    except Exception: eo = enc.forward(pq)
     full = topo.full
-    mean = eo[:, :full]
-    if topo.cfg.get("has_gimbal"):
-        mean = M["gimbal"].forward(mean, eo[:, full:])[0]
-    zr = F.conv1d(mean - topo.w("latent_mean").view(1, -1, 1),
-                  topo.w("latent_pca").unsqueeze(-1))[:, :topo.crop]
-    zmine = topo.run(topo.cfg["encoder_ops"], pq)[:, :full]
-    if topo.cfg.get("has_gimbal"):
-        zmine = zmine * torch.exp(topo.w("gimbal.log_a")) + topo.w("gimbal.b")
-    zmine = F.conv1d(zmine - topo.w("latent_mean").view(1, -1, 1),
-                     topo.w("latent_pca").unsqueeze(-1))[:, :topo.crop]
-    e["encode"] = err(zmine, zr)
 
-    # Decoder network: a known full latent through our decode vs scripted
-    # decoder.forward -> pqmf.inverse (bypasses the AR prior + reparametrisation).
-    T = pq.shape[-1]
-    z5 = torch.randn(1, full, T)
-    try: dref = M["decoder"].forward(z5, False)
-    except Exception: dref = M["decoder"].forward(z5)
-    yr = M["pqmf"].inverse(dref)
-    ymine = topo.decode_from_full(z5)
-    e["decode.net"] = err(ymine, yr)
+    e = {"pqmf.forward": err(topo.pqmf_forward(x), dict(_fresh(ts_path).named_modules())["pqmf"].forward(x))}
 
-    print("  flat stage max-errors:")
+    M = dict(_fresh(ts_path).named_modules())
+    z_ref = _scripted_encode(M, _fresh(ts_path), topo, x)
+    z_mine = topo.encode(x)
+    e["encode"] = err(z_mine, z_ref)
+
+    # Deterministic decode end-to-end. Family B needs an injected noise buffer
+    # (its fill is intrinsically N(0,1)); Family A is fully deterministic.
+    torch.manual_seed(1234)
+    noise = None if topo.mode.startswith("prior") else \
+        torch.randn(z_mine.shape[0], full - z_mine.shape[1], z_mine.shape[-1])
+    m2 = _fresh(ts_path); M2 = dict(m2.named_modules())
+    y_ref = _scripted_decode(M2, m2, topo, z_ref, latent_noise=noise)
+    y_mine = topo.decode(z_mine, deterministic=True, latent_noise=noise)
+    e["decode.e2e"] = err(y_mine, y_ref)
+
+    print("  flat end-to-end max-errors (vs scripted deterministic):")
     for k, v in e.items():
         print(f"    {k:16s} {v:.2e}")
+    print(f"  deterministic decode: peak={float(y_mine.abs().max()):.4f} "
+          f"rms={float(y_mine.pow(2).mean().sqrt()):.4f}")
+
+    # Stochastic sanity: our randomized decode RMS should track m.decode's.
+    g = torch.Generator().manual_seed(7)
+    mine_rms = [float(topo.decode(z_mine, deterministic=False, gen=g).pow(2).mean().sqrt())
+                for _ in range(4)]
+    scr_rms = [float(_fresh(ts_path).decode(z_ref).pow(2).mean().sqrt()) for _ in range(4)]
+    print(f"  stochastic RMS: ours={[round(r,3) for r in mine_rms]} "
+          f"scripted={[round(r,3) for r in scr_rms]}")
+
     ok = all(v < 2e-4 for v in e.values())
     print("  RESULT:", "PASS" if ok else "FAIL")
     return ok
@@ -473,22 +586,33 @@ def selftest_flat(topo, ts_path):
 
 def dump_fixtures_flat(topo, out_dir):
     """C++ fixtures for a flat model: input, deterministic encode latent, and the
-    zero-pad deterministic decode the C++ port must reproduce."""
+    deterministic decode the C++ port must reproduce. Family B also saves the
+    injected N(0,1) latent-noise buffer (its fill can't be deterministic), which
+    the C++ test feeds back in for a bit-exact comparison."""
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     x = (torch.randn(1, 1, 2048 * 8) * 0.1).float()
     z = topo.encode(x)
-    y = topo.decode(z)
+    is_prior = topo.mode.startswith("prior")
+    noise = None
+    if not is_prior:
+        torch.manual_seed(1234)
+        noise = torch.randn(z.shape[0], topo.full - z.shape[1], z.shape[-1]).float()
+    y = topo.decode(z, deterministic=True, latent_noise=noise)
     os.makedirs(out_dir, exist_ok=True)
     def save_bin(name, t):
         t.detach().contiguous().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
     save_bin("input.bin", x)
     save_bin("latent.bin", z)
     save_bin("decode_det.bin", y)
-    meta = {"format": "flat", "input_len": int(x.shape[-1]),
+    meta = {"format": "flat", "latent_mode": topo.mode,
+            "input_len": int(x.shape[-1]),
             "n_latent": int(z.shape[1]), "frames": int(z.shape[2]),
             "output_len": int(y.shape[-1]),
             "output_rms": float(y.pow(2).mean().sqrt())}
+    if noise is not None:
+        save_bin("latent_noise.bin", noise)   # (1, full-n_latent, frames)
+        meta["latent_noise_dims"] = int(noise.shape[1])
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(f"wrote flat C++ fixtures to {out_dir}")
