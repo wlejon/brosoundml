@@ -137,9 +137,15 @@ class RaveReference:
         return z[:, :self.cfg["cropped_latent_size"]], mean, scale
 
     # ── decode ──
-    def _unproject(self, z):
+    def _unproject(self, z, pad=None):
+        # Pad the cropped latent back to full_latent_size before the inverse PCA.
+        # Offline-deterministic decode zero-pads; the real model (and stereo)
+        # pads the discarded dims with N(0,1). `pad` (1, full-cropped, T) injects
+        # that verbatim so the C++ port matches bit-for-bit.
         full = self.cfg["full_latent_size"]
-        z = torch.cat([z, torch.zeros(z.shape[0], full - z.shape[1], z.shape[2])], 1)
+        if pad is None:
+            pad = torch.zeros(z.shape[0], full - z.shape[1], z.shape[2])
+        z = torch.cat([z, pad], 1)
         return F.conv1d(z, self.w("latent_pca").t().unsqueeze(-1)) + \
             self.w("latent_mean").view(1, -1, 1)
 
@@ -176,8 +182,8 @@ class RaveReference:
         out = fft_convolve(noise, ir).permute(0, 2, 1, 3)
         return out.reshape(1, self.cfg["n_band"], -1)
 
-    def decode(self, z, add_noise=False, noise=None):
-        h = self._decoder_net(self._unproject(z))
+    def decode(self, z, add_noise=False, noise=None, latent_pad=None):
+        h = self._decoder_net(self._unproject(z, latent_pad))
         wave = causal_conv(h, self.w("decoder.synth.branches.0.weight"),
                            self.b("decoder.synth.branches.0.bias"))
         loud = causal_conv(h, self.w("decoder.synth.branches.1.weight"),
@@ -186,6 +192,14 @@ class RaveReference:
         if add_noise:
             wf = wf + self._noise_branch(h, noise)
         return self.pqmf_inverse(wf)
+
+    def decode_stereo(self, z, pads):
+        # RAVE has no stereo decoder: the VST runs the mono decoder once per
+        # channel and concatenates (export.py: torch.cat([y[:n], y[n:]], 1)). The
+        # channels decorrelate only via each channel's independent N(0,1) latent
+        # pad. `pads` is a list of (1, full-cropped, T) tensors, one per channel.
+        chans = [self.decode(z, add_noise=False, latent_pad=p) for p in pads]
+        return torch.cat(chans, 1)   # (1, channels, L)
 
 
 def _fresh(ts_path):
@@ -262,6 +276,17 @@ def dump_fixtures(ref, out_dir):
     noise = (torch.rand(1, T_n, nb, 64) * 2 - 1).float()
     y_noise = ref.decode(z, add_noise=True, noise=noise)
 
+    # Stereo fixture: two channels decoded from the SAME latent but with
+    # independent injected N(0,1) latent pads (the only decorrelation source).
+    # Saved as (channels, full-cropped, T) so the C++ test reads channel c's pad
+    # at offset c*pad_dims*T; decode_stereo.bin is (1, channels, L).
+    pad_dims = ref.cfg["full_latent_size"] - z.shape[1]
+    T_lat = z.shape[2]
+    n_stereo = 2
+    torch.manual_seed(4321)
+    pads = torch.randn(n_stereo, pad_dims, T_lat).float()
+    y_stereo = ref.decode_stereo(z, [pads[c:c + 1] for c in range(n_stereo)])
+
     os.makedirs(out_dir, exist_ok=True)
     def save_bin(name, t):
         t.detach().contiguous().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
@@ -270,6 +295,8 @@ def dump_fixtures(ref, out_dir):
     save_bin("decode_det.bin", y)
     save_bin("noise.bin", noise)             # (1, T_n, nb, 64) -> rows (t*nb+band)
     save_bin("decode_noise.bin", y_noise)
+    save_bin("latent_pad.bin", pads)         # (channels, full-cropped, T)
+    save_bin("decode_stereo.bin", y_stereo)  # (1, channels, L)
     meta = {
         "input_len":    int(x.shape[-1]),
         "n_latent":     int(z.shape[1]),
@@ -281,6 +308,10 @@ def dump_fixtures(ref, out_dir):
         "noise_bands":  int(noise_bands),
         "ir_target":    64,
         "decode_noise_rms": float(y_noise.pow(2).mean().sqrt()),
+        "stereo_channels":  int(n_stereo),
+        "pad_dims":         int(pad_dims),
+        "decode_stereo_rms": float(y_stereo.pow(2).mean().sqrt()),
+        "stereo_lr_l1":      float((y_stereo[:, 0] - y_stereo[:, 1]).abs().mean()),
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

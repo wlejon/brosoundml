@@ -123,6 +123,42 @@ int main() {
         std::printf("note: noise fixtures absent — skipping noise-branch parity\n");
     }
 
+    // ── stereo parity (decode_multi) ── optional: only when the stereo fixtures
+    //    are present. Inject the reference's two per-channel latent pads and
+    //    confirm the interleaved 2-channel decode matches the stacked reference
+    //    bit-close, and that the channels actually differ.
+    const std::vector<float> ref_pad    = read_bin(dir + "/latent_pad.bin");
+    const std::vector<float> ref_stereo = read_bin(dir + "/decode_stereo.bin");
+    if (!ref_pad.empty() && !ref_stereo.empty()) {
+        const int ch  = 2;
+        const int per = frames * cfg.total_ratio;          // samples per channel
+        brosoundml::RaveDecodeOptions opts;
+        opts.channels       = ch;
+        opts.latent_pad     = ref_pad.data();
+        opts.latent_pad_len = static_cast<int>(ref_pad.size());
+        brosoundml::RaveMultiBuffer ys = rave.decode_multi(ref_latent.data(), nl, frames, opts);
+        CHECK(ys.channels == ch, "stereo channel count");
+        CHECK(static_cast<int>(ys.samples.size()) == per * ch, "stereo interleaved length");
+        CHECK(ref_stereo.size() == static_cast<std::size_t>(per) * ch, "stereo fixture length");
+        // De-interleave our output and compare to the (channel-major) reference.
+        float st_err = 0.0f, lr_l1 = 0.0f;
+        for (int c = 0; c < ch; ++c)
+            for (int t = 0; t < per; ++t) {
+                const float ours = ys.samples[static_cast<std::size_t>(t) * ch + c];
+                const float ref  = ref_stereo[static_cast<std::size_t>(c) * per + t];
+                st_err = std::max(st_err, std::fabs(ours - ref));
+            }
+        for (int t = 0; t < per; ++t)
+            lr_l1 += std::fabs(ys.samples[static_cast<std::size_t>(t) * ch + 0] -
+                               ys.samples[static_cast<std::size_t>(t) * ch + 1]);
+        lr_l1 /= per;
+        std::printf("stereo  max-abs-err = %.3e  (L/R l1=%.4f)\n", st_err, lr_l1);
+        CHECK(st_err < 2.0e-3f, "stereo decode matches reference");
+        CHECK(lr_l1 > 1.0e-4f, "stereo channels are decorrelated (L != R)");
+    } else {
+        std::printf("note: stereo fixtures absent — skipping stereo parity\n");
+    }
+
     // ── full round trip sanity (our latent -> decode) ──
     brosoundml::AudioBuffer rt = rave.decode(z);
     CHECK(!rt.empty(), "round-trip non-empty");

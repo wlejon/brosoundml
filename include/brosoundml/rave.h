@@ -73,12 +73,42 @@ struct RaveLatent {
 // resampled each call, so the output then varies unless pinned: set `seed` for a
 // reproducible internal draw, or supply `noise` to inject the white noise
 // verbatim (used by the parity test; also handy for fully deterministic noise).
+//
+// Stereo (decode_multi): RAVE has no stereo decoder — the VST's "stereo" runs
+// the same mono decoder once per channel and concatenates the outputs. The two
+// channels decorrelate solely because pre_process_latent pads the discarded
+// latent dims [cropped_latent_size, full_latent_size) with INDEPENDENT N(0,1)
+// noise per channel. We reproduce that exactly: latent_pad_std is the std of
+// that per-channel pad (RAVE uses 1.0; this is the "stereo width" knob — 0 keeps
+// the deterministic zero-pad, identical to mono decode()). Each channel's pad is
+// drawn from `seed` with the channel index as the RNG counter, so a stereo
+// decode is reproducible. latent_pad injects the pad verbatim (parity test).
 struct RaveDecodeOptions {
     bool         add_noise = false;   // run the stochastic noise-synth branch
-    std::uint64_t seed     = 0;       // RNG seed for the white noise (when add_noise && !noise)
+    std::uint64_t seed     = 0;       // RNG seed for white noise + latent pad (when not injected)
     const float* noise     = nullptr; // optional injected white noise in U(-1, 1), row-major:
                                       // (frames/64 * n_band) rows of 64. Used verbatim when set.
     int          noise_len = 0;       // element count of `noise`; must equal frames * total_ratio
+
+    int          channels       = 1;     // decode_multi: output channel count (>=1)
+    float        latent_pad_std = 0.0f;  // std of the N(0,1) pad on dims [n_latent, full); 0 = zero-pad.
+                                         // RAVE-native = 1.0; acts as the stereo-width control.
+    const float* latent_pad     = nullptr; // optional injected pad, channel-concatenated:
+                                           // channels * (full - n_latent) * frames floats, each block
+                                           // (full - n_latent, frames) channel-major. Used verbatim.
+    int          latent_pad_len = 0;       // element count of `latent_pad`
+};
+
+// Multi-channel decode result (decode_multi). `samples` is INTERLEAVED:
+// samples[t*channels + c] is channel c at frame t, so it drops straight into an
+// interleaved sink (broaudio createClip). channels == 1 is a plain mono buffer.
+struct RaveMultiBuffer {
+    std::vector<float> samples;            // interleaved, FP32, nominally [-1, 1]
+    int                sample_rate = 48000;
+    int                channels    = 1;
+
+    size_t frame_count() const { return channels ? samples.size() / channels : 0; }
+    bool   empty()       const { return samples.empty(); }
 };
 
 // The RAVE autoencoder. Construct, load() a converted model directory, then
@@ -112,6 +142,16 @@ public:
                        const RaveDecodeOptions& opts = {}) const;
     AudioBuffer decode(const float* latent, int n_latent, int frames,
                        const RaveDecodeOptions& opts = {}) const;
+
+    // Latent -> multi-channel waveform (interleaved). With opts.channels == 1 and
+    // a zero latent pad this equals decode(); with channels >= 2 it runs the mono
+    // decoder once per channel, each with an independent N(0,1) latent pad
+    // (opts.latent_pad_std / latent_pad), reproducing RAVE's stereo-mode decode.
+    // Each channel is frames * total_ratio samples long.
+    RaveMultiBuffer decode_multi(const RaveLatent& latent,
+                                 const RaveDecodeOptions& opts = {}) const;
+    RaveMultiBuffer decode_multi(const float* latent, int n_latent, int frames,
+                                 const RaveDecodeOptions& opts = {}) const;
 
     const RaveConfig& config() const;
     bool loaded() const;

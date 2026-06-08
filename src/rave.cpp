@@ -241,8 +241,15 @@ struct Rave::Impl {
 
     void load(const std::string& model_dir, bt::Device device);
     RaveLatent encode(const float* audio, int n) const;
+    // Decode one channel to its mono waveform (frames * total_ratio samples).
+    // `channel` selects this channel's latent pad (injected slice, or a seeded
+    // N(0,1) draw) and noise draw — the sole source of L/R decorrelation.
+    std::vector<float> decode_core(const float* latent, int n_latent, int frames,
+                                   const RaveDecodeOptions& opts, int channel) const;
     AudioBuffer decode(const float* latent, int n_latent, int frames,
                        const RaveDecodeOptions& opts) const;
+    RaveMultiBuffer decode_multi(const float* latent, int n_latent, int frames,
+                                 const RaveDecodeOptions& opts) const;
 };
 
 void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
@@ -478,8 +485,8 @@ RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     return out;
 }
 
-AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
-                               const RaveDecodeOptions& opts) const {
+std::vector<float> Rave::Impl::decode_core(const float* latent, int n_latent, int frames,
+                                           const RaveDecodeOptions& opts, int channel) const {
     if (!is_loaded) fail("model not loaded");
     if (n_latent != cfg.cropped_latent_size)
         fail("decode: latent has " + std::to_string(n_latent) + " dims, expected " +
@@ -489,10 +496,33 @@ AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
     const int full = cfg.full_latent_size;
     const int T    = frames;
 
-    // Unproject: zero-pad nl -> full latents, then x = pca^T @ z + latent_mean.
+    // Unproject: pad nl -> full latents, then x = pca^T @ z + latent_mean. The
+    // discarded dims [n_latent, full) carry the per-channel pad — zero by default
+    // (deterministic mono), or an independent N(0,1) draw for stereo width. This
+    // pad is the only thing that differs between stereo channels.
     bt::Tensor zf = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
     bt::Tensor zsrc = bt::Tensor::from_host_on(dev, latent, 1, n_latent * T);
     bt::copy_d2d(zsrc, 0, zf, 0, n_latent * T);
+
+    const int padDims = full - n_latent;
+    if (padDims > 0 && (opts.latent_pad || opts.latent_pad_std > 0.0f)) {
+        bt::Tensor padT;
+        if (opts.latent_pad) {
+            const std::size_t blk = static_cast<std::size_t>(padDims) * T;
+            if (opts.latent_pad_len < static_cast<int>((static_cast<std::size_t>(channel) + 1) * blk))
+                fail("decode: injected latent_pad too small for channel " + std::to_string(channel));
+            padT = bt::Tensor::from_host_on(dev, opts.latent_pad + static_cast<std::size_t>(channel) * blk,
+                                            padDims, T);
+        } else {
+            // Independent per-channel draw: key derived from seed (so it never
+            // collides with the noise stream), counter = channel.
+            padT = bt::Tensor::zeros_on(dev, padDims, T, bt::Dtype::FP32);
+            bt::randn(opts.seed ^ 0x52415645ull, static_cast<std::uint64_t>(channel), padT);
+            bt::scale_inplace(padT, opts.latent_pad_std);
+        }
+        bt::copy_d2d(padT, 0, zf, static_cast<std::size_t>(n_latent) * T,
+                     static_cast<std::size_t>(padDims) * T);
+    }
     int Lz;
     bt::Tensor h = cconv(zf, full, T, dec_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
 
@@ -573,7 +603,9 @@ AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
             if (opts.noise_len < R * 64) fail("decode: injected noise buffer too small");
             nz = bt::Tensor::from_host_on(dev, opts.noise, R, 64);
         } else {
-            bt::rand_uniform(opts.seed, /*counter=*/0, nz);
+            // Per-channel white noise (counter = channel) so stereo channels get
+            // independent noise textures; channel 0 keeps counter 0.
+            bt::rand_uniform(opts.seed, static_cast<std::uint64_t>(channel), nz);
             bt::scale_inplace(nz, 2.0f);
             bt::add_scalar_inplace(nz, -1.0f);
         }
@@ -620,7 +652,38 @@ AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
             wav[static_cast<std::size_t>(t) * nb + c] =
                 static_cast<float>(nb) * Y[static_cast<std::size_t>(nb - 1 - c) * Lc + t];
 
-    return AudioBuffer(std::move(wav), cfg.sampling_rate);
+    return wav;
+}
+
+AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
+                               const RaveDecodeOptions& opts) const {
+    // Mono: a single channel with whatever pad opts specify (zero by default).
+    return AudioBuffer(decode_core(latent, n_latent, frames, opts, /*channel=*/0),
+                       cfg.sampling_rate);
+}
+
+RaveMultiBuffer Rave::Impl::decode_multi(const float* latent, int n_latent, int frames,
+                                         const RaveDecodeOptions& opts) const {
+    const int ch = opts.channels < 1 ? 1 : opts.channels;
+    RaveMultiBuffer out;
+    out.sample_rate = cfg.sampling_rate;
+    out.channels    = ch;
+    if (ch == 1)
+        return { decode_core(latent, n_latent, frames, opts, 0), cfg.sampling_rate, 1 };
+
+    // Decode each channel independently, then interleave: samples[t*ch + c].
+    std::vector<std::vector<float>> chans;
+    chans.reserve(ch);
+    std::size_t per = 0;
+    for (int c = 0; c < ch; ++c) {
+        chans.push_back(decode_core(latent, n_latent, frames, opts, c));
+        per = chans[c].size();
+    }
+    out.samples.resize(per * static_cast<std::size_t>(ch));
+    for (int c = 0; c < ch; ++c)
+        for (std::size_t t = 0; t < per; ++t)
+            out.samples[t * ch + c] = chans[c][t];
+    return out;
 }
 
 // ── public wrapper ───────────────────────────────────────────────────────────
@@ -647,6 +710,14 @@ AudioBuffer Rave::decode(const RaveLatent& latent, const RaveDecodeOptions& opts
 AudioBuffer Rave::decode(const float* latent, int n_latent, int frames,
                          const RaveDecodeOptions& opts) const {
     return impl_->decode(latent, n_latent, frames, opts);
+}
+
+RaveMultiBuffer Rave::decode_multi(const RaveLatent& latent, const RaveDecodeOptions& opts) const {
+    return impl_->decode_multi(latent.data.data(), latent.n_latent, latent.frames, opts);
+}
+RaveMultiBuffer Rave::decode_multi(const float* latent, int n_latent, int frames,
+                                   const RaveDecodeOptions& opts) const {
+    return impl_->decode_multi(latent, n_latent, frames, opts);
 }
 
 const RaveConfig& Rave::config() const { return impl_->cfg; }
