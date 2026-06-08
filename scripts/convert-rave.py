@@ -297,6 +297,10 @@ def extract(ts_path, sr_override=None):
     else:
         cfg["latent_mode"] = "noise_pca"
         cfg["use_pca"] = True
+        # Family B decode never runs the prior; drop its weights if the export
+        # happens to carry a prior_net module (e.g. birds_dawnchorus).
+        for k in [t for t in tensors if t.startswith("prior_net.")]:
+            del tensors[k]
 
     # Two synthesis types:
     #  * "rave"   (A/B): decoder.net -> h; wave=tanh(conv0(h)), loud=mod_sigmoid(
