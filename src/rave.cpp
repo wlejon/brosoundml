@@ -53,6 +53,7 @@ struct ConvW {
     bt::Tensor b;
     bool       has_b = false;
     int        cin = 0, cout = 0, k = 0;
+    int        cin_pg = 0;  // weight.shape[1] = Cin/groups; groups derived at runtime
 };
 
 struct BN {
@@ -89,10 +90,11 @@ ConvW load_conv(const sf::File& f, const std::string& name, int groups, bt::Devi
     const int d1 = static_cast<int>(wv.shape[1]);
     const int k  = static_cast<int>(wv.shape[2]);
     ConvW c;
-    c.cout = d0;
-    c.cin  = d1 * groups;
-    c.k    = k;
-    c.w    = up(f, name + ".weight", d0, d1 * k, dev);
+    c.cout   = d0;
+    c.cin    = d1 * groups;
+    c.cin_pg = d1;
+    c.k      = k;
+    c.w      = up(f, name + ".weight", d0, d1 * k, dev);
     if (const sf::TensorView* bv = f.find(name + ".bias")) {
         c.b = up_vec(f, name + ".bias", static_cast<int>(bv->shape[0]), dev);
         c.has_b = true;
@@ -116,6 +118,51 @@ ConvW load_convt(const sf::File& f, const std::string& name, bt::Device dev) {
     if (const sf::TensorView* bv = f.find(name + ".bias")) {
         c.b = up_vec(f, name + ".bias", static_cast<int>(bv->shape[0]), dev);
         c.has_b = true;
+    }
+    return c;
+}
+
+// ── flat-layout loaders (FLAT exports name weights by their full graph path; the
+//    op-list gives exact weight/bias tensor keys, so load by name) ─────────────
+
+// Conv1d weight (Cout, Cin/groups, K) by its full tensor name. groups is derived
+// at runtime from the input channel count (groups = Cin / weight.shape[1]).
+ConvW load_named_conv(const sf::File& f, const std::string& wname,
+                      const std::string& bname, bt::Device dev) {
+    const sf::TensorView& wv = need(f, wname);
+    if (wv.shape.size() != 3) fail("flat conv '" + wname + "' is not rank-3");
+    const int d0 = static_cast<int>(wv.shape[0]);   // Cout
+    const int d1 = static_cast<int>(wv.shape[1]);   // Cin/groups
+    const int k  = static_cast<int>(wv.shape[2]);
+    ConvW c;
+    c.cout = d0; c.cin_pg = d1; c.cin = d1; c.k = k;
+    c.w = up(f, wname, d0, d1 * k, dev);
+    if (!bname.empty()) {
+        if (const sf::TensorView* bv = f.find(bname)) {
+            c.b = up_vec(f, bname, static_cast<int>(bv->shape[0]), dev);
+            c.has_b = true;
+        }
+    }
+    return c;
+}
+
+// ConvTranspose1d weight (Cin, Cout/groups, K) by name; RAVE upsamplers use
+// groups == 1, so Cout == weight.shape[1].
+ConvW load_named_convt(const sf::File& f, const std::string& wname,
+                       const std::string& bname, bt::Device dev) {
+    const sf::TensorView& wv = need(f, wname);
+    if (wv.shape.size() != 3) fail("flat convT '" + wname + "' is not rank-3");
+    const int d0 = static_cast<int>(wv.shape[0]);   // Cin
+    const int d1 = static_cast<int>(wv.shape[1]);   // Cout
+    const int k  = static_cast<int>(wv.shape[2]);
+    ConvW c;
+    c.cin = d0; c.cout = d1; c.cin_pg = d1; c.k = k;
+    c.w = up(f, wname, d0, d1 * k, dev);
+    if (!bname.empty()) {
+        if (const sf::TensorView* bv = f.find(bname)) {
+            c.b = up_vec(f, bname, static_cast<int>(bv->shape[0]), dev);
+            c.has_b = true;
+        }
     }
     return c;
 }
@@ -157,6 +204,45 @@ bt::Tensor cconvt(const bt::Tensor& x, int Cin, int L, const ConvW& c, int strid
     bt::Tensor y = bt::Tensor::zeros_on(x.device, 1, c.cout * Lout, bt::Dtype::FP32);
     for (int ch = 0; ch < c.cout; ++ch)
         bt::copy_d2d(full, ch * L_full, y, ch * Lout, Lout);
+    return y;
+}
+
+// Flat causal conv with an EXPLICIT left-pad (read from the topology op-list).
+// The pad is not always dilation*(k-1): newer cached convs store dil*(k-1)-(s-1),
+// so a stride-2 k5 downsampler left-pads 3, not 4. groups = Cin / weight.shape[1].
+bt::Tensor frun_conv(const bt::Tensor& x, int Cin, int L, const ConvW& c,
+                     int stride, int dilation, int left_pad, int& Lout) {
+    const int groups = Cin / c.cin_pg;
+    bt::Tensor padded, y;
+    bt::pad1d_forward(x, /*N=*/1, Cin, L, left_pad, /*pad_right=*/0, /*mode=*/0, padded);
+    bt::conv1d(padded, c.w, c.has_b ? &c.b : nullptr, /*N=*/1, Cin, L + left_pad,
+               c.cout, c.k, stride, /*padding=*/0, dilation, groups, y);
+    Lout = (L + left_pad - dilation * (c.k - 1) - 1) / stride + 1;
+    return y;
+}
+
+// Flat causal transposed conv (UpsampleLayer): prepend cpad, conv_transpose1d
+// with the graph's padding, then trim the output to exactly L0*stride. Handles
+// both the CachedPadding+convT(pad>0) and bare convT(pad=0) export conventions.
+bt::Tensor frun_convt(const bt::Tensor& x, int Cin, int L0, const ConvW& c,
+                      int stride, int pad, int cpad, int& Lout) {
+    bt::Tensor xp;
+    int Lin = L0;
+    if (cpad > 0) { bt::pad1d_forward(x, 1, Cin, L0, cpad, 0, 0, xp); Lin = L0 + cpad; }
+    const bt::Tensor& in = (cpad > 0) ? xp : x;
+    // conv_transpose1d with padding=p == full transpose (padding 0) with p samples
+    // dropped from each end. Run the padding-0 form (the only variant the legacy
+    // path verified bit-exact) and slice [pad, pad+L0*stride) ourselves.
+    bt::Tensor full;
+    bt::conv_transpose1d_forward(in, c.w, c.has_b ? &c.b : nullptr, /*N=*/1, Cin, Lin,
+                                 c.cout, c.k, stride, /*padding=*/0, /*output_padding=*/0,
+                                 /*dilation=*/1, full);
+    const int L_full = (Lin - 1) * stride + c.k;
+    const int target = L0 * stride;
+    Lout = target;
+    bt::Tensor y = bt::Tensor::zeros_on(x.device, 1, c.cout * target, bt::Dtype::FP32);
+    for (int ch = 0; ch < c.cout; ++ch)
+        bt::copy_d2d(full, ch * L_full + pad, y, ch * target, target);
     return y;
 }
 
@@ -205,6 +291,18 @@ std::string slurp(const std::string& path) {
     return ss.str();
 }
 
+// ── flat topology op-list (newer RAVE exports) ───────────────────────────────
+// One entry per emitted op. push…add brackets a residual block (add folds the
+// pushed input back in). Replays scripts/rave_reference.py::TopoRave.run.
+enum FKind { F_CONV, F_CONVT, F_LEAKY, F_SNAKE, F_PUSH, F_ADD };
+struct FlatOp {
+    FKind      kind = F_LEAKY;
+    ConvW      conv;                 // F_CONV / F_CONVT
+    int        stride = 1, dil = 1, left_pad = 0;   // F_CONV
+    int        pad = 0, cpad = 0;                    // F_CONVT
+    bt::Tensor alpha;                // F_SNAKE: per-channel (C,1)
+};
+
 }  // namespace
 
 // ── Impl ─────────────────────────────────────────────────────────────────────
@@ -213,6 +311,19 @@ struct Rave::Impl {
     RaveConfig cfg;
     bt::Device dev = bt::Device::CPU;
     bool       is_loaded = false;
+
+    // FLAT path (newer topology-driven exports). When false, the legacy
+    // fixed-topology RAVE-v2 members below are used instead. The two paths share
+    // only pqmf_fwd/pqmf_inv, the PCA convs (enc_pca/dec_pca), and the synth wave/
+    // loud convs — every conv whose causal left-pad equals dilation*(k-1).
+    bool flat = false;
+    std::vector<FlatOp> enc_ops;
+    std::vector<FlatOp> dec_ops;
+    std::string         synth_type;       // "rave" | "amp_mod"
+    int                 loud_stride = 1;
+    bool                has_gimbal  = false;
+    bt::Tensor          gim_a, gim_b;     // per-channel (full,1): mean = mean*a + b
+    bt::Tensor          gim_zero, gim_one;// batch_norm running_mean/var to fold the affine
 
     ConvW pqmf_fwd;        // 1 -> n_band, stride n_band
     ConvW pqmf_inv;        // n_band -> n_band, stride 1
@@ -240,6 +351,11 @@ struct Rave::Impl {
     bt::Tensor           noise_ir_bias; // zeros (64, 1) for linear_forward_batched
 
     void load(const std::string& model_dir, bt::Device device);
+    void build_pca(const sf::File& f, int full);
+    void load_flat(const sf::File& f, const j::Value& root);
+    // Replay a flat op-list over h (1, Cin*Lin); returns h (1, Cout*Lout).
+    bt::Tensor run_ops(const std::vector<FlatOp>& ops, bt::Tensor h,
+                       int Cin, int Lin, int& Cout, int& Lout) const;
     RaveLatent encode(const float* audio, int n) const;
     // Decode one channel to its mono waveform (frames * total_ratio samples).
     // `channel` selects this channel's latent pad (injected slice, or a seeded
@@ -275,9 +391,19 @@ void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
     const sf::File f = sf::File::open(weights_path);
     const int full = cfg.full_latent_size;
 
-    // ── PQMF analysis / synthesis convs ──
+    // ── PQMF analysis / synthesis convs (shared; their left-pad == dil*(k-1)) ──
     pqmf_fwd = load_conv(f, "pqmf.forward_conv", /*groups=*/1, dev);
     pqmf_inv = load_conv(f, "pqmf.inverse_conv", /*groups=*/1, dev);
+
+    // ── FLAT exports: topology-driven path (residual encoders, Snake, gimbal,
+    //    amp-mod synth). Reuses PQMF + PCA; everything else comes from the op-list.
+    if (root.get_string("format", "") == "flat") {
+        flat = true;
+        build_pca(f, full);
+        load_flat(f, root);
+        is_loaded = true;
+        return;
+    }
 
     // ── encoder: [conv, BN, LeakyReLU] x4 downsample, then [conv, LeakyReLU,
     //    grouped-conv(groups=2)] -> (mean | scale). Fixed RAVE v2 topology
@@ -311,36 +437,7 @@ void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
     for (const EncLayer& el : enc) cfg.total_ratio *= el.stride;
 
     // ── PCA projection (fold the latent_mean shift into the 1x1 conv bias) ──
-    {
-        bt::Tensor pca_cpu, mean_cpu;
-        {
-            bt::DeviceScope cpu(bt::Device::CPU);
-            sf::upload(need(f, "latent_pca"),  full, full, pca_cpu);
-            sf::upload(need(f, "latent_mean"), full, 1,    mean_cpu);
-        }
-        const float* P = pca_cpu.host_f32();    // (full, full), row = out dim
-        const float* M = mean_cpu.host_f32();   // (full)
-        std::vector<float> enc_b(full), dec_w(static_cast<std::size_t>(full) * full), dec_b(full);
-        for (int i = 0; i < full; ++i) {
-            float s = 0.0f;
-            for (int k = 0; k < full; ++k) s += P[static_cast<std::size_t>(i) * full + k] * M[k];
-            enc_b[i] = -s;                       // encode bias: -(pca @ mean)
-            dec_b[i] = M[i];                     // decode bias: latent_mean
-        }
-        for (int i = 0; i < full; ++i)           // dec weight = pca^T
-            for (int k = 0; k < full; ++k)
-                dec_w[static_cast<std::size_t>(i) * full + k] = P[static_cast<std::size_t>(k) * full + i];
-
-        enc_pca.w = (dev == bt::Device::CPU) ? pca_cpu : pca_cpu.to(dev);
-        enc_pca.b = bt::Tensor::from_host_on(dev, enc_b.data(), full, 1);
-        enc_pca.has_b = true;
-        enc_pca.cin = full; enc_pca.cout = full; enc_pca.k = 1;
-
-        dec_pca.w = bt::Tensor::from_host_on(dev, dec_w.data(), full, full);
-        dec_pca.b = bt::Tensor::from_host_on(dev, dec_b.data(), full, 1);
-        dec_pca.has_b = true;
-        dec_pca.cin = full; dec_pca.cout = full; dec_pca.k = 1;
-    }
+    build_pca(f, full);
 
     // ── decoder: input conv, then 4x [convT upsample + 3 residual blocks] ──
     dec_in = load_conv(f, "decoder.net.0", /*groups=*/1, dev);
@@ -433,6 +530,157 @@ void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
     is_loaded = true;
 }
 
+// PCA projection folded into two 1x1 convs (shared by the legacy and flat paths).
+// encode:  z = pca @ (mean - latent_mean)  -> enc_pca.w = pca, bias = -(pca@mean)
+// decode:  x = pca^T @ z + latent_mean     -> dec_pca.w = pca^T, bias = latent_mean
+void Rave::Impl::build_pca(const sf::File& f, int full) {
+    bt::Tensor pca_cpu, mean_cpu;
+    {
+        bt::DeviceScope cpu(bt::Device::CPU);
+        sf::upload(need(f, "latent_pca"),  full, full, pca_cpu);
+        sf::upload(need(f, "latent_mean"), full, 1,    mean_cpu);
+    }
+    const float* P = pca_cpu.host_f32();    // (full, full), row = out dim
+    const float* M = mean_cpu.host_f32();   // (full)
+    std::vector<float> enc_b(full), dec_w(static_cast<std::size_t>(full) * full), dec_b(full);
+    for (int i = 0; i < full; ++i) {
+        float s = 0.0f;
+        for (int k = 0; k < full; ++k) s += P[static_cast<std::size_t>(i) * full + k] * M[k];
+        enc_b[i] = -s;                       // encode bias: -(pca @ mean)
+        dec_b[i] = M[i];                     // decode bias: latent_mean
+    }
+    for (int i = 0; i < full; ++i)           // dec weight = pca^T
+        for (int k = 0; k < full; ++k)
+            dec_w[static_cast<std::size_t>(i) * full + k] = P[static_cast<std::size_t>(k) * full + i];
+
+    enc_pca.w = (dev == bt::Device::CPU) ? pca_cpu : pca_cpu.to(dev);
+    enc_pca.b = bt::Tensor::from_host_on(dev, enc_b.data(), full, 1);
+    enc_pca.has_b = true;
+    enc_pca.cin = full; enc_pca.cout = full; enc_pca.k = 1; enc_pca.cin_pg = full;
+
+    dec_pca.w = bt::Tensor::from_host_on(dev, dec_w.data(), full, full);
+    dec_pca.b = bt::Tensor::from_host_on(dev, dec_b.data(), full, 1);
+    dec_pca.has_b = true;
+    dec_pca.cin = full; dec_pca.cout = full; dec_pca.k = 1; dec_pca.cin_pg = full;
+}
+
+// Parse the flat topology op-list + gimbal + synth metadata from config.json,
+// loading every referenced weight by name. Mirrors convert-rave.py's emit order.
+void Rave::Impl::load_flat(const sf::File& f, const j::Value& root) {
+    auto opt_key = [](const j::Value& o, const char* k) -> std::string {
+        const j::Value* v = o.find(k);
+        return (v && v->is_string()) ? v->as_string() : std::string();
+    };
+    auto parse_ops = [&](const char* list_key, std::vector<FlatOp>& out) {
+        const j::Value* arr = root.find(list_key);
+        if (!arr || !arr->is_array()) fail(std::string("config: missing ") + list_key);
+        for (const j::Value& o : arr->as_array()) {
+            const std::string kind = o.get_string("kind", "");
+            FlatOp op;
+            if (kind == "conv") {
+                op.kind = F_CONV;
+                op.stride   = o.get_int("stride", 1);
+                op.dil      = o.get_int("dil", 1);
+                op.left_pad = o.get_int("left_pad", 0);
+                op.conv = load_named_conv(f, o.at("w").as_string(), opt_key(o, "b"), dev);
+            } else if (kind == "convT") {
+                op.kind = F_CONVT;
+                op.stride = o.get_int("stride", 1);
+                op.pad    = o.get_int("pad", 0);
+                op.cpad   = o.get_int("cpad", 0);
+                op.conv = load_named_convt(f, o.at("w").as_string(), opt_key(o, "b"), dev);
+            } else if (kind == "leaky") {
+                op.kind = F_LEAKY;
+            } else if (kind == "snake") {
+                op.kind = F_SNAKE;
+                const std::string ak = o.at("alpha").as_string();
+                const int c = static_cast<int>(need(f, ak).shape[0]);
+                op.alpha = up_vec(f, ak, c, dev);
+            } else if (kind == "push") {
+                op.kind = F_PUSH;
+            } else if (kind == "add") {
+                op.kind = F_ADD;
+            } else {
+                fail("config: unknown op kind '" + kind + "'");
+            }
+            out.push_back(std::move(op));
+        }
+    };
+    parse_ops("encoder_ops", enc_ops);
+    parse_ops("decoder_ops", dec_ops);
+
+    // total_ratio: config carries it; else recompute from the encoder strides.
+    cfg.total_ratio = root.get_int("total_ratio", 0);
+    if (cfg.total_ratio <= 0) {
+        cfg.total_ratio = cfg.n_band;
+        for (const FlatOp& op : enc_ops)
+            if (op.kind == F_CONV) cfg.total_ratio *= op.stride;
+    }
+
+    // gimbal latent affine: mean = mean*exp(log_a) + b. Folded into a batch_norm
+    // (running_mean=0, running_var=1, eps=0) so it runs as one device op.
+    has_gimbal = root.get_bool("has_gimbal", false) && f.find("gimbal.log_a");
+    if (has_gimbal) {
+        const int full = cfg.full_latent_size;
+        bt::Tensor log_a = up_vec(f, "gimbal.log_a", full, dev);
+        bt::exp_forward(log_a, gim_a);
+        gim_b    = up_vec(f, "gimbal.b", full, dev);
+        gim_zero = bt::Tensor::zeros_on(dev, full, 1, bt::Dtype::FP32);
+        std::vector<float> ones(static_cast<std::size_t>(full), 1.0f);
+        gim_one  = bt::Tensor::from_host_on(dev, ones.data(), full, 1);
+    }
+
+    // synthesis: "rave" (wave/loud branches, loud broadcast over bands) or
+    // "amp_mod" (decoder ends at 2*n_band -> tanh(wave*sigmoid(amp))).
+    synth_type = root.get_string("synth_type", "rave");
+    if (synth_type == "rave") {
+        synth_wave = load_conv(f, "decoder.synth.branches.0", /*groups=*/1, dev);
+        synth_loud = load_conv(f, "decoder.synth.branches.1", /*groups=*/1, dev);
+        const j::Value* sv = root.find("synth");
+        loud_stride = (sv && sv->is_object()) ? sv->get_int("loud_stride", 1) : 1;
+    }
+}
+
+bt::Tensor Rave::Impl::run_ops(const std::vector<FlatOp>& ops, bt::Tensor h,
+                               int Cin, int Lin, int& Cout, int& Lout) const {
+    std::vector<bt::Tensor> stack;
+    int C = Cin, L = Lin;
+    for (const FlatOp& op : ops) {
+        switch (op.kind) {
+            case F_CONV: {
+                int Lo;
+                h = frun_conv(h, C, L, op.conv, op.stride, op.dil, op.left_pad, Lo);
+                C = op.conv.cout; L = Lo;
+                break;
+            }
+            case F_CONVT: {
+                int Lo;
+                h = frun_convt(h, C, L, op.conv, op.stride, op.pad, op.cpad, Lo);
+                C = op.conv.cout; L = Lo;
+                break;
+            }
+            case F_LEAKY:
+                h = leaky(h, cfg.leaky_slope);
+                break;
+            case F_SNAKE: {
+                bt::Tensor y;
+                bt::snake_forward(h, op.alpha, /*beta=*/nullptr, /*N=*/1, C, L, y);
+                h = std::move(y);
+                break;
+            }
+            case F_PUSH:
+                stack.push_back(h);
+                break;
+            case F_ADD:
+                bt::add_inplace(h, stack.back());   // x + pushed residual input
+                stack.pop_back();
+                break;
+        }
+    }
+    Cout = C; Lout = L;
+    return h;
+}
+
 RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     if (!is_loaded) fail("model not loaded");
     bt::DeviceScope scope(dev);
@@ -450,17 +698,21 @@ RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     reverse_half_inplace(h, cfg.n_band, Lb);
 
     int C = cfg.n_band, Lc = Lb;
-    for (const EncLayer& el : enc) {
-        int Lo;
-        h = cconv(h, C, Lc, el.conv, el.stride, /*dilation=*/1, el.groups, Lo);
-        C = el.conv.cout; Lc = Lo;
-        if (el.has_bn) {
-            bt::Tensor y;
-            bt::batch_norm_inference(h, el.bn.g, el.bn.beta, el.bn.mean, el.bn.var,
-                                     /*N=*/1, C, /*H=*/1, /*W=*/Lc, cfg.bn_eps, y);
-            h = std::move(y);
+    if (flat) {
+        h = run_ops(enc_ops, h, C, Lc, C, Lc);   // residual encoder / Snake topology
+    } else {
+        for (const EncLayer& el : enc) {
+            int Lo;
+            h = cconv(h, C, Lc, el.conv, el.stride, /*dilation=*/1, el.groups, Lo);
+            C = el.conv.cout; Lc = Lo;
+            if (el.has_bn) {
+                bt::Tensor y;
+                bt::batch_norm_inference(h, el.bn.g, el.bn.beta, el.bn.mean, el.bn.var,
+                                         /*N=*/1, C, /*H=*/1, /*W=*/Lc, cfg.bn_eps, y);
+                h = std::move(y);
+            }
+            if (el.act) h = leaky(h, cfg.leaky_slope);
         }
-        if (el.act) h = leaky(h, cfg.leaky_slope);
     }
 
     // Split (mean | scale): take the first `full` channels (the posterior mean).
@@ -468,6 +720,15 @@ RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     const int T    = Lc;
     bt::Tensor mean = bt::Tensor::zeros_on(dev, 1, full * T, bt::Dtype::FP32);
     bt::copy_d2d(h, 0, mean, 0, full * T);
+
+    // Gimbal latent affine (flat models that ship it): mean = mean*exp(log_a)+b,
+    // folded into a batch_norm so it's one device op. Applied before the PCA.
+    if (flat && has_gimbal) {
+        bt::Tensor y;
+        bt::batch_norm_inference(mean, gim_a, gim_b, gim_zero, gim_one,
+                                 /*N=*/1, full, /*H=*/1, /*W=*/T, /*eps=*/0.0f, y);
+        mean = std::move(y);
+    }
 
     // z = pca @ (mean - latent_mean)  (folded into the 1x1 conv bias).
     int Lz;
@@ -523,6 +784,59 @@ std::vector<float> Rave::Impl::decode_core(const float* latent, int n_latent, in
         bt::copy_d2d(padT, 0, zf, static_cast<std::size_t>(n_latent) * T,
                      static_cast<std::size_t>(padDims) * T);
     }
+    // ── FLAT decode: decoder.net consumes the full (zero-padded) latent DIRECTLY.
+    //    Flat exports fold NO inverse-PCA into decode (the latent_pca rotation is
+    //    applied only at encode; the decoder is trained in that rotated space) —
+    //    unlike the legacy path's dec_pca unprojection below. Replay the decoder
+    //    op-list, then the flat synth + PQMF. Deterministic (no noise branch). ──
+    if (flat) {
+        const int nb = cfg.n_band;
+        int C, Lc;
+        bt::Tensor hh = run_ops(dec_ops, zf, full, T, C, Lc);
+
+        bt::Tensor tw;   // multiband waveform (1, nb*Lc)
+        if (synth_type == "amp_mod") {
+            // decoder ends at 2*n_band: split (wave | amp); out = tanh(wave*sigmoid(amp)).
+            const int half = C / 2;
+            if (half != nb) fail("amp_mod synth: decoder out (" + std::to_string(C) +
+                                 ") != 2*n_band");
+            bt::Tensor wave = bt::Tensor::zeros_on(dev, 1, half * Lc, bt::Dtype::FP32);
+            bt::Tensor amp  = bt::Tensor::zeros_on(dev, 1, half * Lc, bt::Dtype::FP32);
+            bt::copy_d2d(hh, 0, wave, 0, half * Lc);
+            bt::copy_d2d(hh, static_cast<std::size_t>(half) * Lc, amp, 0, half * Lc);
+            bt::Tensor sa;
+            bt::sigmoid_forward(amp, sa);
+            bt::mul_inplace(wave, sa);
+            bt::tanh_forward(wave, tw);
+        } else {
+            // "rave": tanh(wave) * mod_sigmoid(loud), loud broadcast across bands.
+            if (loud_stride > 1) fail("flat decode: loud_stride>1 not supported");
+            int Lw;
+            bt::Tensor wave = cconv(hh, C, Lc, synth_wave, 1, 1, 1, Lw);
+            int Ll;
+            bt::Tensor loud = cconv(hh, C, Lc, synth_loud, 1, 1, 1, Ll);
+            bt::tanh_forward(wave, tw);              // (1, nb*Lc), Lw == Lc
+            bt::Tensor m = mod_sigmoid(loud);        // (1, 1*Lc)
+            bt::Tensor mt = bt::Tensor::zeros_on(dev, 1, nb * Lc, bt::Dtype::FP32);
+            for (int c = 0; c < nb; ++c) bt::copy_d2d(m, 0, mt, c * Lc, Lc);
+            bt::mul_inplace(tw, mt);
+        }
+
+        // PQMF synthesis (same as the legacy tail): reverse_half, conv, *n_band,
+        // polyphase interleave.
+        reverse_half_inplace(tw, nb, Lc);
+        int Ly;
+        bt::Tensor y = cconv(tw, nb, Lc, pqmf_inv, 1, 1, 1, Ly);
+        std::vector<float> Y = y.to_host_vector();   // (nb, Lc) channel-major
+        std::vector<float> wav(static_cast<std::size_t>(nb) * Lc);
+        for (int t = 0; t < Lc; ++t)
+            for (int c = 0; c < nb; ++c)
+                wav[static_cast<std::size_t>(t) * nb + c] =
+                    static_cast<float>(nb) * Y[static_cast<std::size_t>(nb - 1 - c) * Lc + t];
+        return wav;
+    }
+
+    // Legacy unprojection: x = pca^T @ zf + latent_mean (inverse PCA before decode).
     int Lz;
     bt::Tensor h = cconv(zf, full, T, dec_pca, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Lz);
 
