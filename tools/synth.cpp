@@ -132,9 +132,9 @@ int main(int argc, char** argv) {
             int idx = 0;
             auto audio = k.synthesize_stream(
                 chunks, voice,
-                [&](const float*, int n) {
-                    std::fprintf(stderr, "  chunk %d: %d samples (%.2fs)\n",
-                                 idx++, n, n / 24000.0);
+                [&](const float*, int n, const int32_t*, int nd) {
+                    std::fprintf(stderr, "  chunk %d: %d samples (%.2fs), %d dur\n",
+                                 idx++, n, n / 24000.0, nd);
                 },
                 speed);
             audio.write_wav(out_path);

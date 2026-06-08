@@ -526,14 +526,19 @@ AudioBuffer Kokoro::synthesize_stream(
 
         // Each chunk is a self-contained utterance — synthesize() applies the
         // BOS/EOS wrap, duration prediction, and length-aware voice row. It
-        // returns an empty buffer if cancelled mid-chunk.
+        // returns an empty buffer if cancelled mid-chunk. Capture the chunk's
+        // per-phoneme durations so on_chunk can align words to the streamed
+        // audio without a second synthesize().
+        std::vector<int32_t> pred_dur;
         AudioBuffer seg = synthesize(chunk, voice, speed,
-                                     /*pred_dur_out=*/nullptr, cancel,
+                                     &pred_dur, cancel,
                                      /*trace_out=*/nullptr);
         if (seg.samples.empty()) continue;
 
         if (on_chunk) on_chunk(seg.samples.data(),
-                               static_cast<int>(seg.samples.size()));
+                               static_cast<int>(seg.samples.size()),
+                               pred_dur.data(),
+                               static_cast<int>(pred_dur.size()));
         out.samples.insert(out.samples.end(),
                            seg.samples.begin(), seg.samples.end());
     }

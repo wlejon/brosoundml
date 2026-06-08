@@ -182,14 +182,25 @@ struct KokoroTrace {
 };
 
 // Streaming sink: receives `n` finalized 24 kHz mono samples each time a
-// phoneme chunk finishes synthesizing. See Kokoro::synthesize_stream. Unlike
-// Qwen3-TTS (autoregressive, so its codec streams the growing token tail),
-// Kokoro is a single non-autoregressive forward pass — the whole utterance is
-// length-regulated and decoded at once, with no internal point at which a
-// prefix is final. Streaming therefore chunks the *input*: each phoneme chunk
-// is synthesized independently and its audio is emitted as it completes, which
-// is what gets first-audio latency down for a long script.
-using KokoroStreamChunkFn = std::function<void(const float* samples, int n)>;
+// phoneme chunk finishes synthesizing, plus that chunk's per-phoneme duration
+// prediction — `pred_dur` points at `n_dur` frame counts, one per token in the
+// chunk's BOS/EOS-wrapped sequence (so n_dur == chunk.size() + 2, exactly the
+// pred_dur_out of a synthesize() over the same chunk). The sample count is a
+// fixed multiple of the summed frame count, so a caller can recover per-phoneme
+// timing within the chunk as `frame_offset * (n / sum(pred_dur))` — enough to
+// align words to the streamed audio without a second synthesize(). The pointer
+// is valid only for the duration of the call.
+//
+// See Kokoro::synthesize_stream. Unlike Qwen3-TTS (autoregressive, so its codec
+// streams the growing token tail), Kokoro is a single non-autoregressive forward
+// pass — the whole utterance is length-regulated and decoded at once, with no
+// internal point at which a prefix is final. Streaming therefore chunks the
+// *input*: each phoneme chunk is synthesized independently and its audio is
+// emitted as it completes, which is what gets first-audio latency down for a
+// long script.
+using KokoroStreamChunkFn = std::function<void(const float* samples, int n,
+                                               const int32_t* pred_dur,
+                                               int n_dur)>;
 
 // The Kokoro TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a

@@ -255,11 +255,13 @@ static int run() {
                 AudioBuffer s1 = real.synthesize(c1, v, 1.0f);
 
                 std::vector<int> chunk_sizes;
+                std::vector<int> dur_lens;
                 AudioBuffer joined;
                 AudioBuffer streamed = real.synthesize_stream(
                     {c0, c1}, v,
-                    [&](const float* p, int n) {
+                    [&](const float* p, int n, const int32_t* d, int nd) {
                         chunk_sizes.push_back(n);
+                        dur_lens.push_back((d && nd > 0) ? nd : 0);
                         joined.samples.insert(joined.samples.end(), p, p + n);
                     },
                     1.0f);
@@ -268,6 +270,10 @@ static int run() {
                       tag("synthesize_stream: 24 kHz output"));
                 CHECK(chunk_sizes.size() == 2,
                       tag("synthesize_stream: one on_chunk per non-empty chunk"));
+                CHECK(dur_lens.size() == 2 &&
+                      dur_lens[0] == static_cast<int>(c0.size()) + 2 &&
+                      dur_lens[1] == static_cast<int>(c1.size()) + 2,
+                      tag("synthesize_stream: pred_dur length == chunk size + 2"));
                 CHECK(chunk_sizes.size() == 2 &&
                       chunk_sizes[0] == static_cast<int>(s0.samples.size()) &&
                       chunk_sizes[1] == static_cast<int>(s1.samples.size()),
@@ -291,7 +297,7 @@ static int run() {
                 int seen = 0;
                 AudioBuffer partial = real.synthesize_stream(
                     {c0, c1}, v,
-                    [&](const float*, int) { ++seen; },
+                    [&](const float*, int, const int32_t*, int) { ++seen; },
                     1.0f,
                     [&] { return seen >= 1; });   // cancel after the 1st chunk
                 CHECK(seen == 1,
