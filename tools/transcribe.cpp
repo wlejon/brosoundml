@@ -7,7 +7,7 @@
 // Usage:
 //   brosoundml_transcribe <wav> <model_dir>
 //                         [--lang en] [--task transcribe]
-//                         [--no-timestamps] [--max-new-tokens N]
+//                         [--no-timestamps] [--max-new-tokens N] [--stream]
 //
 // Notes:
 //   * The WAV must be 16 kHz mono PCM — Whisper's input rate is fixed and
@@ -15,7 +15,12 @@
 //   * `--lang` is an ISO-639-1 code (en, zh, fr, ...); `--task` is
 //     `transcribe` or `translate`.
 //   * `--max-new-tokens 0` (the default) lets Whisper run until either EOS
-//     or max_target_positions - prompt_len.
+//     or max_target_positions - prompt_len (per 30 s window in long-form).
+//   * `--stream` prints the transcript incrementally as each token decodes
+//     instead of waiting for the whole clip.
+//   * Clips longer than 30 s are decoded with Whisper's sequential long-form
+//     windowing (30 s segments + timestamp seek) instead of being truncated;
+//     this needs timestamps, so it is disabled under `--no-timestamps`.
 
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
@@ -55,8 +60,9 @@ void print_usage() {
         "Options:\n"
         "  --lang LC           ISO-639-1 language code (default: en).\n"
         "  --task T            'transcribe' (default) or 'translate'.\n"
-        "  --no-timestamps     Suppress timestamp tokens in the prompt.\n"
+        "  --no-timestamps     Suppress timestamp tokens (disables long-form).\n"
         "  --max-new-tokens N  Cap generated tokens (0 = model default).\n"
+        "  --stream            Print the transcript incrementally as it decodes.\n"
         "  -h, --help          Show this help and exit.\n");
 }
 
@@ -68,6 +74,7 @@ int main(int argc, char** argv) {
     std::string task = "transcribe";
     bool        with_timestamps = true;
     int         max_new_tokens  = 0;
+    bool        stream          = false;
 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
@@ -80,6 +87,7 @@ int main(int argc, char** argv) {
         else if (a == "--lang")             lang = next("--lang");
         else if (a == "--task")             task = next("--task");
         else if (a == "--no-timestamps")    with_timestamps = false;
+        else if (a == "--stream")           stream = true;
         else if (a == "--max-new-tokens")   max_new_tokens = std::atoi(next("--max-new-tokens").c_str());
         else if (!a.empty() && a[0] == '-') die("unknown flag '" + a + "'");
         else                                positional.push_back(std::move(a));
@@ -112,22 +120,52 @@ int main(int argc, char** argv) {
                 "Resample externally (ffmpeg -ar 16000 -ac 1 ...) and retry.");
         }
 
-        // 4. Build prompt + run.
+        // 4. Build prompt + options.
         std::vector<int32_t> prompt =
             tok.build_prompt(lang, task, with_timestamps);
         std::fprintf(stderr,
                      "brosoundml_transcribe: %.2fs audio, prompt=%zu tokens\n",
                      audio.duration_seconds(), prompt.size());
 
-        auto result = model.transcribe(audio, prompt, max_new_tokens);
+        brosoundml::Whisper::TranscribeOptions opts;
+        opts.max_new_tokens = max_new_tokens;
+        // Long-form: window clips past 30 s instead of truncating them. Seek
+        // reads timestamp tokens, so only enable it when the prompt carries
+        // timestamps. Harmless for <=30 s clips (the windowing gate also checks
+        // duration).
+        if (with_timestamps) opts.timestamp_begin_id = tok.first_timestamp_id();
 
-        // 5. Decode and print. Skip the prompt prefix in the printed output
-        // (specials stripped + the prompt tokens dropped) so the user sees a
-        // clean transcript.
-        std::vector<int32_t> generated(result.token_ids.begin() + prompt.size(),
-                                       result.token_ids.end());
-        std::string text = tok.decode(generated, /*skip_special=*/true);
-        std::printf("%s\n", text.c_str());
+        // --stream: re-decode the running id list each token and print only the
+        // newly revealed suffix, so the transcript grows live on stdout. (BPE
+        // decode of a growing prefix is monotonic for the committed text.)
+        std::vector<int32_t> generated;
+        std::size_t printed = 0;
+        if (stream) {
+            opts.on_token = [&](int32_t id) {
+                generated.push_back(id);
+                std::string text = tok.decode(generated, /*skip_special=*/true);
+                if (text.size() > printed) {
+                    std::fwrite(text.data() + printed, 1, text.size() - printed,
+                                stdout);
+                    std::fflush(stdout);
+                    printed = text.size();
+                }
+            };
+        }
+
+        // 5. Run. In --stream mode the transcript has already been printed by
+        // the callback; just terminate the line. Otherwise decode + print the
+        // full transcript at the end (prompt prefix dropped, specials stripped).
+        auto result = model.transcribe(audio, prompt, opts);
+
+        if (stream) {
+            std::printf("\n");
+        } else {
+            std::vector<int32_t> out(result.token_ids.begin() + prompt.size(),
+                                     result.token_ids.end());
+            std::string text = tok.decode(out, /*skip_special=*/true);
+            std::printf("%s\n", text.c_str());
+        }
         return 0;
     } catch (const std::exception& e) {
         die(std::string("error: ") + e.what());

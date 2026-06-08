@@ -127,6 +127,24 @@ struct Whisper::Impl {
         const int pos_offset = cache.size();
         decoder.forward(&token_id, /*T=*/1, pos_offset, cache, logits);
     }
+
+    // Decode one 30 s window: encode `window`, reset + prefill `prompt_ids`,
+    // then run the greedy loop appending generated tokens to `generated`.
+    // `on_token` (if set) fires per token as it is produced; `cancel` (if set)
+    // is polled per token and a true return sets `*cancelled` and stops.
+    // Returns the offset (into this window's run, i.e. relative to
+    // generated.size() on entry) of the last timestamp token whose id >=
+    // `timestamp_begin_id`, or -1 if seek is disabled / none was emitted — the
+    // long-form caller uses it to advance the window. Defined out-of-line below
+    // (after argmax_last_row).
+    int decode_window(const AudioBuffer& window,
+                      const std::vector<int32_t>& prompt_ids,
+                      int budget,
+                      const CancelCheck& cancel,
+                      const TokenCallback& on_token,
+                      int timestamp_begin_id,
+                      std::vector<int32_t>& generated,
+                      bool* cancelled) const;
 };
 
 Whisper::Whisper() : impl_(std::make_unique<Impl>()) {}
@@ -230,10 +248,68 @@ int32_t argmax_last_row(const brotensor::Tensor& logits) {
 
 }  // namespace
 
+// Defined out-of-line (declared in struct Impl) so it can reach the
+// file-local argmax_last_row above.
+int Whisper::Impl::decode_window(const AudioBuffer& window,
+                                 const std::vector<int32_t>& prompt_ids,
+                                 int budget,
+                                 const CancelCheck& cancel,
+                                 const TokenCallback& on_token,
+                                 int timestamp_begin_id,
+                                 std::vector<int32_t>& generated,
+                                 bool* cancelled) const {
+    const int prompt_len = static_cast<int>(prompt_ids.size());
+
+    // 1. Encode the window. Pre-allocate on the model device — Tensor::resize
+    // preserves the device field, so a default-constructed (CPU) Tensor would
+    // crash brotensor's CUDA dispatch.
+    brotensor::Tensor hidden = brotensor::Tensor::empty_on(
+        device, 0, 0, brotensor::Dtype::FP32);
+    encode_audio(window, hidden);
+
+    // 2. Reset cache for this window, then prefill the prompt.
+    cache.reset();
+    brotensor::Tensor logits = brotensor::Tensor::empty_on(
+        device, 0, 0, brotensor::Dtype::FP32);
+    decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
+
+    // 3. Greedy loop. `logits` is mutated in-place by decode_step (no fresh
+    // tensor per step, per project memory: Tensor copy ctor is deep).
+    const std::size_t gen_start = generated.size();
+    int last_ts_rel = -1;  // offset into this window's run, or -1
+    for (int step = 0; step < budget; ++step) {
+        // Cooperative cancellation: a barge-in drops the in-flight turn, so
+        // stop decoding and return what we have (the caller discards it).
+        if (cancel && cancel()) { if (cancelled) *cancelled = true; break; }
+        const int32_t next_id = argmax_last_row(logits);
+        if (next_id == config.eos_token_id) break;
+        if (timestamp_begin_id >= 0 && next_id >= timestamp_begin_id) {
+            last_ts_rel = static_cast<int>(generated.size() - gen_start);
+        }
+        generated.push_back(next_id);
+        if (on_token) on_token(next_id);
+        if (static_cast<int>(prompt_len + (generated.size() - gen_start))
+            >= config.max_target_positions) {
+            break;
+        }
+        decode_step(next_id, logits);
+    }
+    return last_ts_rel;
+}
+
 Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
                                            const std::vector<int32_t>& prompt_ids,
                                            int max_new_tokens,
                                            const CancelCheck& cancel) const {
+    TranscribeOptions opts;
+    opts.max_new_tokens = max_new_tokens;
+    opts.cancel         = cancel;
+    return transcribe(audio, prompt_ids, opts);
+}
+
+Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           const TranscribeOptions& opts) const {
     if (!impl_->loaded) {
         fail("Whisper::transcribe", "no model loaded; call Whisper::load() first");
     }
@@ -256,47 +332,73 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
         fail("Whisper::transcribe",
              "prompt_ids length >= max_target_positions; nothing to generate");
     }
-    int budget = max_new_tokens;
-    if (budget <= 0) {
-        budget = impl_->config.max_target_positions - prompt_len;
-    } else {
-        const int hard_cap = impl_->config.max_target_positions - prompt_len;
-        if (budget > hard_cap) budget = hard_cap;
-    }
+    // Per-window token budget (long-form caps each 30 s segment independently).
+    int budget = opts.max_new_tokens;
+    const int hard_cap = impl_->config.max_target_positions - prompt_len;
+    if (budget <= 0 || budget > hard_cap) budget = hard_cap;
 
-    // 1. Encode the audio once. Pre-allocate on the model device — Tensor::resize
-    // preserves the device field, so a default-constructed (CPU) Tensor would
-    // crash brotensor's CUDA dispatch.
-    brotensor::Tensor hidden = brotensor::Tensor::empty_on(
-        impl_->device, 0, 0, brotensor::Dtype::FP32);
-    impl_->encode_audio(audio, hidden);
-
-    // 2. Reset cache for this transcription, then prefill the prompt.
-    impl_->cache.reset();
-    brotensor::Tensor logits = brotensor::Tensor::empty_on(
-        impl_->device, 0, 0, brotensor::Dtype::FP32);
-    impl_->decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
-
-    // 3. Greedy loop. `logits` is mutated in-place by decode_step (no fresh
-    // tensor per step, per project memory: Tensor copy ctor is deep).
-    std::vector<int32_t> generated;
-    generated.reserve(static_cast<std::size_t>(budget));
-    for (int step = 0; step < budget; ++step) {
-        // Cooperative cancellation: a barge-in drops the in-flight turn, so
-        // stop decoding and return what we have (the caller discards it).
-        if (cancel && cancel()) break;
-        const int32_t next_id = argmax_last_row(logits);
-        if (next_id == impl_->config.eos_token_id) break;
-        generated.push_back(next_id);
-        if (static_cast<int>(prompt_len + generated.size())
-            >= impl_->config.max_target_positions) {
-            break;
-        }
-        impl_->decode_step(next_id, logits);
-    }
+    const int   window_samples = impl_->config.sample_rate * 30;  // 30 s
+    const std::size_t total     = audio.samples.size();
+    const bool long_form = opts.timestamp_begin_id >= 0 &&
+                           total > static_cast<std::size_t>(window_samples);
 
     Transcription out;
     out.token_ids = prompt_ids;
+
+    // ── Short form (legacy): one window over the whole (truncated) clip. ──
+    if (!long_form) {
+        std::vector<int32_t> generated;
+        generated.reserve(static_cast<std::size_t>(budget));
+        bool cancelled = false;
+        impl_->decode_window(audio, prompt_ids, budget, opts.cancel,
+                             opts.on_token, opts.timestamp_begin_id, generated,
+                             &cancelled);
+        out.token_ids.insert(out.token_ids.end(),
+                             generated.begin(), generated.end());
+        return out;
+    }
+
+    // ── Long form: sequential 30 s windows with timestamp seek. ──
+    // seek advances by the last timestamp the decoder emits in each window;
+    // when a window emits no timestamp we hop a full 30 s so the loop always
+    // makes progress (no infinite loop on a degenerate decode).
+    std::vector<int32_t> generated;
+    std::size_t seek = 0;
+    while (seek < total) {
+        const std::size_t win_len =
+            std::min<std::size_t>(window_samples, total - seek);
+
+        AudioBuffer window;
+        window.sample_rate = audio.sample_rate;
+        window.samples.assign(audio.samples.begin() + static_cast<std::ptrdiff_t>(seek),
+                              audio.samples.begin() +
+                                  static_cast<std::ptrdiff_t>(seek + win_len));
+
+        const std::size_t gen_before = generated.size();
+        bool cancelled = false;
+        const int last_ts_rel =
+            impl_->decode_window(window, prompt_ids, budget, opts.cancel,
+                                 opts.on_token, opts.timestamp_begin_id,
+                                 generated, &cancelled);
+        if (cancelled) break;
+
+        // Advance the window. A timestamp token id maps to seconds via
+        // 0.02 * (id - timestamp_begin_id); advance to that point so the next
+        // window resumes where this segment's last emitted timestamp lands.
+        std::size_t advance = win_len;  // default: whole window consumed
+        if (last_ts_rel >= 0) {
+            const int32_t ts_id = generated[gen_before +
+                                            static_cast<std::size_t>(last_ts_rel)];
+            const double  ts_sec = 0.02 * static_cast<double>(
+                                       ts_id - opts.timestamp_begin_id);
+            const std::size_t ts_samples = static_cast<std::size_t>(
+                ts_sec * static_cast<double>(audio.sample_rate));
+            if (ts_samples > 0 && ts_samples <= win_len) advance = ts_samples;
+        }
+        if (advance == 0) advance = win_len;  // never stall
+        seek += advance;
+    }
+
     out.token_ids.insert(out.token_ids.end(),
                          generated.begin(), generated.end());
     return out;

@@ -5,6 +5,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,7 +48,10 @@ namespace brosoundml {
 //
 // STATUS: complete. load() reads config.json + the safetensors weights onto
 // the requested device; transcribe() runs the full log-mel ▶ encoder ▶
-// autoregressive-decoder forward pass and returns token ids.
+// autoregressive-decoder forward pass and returns token ids. The
+// TranscribeOptions overload adds per-token streaming (on_token) and sequential
+// long-form decode (audio > 30 s windowed into 30 s segments with timestamp
+// seek) on top of the one-shot path.
 
 // Model hyperparameters. Read from `config.json` by Whisper::load. Zero
 // defaults are placeholders overwritten on a real load; the fixed
@@ -96,9 +100,49 @@ public:
 
     // Result of a transcribe() call. `token_ids` is the raw decoded id
     // sequence (including SOT/lang/task prompt + content + EOS); callers
-    // detokenize via brolm::whisper::Tokenizer::decode.
+    // detokenize via brolm::whisper::Tokenizer::decode. In long-form mode the
+    // prompt prefix is emitted once, followed by the concatenated content of
+    // every 30 s window (see TranscribeOptions::timestamp_begin_id).
     struct Transcription {
         std::vector<int32_t> token_ids;
+    };
+
+    // Streaming sink: invoked once per generated token, in decode order, with
+    // the freshly produced id — the same ids that land in
+    // Transcription::token_ids (content + any timestamp tokens; EOS is not
+    // delivered, the greedy loop breaks on it). Lets a caller detokenize and
+    // emit partial text mid-decode instead of waiting for the whole utterance.
+    // Runs synchronously on the decode thread between steps — keep it cheap.
+    // Empty (the default) = no streaming.
+    using TokenCallback = std::function<void(int32_t token_id)>;
+
+    // Options for the richer transcribe() overload — streaming emission and
+    // long-form (>30 s) windowing on top of the legacy one-shot decode.
+    struct TranscribeOptions {
+        // Cap on the autoregressive loop; 0 => max_target_positions -
+        // prompt_len. In long-form mode this caps EACH 30 s window independently.
+        int max_new_tokens = 0;
+
+        // Polled once per decoded token (the dominant cost): true => stop and
+        // return what we have. Empty (the default) = no cancel.
+        CancelCheck cancel = {};
+
+        // Invoked once per generated token, as it is produced (see
+        // TokenCallback). Empty (the default) = no streaming.
+        TokenCallback on_token = {};
+
+        // Long-form seek anchor: the id of the `<|0.00|>` timestamp token
+        // (brolm::whisper::Tokenizer::first_timestamp_id()). When set (>= 0)
+        // AND the audio is longer than 30 s, transcribe() windows the audio
+        // into 30 s segments and advances the window by the last timestamp the
+        // decoder emits in each segment — Whisper's standard sequential
+        // long-form decode. When < 0 (the default) audio beyond 30 s is
+        // truncated to the first window, matching the legacy behavior. For seek
+        // to engage the prompt must request timestamps (built with
+        // with_timestamps=true); a no-timestamps prompt degrades to fixed 30 s
+        // hops. brosoundml stays tokenizer-free — only this single int crosses
+        // the boundary; the caller still owns build_prompt / decode.
+        int timestamp_begin_id = -1;
     };
 
     // Run the full pipeline: 16 kHz mono PCM -> token ids. `prompt_ids` is
@@ -112,10 +156,24 @@ public:
     // whatever tokens were produced so far. The one-shot encode + prompt
     // prefill that precede the loop are not interruptible, but they are a small
     // fraction of a multi-second transcription. Empty (the default) = no cancel.
+    //
+    // This legacy overload always decodes a single 30 s window (audio beyond
+    // 30 s is truncated). For per-token streaming or long-form windowing use
+    // the TranscribeOptions overload below.
     Transcription transcribe(const AudioBuffer& audio,
                              const std::vector<int32_t>& prompt_ids,
                              int max_new_tokens = 0,
                              const CancelCheck& cancel = {}) const;
+
+    // Streaming / long-form transcribe. Same pipeline as above, with per-token
+    // emission (opts.on_token) and, when opts.timestamp_begin_id is set, an
+    // arbitrary-length input windowed into 30 s segments instead of truncated
+    // (see TranscribeOptions). Returns the full token stream just like the
+    // legacy overload; on_token has already delivered each content token by the
+    // time it returns.
+    Transcription transcribe(const AudioBuffer& audio,
+                             const std::vector<int32_t>& prompt_ids,
+                             const TranscribeOptions& opts) const;
 
     const WhisperConfig& config() const;
     bool loaded() const;

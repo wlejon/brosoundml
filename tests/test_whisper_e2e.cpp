@@ -328,6 +328,74 @@ static int run_for_device(brotensor::Device dev, const char* dev_name) {
           static_cast<std::size_t>(shape.max_target_positions - prompt.size()),
           tag("default max_new_tokens respects max_target_positions", dev_name).c_str());
 
+    // ── Streaming: on_token sees exactly the generated tokens, in order ──────
+    {
+        Whisper::TranscribeOptions opts;
+        opts.max_new_tokens = 5;
+        std::vector<int32_t> streamed;
+        opts.on_token = [&](int32_t id) { streamed.push_back(id); };
+        auto streamed_result = w.transcribe(audio, prompt, opts);
+
+        const std::size_t n_stream =
+            streamed_result.token_ids.size() - prompt.size();
+        CHECK(streamed.size() == n_stream,
+              tag("on_token fired once per generated token", dev_name).c_str());
+        bool stream_matches = true;
+        for (std::size_t i = 0; i < streamed.size(); ++i) {
+            if (streamed[i] != streamed_result.token_ids[prompt.size() + i])
+                stream_matches = false;
+        }
+        CHECK(stream_matches,
+              tag("streamed ids match the final token_ids tail in order",
+                  dev_name).c_str());
+        // Streaming must not change the result vs. the non-streaming overload.
+        auto plain = w.transcribe(audio, prompt, /*max_new_tokens=*/5);
+        CHECK(plain.token_ids == streamed_result.token_ids,
+              tag("streaming yields the same tokens as the legacy overload",
+                  dev_name).c_str());
+    }
+
+    // ── Long-form: >30 s audio is windowed, not truncated ──────────────────
+    {
+        // 61 s of audio spans 3 windows (30 s + 30 s + 1 s). timestamp_begin_id
+        // is set out of the tiny vocab's range so no token registers as a
+        // timestamp — the seek then falls back to deterministic full-30 s hops,
+        // which is exactly the "don't silently drop everything past 30 s" fix.
+        AudioBuffer long_audio = sine(440.0f, 61.0f);
+
+        // Legacy single-window over the same clip: truncated to the first 30 s.
+        auto short_form = w.transcribe(long_audio, prompt, /*max_new_tokens=*/4);
+        const std::size_t n_short = short_form.token_ids.size() - prompt.size();
+
+        Whisper::TranscribeOptions lf;
+        lf.max_new_tokens     = 4;            // per-window cap
+        lf.timestamp_begin_id = shape.vocab_size;  // out of range -> full hops
+        std::vector<int32_t> streamed;
+        lf.on_token = [&](int32_t id) { streamed.push_back(id); };
+        auto long_form = w.transcribe(long_audio, prompt, lf);
+        const std::size_t n_long = long_form.token_ids.size() - prompt.size();
+
+        CHECK(long_form.token_ids.size() >= prompt.size(),
+              tag("long-form result includes the prompt", dev_name).c_str());
+        for (std::size_t i = 0; i < prompt.size(); ++i) {
+            CHECK(long_form.token_ids[i] == prompt[i],
+                  tag("long-form preserves the prompt prefix", dev_name).c_str());
+        }
+        // Multiple windows each contribute, so the long-form stream covers more
+        // than the single truncated window (the silent-truncation bug).
+        CHECK(n_long > n_short,
+              tag("long-form decodes past 30 s (more tokens than truncated run)",
+                  dev_name).c_str());
+        CHECK(streamed.size() == n_long,
+              tag("long-form streams every generated token via on_token",
+                  dev_name).c_str());
+        bool in_range_long = true;
+        for (auto id : long_form.token_ids)
+            if (id < 0 || id >= shape.vocab_size) in_range_long = false;
+        CHECK(in_range_long,
+              tag("long-form ids stay within [0, vocab_size)", dev_name).c_str());
+    }
+
     fs::remove_all(root);
     return failures;
 }
