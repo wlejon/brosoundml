@@ -7,6 +7,7 @@
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -176,6 +177,12 @@ void reverse_half_inplace(bt::Tensor& x, int C, int L) {
     bt::mul_inplace(x, m);
 }
 
+// Host-side mod_sigmoid for the noise-branch amplitudes (matches the device op).
+inline float mod_sigmoid_scalar(float x) {
+    const float s = 1.0f / (1.0f + std::exp(-x));
+    return 2.0f * std::pow(s, 2.3f) + 1.0e-7f;
+}
+
 // mod_sigmoid(x) = 2*sigmoid(x)^2.3 + 1e-7, via s^2.3 = exp(2.3*log(s)).
 bt::Tensor mod_sigmoid(const bt::Tensor& x) {
     bt::Tensor s;
@@ -222,9 +229,20 @@ struct Rave::Impl {
     ConvW                synth_wave;  // decoder.synth.branches.0 (-> n_band)
     ConvW                synth_loud;  // decoder.synth.branches.1 (-> 1)
 
+    // Noise-synth branch (decoder.synth.branches.2): 3 stride-4 convs -> per-band
+    // amplitudes -> impulse response -> fft_convolve(white noise). Optional —
+    // present only when the model ships the branch.
+    bool                 has_noise = false;
+    std::vector<ConvW>   synth_noise;   // 3 convs (net.0, net.2, net.4)
+    int                  noise_bands = 0;
+    bt::Tensor           noise_ir_mat;  // (ir_target=64, noise_bands): amp_to_impulse_response
+                                        // folded to a matrix (the op is linear in amp)
+    bt::Tensor           noise_ir_bias; // zeros (64, 1) for linear_forward_batched
+
     void load(const std::string& model_dir, bt::Device device);
     RaveLatent encode(const float* audio, int n) const;
-    AudioBuffer decode(const float* latent, int n_latent, int frames) const;
+    AudioBuffer decode(const float* latent, int n_latent, int frames,
+                       const RaveDecodeOptions& opts) const;
 };
 
 void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
@@ -344,6 +362,67 @@ void Rave::Impl::load(const std::string& model_dir, bt::Device device) {
     synth_wave = load_conv(f, "decoder.synth.branches.0", /*groups=*/1, dev);
     synth_loud = load_conv(f, "decoder.synth.branches.1", /*groups=*/1, dev);
 
+    // ── noise-synth branch (optional) ──
+    // 3 stride-4 causal convs (net.0, net.2, net.4, LeakyReLU between) predict a
+    // per-band amplitude response; amp_to_impulse_response turns each into a
+    // 64-tap FIR, which fft_convolve applies to white noise. amp_to_impulse_
+    // response (irfft -> roll -> Hann window -> zero-pad -> roll) is LINEAR in
+    // the amplitude vector, so we fold it to a fixed (64 x noise_bands) matrix
+    // here and apply it as one matmul at decode time.
+    if (f.find("decoder.synth.branches.2.net.0.weight")) {
+        synth_noise.clear();
+        for (int i : {0, 2, 4})
+            synth_noise.push_back(
+                load_conv(f, "decoder.synth.branches.2.net." + std::to_string(i),
+                          /*groups=*/1, dev));
+        const int c_amp = synth_noise.back().cout;
+        if (c_amp % cfg.n_band != 0)
+            fail("noise branch: amp channels (" + std::to_string(c_amp) +
+                 ") not divisible by n_band");
+        noise_bands = c_amp / cfg.n_band;
+
+        const int target = 64;                 // amp_to_impulse_response IR length
+        const int FS = 2 * (noise_bands - 1);  // irfft length for noise_bands bins
+        if (FS <= 0 || FS > target) fail("noise branch: unexpected noise_bands");
+
+        // Build M (target x noise_bands) on CPU: column k is the IR of the unit
+        // amplitude basis vector e_k, using brotensor's irfft + host roll/window.
+        std::vector<float> Mh(static_cast<std::size_t>(target) * noise_bands, 0.0f);
+        {
+            bt::DeviceScope cpu(bt::Device::CPU);
+            // Identity basis as interleaved-complex (noise_bands rows, im = 0).
+            std::vector<float> basis(static_cast<std::size_t>(noise_bands) * 2 * noise_bands, 0.0f);
+            for (int k = 0; k < noise_bands; ++k)
+                basis[static_cast<std::size_t>(k) * 2 * noise_bands + 2 * k] = 1.0f;
+            bt::Tensor cplx = bt::Tensor::from_host_on(bt::Device::CPU, basis.data(),
+                                                       noise_bands, 2 * noise_bands);
+            bt::Tensor a;
+            bt::irfft(cplx, FS, a);                  // (noise_bands, FS)
+            const std::vector<float> ah = a.to_host_vector();
+
+            std::vector<float> hann(FS);
+            const double two_pi = 6.283185307179586476925286766559;
+            for (int n = 0; n < FS; ++n)
+                hann[n] = static_cast<float>(0.5 * (1.0 - std::cos(two_pi * n / FS)));
+
+            for (int k = 0; k < noise_bands; ++k) {
+                const float* ak = &ah[static_cast<std::size_t>(k) * FS];
+                std::vector<float> d(target, 0.0f);
+                for (int i = 0; i < FS; ++i) {       // roll(+FS/2) then Hann, then zero-pad
+                    const int src = ((i - FS / 2) % FS + FS) % FS;
+                    d[i] = ak[src] * hann[i];
+                }
+                for (int i = 0; i < target; ++i) {   // roll(-FS/2) on the padded length
+                    const int src = ((i + FS / 2) % target + target) % target;
+                    Mh[static_cast<std::size_t>(i) * noise_bands + k] = d[src];
+                }
+            }
+        }
+        noise_ir_mat  = bt::Tensor::from_host_on(dev, Mh.data(), target, noise_bands);
+        noise_ir_bias = bt::Tensor::zeros_on(dev, target, 1, bt::Dtype::FP32);
+        has_noise = true;
+    }
+
     is_loaded = true;
 }
 
@@ -399,7 +478,8 @@ RaveLatent Rave::Impl::encode(const float* audio, int n) const {
     return out;
 }
 
-AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames) const {
+AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames,
+                               const RaveDecodeOptions& opts) const {
     if (!is_loaded) fail("model not loaded");
     if (n_latent != cfg.cropped_latent_size)
         fail("decode: latent has " + std::to_string(n_latent) + " dims, expected " +
@@ -451,8 +531,84 @@ AudioBuffer Rave::Impl::decode(const float* latent, int n_latent, int frames) co
     for (int c = 0; c < cfg.n_band; ++c) bt::copy_d2d(m, 0, mt, c * Lc, Lc);
     bt::mul_inplace(tw, mt);                     // multiband waveform
 
-    // PQMF synthesis: reverse_half, conv, *n_band, then polyphase interleave.
     const int nb = cfg.n_band;
+
+    // Optional stochastic noise-synth branch, added to the multiband waveform
+    // before PQMF synthesis. Mirrors rave_reference.py::_noise_branch.
+    if (opts.add_noise && has_noise) {
+        // 3 stride-4 causal convs (LeakyReLU between, none after the last).
+        bt::Tensor hn = h;
+        int Cn = C, Ln = Lc;
+        for (int i = 0; i < 3; ++i) {
+            int Lo;
+            hn = cconv(hn, Cn, Ln, synth_noise[i], /*stride=*/4, /*dilation=*/1,
+                       /*groups=*/1, Lo);
+            Cn = synth_noise[i].cout; Ln = Lo;
+            if (i < 2) hn = leaky(hn, cfg.leaky_slope);
+        }
+        const int T_n = Ln;                  // noise frames; T_n * 64 == Lc
+        const int R   = T_n * nb;            // one FFT row per (frame, band)
+        if (T_n * 64 != Lc) fail("noise branch: frame/length mismatch");
+
+        // amp = mod_sigmoid(hn - 5), transposed+reshaped to (R, noise_bands) in
+        // (frame, band) row order. hn is (C_amp, T_n), C_amp = nb*noise_bands.
+        const std::vector<float> hnh = hn.to_host_vector();   // [c*T_n + t]
+        std::vector<float> amp(static_cast<std::size_t>(R) * noise_bands);
+        for (int t = 0; t < T_n; ++t)
+            for (int band = 0; band < nb; ++band)
+                for (int j = 0; j < noise_bands; ++j)
+                    amp[(static_cast<std::size_t>(t) * nb + band) * noise_bands + j] =
+                        mod_sigmoid_scalar(
+                            hnh[(static_cast<std::size_t>(band) * noise_bands + j) * T_n + t]
+                            - 5.0f);
+        bt::Tensor amp_d = bt::Tensor::from_host_on(dev, amp.data(), R, noise_bands);
+
+        // ir = M @ amp  (amp_to_impulse_response folded to a matmul), -> (R, 64).
+        bt::Tensor ir;
+        bt::linear_forward_batched(noise_ir_mat, noise_ir_bias, amp_d, ir);
+
+        // White noise in U(-1, 1): injected (reproducible / parity) or sampled.
+        bt::Tensor nz = bt::Tensor::zeros_on(dev, R, 64, bt::Dtype::FP32);
+        if (opts.noise) {
+            if (opts.noise_len < R * 64) fail("decode: injected noise buffer too small");
+            nz = bt::Tensor::from_host_on(dev, opts.noise, R, 64);
+        } else {
+            bt::rand_uniform(opts.seed, /*counter=*/0, nz);
+            bt::scale_inplace(nz, 2.0f);
+            bt::add_scalar_inplace(nz, -1.0f);
+        }
+
+        // fft_convolve(noise, ir): right-pad noise and left-pad ir to 128, then
+        // irfft(rfft(sig) * rfft(ker)) and take the second half (64 samples).
+        bt::Tensor sig = bt::Tensor::zeros_on(dev, R, 128, bt::Dtype::FP32);
+        bt::Tensor ker = bt::Tensor::zeros_on(dev, R, 128, bt::Dtype::FP32);
+        for (int r = 0; r < R; ++r) {
+            bt::copy_d2d(nz, r * 64, sig, r * 128, 64);          // [0:64]
+            bt::copy_d2d(ir, r * 64, ker, r * 128 + 64, 64);     // [64:128]
+        }
+        bt::Tensor Sf, Kf, Pf, conv;
+        bt::rfft(sig, Sf);
+        bt::rfft(ker, Kf);
+        bt::complex_mul(Sf, Kf, Pf);
+        bt::irfft(Pf, 128, conv);                                // (R, 128)
+        // Take the second half (samples [64:128]) of each row.
+        bt::Tensor tail = bt::Tensor::zeros_on(dev, R, 64, bt::Dtype::FP32);
+        for (int r = 0; r < R; ++r) bt::copy_d2d(conv, r * 128 + 64, tail, r * 64, 64);
+
+        // Permute (frame, band) -> (band, frame) and reshape to (nb, T_n*64=Lc),
+        // then add to the multiband waveform.
+        const std::vector<float> th = tail.to_host_vector();     // [r*64 + s]
+        std::vector<float> nbuf(static_cast<std::size_t>(nb) * Lc);
+        for (int band = 0; band < nb; ++band)
+            for (int t = 0; t < T_n; ++t)
+                for (int s = 0; s < 64; ++s)
+                    nbuf[(static_cast<std::size_t>(band) * T_n + t) * 64 + s] =
+                        th[(static_cast<std::size_t>(t) * nb + band) * 64 + s];
+        bt::Tensor nb_d = bt::Tensor::from_host_on(dev, nbuf.data(), 1, nb * Lc);
+        bt::add_inplace(tw, nb_d);
+    }
+
+    // PQMF synthesis: reverse_half, conv, *n_band, then polyphase interleave.
     reverse_half_inplace(tw, nb, Lc);
     int Ly;
     bt::Tensor y = cconv(tw, nb, Lc, pqmf_inv, /*stride=*/1, /*dilation=*/1, /*groups=*/1, Ly);
@@ -485,11 +641,12 @@ RaveLatent Rave::encode(const float* audio, int n) const {
     return impl_->encode(audio, n);
 }
 
-AudioBuffer Rave::decode(const RaveLatent& latent) const {
-    return impl_->decode(latent.data.data(), latent.n_latent, latent.frames);
+AudioBuffer Rave::decode(const RaveLatent& latent, const RaveDecodeOptions& opts) const {
+    return impl_->decode(latent.data.data(), latent.n_latent, latent.frames, opts);
 }
-AudioBuffer Rave::decode(const float* latent, int n_latent, int frames) const {
-    return impl_->decode(latent, n_latent, frames);
+AudioBuffer Rave::decode(const float* latent, int n_latent, int frames,
+                         const RaveDecodeOptions& opts) const {
+    return impl_->decode(latent, n_latent, frames, opts);
 }
 
 const RaveConfig& Rave::config() const { return impl_->cfg; }

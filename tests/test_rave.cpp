@@ -49,6 +49,7 @@ static float max_abs_err(const std::vector<float>& a, const std::vector<float>& 
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // unbuffered: keep progress on a crash
     const char* dir_env = std::getenv("BROSOUNDML_RAVE_DIR");
     if (!dir_env || !*dir_env) {
         std::printf("SKIP: BROSOUNDML_RAVE_DIR not set (real-weights RAVE parity test)\n");
@@ -100,6 +101,27 @@ int main() {
     const float dec_err = max_abs_err(y.samples, ref_decode);
     std::printf("decode  max-abs-err = %.3e  (out rms=%.4f)\n", dec_err, y.rms());
     CHECK(dec_err < 2.0e-3f, "decode waveform matches reference");
+
+    // ── noise-branch parity (inject the reference's white noise, compare the
+    //    stochastic synth bit-close) ── optional: only when the noise fixtures
+    //    are present (older fixture dumps lack them).
+    const std::vector<float> ref_noise        = read_bin(dir + "/noise.bin");
+    const std::vector<float> ref_decode_noise = read_bin(dir + "/decode_noise.bin");
+    if (!ref_noise.empty() && !ref_decode_noise.empty()) {
+        brosoundml::RaveDecodeOptions opts;
+        opts.add_noise = true;
+        opts.noise     = ref_noise.data();
+        opts.noise_len = static_cast<int>(ref_noise.size());
+        brosoundml::AudioBuffer yn = rave.decode(ref_latent.data(), nl, frames, opts);
+        CHECK(yn.samples.size() == ref_decode_noise.size(), "noise decode length");
+        const float noise_err = max_abs_err(yn.samples, ref_decode_noise);
+        std::printf("noise   max-abs-err = %.3e  (out rms=%.4f)\n", noise_err, yn.rms());
+        CHECK(noise_err < 2.0e-3f, "noise-branch waveform matches reference");
+        // Sanity: noise actually changed the output vs the deterministic decode.
+        CHECK(max_abs_err(yn.samples, ref_decode) > 1.0e-4f, "noise alters the output");
+    } else {
+        std::printf("note: noise fixtures absent — skipping noise-branch parity\n");
+    }
 
     // ── full round trip sanity (our latent -> decode) ──
     brosoundml::AudioBuffer rt = rave.decode(z);

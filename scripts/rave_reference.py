@@ -160,7 +160,7 @@ class RaveReference:
                 h = self._resblock(h, idx + 1, blk, dil)
         return h
 
-    def _noise_branch(self, h):
+    def _noise_branch(self, h, noise=None):
         for i in (0, 2, 4):
             h = causal_conv(h, self.w(f"decoder.synth.branches.2.net.{i}.weight"),
                             self.b(f"decoder.synth.branches.2.net.{i}.bias"), stride=4)
@@ -169,11 +169,14 @@ class RaveReference:
         amp = mod_sigmoid(h - 5).permute(0, 2, 1)
         amp = amp.reshape(1, amp.shape[1], self.cfg["n_band"], -1)
         ir = amp_to_impulse_response(amp, 64)
-        noise = torch.rand_like(ir) * 2 - 1
+        # `noise` (if given) is injected verbatim so the C++ port can match the
+        # stochastic branch bit-for-bit; otherwise sample fresh U(-1,1).
+        if noise is None:
+            noise = torch.rand_like(ir) * 2 - 1
         out = fft_convolve(noise, ir).permute(0, 2, 1, 3)
         return out.reshape(1, self.cfg["n_band"], -1)
 
-    def decode(self, z, add_noise=False):
+    def decode(self, z, add_noise=False, noise=None):
         h = self._decoder_net(self._unproject(z))
         wave = causal_conv(h, self.w("decoder.synth.branches.0.weight"),
                            self.b("decoder.synth.branches.0.bias"))
@@ -181,7 +184,7 @@ class RaveReference:
                            self.b("decoder.synth.branches.1.bias"))
         wf = torch.tanh(wave) * mod_sigmoid(loud.reshape(1, 1, -1))
         if add_noise:
-            wf = wf + self._noise_branch(h)
+            wf = wf + self._noise_branch(h, noise)
         return self.pqmf_inverse(wf)
 
 
@@ -247,12 +250,26 @@ def dump_fixtures(ref, out_dir):
     z, _, _ = ref.encode(x)
     y = ref.decode(z, add_noise=False)
 
+    # Noise-branch fixture: a fixed injected white-noise buffer + the noise-on
+    # decode it produces. The stochastic branch can't be matched against fresh
+    # RNG, so the C++ test injects this same buffer and compares bit-for-bit.
+    h = ref._decoder_net(ref._unproject(z))
+    Lc = h.shape[-1]                                  # per-band decoder length
+    T_n = Lc // 64                                    # noise frames (3x stride-4 convs)
+    nb = ref.cfg["n_band"]
+    noise_bands = ref.w("decoder.synth.branches.2.net.4.weight").shape[0] // nb
+    torch.manual_seed(1234)
+    noise = (torch.rand(1, T_n, nb, 64) * 2 - 1).float()
+    y_noise = ref.decode(z, add_noise=True, noise=noise)
+
     os.makedirs(out_dir, exist_ok=True)
     def save_bin(name, t):
         t.detach().contiguous().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
     save_bin("input.bin", x)
     save_bin("latent.bin", z)
     save_bin("decode_det.bin", y)
+    save_bin("noise.bin", noise)             # (1, T_n, nb, 64) -> rows (t*nb+band)
+    save_bin("decode_noise.bin", y_noise)
     meta = {
         "input_len":    int(x.shape[-1]),
         "n_latent":     int(z.shape[1]),
@@ -260,6 +277,10 @@ def dump_fixtures(ref, out_dir):
         "output_len":   int(y.shape[-1]),
         "latent_mean":  float(z.mean()), "latent_std": float(z.std()),
         "output_rms":   float(y.pow(2).mean().sqrt()),
+        "noise_frames": int(T_n),
+        "noise_bands":  int(noise_bands),
+        "ir_target":    64,
+        "decode_noise_rms": float(y_noise.pow(2).mean().sqrt()),
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

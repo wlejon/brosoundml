@@ -4,6 +4,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,8 +30,11 @@ namespace brosoundml {
 //
 // encode() is deterministic: it uses the posterior mean (no reparameterisation
 // sampling). decode() runs the deterministic waveform + loudness synthesis
-// branches. The model's stochastic FFT noise-synth branch is not applied here,
-// so a clip round-trips reproducibly — the right default for editing.
+// branches by default, so a clip round-trips reproducibly — the right default
+// for editing. Passing RaveDecodeOptions{add_noise=true} additionally runs the
+// model's stochastic FFT filtered-noise synthesizer (breathy / unvoiced /
+// textural energy); pin it with a `seed` or an injected `noise` buffer when you
+// need reproducibility.
 
 // Model hyperparameters, read from the converted config.json by Rave::load.
 struct RaveConfig {
@@ -63,6 +67,20 @@ struct RaveLatent {
     }
 };
 
+// decode() options. The default (no noise) is deterministic and reproducible —
+// the right choice for latent editing. add_noise enables RAVE's stochastic FFT
+// filtered-noise synthesizer (the third synthesis branch). Its white noise is
+// resampled each call, so the output then varies unless pinned: set `seed` for a
+// reproducible internal draw, or supply `noise` to inject the white noise
+// verbatim (used by the parity test; also handy for fully deterministic noise).
+struct RaveDecodeOptions {
+    bool         add_noise = false;   // run the stochastic noise-synth branch
+    std::uint64_t seed     = 0;       // RNG seed for the white noise (when add_noise && !noise)
+    const float* noise     = nullptr; // optional injected white noise in U(-1, 1), row-major:
+                                      // (frames/64 * n_band) rows of 64. Used verbatim when set.
+    int          noise_len = 0;       // element count of `noise`; must equal frames * total_ratio
+};
+
 // The RAVE autoencoder. Construct, load() a converted model directory, then
 // encode() / decode(). Heavy state (weights, config, module graph) lives behind
 // a pImpl so this header stays free of brotensor module internals.
@@ -88,9 +106,12 @@ public:
     RaveLatent encode(const float* audio, int n) const;
 
     // Latent -> waveform (mono, sampling_rate Hz). Produces frames * total_ratio
-    // samples. Runs the deterministic waveform + loudness branches.
-    AudioBuffer decode(const RaveLatent& latent) const;
-    AudioBuffer decode(const float* latent, int n_latent, int frames) const;
+    // samples. Runs the deterministic waveform + loudness branches; pass
+    // RaveDecodeOptions{add_noise=true} to add the stochastic noise-synth branch.
+    AudioBuffer decode(const RaveLatent& latent,
+                       const RaveDecodeOptions& opts = {}) const;
+    AudioBuffer decode(const float* latent, int n_latent, int frames,
+                       const RaveDecodeOptions& opts = {}) const;
 
     const RaveConfig& config() const;
     bool loaded() const;
