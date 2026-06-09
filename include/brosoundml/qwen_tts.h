@@ -385,6 +385,21 @@ public:
                                         const QwenTtsSampling& sampling = {},
                                         QwenTtsTrace* trace = nullptr) const;
 
+    // Streaming twin of synthesize_with_xvector: render a designed speaker
+    // x-vector with the audio delivered in chunks as the AR loop produces it
+    // (see synthesize_stream). `xvector` must be enc_dim floats and is spliced
+    // into the Talker prefill where a preset speaker token would sit. The
+    // complete waveform is also returned; `cancel` is polled once per frame
+    // (barge-in). Base variant only; throws if no model is loaded, the
+    // checkpoint is not Base, or the vector length is wrong.
+    AudioBuffer synthesize_stream_with_xvector(const std::string& text,
+                                               const std::vector<float>& xvector,
+                                               int chunk_frames,
+                                               const QwenTtsStreamChunkFn& on_chunk,
+                                               const std::string& language = "english",
+                                               const CancelCheck& cancel = {},
+                                               const QwenTtsSampling& sampling = {}) const;
+
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
     // on its own once the Talker / Code Predictor have produced (or a caller

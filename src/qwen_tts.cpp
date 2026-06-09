@@ -547,6 +547,47 @@ AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
                       /*chunk_frames=*/0, /*on_chunk=*/{}, trace);
 }
 
+AudioBuffer QwenTts::synthesize_stream_with_xvector(
+        const std::string& text, const std::vector<float>& xvector,
+        int chunk_frames, const QwenTtsStreamChunkFn& on_chunk,
+        const std::string& language, const CancelCheck& cancel,
+        const QwenTtsSampling& sampling) const {
+    if (!impl_->loaded) {
+        fail("QwenTts::synthesize_stream_with_xvector", "no model loaded; call QwenTts::load() first");
+    }
+    if (!impl_->config.speaker_encoder.present) {
+        fail("QwenTts::synthesize_stream_with_xvector",
+             "loaded checkpoint has no speaker encoder; the x-vector splice needs "
+             "a Base-variant model");
+    }
+    const int want = impl_->config.speaker_encoder.enc_dim;
+    if (static_cast<int>(xvector.size()) != want) {
+        fail("QwenTts::synthesize_stream_with_xvector",
+             "x-vector must be " + std::to_string(want) + " floats (got " +
+             std::to_string(xvector.size()) + ")");
+    }
+    const QwenTtsTalkerConfig& tk = impl_->config.talker;
+
+    int language_id = -1;
+    if (language != "auto") {
+        auto it = tk.codec_language_id.find(language);
+        if (it == tk.codec_language_id.end())
+            fail("QwenTts::synthesize_stream_with_xvector", "unsupported language '" + language + "'");
+        language_id = it->second;
+    }
+
+    const std::string prompt =
+        "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+    const std::vector<int32_t> input_ids = impl_->tokenizer->encode(prompt);
+    if (input_ids.size() < 9) {
+        fail("QwenTts::synthesize_stream_with_xvector", "prompt tokenized to too few tokens");
+    }
+
+    const int cf = chunk_frames > 0 ? chunk_frames : 25;
+    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+                      xvector.data(), language_id, cancel, sampling, cf, on_chunk);
+}
+
 std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
     if (!impl_->loaded) {
         fail("QwenTts::embed_speaker", "no model loaded; call QwenTts::load() first");
