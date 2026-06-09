@@ -374,10 +374,12 @@ void QwenTts::resolve_inputs(const char* who, const std::string& text,
 
     // Resolve speaker / language to codec tokens (and apply the dialect override
     // the upstream pipeline does for dialect speakers). A model with no speaker
-    // presets (VoiceDesign) has an empty spk_id table — leave spk_id -1. The
-    // speaker name is then only consulted for the dialect override below.
+    // presets (VoiceDesign) has an empty spk_id table — leave spk_id -1. An EMPTY
+    // speaker name also leaves spk_id -1 (no preset): the caller is supplying the
+    // slot another way — a designed-voice x-vector (sampling.speaker_vector). A
+    // non-empty name that isn't a preset is still an error (a typo, not intent).
     spk_id = -1;
-    if (!tk.spk_id.empty()) {
+    if (!tk.spk_id.empty() && !speaker.empty()) {
         auto it = tk.spk_id.find(speaker);
         if (it == tk.spk_id.end()) fail(who, "unknown speaker '" + speaker + "'");
         spk_id = it->second;
@@ -587,6 +589,22 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
+    // Optional voice-slot REPLACE: a caller-supplied 1024-D point that fills the
+    // speaker slot instead of the preset token / Base x-vector (lets CustomVoice
+    // render an arbitrary designed voice). When set it overrides spk_embed and
+    // disables the preset-token lookup for the slot.
+    int         spk_id_eff    = spk_id;
+    const float* spk_embed_eff = spk_embed;
+    if (!sampling.speaker_vector.empty()) {
+        if (static_cast<int>(sampling.speaker_vector.size()) != impl_->talker.hidden) {
+            fail("QwenTts::synth_core",
+                 "speaker_vector must be " + std::to_string(impl_->talker.hidden) +
+                 " floats (got " + std::to_string(sampling.speaker_vector.size()) + ")");
+        }
+        spk_embed_eff = sampling.speaker_vector.data();
+        spk_id_eff    = -1;
+    }
+
     // Optional voice-slot steering: an additive offset on the speaker row of the
     // prefill (emotion / masc-fem direction-add). Empty = no-op; otherwise it must
     // be exactly the Talker hidden width. A no-op when there is no speaker slot
@@ -604,8 +622,8 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     // Assemble the prefill embedding stream + trailing-text embeddings.
     std::vector<float> prefill, trailing, tts_pad;
     int T = 0, L = 0;
-    assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id,
-                            spk_embed, spk_steer, language_id, prefill, T, trailing,
+    assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id_eff,
+                            spk_embed_eff, spk_steer, language_id, prefill, T, trailing,
                             L, tts_pad);
 
     // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's

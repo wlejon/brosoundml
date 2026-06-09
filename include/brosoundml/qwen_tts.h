@@ -238,6 +238,18 @@ struct QwenTtsSampling {
     // codec-embedding slot and the ECAPA x-vector share one 1024-D space, so the
     // Base emotion_basis.json / masc_fem_basis.json directions apply directly.
     std::vector<float> voice_steer;
+
+    // ── Voice-slot REPLACE (designed voice on any variant) ──────────────────
+    // When non-empty, this vector REPLACES whatever would fill the speaker slot —
+    // the preset token (CustomVoice) or the Base x-vector — with a caller-supplied
+    // 1024-D point. Must be exactly the Talker hidden width. It lets CustomVoice
+    // render an arbitrary designed voice (a voice-basis point) instead of one of
+    // its 9 presets, by dropping that x-vector straight into the slot. voice_steer
+    // (above) still adds on top, so slot = speaker_vector + voice_steer. Empty =
+    // use the variant's normal slot source (the default). On a checkpoint whose
+    // Talker only trained on its preset rows this is off-distribution, but the
+    // slot is dimensionally identical, so it renders.
+    std::vector<float> speaker_vector;
 };
 
 // Streaming sink: receives `n` finalized 24 kHz mono samples as the codec decodes
