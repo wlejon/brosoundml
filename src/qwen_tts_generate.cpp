@@ -243,7 +243,8 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const QwenTtsConfig& cfg,
                              const std::vector<int32_t>& input_ids,
                              const std::vector<int32_t>& instruct_ids,
-                             int spk_id, const float* spk_embed, int language_id,
+                             int spk_id, const float* spk_embed,
+                             const float* spk_steer, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
                              std::vector<float>& tts_pad) {
@@ -273,12 +274,17 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
     // The speaker sits between the think tag and the pad/bos. CustomVoice uses a
     // preset speaker token (looked up in codec_embedding); the Base zero-shot
     // clone instead splices a raw x-vector at that position (spk_pos), so push a
-    // placeholder token there and override the row below.
-    int spk_pos = -1;
+    // placeholder token there and override the row below. `slot_pos` records
+    // where the speaker row lands for EITHER source, so an optional steer offset
+    // can nudge it regardless of how it was filled.
+    int spk_pos = -1;     // x-vector splice position (codec source = spk_embed)
+    int slot_pos = -1;    // speaker row, whether token- or x-vector-filled
     if (spk_embed) {
         spk_pos = static_cast<int>(codec_input.size());
+        slot_pos = spk_pos;
         codec_input.push_back(tk.codec_pad_id);
     } else if (spk_id >= 0) {
+        slot_pos = static_cast<int>(codec_input.size());
         codec_input.push_back(spk_id);
     }
     codec_input.push_back(tk.codec_pad_id);
@@ -314,6 +320,10 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
         const float* codec = spk_embed;             // raw x-vector at spk_pos
         if (i != spk_pos) { codec_row(codec_input[i], ce); codec = ce.data(); }
         for (int d = 0; d < H; ++d) dst[d] = txt[d] + codec[d];
+        // Voice-slot steering: an additive direction on the speaker row (emotion /
+        // masc-fem), applied once whether the row came from a token or an x-vector.
+        if (spk_steer && i == slot_pos)
+            for (int d = 0; d < H; ++d) dst[d] += spk_steer[d];
     }
 
     // last prefill row: text_projection(first body token) + codec_embedding(codec_bos).

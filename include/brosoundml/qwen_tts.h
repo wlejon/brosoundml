@@ -225,6 +225,19 @@ struct QwenTtsSampling {
     // where it hedged — the same frames the c0_confidence trace lights up. 0
     // disables it (flat temperature, the default).
     float adaptive = 0.0f;
+
+    // ── Voice-slot steering (additive prefill offset) ───────────────────────
+    // An additive offset applied once to the speaker-slot row of the Talker
+    // prefill — the same row a preset speaker token (CustomVoice) or an x-vector
+    // (Base) fills. Empty (the default) = no-op; otherwise must be exactly the
+    // Talker hidden width (config().talker.hidden) floats. This generalizes the
+    // Base designer's x-vector direction-add (the emotion / masc-fem bases) to
+    // any variant that HAS a speaker slot: on CustomVoice the preset's
+    // codec_embedding row is nudged in place; on Base it rides on the x-vector.
+    // No effect on VoiceDesign (no speaker slot). On the 0.6B checkpoints the
+    // codec-embedding slot and the ECAPA x-vector share one 1024-D space, so the
+    // Base emotion_basis.json / masc_fem_basis.json directions apply directly.
+    std::vector<float> voice_steer;
 };
 
 // Streaming sink: receives `n` finalized 24 kHz mono samples as the codec decodes

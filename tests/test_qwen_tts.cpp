@@ -543,7 +543,7 @@ static int run() {
                 int gotT = 0, gotL = 0;
                 brosoundml::assemble_talker_prefill(
                     talker, cfg, ids, /*instruct_ids=*/{}, spk_id,
-                    /*spk_embed=*/nullptr, language_id,
+                    /*spk_embed=*/nullptr, /*spk_steer=*/nullptr, language_id,
                     prefill, gotT, trailing, gotL, tts_pad);
                 CHECK(gotT == T, tag("assembled prefill length matches"));
                 CHECK(gotL == L, tag("assembled trailing length matches"));
@@ -752,7 +752,8 @@ static int run() {
                 int gotT = 0, gotL = 0;
                 brosoundml::assemble_talker_prefill(
                     talker, cfg, ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
-                    xv.data(), language_id, prefill, gotT, trailing, gotL, tts_pad);
+                    xv.data(), /*spk_steer=*/nullptr, language_id,
+                    prefill, gotT, trailing, gotL, tts_pad);
                 CHECK(gotT == T, "clone: prefill length matches");
                 CHECK(gotL == L, "clone: trailing length matches");
                 auto cmpc = [&](const char* what, const std::vector<float>& got,

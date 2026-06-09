@@ -103,6 +103,13 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
 //                    (QwenTtsSpeakerEncoder::embed), used directly rather than
 //                    looked up in the codec_embedding table. nullptr = none; not
 //                    combined with spk_id (a model uses one or the other).
+//   `spk_steer`    — an optional additive offset (hidden floats) applied to that
+//                    same speaker-slot row, whether it was filled by a preset
+//                    token (CustomVoice) or an x-vector (Base). nullptr = no-op.
+//                    This is the variant-agnostic seam the voice designer's
+//                    emotion / masc-fem direction-add drives; with no speaker
+//                    slot (VoiceDesign) there is nothing to steer and it is
+//                    ignored.
 //   `language_id`  — the codec language token (>=0), or -1 for "auto".
 //
 // Writes the prefill (T*hidden row-major), the per-frame trailing-text hidden
@@ -114,7 +121,8 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const QwenTtsConfig& cfg,
                              const std::vector<int32_t>& input_ids,
                              const std::vector<int32_t>& instruct_ids,
-                             int spk_id, const float* spk_embed, int language_id,
+                             int spk_id, const float* spk_embed,
+                             const float* spk_steer, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
                              std::vector<float>& tts_pad);

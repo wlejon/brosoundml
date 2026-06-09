@@ -587,11 +587,26 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     const QwenTtsConfig&       cfg = impl_->config;
     const QwenTtsTalkerConfig& tk  = cfg.talker;
 
+    // Optional voice-slot steering: an additive offset on the speaker row of the
+    // prefill (emotion / masc-fem direction-add). Empty = no-op; otherwise it must
+    // be exactly the Talker hidden width. A no-op when there is no speaker slot
+    // (VoiceDesign) — the offset is simply never applied.
+    const float* spk_steer = nullptr;
+    if (!sampling.voice_steer.empty()) {
+        if (static_cast<int>(sampling.voice_steer.size()) != impl_->talker.hidden) {
+            fail("QwenTts::synth_core",
+                 "voice_steer must be " + std::to_string(impl_->talker.hidden) +
+                 " floats (got " + std::to_string(sampling.voice_steer.size()) + ")");
+        }
+        spk_steer = sampling.voice_steer.data();
+    }
+
     // Assemble the prefill embedding stream + trailing-text embeddings.
     std::vector<float> prefill, trailing, tts_pad;
     int T = 0, L = 0;
     assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id,
-                            spk_embed, language_id, prefill, T, trailing, L, tts_pad);
+                            spk_embed, spk_steer, language_id, prefill, T, trailing,
+                            L, tts_pad);
 
     // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's
     // get_rope_index is cumsum of an all-ones mask), rope_delta 0.
