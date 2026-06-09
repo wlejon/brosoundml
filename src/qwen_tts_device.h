@@ -54,6 +54,16 @@ inline bt::Tensor gather_rows(const bt::Tensor& W,
     return out;
 }
 
+// Gather rows of `W` (V,D) by an on-device INT32 index tensor `idx` (M,1) ->
+// (M, D). Routes through brotensor::gather_rows (the Tensor-Idx variant), so the
+// index never leaves the device — the AR-decode hot path feeds an argmax/sample
+// result straight back into the next embedding lookup with no host round-trip.
+inline bt::Tensor gather_rows(const bt::Tensor& W, const bt::Tensor& idx) {
+    bt::Tensor out = bt::Tensor::empty_on(W.device, 0, 0, W.dtype);
+    bt::gather_rows(W, idx, out);
+    return out;
+}
+
 // A cached all-zero bias for the bias-less linear path. linear_forward_batched
 // requires a bias, but the projections in the transformer loops have none — and
 // the AR loop calls linear ~700×/frame, so allocating + memset-zeroing a fresh

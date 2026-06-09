@@ -260,34 +260,42 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     DepthCache cache;
     cache.reset(num_layers, num_code_groups, dev, kd);
 
-    // lm_head[head_idx] over one (1,hidden) device row -> on-device argmax over
-    // vocab. argmax_rows returns the index as a float in a (1,1) tensor; only
-    // that scalar comes back to the host (4 bytes), not the whole vocab row.
-    // Ties keep the lowest index, matching the greedy host reference.
+    // All 15 codes accumulate into one device INT32 buffer and come back to the
+    // host in a single D2H after the loop. Each step's winning index stays on
+    // device and feeds the next step's embedding gather directly, so the 14
+    // depth steps issue as an unbroken async kernel stream — no per-step
+    // host sync, where the old path paid a blocking D2H (argmax read) + H2D
+    // (gather-index upload) on every step.
+    bt::Tensor code_dev = bt::Tensor::empty_on(dev, n_out, 1, bt::Dtype::INT32);
+    auto code_slot = [&](int j) {                       // device INT32 view (1,1)
+        return bt::Tensor::view(
+            dev, static_cast<std::int32_t*>(code_dev.data) + j, 1, 1, bt::Dtype::INT32);
+    };
+
+    // lm_head[head_idx] over one (1,hidden) device row -> on-device argmax (or
+    // seeded sample) over vocab, written as a device INT32 into code_dev[j].
+    // argmax_rows writes the index in place when handed an INT32-shaped Idx, so
+    // the result never touches the host; the returned view is the gather index
+    // for the next step. Ties keep the lowest index (greedy host reference).
     const bool prof = CpProf::on();
     const bool sampling = temperature > 0.0f && counter != nullptr;
     using clk = std::chrono::steady_clock;
-    auto code_from = [&](const bt::Tensor& row, int head_idx) -> int {
+    auto emit = [&](const bt::Tensor& row, int head_idx, int j) -> bt::Tensor {
         bt::Tensor lg;
         qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
+        bt::Tensor slot = code_slot(j);
         if (sampling) {
             // Draw this codebook from the seeded sampler, advancing the shared
-            // counter so each code consumes a distinct Philox substream.
+            // counter so each code consumes a distinct Philox substream. The
+            // (1,1) INT32 result is copied (device->device) into code_dev[j].
             bt::Tensor idx;
             bt::sample_logits(lg, temperature, top_k, top_p, key, *counter, idx);
             ++(*counter);
-            bt::Tensor cidx = idx.to(bt::Device::CPU);      // (1, 1) INT32
-            return *static_cast<const std::int32_t*>(cidx.host_raw());
+            bt::copy_d2d(idx, 0, code_dev, j, 1);
+        } else {
+            bt::argmax_rows(lg, slot);                      // INT32 in place
         }
-        bt::Tensor idx;
-        bt::argmax_rows(lg, idx);                           // (1, 1) FP32
-        clk::time_point t0;
-        if (prof) { bt::sync_all(); t0 = clk::now(); }
-        float f = 0.0f;
-        qtd::to_host(idx, &f);
-        if (prof) CpProf::argmax() +=
-            std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-        return static_cast<int>(f);
+        return slot;
     };
 
     // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1,
@@ -305,7 +313,7 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     // codebook 1 from lm_head[0] applied to the last prefill row (row 1).
     bt::Tensor row1 = bt::Tensor::view(
         dev, static_cast<float*>(h.data) + hidden, 1, hidden, bt::Dtype::FP32);
-    out_codes[0] = code_from(row1, 0);
+    bt::Tensor idx_prev = emit(row1, 0, 0);
     if (prof) { bt::sync_all(); CpProf::prefill() +=
         std::chrono::duration<double, std::milli>(clk::now() - tpf).count(); }
 
@@ -313,15 +321,25 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     clk::time_point tst;
     if (prof) { bt::sync_all(); tst = clk::now(); }
     for (int j = 1; j < n_out; ++j) {
-        const int prev_code = out_codes[j - 1];
-        bt::Tensor erow = qtd::gather_rows(
-            codec_embedding[j - 1], {static_cast<std::int32_t>(prev_code)});  // (1, talker_hidden)
+        // Embed the previous code straight from its device INT32 index — no
+        // host round-trip between the argmax/sample and this gather.
+        bt::Tensor erow = qtd::gather_rows(codec_embedding[j - 1], idx_prev);  // (1, talker_hidden)
         bt::Tensor hstep;
         cp_run(*this, cp_project_in(*this, erow), 1, /*pos_start=*/1 + j, cache, hstep);
-        out_codes[j] = code_from(hstep, j);
+        idx_prev = emit(hstep, j, j);
     }
     if (prof) { bt::sync_all(); CpProf::steps() +=
         std::chrono::duration<double, std::milli>(clk::now() - tst).count(); }
+
+    // ── single batched read-back: the whole (15,1) INT32 code vector D2H ──
+    clk::time_point trb;
+    if (prof) { bt::sync_all(); trb = clk::now(); }
+    bt::Tensor codes_host = (dev == bt::Device::CPU) ? code_dev
+                                                     : code_dev.to(bt::Device::CPU);
+    const std::int32_t* cp = static_cast<const std::int32_t*>(codes_host.host_raw());
+    for (int j = 0; j < n_out; ++j) out_codes[j] = cp[j];
+    if (prof) CpProf::argmax() +=
+        std::chrono::duration<double, std::milli>(clk::now() - trb).count();
 }
 
 // Print + reset the Code Predictor internal profile (called from generate_codes).
@@ -332,7 +350,7 @@ void qwen_cp_profile_report() {
         "  [code_predictor internals over %ld frames]\n"
         "    prefill (2-tok, 5L)  %9.1f ms  %7.3f ms/frame\n"
         "    14 depth steps (5L)  %9.1f ms  %7.3f ms/frame\n"
-        "      of which argmax rb %9.1f ms  %7.3f ms/frame\n",
+        "    code read-back (1xD2H)%8.1f ms  %7.3f ms/frame\n",
         CpProf::calls(),
         CpProf::prefill(), CpProf::prefill() / f,
         CpProf::steps(),   CpProf::steps() / f,
