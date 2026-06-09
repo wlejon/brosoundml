@@ -4,6 +4,9 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#ifdef BROSOUNDML_HAS_CUDA
+#include <brotensor/cuda_graph.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -19,17 +23,18 @@ namespace brosoundml {
 
 namespace {
 
-// Env-gated internal profiling for predict_dev: splits the 2-token prefill pass
-// from the 14 single-token depth steps, and the per-step argmax read-back.
+// Env-gated internal profiling for predict_dev: the per-frame depth compute
+// (whole-frame eager body, or one CUDA-graph replay) and the final batched
+// code read-back. `graph` records whether the steady-state path is graph replay.
 struct CpProf {
     static bool on() {
         static const bool v = std::getenv("BROSOUNDML_QWEN_PROFILE") != nullptr;
         return v;
     }
-    static double& prefill() { static double v = 0; return v; }
-    static double& steps()   { static double v = 0; return v; }
-    static double& argmax()  { static double v = 0; return v; }
-    static long&   calls()   { static long v = 0;   return v; }
+    static double& frame()    { static double v = 0; return v; }
+    static double& readback() { static double v = 0; return v; }
+    static long&   calls()    { static long v = 0;   return v; }
+    static bool&   graph()    { static bool v = false; return v; }
 };
 
 namespace bt = brotensor;
@@ -60,13 +65,14 @@ bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
 }
 
 // A depth-local KV cache: per-layer post-RoPE K/V for the <=16 depth tokens,
-// stored expanded to full per-query heads (plain MHA for flash). FP32 device
-// tensors, preallocated to the known depth length.
+// stored as the n_kv (grouped) heads — the windowed attention op expands to the
+// n_q query heads internally (GQA). FP32 device tensors, allocated once to the
+// known depth length and reused across frames (len resets to 0 per frame).
 struct DepthCache {
     int len = 0;
     std::vector<bt::Tensor> k, v;
-    void reset(int num_layers, int cap, bt::Device dev, int D) {
-        len = 0;
+    bool allocated() const { return !k.empty(); }
+    void alloc(int num_layers, int cap, bt::Device dev, int D) {
         k.assign(num_layers, {});
         v.assign(num_layers, {});
         for (int l = 0; l < num_layers; ++l) {
@@ -76,11 +82,56 @@ struct DepthCache {
     }
 };
 
+// Per-decoder-pass scratch — every intermediate of one cp_run_into call. Reused
+// across all layers within a pass (each layer fully overwrites it) and across
+// frames. Persisting these is what lets a frame allocate nothing on the steady
+// path and lets the whole pass be recorded into a CUDA graph (capture forbids
+// mid-capture allocation, so the buffers must already exist and be reused).
+struct LayerScratch {
+    bt::Tensor normed, q, k, v, qn, kn, qr, kr, ctx, attn, n2, g, u, dn;
+};
+
+}  // namespace
+
+// Persistent decode state for one predictor instance: the reused scratch for a
+// frame's prefill (n=2) and depth-step (n=1) passes, the depth KV cache, the
+// conditioning-input staging buffer, and the (15,1) INT32 code buffer. On CUDA
+// greedy it also owns the captured whole-frame graph. At namespace scope (not
+// anonymous) so it is the same brosoundml::CpFrameState the header forward-
+// declares for the predictor's unique_ptr member; it still uses the
+// anonymous-namespace DepthCache / LayerScratch (visible in the enclosing
+// namespace).
+struct CpFrameState {
+    bt::Tensor cond_in;        // (2, talker_hidden) conditioning rows, in place
+    bt::Tensor proj_pre;       // (2, hidden) prefill projection (1.7B only)
+    bt::Tensor proj_step;      // (1, hidden) step projection (1.7B only)
+    bt::Tensor hs_pre;         // (2, hidden) prefill residual stream
+    bt::Tensor hs_step;        // (1, hidden) step residual stream
+    LayerScratch sc_pre;       // prefill (n=2) layer scratch
+    LayerScratch sc_step;      // step (n=1) layer scratch
+    bt::Tensor erow;           // (1, talker_hidden) gathered code embedding
+    bt::Tensor hidden_pre;     // (2, hidden) prefill final-norm output
+    bt::Tensor hidden_step;    // (1, hidden) step final-norm output
+    bt::Tensor logits;         // (1, vocab) lm_head output
+    bt::Tensor code_dev;       // (n_out, 1) INT32 accumulated codes
+    DepthCache cache;
+#ifdef BROSOUNDML_HAS_CUDA
+    bt::CudaGraph graph;       // captured whole-frame greedy step (CUDA only)
+#endif
+    bool captured = false;
+};
+
+namespace {
+
 // One cached decoder pass over `n` new tokens at depth positions
 // [pos_start, pos_start+n). Plain single-axis RoPE, GQA + QK-norm, full causal.
-// `embeds` is an (n, hidden) device tensor; writes hidden_out (n, hidden).
-void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
-            int pos_start, DepthCache& cache, bt::Tensor& hidden_out) {
+// `embeds` (n, hidden) is copied into the persistent residual `hs`; all
+// intermediates land in `sc`; the final-norm output is written to `hidden_out`.
+// Every tensor it touches is persistent and reused — sized on the first (warm-up)
+// call, a no-op resize thereafter — so a captured replay re-runs with no alloc.
+void cp_run_into(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
+                 int pos_start, DepthCache& cache, LayerScratch& sc,
+                 bt::Tensor& hs, bt::Tensor& hidden_out) {
     const bt::Device dev = cp.final_norm.device;
     const int head_dim = cp.head_dim;
     const int n_q = cp.n_q_heads, n_kv = cp.n_kv_heads;
@@ -98,64 +149,120 @@ void cp_run(const QwenTtsCodePredictor& cp, const bt::Tensor& embeds, int n,
         dev, static_cast<float*>(cp.rope_sin.data) + static_cast<std::size_t>(pos_start) * half,
         n, half, bt::Dtype::FP32);
 
-    bt::Tensor hs = embeds;   // deep copy; mutated in place by residual adds
+    // Residual stream starts as a copy of the (projected) input rows. Sized on
+    // the warm-up call; a plain device copy into the same buffer thereafter.
+    if (hs.rows != n || hs.cols != cp.hidden || hs.dtype != bt::Dtype::FP32)
+        hs = bt::Tensor::empty_on(dev, n, cp.hidden, bt::Dtype::FP32);
+    bt::copy_d2d(embeds, 0, hs, 0, n * cp.hidden);
 
     for (int l = 0; l < cp.num_layers; ++l) {
         const QwenTtsCodePredictorLayer& cl = cp.layers[l];
-        bt::Tensor normed;
-        bt::rms_norm_forward(hs, cl.in_ln, cp.rms_eps, normed);
-        bt::Tensor q, k, v;
-        qtd::linear(cl.qw, nullptr, normed, q);
-        qtd::linear(cl.kw, nullptr, normed, k);
-        qtd::linear(cl.vw, nullptr, normed, v);
-        bt::Tensor qn, kn;
-        qtd::head_rms_norm(q, n, n_q,  head_dim, cl.q_norm, cp.rms_eps, qn);
-        qtd::head_rms_norm(k, n, n_kv, head_dim, cl.k_norm, cp.rms_eps, kn);
-        bt::Tensor qr, kr;
-        bt::rope_apply(qn, cosT, sinT, head_dim, n_q,  qr);
-        bt::rope_apply(kn, cosT, sinT, head_dim, n_kv, kr);
-        // Cache the n_kv (grouped) heads; the windowed attention op expands to
-        // the n_q query heads internally (GQA) — no per-layer expand_kv gather.
-        bt::copy_d2d(kr, 0, cache.k[l], offset * kd, n * kd);
-        bt::copy_d2d(v,  0, cache.v[l], offset * kd, n * kd);
+        bt::rms_norm_forward(hs, cl.in_ln, cp.rms_eps, sc.normed);
+        qtd::linear(cl.qw, nullptr, sc.normed, sc.q);
+        qtd::linear(cl.kw, nullptr, sc.normed, sc.k);
+        qtd::linear(cl.vw, nullptr, sc.normed, sc.v);
+        qtd::head_rms_norm(sc.q, n, n_q,  head_dim, cl.q_norm, cp.rms_eps, sc.qn);
+        qtd::head_rms_norm(sc.k, n, n_kv, head_dim, cl.k_norm, cp.rms_eps, sc.kn);
+        bt::rope_apply(sc.qn, cosT, sinT, head_dim, n_q,  sc.qr);
+        bt::rope_apply(sc.kn, cosT, sinT, head_dim, n_kv, sc.kr);
+        bt::copy_d2d(sc.kr, 0, cache.k[l], offset * kd, n * kd);
+        bt::copy_d2d(sc.v,  0, cache.v[l], offset * kd, n * kd);
         const int valid = offset + n;
         bt::Tensor Kf = bt::Tensor::view(dev, cache.k[l].data, valid, kd, bt::Dtype::FP32);
         bt::Tensor Vf = bt::Tensor::view(dev, cache.v[l].data, valid, kd, bt::Dtype::FP32);
-        bt::Tensor ctx;
-        qtd::flash_attn(qr, Kf, Vf, n_q, head_dim, /*causal=*/offset == 0, ctx);
-        bt::Tensor attn;
-        qtd::linear(cl.ow, nullptr, ctx, attn);
-        bt::add_inplace_batched(hs, attn);
+        qtd::flash_attn(sc.qr, Kf, Vf, n_q, head_dim, /*causal=*/offset == 0, sc.ctx);
+        qtd::linear(cl.ow, nullptr, sc.ctx, sc.attn);
+        bt::add_inplace_batched(hs, sc.attn);
 
-        bt::Tensor n2;
-        bt::rms_norm_forward(hs, cl.post_ln, cp.rms_eps, n2);
-        bt::Tensor g, u;
-        qtd::linear(cl.gate, nullptr, n2, g);
-        qtd::linear(cl.up,   nullptr, n2, u);
-        qtd::swiglu(g, u);
-        bt::Tensor dn;
-        qtd::linear(cl.down, nullptr, g, dn);
-        bt::add_inplace_batched(hs, dn);
+        bt::rms_norm_forward(hs, cl.post_ln, cp.rms_eps, sc.n2);
+        qtd::linear(cl.gate, nullptr, sc.n2, sc.g);
+        qtd::linear(cl.up,   nullptr, sc.n2, sc.u);
+        qtd::swiglu(sc.g, sc.u);
+        qtd::linear(cl.down, nullptr, sc.g, sc.dn);
+        bt::add_inplace_batched(hs, sc.dn);
     }
 
     cache.len = offset + n;
     bt::rms_norm_forward(hs, cp.final_norm, cp.rms_eps, hidden_out);
 }
 
-// Project an (n, talker_hidden) input batch down to the depth-transformer hidden
-// via small_to_mtp_projection. Identity (returns the input) when widths match.
-bt::Tensor cp_project_in(const QwenTtsCodePredictor& cp, const bt::Tensor& in) {
+// Project an (n, talker_hidden) input down to the depth-transformer hidden via
+// small_to_mtp_projection, into the persistent `scratch`. Identity (returns the
+// input unchanged) when widths match (0.6B). Returns a reference, never a copy.
+const bt::Tensor& cp_project_into(const QwenTtsCodePredictor& cp,
+                                  const bt::Tensor& in, bt::Tensor& scratch) {
     if (!cp.has_mtp_proj) return in;
-    bt::Tensor out;
-    qtd::linear(cp.mtp_proj_w, &cp.mtp_proj_b, in, out);
-    return out;
+    qtd::linear(cp.mtp_proj_w, &cp.mtp_proj_b, in, scratch);
+    return scratch;
+}
+
+// The full per-frame depth compute over the persistent state: a 2-token prefill
+// then the 14 single-token steps, emitting all 15 codes into st.code_dev. Every
+// op is device-resident and reuses st's buffers, so this same body runs eagerly
+// (CPU / sampling) and is the exact sequence captured into the CUDA graph. The
+// conditioning rows must already be staged in st.cond_in and st.cache.len == 0.
+void run_frame_body(const QwenTtsCodePredictor& cp, CpFrameState& st,
+                    bool sampling, float temperature, int top_k, float top_p,
+                    std::uint64_t key, std::uint64_t* counter) {
+    const bt::Device dev = cp.final_norm.device;
+    const int n_out = cp.num_code_groups - 1;   // 15
+    const int hidden = cp.hidden;
+
+    auto code_slot = [&](int j) {                // device INT32 view (1,1)
+        return bt::Tensor::view(
+            dev, static_cast<std::int32_t*>(st.code_dev.data) + j, 1, 1, bt::Dtype::INT32);
+    };
+    // lm_head[head_idx] over one (1,hidden) row -> winning code id, written as a
+    // device INT32 into code_dev[j]; the returned view is the next step's gather
+    // index. Greedy argmax writes in place; sampling copies the seeded draw in.
+    auto emit = [&](const bt::Tensor& row, int head_idx, int j) -> bt::Tensor {
+        qtd::linear(cp.lm_head[head_idx], nullptr, row, st.logits);   // (1, vocab)
+        bt::Tensor slot = code_slot(j);
+        if (sampling) {
+            bt::Tensor idx;
+            bt::sample_logits(st.logits, temperature, top_k, top_p, key, *counter, idx);
+            ++(*counter);
+            bt::copy_d2d(idx, 0, st.code_dev, j, 1);
+        } else {
+            bt::argmax_rows(st.logits, slot);                        // INT32 in place
+        }
+        return slot;
+    };
+
+    // prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1.
+    const bt::Tensor& pre_in = cp_project_into(cp, st.cond_in, st.proj_pre);
+    cp_run_into(cp, pre_in, 2, /*pos_start=*/0, st.cache, st.sc_pre, st.hs_pre, st.hidden_pre);
+    // codebook 1 from lm_head[0] applied to the last prefill row (row 1).
+    bt::Tensor row1 = bt::Tensor::view(
+        dev, static_cast<float*>(st.hidden_pre.data) + hidden, 1, hidden, bt::Dtype::FP32);
+    bt::Tensor idx_prev = emit(row1, 0, 0);
+
+    // steps: emit codebooks 2..(num_code_groups-1).
+    for (int j = 1; j < n_out; ++j) {
+        // Embed the previous code straight from its device INT32 index, into the
+        // persistent buffer (no fresh allocation — capture forbids it).
+        bt::gather_rows(cp.codec_embedding[j - 1], idx_prev, st.erow);  // (1, talker_hidden)
+        const bt::Tensor& step_in = cp_project_into(cp, st.erow, st.proj_step);
+        cp_run_into(cp, step_in, 1, /*pos_start=*/1 + j, st.cache, st.sc_step,
+                    st.hs_step, st.hidden_step);
+        idx_prev = emit(st.hidden_step, j, j);
+    }
 }
 
 }  // namespace
 
+// Out-of-line so frame_state (unique_ptr<CpFrameState>) can be an incomplete
+// type in the header — CpFrameState is only fully defined here.
+QwenTtsCodePredictor::QwenTtsCodePredictor() = default;
+QwenTtsCodePredictor::~QwenTtsCodePredictor() = default;
+QwenTtsCodePredictor::QwenTtsCodePredictor(QwenTtsCodePredictor&&) noexcept = default;
+QwenTtsCodePredictor&
+QwenTtsCodePredictor::operator=(QwenTtsCodePredictor&&) noexcept = default;
+
 void QwenTtsCodePredictor::load(const sf::File& f,
                                 const QwenTtsCodePredictorConfig& cfg,
                                 int talker_hidden_, bt::Device dev) {
+    frame_state.reset();   // drop any stale per-instance decode state on reload
     num_layers      = cfg.transformer.num_hidden_layers;
     hidden          = cfg.transformer.hidden_size;
     talker_hidden   = talker_hidden_;
@@ -254,92 +361,84 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
-    const int kd    = n_kv_heads * head_dim;  // GQA K/V cache width
     out_codes.assign(n_out, 0);
 
-    DepthCache cache;
-    cache.reset(num_layers, num_code_groups, dev, kd);
-
-    // All 15 codes accumulate into one device INT32 buffer and come back to the
-    // host in a single D2H after the loop. Each step's winning index stays on
-    // device and feeds the next step's embedding gather directly, so the 14
-    // depth steps issue as an unbroken async kernel stream — no per-step
-    // host sync, where the old path paid a blocking D2H (argmax read) + H2D
-    // (gather-index upload) on every step.
-    bt::Tensor code_dev = bt::Tensor::empty_on(dev, n_out, 1, bt::Dtype::INT32);
-    auto code_slot = [&](int j) {                       // device INT32 view (1,1)
-        return bt::Tensor::view(
-            dev, static_cast<std::int32_t*>(code_dev.data) + j, 1, 1, bt::Dtype::INT32);
-    };
-
-    // lm_head[head_idx] over one (1,hidden) device row -> on-device argmax (or
-    // seeded sample) over vocab, written as a device INT32 into code_dev[j].
-    // argmax_rows writes the index in place when handed an INT32-shaped Idx, so
-    // the result never touches the host; the returned view is the gather index
-    // for the next step. Ties keep the lowest index (greedy host reference).
     const bool prof = CpProf::on();
     const bool sampling = temperature > 0.0f && counter != nullptr;
     using clk = std::chrono::steady_clock;
-    auto emit = [&](const bt::Tensor& row, int head_idx, int j) -> bt::Tensor {
-        bt::Tensor lg;
-        qtd::linear(lm_head[head_idx], nullptr, row, lg);   // (1, vocab)
-        bt::Tensor slot = code_slot(j);
-        if (sampling) {
-            // Draw this codebook from the seeded sampler, advancing the shared
-            // counter so each code consumes a distinct Philox substream. The
-            // (1,1) INT32 result is copied (device->device) into code_dev[j].
-            bt::Tensor idx;
-            bt::sample_logits(lg, temperature, top_k, top_p, key, *counter, idx);
-            ++(*counter);
-            bt::copy_d2d(idx, 0, code_dev, j, 1);
-        } else {
-            bt::argmax_rows(lg, slot);                      // INT32 in place
-        }
-        return slot;
+    auto dur = [](clk::duration d) {
+        return std::chrono::duration<double, std::milli>(d).count();
     };
 
-    // ── prefill: two tokens [past_hidden, c0_embed] at depth positions 0, 1,
-    //    assembled on-device (no host staging of the two hidden-width rows) ──
-    clk::time_point tpf;
-    if (prof) { bt::sync_all(); tpf = clk::now(); ++CpProf::calls(); }
-    // The two conditioning rows arrive in the Talker hidden width; stage them,
-    // then project to the depth-transformer width (identity when widths match).
-    bt::Tensor pre_t = bt::Tensor::empty_on(dev, 2, talker_hidden, bt::Dtype::FP32);
-    bt::copy_d2d(past_hidden, 0, pre_t, 0,             talker_hidden);
-    bt::copy_d2d(c0_embed,    0, pre_t, talker_hidden, talker_hidden);
-    bt::Tensor h;
-    cp_run(*this, cp_project_in(*this, pre_t), 2, /*pos_start=*/0, cache, h);  // (2, hidden)
-
-    // codebook 1 from lm_head[0] applied to the last prefill row (row 1).
-    bt::Tensor row1 = bt::Tensor::view(
-        dev, static_cast<float*>(h.data) + hidden, 1, hidden, bt::Dtype::FP32);
-    bt::Tensor idx_prev = emit(row1, 0, 0);
-    if (prof) { bt::sync_all(); CpProf::prefill() +=
-        std::chrono::duration<double, std::milli>(clk::now() - tpf).count(); }
-
-    // ── steps: emit codebooks 2..(num_code_groups-1) ──
-    clk::time_point tst;
-    if (prof) { bt::sync_all(); tst = clk::now(); }
-    for (int j = 1; j < n_out; ++j) {
-        // Embed the previous code straight from its device INT32 index — no
-        // host round-trip between the argmax/sample and this gather.
-        bt::Tensor erow = qtd::gather_rows(codec_embedding[j - 1], idx_prev);  // (1, talker_hidden)
-        bt::Tensor hstep;
-        cp_run(*this, cp_project_in(*this, erow), 1, /*pos_start=*/1 + j, cache, hstep);
-        idx_prev = emit(hstep, j, j);
+    // Lazily build the per-instance persistent state: the depth KV cache, the
+    // conditioning-input staging buffer, and the (15,1) INT32 code buffer. The
+    // pass scratch sizes itself on the first run_frame_body call.
+    if (!frame_state) {
+        frame_state = std::make_unique<CpFrameState>();
+        const int kd = n_kv_heads * head_dim;
+        frame_state->cache.alloc(num_layers, num_code_groups, dev, kd);
+        frame_state->cond_in  = bt::Tensor::empty_on(dev, 2, talker_hidden, bt::Dtype::FP32);
+        frame_state->code_dev = bt::Tensor::empty_on(dev, n_out, 1, bt::Dtype::INT32);
     }
-    if (prof) { bt::sync_all(); CpProf::steps() +=
-        std::chrono::duration<double, std::milli>(clk::now() - tst).count(); }
+    CpFrameState& st = *frame_state;
 
-    // ── single batched read-back: the whole (15,1) INT32 code vector D2H ──
+    // Stage the two conditioning rows into the persistent input buffer in place —
+    // the only per-frame input a captured graph reads (everything downstream is
+    // deterministic device compute over st's buffers).
+    bt::copy_d2d(past_hidden, 0, st.cond_in, 0,             talker_hidden);
+    bt::copy_d2d(c0_embed,    0, st.cond_in, talker_hidden, talker_hidden);
+
+    if (prof) { bt::sync_all(); ++CpProf::calls(); }
+    clk::time_point t0;
+    if (prof) t0 = clk::now();
+
+#ifdef BROSOUNDML_HAS_CUDA
+    // CUDA greedy: the whole frame is a fixed-shape sequence of device ops with
+    // no host control flow, so capture it once and replay it as a single launch
+    // (~700 tiny kernel launches/frame -> one cudaGraphLaunch). Sampling is NOT
+    // captured: its Philox counter must advance on the host per code per frame.
+    // BROSOUNDML_QWEN_NO_GRAPH forces the eager path (A/B + escape hatch).
+    static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
+    const bool use_graph = (dev == bt::Device::CUDA) && !sampling && !no_graph;
+    if (use_graph) {
+        CpProf::graph() = true;
+        if (!st.captured) {
+            // Warm-up: an eager run allocates + sizes every scratch buffer (the
+            // capture itself must allocate nothing). It also yields this frame's
+            // codes — capture re-runs the identical compute, so they agree.
+            st.cache.len = 0;
+            run_frame_body(*this, st, /*sampling=*/false, 0.0f, 0, 1.0f, 0, nullptr);
+            bt::sync_all();
+            st.cache.len = 0;   // re-bake offsets 0,1,2,... into the graph
+            {
+                bt::CudaGraphCapture cap;
+                run_frame_body(*this, st, /*sampling=*/false, 0.0f, 0, 1.0f, 0, nullptr);
+                st.graph = cap.finish();
+            }
+            st.captured = true;
+        } else {
+            st.graph.launch();   // replay: reads st.cond_in, writes st.code_dev
+        }
+        bt::sync(bt::Device::CUDA);
+    } else
+#endif
+    {
+        // Eager path (CPU, or any sampling frame): the same body over the same
+        // persistent buffers, run directly. cache.len resets per frame.
+        st.cache.len = 0;
+        run_frame_body(*this, st, sampling, temperature, top_k, top_p, key, counter);
+        if (prof) bt::sync_all();
+    }
+    if (prof) CpProf::frame() += dur(clk::now() - t0);
+
+    // Single batched read-back of the whole (15,1) INT32 code vector.
     clk::time_point trb;
-    if (prof) { bt::sync_all(); trb = clk::now(); }
-    bt::Tensor codes_host = (dev == bt::Device::CPU) ? code_dev
-                                                     : code_dev.to(bt::Device::CPU);
-    const std::int32_t* cp = static_cast<const std::int32_t*>(codes_host.host_raw());
-    for (int j = 0; j < n_out; ++j) out_codes[j] = cp[j];
-    if (prof) CpProf::argmax() +=
-        std::chrono::duration<double, std::milli>(clk::now() - trb).count();
+    if (prof) trb = clk::now();
+    bt::Tensor codes_host = (dev == bt::Device::CPU) ? st.code_dev
+                                                     : st.code_dev.to(bt::Device::CPU);
+    const std::int32_t* codes = static_cast<const std::int32_t*>(codes_host.host_raw());
+    for (int j = 0; j < n_out; ++j) out_codes[j] = codes[j];
+    if (prof) CpProf::readback() += dur(clk::now() - trb);
 }
 
 // Print + reset the Code Predictor internal profile (called from generate_codes).
@@ -347,16 +446,15 @@ void qwen_cp_profile_report() {
     if (!CpProf::on() || CpProf::calls() == 0) return;
     const double f = static_cast<double>(CpProf::calls());
     std::fprintf(stderr,
-        "  [code_predictor internals over %ld frames]\n"
-        "    prefill (2-tok, 5L)  %9.1f ms  %7.3f ms/frame\n"
-        "    14 depth steps (5L)  %9.1f ms  %7.3f ms/frame\n"
+        "  [code_predictor internals over %ld frames, mode=%s]\n"
+        "    frame compute        %9.1f ms  %7.3f ms/frame\n"
         "    code read-back (1xD2H)%8.1f ms  %7.3f ms/frame\n",
-        CpProf::calls(),
-        CpProf::prefill(), CpProf::prefill() / f,
-        CpProf::steps(),   CpProf::steps() / f,
-        CpProf::argmax(),  CpProf::argmax() / f);
-    CpProf::prefill() = CpProf::steps() = CpProf::argmax() = 0;
+        CpProf::calls(), CpProf::graph() ? "graph-replay" : "eager",
+        CpProf::frame(),    CpProf::frame() / f,
+        CpProf::readback(), CpProf::readback() / f);
+    CpProf::frame() = CpProf::readback() = 0;
     CpProf::calls() = 0;
+    CpProf::graph() = false;
 }
 
 const float* QwenTtsCodePredictor::codec_embedding_row(int table, int id) const {

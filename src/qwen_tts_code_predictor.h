@@ -26,6 +26,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace brosoundml {
@@ -38,7 +39,20 @@ struct QwenTtsCodePredictorLayer {
     brotensor::Tensor gate, up, down;
 };
 
+// Per-instance persistent decode state for predict_dev: the reused scratch
+// buffers (so a frame allocates nothing on the steady-state path) and, on CUDA
+// greedy, the captured CUDA graph that replays the whole frame as one launch.
+// Defined in qwen_tts_code_predictor.cpp; opaque here.
+struct CpFrameState;
+
 struct QwenTtsCodePredictor {
+    // Out-of-line so the unique_ptr<CpFrameState> member can hold an incomplete
+    // type in this header (state lives entirely in the .cpp).
+    QwenTtsCodePredictor();
+    ~QwenTtsCodePredictor();
+    QwenTtsCodePredictor(QwenTtsCodePredictor&&) noexcept;
+    QwenTtsCodePredictor& operator=(QwenTtsCodePredictor&&) noexcept;
+
     // ── dims ──
     int num_layers = 0;
     int hidden = 0, intermediate = 0;   // depth-transformer hidden width
@@ -106,6 +120,10 @@ struct QwenTtsCodePredictor {
 
     // Raw pointer to codec_embedding table `table` row `id` (hidden floats).
     const float* codec_embedding_row(int table, int id) const;
+
+    // Reused scratch + captured CUDA graph for predict_dev. Mutable: predict_dev
+    // is logically const (weights unchanged) but lazily builds this on first use.
+    mutable std::unique_ptr<CpFrameState> frame_state;
 };
 
 }  // namespace brosoundml

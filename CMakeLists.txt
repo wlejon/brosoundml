@@ -92,6 +92,14 @@ target_link_libraries(brosoundml PUBLIC
     brolm::brolm
 )
 
+# Compile-time flag for the CUDA-only fast paths (the Qwen3-TTS Code Predictor
+# CUDA-graph capture). The brotensor_cuda target exists only when the CUDA
+# backend was built — standalone (-DBROTENSOR_WITH_CUDA=ON) or inside bro — so
+# keying on it forwards the backend choice without a brosoundml-side option.
+if(TARGET brotensor_cuda)
+    target_compile_definitions(brosoundml PRIVATE BROSOUNDML_HAS_CUDA=1)
+endif()
+
 if(MSVC)
     target_compile_options(brosoundml PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else()
