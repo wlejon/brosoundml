@@ -4,7 +4,7 @@ Audio-ML model inference. brosoundml is the **expression layer** for neural
 audio models — it composes the FP32 audio op family in `brotensor` (FFT/STFT,
 1D convolution, vocoder/codec activations, codec quantization, resampling,
 autoregressive sampling) into runnable text-to-speech, speech-to-text,
-neural-codec, and wake-word models.
+neural-codec, neural-autoencoder, and wake-word models.
 
 It is to audio what [`brodiffusion`](https://github.com/wlejon/brodiffusion) is to images and
 [`brolm`](https://github.com/wlejon/brolm) is to text: a sibling library that turns a tensor op
@@ -17,6 +17,10 @@ Models implemented (all complete, CPU FP32; CUDA where noted):
   token, 24 kHz output; CustomVoice presets, VoiceDesign instruct prompts, and
   Base-variant zero-shot voice cloning). Device-neutral CPU + CUDA.
 - **Whisper** — speech-to-text (HF transformers checkpoints, tiny → large-v3).
+- **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ low-rate
+  PCA-sorted latent that the lab edits per-dimension. Device-neutral (CPU /
+  CUDA / Metal); deterministic encode/decode plus the optional stochastic
+  noise-synth and per-channel stereo decode.
 - **Wake-word** — a small BC-ResNet streaming keyword spotter for an always-on
   mic loop, plus its Kokoro-driven training toolchain.
 
@@ -25,8 +29,10 @@ can phonemize text with no misaki/Python dependency.
 
 CLI tools drive each model end-to-end — `brosoundml_synth` (Kokoro),
 `brosoundml_transcribe` (Whisper), the `brosoundml_qwen_tts_*` tools
-(bench / roundtrip / clone), and the `brosoundml_wake_*` toolchain
-(synth / inspect / train / test / probe / melcmp).
+(bench / roundtrip / clone), `brosoundml_build_speaker_encoder` (pack the
+standalone Qwen voice-clone enroller), and the `brosoundml_wake_*` toolchain
+(synth / inspect / train / test / probe / melcmp). RAVE is a library-only model
+(no CLI driver), exercised by `test_rave`.
 
 ## Dependencies
 
@@ -114,8 +120,30 @@ prefix to stream the way Qwen3-TTS does. `synthesize_stream()` instead chunks th
 *input*: the caller passes phoneme chunks split at sentence/clause boundaries,
 each is synthesized independently and its 24 kHz audio is handed to an `on_chunk`
 sink the moment it finishes (first-chunk latency for a long script), with the
-full concatenation also returned. The `synth --stream` CLI drives this, one
-`--ids-file` line per chunk.
+full concatenation also returned (each chunk also reports its own per-phoneme
+frame durations so a caller can align words to the streamed audio). The
+`synth --stream` CLI drives this, one `--ids-file` line per chunk.
+
+### Authoring, introspection, and a trainable decoder
+
+A handful of seams open Kokoro up beyond one-shot synthesis:
+
+- **`make_voice()`** builds a `Voice` from raw style data in memory (rather than
+  a voice-pack file) — for authoring, blending, or otherwise constructing a
+  voice the application holds itself.
+- **`decode_from()`** re-runs only the decoder from the intermediate stages of a
+  prior synthesis (the `asr` / `F0_pred` / `N_pred` tensors), so an edited
+  pitch/energy curve can be re-rendered without re-running the front half.
+- **`KokoroTrace`** — passing a `KokoroTrace*` to `synthesize()` fills a
+  per-stage host copy of the intermediates for introspection / visualization. A
+  normal `synthesize()` with no trace requested pays nothing.
+- **Trainable decoder LoRA** (`decoder_lora.h`). The iSTFTNet decoder's AdaIN
+  style→(γ,β) projections are made trainable: a backward pass over the decoder
+  back half (`kokoro_decoder_backward.{h,cpp}`) plus a conditioned LoRA
+  (`DecoderLora`) with Adam, checkpoint I/O, and a conditioning gate that is
+  exactly identity at condition 0 (so cond = 0 reproduces the base voice). The
+  condition vector is generic — any small control signal (e.g. a style/affect
+  coordinate) can drive it.
 
 ### brotensor op coverage
 
@@ -180,7 +208,25 @@ bit-for-bit (the codec tail then matches to ~1e-5).
   where a CustomVoice preset token would sit ("x-vector-only" enrollment, no
   reference transcript). `embed_speaker()` exposes that enrollment step on its
   own — the honest audio→identity front-end for training an adapter into another
-  model's style space.
+  model's style space — and `synthesize_with_xvector()` renders straight from a
+  supplied x-vector, so a caller can enroll real voices and then interpolate /
+  morph / steer in that 1024-d identity space before speaking.
+
+**Standalone speaker encoder.** The Base ECAPA-TDNN extractor is also liftable
+out of the ~2.5 GB checkpoint: `brosoundml_build_speaker_encoder` packs it into a
+~18 MB two-file artifact, and the `SpeakerEncoder` class (`speaker_encoder.h`)
+loads just that to enroll a clip — bit-identical to `QwenTts::embed_speaker` —
+without touching the Talker, codec, or tokenizer it never needs.
+
+**Streaming, steering, and tracing.** `synthesize_stream()` decodes the growing
+code stream as the AR loop runs and hands each new 24 kHz chunk to an `on_chunk`
+sink (the codec is causal, so delivered samples never change). `QwenTtsSampling`
+exposes optional seeded sampling (temperature/top-p, reproducible per `seed`) and
+codebook-0 logit steering (repetition penalty, a logit bias, and an adaptive
+temperature that nudges only the frames where the model hedged); the default
+(temperature 0) stays the greedy, bit-exact upstream policy. Passing a
+`QwenTtsTrace*` to `synthesize()` captures the per-frame codes and codebook-0
+confidence for visualization at near-zero cost.
 
 The bundled codec is reachable directly: `encode_audio()` (waveform → RVQ codes)
 and `decode_codes()` (RVQ codes → 24 kHz waveform) are inverses that round-trip,
@@ -232,6 +278,57 @@ int crosses the tokenizer boundary; the caller still owns `build_prompt`/`decode
 `stft` + `complex_abs` + `matmul` (mel front-end), `conv1d`, `gelu`,
 `layer_norm`, MHA (composed via brosoundml's FP32 MHA / CrossAttention
 modules — see `modules.h`), `embedding_lookup`, `sample_logits` / `argmax`.
+
+## RAVE
+
+[RAVE](https://github.com/acids-ircam/RAVE) (Realtime Audio Variational
+autoEncoder, ACIDS/IRCAM) is a small (<20M-param), faster-than-realtime neural
+audio autoencoder. A multiband (PQMF) variational convolutional encoder
+compresses a waveform to a low-rate latent `z` of shape `(n_latent × frames)`; a
+residual upsampling decoder synthesises the waveform back. The latent axes are
+PCA-sorted by variance — dim 0 tracks loudness, dim 1 pitch/centroid, the rest
+timbre — so editing the per-dimension time series (the lab's use case) morphs the
+audio in musically meaningful ways. brosoundml runs **inference** of an exported
+RAVE v2 model; the whole forward pass composes brotensor's existing op surface,
+so a CUDA / Metal build runs on the GPU with no model-specific kernels.
+
+### Pipeline
+
+```
+   1. Convert   the exported streaming `.ts` (the cached_conv build used by the
+                nn~/VST) -> safetensors + config.json, offline, by
+                scripts/convert-rave.py. The loader reads that layout.
+   2. Encode    waveform -> PQMF analysis -> variational conv encoder -> PCA
+                crop -> latent (cropped_latent_size × frames). Deterministic:
+                the posterior mean, no reparameterisation sampling.
+   3. Decode    latent -> residual upsampling decoder -> deterministic waveform +
+                loudness branches -> PQMF synthesis -> waveform (sampling_rate Hz).
+                A single fresh-cache (offline causal) pass.
+```
+
+### Editing, noise, and stereo
+
+`encode()` / `decode()` round-trip a clip reproducibly — the right default for
+editing the latent curves. Two options extend the decoder:
+
+- **Stochastic noise synth** — `RaveDecodeOptions{add_noise = true}` adds RAVE's
+  third synthesis branch, an FFT filtered-noise synthesizer for breathy /
+  unvoiced / textural energy. Its white noise is redrawn each call, so pin it
+  with a `seed` (or inject a `noise` buffer) when you need reproducibility.
+- **Stereo decode** — RAVE has no stereo decoder; the VST runs the mono decoder
+  once per channel and the channels decorrelate only because the discarded latent
+  dims are padded with *independent* N(0,1) noise per channel. `decode_multi()`
+  reproduces that exactly: `latent_pad_std` is the per-channel pad std (RAVE-native
+  1.0; it doubles as the "stereo width" knob, 0 = identical to mono), each channel
+  drawn reproducibly from `seed`. Output is interleaved, dropping straight into an
+  interleaved sink.
+
+### brotensor op coverage
+
+PQMF analysis/synthesis and every encoder/decoder block are `conv1d` /
+`conv_transpose1d` + `batch_norm` + `leaky_relu` + `snake`; the waveform and
+loudness heads use `tanh` / `sigmoid` / `exp`; the optional noise branch is an
+`rfft` / `irfft` filtered-noise synth. RAVE adds no op brotensor lacks.
 
 ## Wake-word
 
