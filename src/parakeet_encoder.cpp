@@ -426,26 +426,30 @@ void ParakeetEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
     auto bias_ptr = [](const bt::Tensor& b) -> const bt::Tensor* {
         return b.rows > 0 ? &b : nullptr;
     };
+    // conv2d_forward args: (X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+    //   stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups, Y). The
+    //   depthwise stages MUST pass groups=ch — keep dil_h=dil_w=1 explicit so
+    //   `ch` lands in `groups`, not `dil_w`.
     int H = n_mels, W = frames;
     bt::Tensor y;
-    // layers[0]: Conv2d(1->ch, k, s2, p1) + ReLU.
+    // layers[0]: Conv2d(1 -> ch, k, s2, p1) + ReLU.
     bt::conv2d_forward(x, sub_conv_w[0], bias_ptr(sub_conv_b[0]),
-                       1, 1, H, W, ch, kk, kk, 2, 2, 1, 1, 1, 1, y);
+                       1, 1, H, W, ch, kk, kk, 2, 2, 1, 1, 1, 1, 1, y);
     H = conv_len(H); W = conv_len(W);
     bt::relu_forward(y, y);
-    // layers[2,3]: depthwise + pointwise + ReLU.
+    // layers[2,3]: depthwise (groups=ch) + pointwise + ReLU.
     bt::conv2d_forward(y, sub_conv_w[1], bias_ptr(sub_conv_b[1]),
-                       1, ch, H, W, ch, kk, kk, 2, 2, 1, 1, 1, ch, x);
+                       1, ch, H, W, ch, kk, kk, 2, 2, 1, 1, 1, 1, ch, x);
     H = conv_len(H); W = conv_len(W);
     bt::conv2d_forward(x, sub_conv_w[2], bias_ptr(sub_conv_b[2]),
-                       1, ch, H, W, ch, 1, 1, 1, 1, 0, 0, 1, 1, y);
+                       1, ch, H, W, ch, 1, 1, 1, 1, 0, 0, 1, 1, 1, y);
     bt::relu_forward(y, y);
-    // layers[5,6]: depthwise + pointwise + ReLU.
+    // layers[5,6]: depthwise (groups=ch) + pointwise + ReLU.
     bt::conv2d_forward(y, sub_conv_w[3], bias_ptr(sub_conv_b[3]),
-                       1, ch, H, W, ch, kk, kk, 2, 2, 1, 1, 1, ch, x);
+                       1, ch, H, W, ch, kk, kk, 2, 2, 1, 1, 1, 1, ch, x);
     H = conv_len(H); W = conv_len(W);
     bt::conv2d_forward(x, sub_conv_w[4], bias_ptr(sub_conv_b[4]),
-                       1, ch, H, W, ch, 1, 1, 1, 1, 0, 0, 1, 1, y);
+                       1, ch, H, W, ch, 1, 1, 1, 1, 0, 0, 1, 1, 1, y);
     bt::relu_forward(y, y);
 
     // Flatten (C=ch, F=H, T=W) -> (T, ch*H) and project to d_model. The conv
