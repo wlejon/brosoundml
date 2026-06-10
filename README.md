@@ -17,6 +17,10 @@ Models implemented (all complete, CPU FP32; CUDA where noted):
   token, 24 kHz output; CustomVoice presets, VoiceDesign instruct prompts, and
   Base-variant zero-shot voice cloning). Device-neutral CPU + CUDA.
 - **Whisper** — speech-to-text (HF transformers checkpoints, tiny → large-v3).
+- **Parakeet-TDT** — speech-to-text (NVIDIA FastConformer encoder + a
+  Token-and-Duration Transducer decoder; multilingual 0.6B-v3). Device-neutral
+  CPU + CUDA; emits token ids plus per-token encoder-frame positions for word
+  timestamps.
 - **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ low-rate
   PCA-sorted latent that the lab edits per-dimension. Device-neutral (CPU /
   CUDA / Metal); deterministic encode/decode plus the optional stochastic
@@ -28,7 +32,8 @@ brosoundml also ships an in-tree English **G2P** (`brosoundml::g2p::`) so Kokoro
 can phonemize text with no misaki/Python dependency.
 
 CLI tools drive each model end-to-end — `brosoundml_synth` (Kokoro),
-`brosoundml_transcribe` (Whisper), the `brosoundml_qwen_tts_*` tools
+`brosoundml_transcribe` (Whisper), `brosoundml_parakeet_transcribe` (Parakeet),
+the `brosoundml_qwen_tts_*` tools
 (bench / roundtrip / clone), `brosoundml_build_speaker_encoder` (pack the
 standalone Qwen voice-clone enroller), and the `brosoundml_wake_*` toolchain
 (synth / inspect / train / test / probe / melcmp). RAVE is a library-only model
@@ -278,6 +283,49 @@ int crosses the tokenizer boundary; the caller still owns `build_prompt`/`decode
 `stft` + `complex_abs` + `matmul` (mel front-end), `conv1d`, `gelu`,
 `layer_norm`, MHA (composed via brosoundml's FP32 MHA / CrossAttention
 modules — see `modules.h`), `embedding_lookup`, `sample_logits` / `argmax`.
+
+## Parakeet
+
+[NVIDIA Parakeet-TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) is a
+FastConformer encoder feeding a Token-and-Duration Transducer (TDT) decoder —
+the v3 0.6B model is multilingual (25 European languages). brosoundml targets
+the HF `transformers` `ParakeetForTDT` checkpoint (`config.json` +
+`model.safetensors`); the unified SentencePiece tokenizer (`tokenizer.json`,
+loaded by `brolm::t5::Tokenizer`) is the caller's, as with Whisper — brosoundml
+emits token ids plus their encoder-frame positions (×0.08 s) for word
+timestamps. `scripts/download-parakeet.sh` fetches the weights.
+
+### Pipeline
+
+```
+   1. Log-mel front-end  16 kHz mono PCM ─▶ (128-mel × T) log-mel. NeMo recipe:
+                         pre-emphasis 0.97, STFT (n_fft 512, win 400, hop 160,
+                         symmetric Hann), power, Slaney mel, log(x + 2^-24),
+                         per-feature mean/var normalization.
+   2. FastConformer enc  8x depthwise-separable conv2d subsampling, then 24
+                         Conformer blocks (½-FFN macaron, Transformer-XL
+                         relative-position attention, conv module
+                         [pointwise ▶ GLU ▶ depthwise k=9 ▶ BatchNorm ▶ SiLU ▶
+                         pointwise], ½-FFN, LayerNorm); a projector to width 640.
+   3. TDT decoder        a prediction network (token embedding + 2-layer LSTM +
+                         projection) and a joint network (relu(enc + dec) ▶
+                         token+duration logits). Greedy TDT decode emits a token
+                         and a frame-duration per step, skipping `duration`
+                         encoder frames at once — TDT's speed-up.
+```
+
+The relative-position attention rides `brotensor::self_attention_bias_forward`:
+the Transformer-XL content bias `pos_bias_u` folds into the Q-projection bias
+and the position term `rel_shift(Q_v · p)` is supplied as the additive
+attention bias. FP32 on CPU and CUDA — both reproduce the reference transcript.
+
+### brotensor op coverage
+
+`stft` + `complex_abs` + `matmul` (mel front-end), `conv2d` (subsampling +
+conv module, depthwise via groups), `silu`, `sigmoid`, `layer_norm`,
+`batch_norm_inference`, `self_attention_bias_forward` (rel-pos attention),
+`embedding_lookup`, `matmul`, `argmax`. No op brotensor lacks; the LSTM
+prediction network composes the cell from `matmul`/`sigmoid`/`tanh`.
 
 ## RAVE
 

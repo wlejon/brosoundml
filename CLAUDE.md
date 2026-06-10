@@ -6,7 +6,7 @@ TTS / STT / neural-codec / wake-word models, the same way `brodiffusion`
 composes the diffusion ops and `brolm` composes the text-model ops. One flat
 namespace, `brosoundml::`.
 
-**Status: operational.** Four model families are complete (CPU FP32; CUDA where
+**Status: operational.** Five model families are complete (CPU FP32; CUDA where
 noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
 
 - **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz).
@@ -14,6 +14,9 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   token, 24 kHz). Device-neutral CPU + CUDA; CustomVoice presets, VoiceDesign
   instruct prompts, Base-variant zero-shot voice cloning.
 - **Whisper** — speech-to-text (HF checkpoints, tiny → large-v3).
+- **Parakeet-TDT** — speech-to-text (NVIDIA FastConformer encoder + TDT
+  transducer decoder, multilingual 0.6B-v3). Device-neutral CPU + CUDA;
+  validated bit-faithful against the reference checkpoint.
 - **Wake-word** — BC-ResNet streaming keyword spotter + its training toolchain.
 
 Plus an in-tree English **G2P** (`brosoundml::g2p::`) so Kokoro phonemizes with
@@ -33,6 +36,8 @@ include/brosoundml/
                      configs, synthesize / synthesize_clone / encode/decode
   whisper.h          Whisper: WhisperConfig + the encoder/decoder pipeline
   whisper_modules.h  Whisper-specific modules (conv stems, cross-attn decoder)
+  parakeet.h         Parakeet-TDT: ParakeetConfig + the FastConformer/TDT
+                     pipeline (src/parakeet_modules.h holds the module graph)
   wake.h             WakeWord streaming detector (front-end + model + policy)
   bc_resnet.h        BC-ResNet wake model: forward, streaming, train_step
   bc_resnet2d.h      2D BC-ResNet variant (freq×time) + training surface
@@ -157,6 +162,7 @@ CLI drivers, built when brosoundml is the top-level project
 
 - `brosoundml_synth` — Kokoro text → WAV.
 - `brosoundml_transcribe` — Whisper WAV → text.
+- `brosoundml_parakeet_transcribe` — Parakeet-TDT WAV → text (+ `--timestamps`).
 - `brosoundml_qwen_tts_bench` / `_roundtrip` / `_clone` — Qwen3-TTS synthesis,
   codec encode↔decode round-trip, and zero-shot voice clone.
 - `brosoundml_wake_synth` / `_inspect` / `_train` / `_test` / `_probe` /
