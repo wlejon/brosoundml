@@ -45,6 +45,21 @@ struct SpotterConfig {
     int   min_phonemes   = 3;       // templates shorter than this never fire (noise floor).
     int   entry_silence_frames = 2; // a match may only BEGIN after >= this many recent
                                     // silence frames (word-boundary entry gate).
+    float emission_floor = 0.15f;   // per-frame log-posterior floor in the matcher: no
+                                    // single frame may drive a template phoneme's
+                                    // contribution below log(emission_floor). Frame-level
+                                    // posteriors for brief/transient phonemes (stop
+                                    // bursts, glides, flaps) are unreliable and routinely
+                                    // collapse to ~0; without a floor one such phoneme
+                                    // multiplicatively crushes the whole geometric-mean
+                                    // confidence to zero, so a CITATION template (enroll
+                                    // from g2p ids, where every canonical phoneme must
+                                    // align) can never fire even when the word is clearly
+                                    // present. The floor bounds that veto so the score
+                                    // degrades gracefully instead of underflowing. Must be
+                                    // < threshold (a garbage span where every template
+                                    // class is absent scores ~emission_floor, so the
+                                    // threshold still rejects it). 0 disables.
 };
 
 struct SpotEvent {

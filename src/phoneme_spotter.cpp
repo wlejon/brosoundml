@@ -52,6 +52,15 @@ struct TemplateMatcher {
     // DP arrays, length L+1 (index 0 = launch pad).
     std::vector<double>  S;
     std::vector<int>     N;
+    // Per-phoneme coverage on the best path reaching each state. Cov[j] = count
+    // of FULLY-PASSED phonemes (1..j-1) whose aligned run held >= 1 above-floor
+    // frame; Cur[j] = whether the CURRENT phoneme j's run has yet seen an
+    // above-floor frame. covered(j) = Cov[j] + Cur[j]. A template phoneme that is
+    // only ever matched at the emission floor (the model never actually emitted
+    // it) is NOT covered, so a fragment with whole phonemes absent can't fire
+    // even though the floor keeps its geometric-mean confidence finite.
+    std::vector<int>          Cov;
+    std::vector<std::uint8_t> Cur;
 
     // M-of-N smoothing ring of per-frame "confidence > threshold" flags.
     std::vector<std::uint8_t> hits_ring;
@@ -74,6 +83,8 @@ struct TemplateMatcher {
         const int L = this->L();
         S.assign(static_cast<std::size_t>(L) + 1, kNegInf);
         N.assign(static_cast<std::size_t>(L) + 1, 0);
+        Cov.assign(static_cast<std::size_t>(L) + 1, 0);
+        Cur.assign(static_cast<std::size_t>(L) + 1, 0u);
         refractory_frames = 0;
         furthest = 0;
         size_ring();
@@ -86,9 +97,17 @@ struct TemplateMatcher {
     bool step(const std::vector<float>& lp, bool gate_open, SpotEvent& out_ev) {
         const int L = this->L();
 
+        // Per-frame emission floor: a template phoneme's contribution is clamped
+        // to >= log(emission_floor) so an unreliable brief-phoneme posterior
+        // (~0) can't multiplicatively underflow the geometric-mean confidence.
+        const double log_floor = (policy.emission_floor > 0.0f)
+            ? std::log(static_cast<double>(policy.emission_floor)) : kNegInf;
+
         // Launch pad for this frame.
-        S[0] = gate_open ? 0.0 : kNegInf;
-        N[0] = 0;
+        S[0]   = gate_open ? 0.0 : kNegInf;
+        N[0]   = 0;
+        Cov[0] = 0;
+        Cur[0] = 0u;
 
         // Transitions: iterate j = L .. 1 so each candidate reads the PREVIOUS
         // frame's S[j-1]/N[j-1] (lower indices not yet touched this frame), and
@@ -98,14 +117,29 @@ struct TemplateMatcher {
             const double s_adv  = S[j - 1];    // previous frame (or launch pad)
             const double best   = s_stay > s_adv ? s_stay : s_adv;
             if (best == kNegInf) {
-                S[j] = kNegInf;
-                N[j] = 0;
+                S[j]   = kNegInf;
+                N[j]   = 0;
+                Cov[j] = 0;
+                Cur[j] = 0u;
                 continue;
             }
-            const int prevN = (s_adv > s_stay) ? N[j - 1] : N[j];
-            S[j] = best + static_cast<double>(lp[static_cast<std::size_t>(classes[
-                       static_cast<std::size_t>(j - 1)])]);
+            const bool   advance = (s_adv > s_stay);
+            const int    prevN    = advance ? N[j - 1] : N[j];
+            const double raw_emit = static_cast<double>(lp[static_cast<std::size_t>(
+                       classes[static_cast<std::size_t>(j - 1)])]);
+            const bool   above    = raw_emit > log_floor;   // phoneme actually emitted
+            const double emit     = (raw_emit < log_floor) ? log_floor : raw_emit;
+            S[j] = best + emit;
             N[j] = prevN + 1;
+            if (advance) {
+                // Entered phoneme j fresh: bank phoneme j-1's coverage, start j.
+                Cov[j] = Cov[j - 1] + (Cur[j - 1] ? 1 : 0);
+                Cur[j] = above ? 1u : 0u;
+            } else {
+                // Stayed on phoneme j: keep its completed-phoneme count, OR in this
+                // frame's coverage (a run is covered if ANY of its frames is above).
+                Cur[j] = (Cur[j] || above) ? 1u : 0u;
+            }
         }
 
         // Prefix progress: furthest finite state.
@@ -119,12 +153,14 @@ struct TemplateMatcher {
 
         // Completion confidence: geometric-mean posterior over the matched span.
         const bool complete = (S[L] != kNegInf) && (N[L] > 0);
+        const int  covered  = Cov[L] + (Cur[L] ? 1 : 0);  // phonemes actually emitted
         float conf = 0.0f;
         if (complete) {
             conf = static_cast<float>(std::exp(S[L] / static_cast<double>(N[L])));
             if (conf > 1.0f) conf = 1.0f;   // guard FP overshoot
         }
-        const bool frame_pos = complete && (conf > policy.threshold);
+        const bool frame_pos = complete && (covered >= policy.min_phonemes) &&
+                               (conf > policy.threshold);
 
         // Update the smoothing ring.
         const int w = policy.smoothing_window > 0 ? policy.smoothing_window : 1;
@@ -133,8 +169,13 @@ struct TemplateMatcher {
         ring_head = (ring_head + 1) % w;
         if (ring_len < w) ++ring_len;
 
-        // Fire test.
-        if (L >= policy.min_phonemes && complete && refractory_frames == 0) {
+        // Fire test. The template must be long enough (min_phonemes), fully
+        // aligned (complete), and — crucially for citation templates under the
+        // emission floor — at least min_phonemes of its phonemes must have been
+        // ACTUALLY emitted (covered), so a fragment whose missing phonemes are
+        // merely floored cannot complete a spurious match.
+        if (L >= policy.min_phonemes && complete && covered >= policy.min_phonemes &&
+            refractory_frames == 0) {
             int hits = 0;
             for (int i = 0; i < ring_len; ++i)
                 if (hits_ring[static_cast<std::size_t>(i)]) ++hits;
@@ -147,6 +188,8 @@ struct TemplateMatcher {
                 // the smoothing ring, and arm the refractory window.
                 S.assign(static_cast<std::size_t>(L) + 1, kNegInf);
                 N.assign(static_cast<std::size_t>(L) + 1, 0);
+                Cov.assign(static_cast<std::size_t>(L) + 1, 0);
+                Cur.assign(static_cast<std::size_t>(L) + 1, 0u);
                 furthest = 0;
                 size_ring();            // drop stale positive flags
                 refractory_frames = 0;  // set below from ms→frames by the owner
