@@ -79,11 +79,25 @@ inline const bt::Tensor& zero_bias(bt::Device dev, int rows, bt::Dtype dt) {
     return cache.back().t;
 }
 
-// Y = X @ W^T (+ bias). A null bias uses a cached zero bias on W's device/dtype.
+// Y = X @ W^T (+ bias). A null bias uses a cached zero bias on W's device.
+// The bias is always FP32: linear_forward_batched takes FP32 bias/X/Y with W
+// stored FP32 or 16-bit (the BF16 weight mode), never a 16-bit bias.
 inline void linear(const bt::Tensor& W, const bt::Tensor* bias,
                    const bt::Tensor& X, bt::Tensor& Y) {
-    const bt::Tensor& b = bias ? *bias : zero_bias(W.device, W.rows, W.dtype);
+    const bt::Tensor& b =
+        bias ? *bias : zero_bias(W.device, W.rows, bt::Dtype::FP32);
     bt::linear_forward_batched(W, b, X, Y);
+}
+
+// Narrow a linear weight back to the checkpoint's native BF16 (exact: the
+// load-time FP32 widening is lossless, so round-to-nearest restores the
+// on-disk bits). Only weights consumed by linear() take this path — biases,
+// norms and embeddings stay FP32, as do all activations and the KV cache.
+inline bt::Tensor narrow_bf16(bt::Tensor t, bool enable) {
+    if (!enable) return t;
+    bt::Tensor n;
+    bt::cast(t, n, bt::Dtype::BF16);
+    return n;
 }
 
 // Per-head RMSNorm over head_dim. X (n, heads*hd) viewed as (n*heads, hd),

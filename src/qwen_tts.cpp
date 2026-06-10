@@ -263,8 +263,10 @@ QwenTts::~QwenTts() = default;
 QwenTts::QwenTts(QwenTts&&) noexcept = default;
 QwenTts& QwenTts::operator=(QwenTts&&) noexcept = default;
 
-void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
+void QwenTts::load(const std::string& model_dir, brotensor::Device device,
+                   QwenTtsWeightPrecision precision) {
     brotensor::init();
+    const bool bf16_w = (precision == QwenTtsWeightPrecision::BF16);
 
     const fs::path dir          = model_dir;
     const fs::path cfg_path     = dir / "config.json";
@@ -307,9 +309,10 @@ void QwenTts::load(const std::string& model_dir, brotensor::Device device) {
                 ".input_layernorm.weight",
         }, "model.safetensors");
         // Stages 3-4: build the Talker + Code Predictor (the AR generator).
-        impl_->talker.load(w, impl_->config.talker, device);
+        impl_->talker.load(w, impl_->config.talker, device, bf16_w);
         impl_->code_pred.load(w, impl_->config.talker.code_predictor,
-                              impl_->config.talker.transformer.hidden_size, device);
+                              impl_->config.talker.transformer.hidden_size, device,
+                              bf16_w);
 
         // Base ships an ECAPA-TDNN speaker encoder (in this same checkpoint) for
         // the zero-shot voice clone. Loaded host-side (enrollment is one-shot).

@@ -93,9 +93,14 @@ struct QwenTtsTalker {
 
     // Build from the talker.* tensors of model.safetensors (BF16 -> FP32 on
     // `device`). q/k projections and q/k_norm are permuted into brotensor's
-    // adjacent-pair RoPE layout at load (see qwen_tts_talker.cpp).
+    // adjacent-pair RoPE layout at load (see qwen_tts_talker.cpp). With
+    // `bf16_weights` the projection / MLP / codec_head weights are narrowed
+    // back to the checkpoint's native BF16 after the permutation (exact
+    // roundtrip of the on-disk values); norms, biases, embeddings and all
+    // activations stay FP32.
     void load(const brotensor::safetensors::File& f, const QwenTtsTalkerConfig& cfg,
-              brotensor::Device device = brotensor::Device::CPU);
+              brotensor::Device device = brotensor::Device::CPU,
+              bool bf16_weights = false);
 
     // Prefill forward. `inputs_embeds` is T*hidden row-major (row t = frame t).
     // `pos3T` is the 3-axis M-RoPE position grid, axis-major: pos3T[a*T + t]

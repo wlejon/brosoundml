@@ -182,6 +182,16 @@ CUDA**: `load(device)` places the weights on the chosen backend, and because
 compute is FP32 on both, CUDA reproduces the CPU/upstream discrete-code stream
 bit-for-bit (the codec tail then matches to ~1e-5).
 
+`load(dir, device, QwenTtsWeightPrecision::BF16)` keeps the Talker / Code
+Predictor projection, MLP and head weights at the checkpoint's native BF16
+instead of widening them (activations, accumulation, norms, embeddings and the
+KV cache stay FP32) — halving the weight-read bandwidth that floors the
+autoregressive decode, ~1.3-1.4× end-to-end. The kernels widen each BF16
+weight to FP32 in register and accumulate in the same order as the FP32 path,
+so the output has matched FP32 mode byte-for-byte in practice; FP32 stays the
+fixture-gated reference. The `BROSOUNDML_QWEN_BF16` env var switches the
+qwen-tts tools to this mode.
+
 ### Pipeline
 
 ```

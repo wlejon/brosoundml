@@ -289,6 +289,22 @@ struct QwenTtsConfig {
     QwenTtsSpeakerEncoderConfig speaker_encoder;  // Base only (present == true)
 };
 
+// Storage precision for the Talker / Code Predictor linear weights.
+//   FP32 — widen everything to FP32 (the default). CPU and CUDA produce a
+//          bit-identical discrete code stream; the exact-match fixtures gate
+//          this mode.
+//   BF16 — keep the projection / MLP / head weights at the checkpoint's
+//          native BF16 (an exact roundtrip of the on-disk values); biases,
+//          norms, embeddings, activations, accumulation and the KV cache stay
+//          FP32. Halves the weight-read bandwidth that floors the
+//          autoregressive decode. In practice this matches FP32 mode
+//          bit-for-bit: the kernels widen each BF16 weight to FP32 in
+//          register — the same values FP32 mode loads — and traverse and
+//          accumulate in the same order (observed byte-identical waveforms).
+//          Equality is an empirical property of the current kernels, not a
+//          contract; FP32 remains the fixture-gated reference mode.
+enum class QwenTtsWeightPrecision { FP32, BF16 };
+
 // The Qwen3-TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -303,10 +319,13 @@ public:
 
     // Load config.json + model.safetensors and the bundled
     // speech_tokenizer/{config.json,model.safetensors} from `model_dir`,
-    // placing weights on `device`. Throws std::runtime_error on a missing /
-    // malformed model.
+    // placing weights on `device`. `precision` selects the Talker / Code
+    // Predictor weight storage (see QwenTtsWeightPrecision); the codec and
+    // speaker encoder are FP32 regardless. Throws std::runtime_error on a
+    // missing / malformed model.
     void load(const std::string& model_dir,
-              brotensor::Device device = brotensor::Device::CPU);
+              brotensor::Device device = brotensor::Device::CPU,
+              QwenTtsWeightPrecision precision = QwenTtsWeightPrecision::FP32);
 
     // Synthesize speech for `text` in `language`. The voice is chosen by variant:
     //   CustomVoice — pass a preset `speaker` name (see speakers()); `instruct`

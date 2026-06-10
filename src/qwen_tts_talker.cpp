@@ -52,6 +52,8 @@ bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
     return up(f, name, n, 1, dev);
 }
 
+using qtd::narrow_bf16;
+
 // Per-step scratch — every intermediate of one captured (n=1) decoder pass.
 // Persisting these lets the step run with no allocation, which is what makes
 // it CUDA-graph-capturable (capture forbids mid-capture allocation).
@@ -91,7 +93,7 @@ QwenTtsTalker::QwenTtsTalker(QwenTtsTalker&&) noexcept = default;
 QwenTtsTalker& QwenTtsTalker::operator=(QwenTtsTalker&&) noexcept = default;
 
 void QwenTtsTalker::load(const sf::File& f, const QwenTtsTalkerConfig& cfg,
-                         bt::Device dev) {
+                         bt::Device dev, bool bf16_weights) {
     step_state.reset();   // drop any stale decode session on reload
     num_layers   = cfg.transformer.num_hidden_layers;
     hidden       = cfg.transformer.hidden_size;
@@ -111,11 +113,11 @@ void QwenTtsTalker::load(const sf::File& f, const QwenTtsTalkerConfig& cfg,
     codec_embedding = up(f, P + "model.codec_embedding.weight", vocab, hidden, dev);
     text_embedding  = up(f, P + "model.text_embedding.weight", text_vocab, text_hidden, dev);
     final_norm      = up_vec(f, P + "model.norm.weight", hidden, dev);
-    tp_fc1_w = up(f, P + "text_projection.linear_fc1.weight", text_hidden, text_hidden, dev);
+    tp_fc1_w = narrow_bf16(up(f, P + "text_projection.linear_fc1.weight", text_hidden, text_hidden, dev), bf16_weights);
     tp_fc1_b = up_vec(f, P + "text_projection.linear_fc1.bias", text_hidden, dev);
-    tp_fc2_w = up(f, P + "text_projection.linear_fc2.weight", hidden, text_hidden, dev);
+    tp_fc2_w = narrow_bf16(up(f, P + "text_projection.linear_fc2.weight", hidden, text_hidden, dev), bf16_weights);
     tp_fc2_b = up_vec(f, P + "text_projection.linear_fc2.bias", hidden, dev);
-    codec_head = up(f, P + "codec_head.weight", vocab, hidden, dev);
+    codec_head = narrow_bf16(up(f, P + "codec_head.weight", vocab, hidden, dev), bf16_weights);
 
     // RoPE convention bridge: brotensor's rope_apply rotates adjacent pairs
     // (2i, 2i+1); HF Qwen rotates split-half pairs (i, i+half). Permute each
@@ -137,15 +139,15 @@ void QwenTtsTalker::load(const sf::File& f, const QwenTtsTalkerConfig& cfg,
         QwenTtsTalkerLayer& tl = layers[i];
         tl.in_ln   = up_vec(f, L + "input_layernorm.weight", hidden, dev);
         tl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", hidden, dev);
-        tl.qw      = qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm);
-        tl.kw      = qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm);
-        tl.vw      = up(f, L + "self_attn.v_proj.weight", kd, hidden, dev);
-        tl.ow      = up(f, L + "self_attn.o_proj.weight", hidden, qd, dev);
+        tl.qw      = narrow_bf16(qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm), bf16_weights);
+        tl.kw      = narrow_bf16(qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm), bf16_weights);
+        tl.vw      = narrow_bf16(up(f, L + "self_attn.v_proj.weight", kd, hidden, dev), bf16_weights);
+        tl.ow      = narrow_bf16(up(f, L + "self_attn.o_proj.weight", hidden, qd, dev), bf16_weights);
         tl.q_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.q_norm.weight", head_dim, dev), hd_perm);
         tl.k_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.k_norm.weight", head_dim, dev), hd_perm);
-        tl.gate    = up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev);
-        tl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev);
-        tl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev);
+        tl.gate    = narrow_bf16(up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev), bf16_weights);
+        tl.up      = narrow_bf16(up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev), bf16_weights);
+        tl.down    = narrow_bf16(up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev), bf16_weights);
     }
 }
 

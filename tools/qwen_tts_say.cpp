@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 using clk = std::chrono::steady_clock;
@@ -35,10 +36,14 @@ int main(int argc, char** argv) {
     const std::string language = argc > 4 ? argv[4] : "english";
     const std::string out      = argc > 5 ? argv[5] : "qwen_say.wav";
 
+    const bool bf16 = std::getenv("BROSOUNDML_QWEN_BF16") != nullptr;
+    const auto precision = bf16 ? brosoundml::QwenTtsWeightPrecision::BF16
+                                : brosoundml::QwenTtsWeightPrecision::FP32;
+
     brosoundml::QwenTts q;
     auto t0 = clk::now();
-    q.load(root, brotensor::Device::CUDA);
-    std::printf("load: %.0f ms\n", ms_since(t0));
+    q.load(root, brotensor::Device::CUDA, precision);
+    std::printf("load: %.0f ms%s\n", ms_since(t0), bf16 ? "  (BF16 weights)" : "");
 
     t0 = clk::now();
     brosoundml::AudioBuffer wav = q.synthesize(text, speaker, language);

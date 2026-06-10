@@ -89,9 +89,13 @@ struct QwenTtsCodePredictor {
     // — the width of the code embeddings and the conditioning hidden, which the
     // small_to_mtp_projection maps to the depth-transformer width when they
     // differ.
+    // With `bf16_weights` the projection / MLP / lm_head weights keep the
+    // checkpoint's native BF16 (see QwenTtsTalker::load); norms, biases,
+    // code embeddings and all activations stay FP32.
     void load(const brotensor::safetensors::File& f,
               const QwenTtsCodePredictorConfig& cfg, int talker_hidden,
-              brotensor::Device device = brotensor::Device::CPU);
+              brotensor::Device device = brotensor::Device::CPU,
+              bool bf16_weights = false);
 
     // Greedy expansion of one frame. `past_hidden` is the Talker hidden state
     // that produced codebook 0 (hidden floats); `c0_embed` is the Talker's

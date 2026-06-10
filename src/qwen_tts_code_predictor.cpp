@@ -261,7 +261,8 @@ QwenTtsCodePredictor::operator=(QwenTtsCodePredictor&&) noexcept = default;
 
 void QwenTtsCodePredictor::load(const sf::File& f,
                                 const QwenTtsCodePredictorConfig& cfg,
-                                int talker_hidden_, bt::Device dev) {
+                                int talker_hidden_, bt::Device dev,
+                                bool bf16_weights) {
     frame_state.reset();   // drop any stale per-instance decode state on reload
     num_layers      = cfg.transformer.num_hidden_layers;
     hidden          = cfg.transformer.hidden_size;
@@ -286,15 +287,18 @@ void QwenTtsCodePredictor::load(const sf::File& f,
     for (int j = 0; j < n_tables; ++j) {
         codec_embedding.push_back(
             up(f, P + "model.codec_embedding." + std::to_string(j) + ".weight", vocab, talker_hidden, dev));
-        lm_head.push_back(
-            up(f, P + "lm_head." + std::to_string(j) + ".weight", vocab, hidden, dev));
+        lm_head.push_back(qtd::narrow_bf16(
+            up(f, P + "lm_head." + std::to_string(j) + ".weight", vocab, hidden, dev),
+            bf16_weights));
     }
 
     // small_to_mtp_projection (Linear talker_hidden -> hidden + bias). Present
     // only when the widths differ (1.7B); an identity is omitted upstream (0.6B).
     has_mtp_proj = (talker_hidden != hidden);
     if (has_mtp_proj) {
-        mtp_proj_w = up(f, P + "small_to_mtp_projection.weight", hidden, talker_hidden, dev);
+        mtp_proj_w = qtd::narrow_bf16(
+            up(f, P + "small_to_mtp_projection.weight", hidden, talker_hidden, dev),
+            bf16_weights);
         mtp_proj_b = up_vec(f, P + "small_to_mtp_projection.bias", hidden, dev);
     }
 
@@ -314,15 +318,15 @@ void QwenTtsCodePredictor::load(const sf::File& f,
         QwenTtsCodePredictorLayer& cl = layers[i];
         cl.in_ln   = up_vec(f, L + "input_layernorm.weight", hidden, dev);
         cl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", hidden, dev);
-        cl.qw      = qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm);
-        cl.kw      = qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm);
-        cl.vw      = up(f, L + "self_attn.v_proj.weight", kd, hidden, dev);
-        cl.ow      = up(f, L + "self_attn.o_proj.weight", hidden, qd, dev);
+        cl.qw      = qtd::narrow_bf16(qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm), bf16_weights);
+        cl.kw      = qtd::narrow_bf16(qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm), bf16_weights);
+        cl.vw      = qtd::narrow_bf16(up(f, L + "self_attn.v_proj.weight", kd, hidden, dev), bf16_weights);
+        cl.ow      = qtd::narrow_bf16(up(f, L + "self_attn.o_proj.weight", hidden, qd, dev), bf16_weights);
         cl.q_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.q_norm.weight", head_dim, dev), hd_perm);
         cl.k_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.k_norm.weight", head_dim, dev), hd_perm);
-        cl.gate    = up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev);
-        cl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev);
-        cl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev);
+        cl.gate    = qtd::narrow_bf16(up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev), bf16_weights);
+        cl.up      = qtd::narrow_bf16(up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev), bf16_weights);
+        cl.down    = qtd::narrow_bf16(up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev), bf16_weights);
     }
 
     // Precompute the plain-RoPE cos/sin tables for the fixed depth positions

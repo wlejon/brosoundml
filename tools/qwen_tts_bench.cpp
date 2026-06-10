@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -38,12 +39,16 @@ int main(int argc, char** argv) {
     const std::string root = (argc > 1)
         ? argv[1] : std::string("weights/qwen-tts/0.6B-customvoice");
 
+    const bool bf16 = std::getenv("BROSOUNDML_QWEN_BF16") != nullptr;
+
     QwenTts q;
-    q.load(root, brotensor::Device::CUDA);
+    q.load(root, brotensor::Device::CUDA,
+           bf16 ? brosoundml::QwenTtsWeightPrecision::BF16
+                : brosoundml::QwenTtsWeightPrecision::FP32);
     const int K = q.config().codec.num_quantizers;
     const int win = q.config().codec.sliding_window;
-    std::printf("loaded %s on CUDA (K=%d codebooks, window=%d frames, 12.5 Hz)\n\n",
-                root.c_str(), K, win);
+    std::printf("loaded %s on CUDA (K=%d codebooks, window=%d frames, 12.5 Hz%s)\n\n",
+                root.c_str(), K, win, bf16 ? ", BF16 weights" : "");
 
     std::printf("== codec decode_codes (CUDA) ==\n");
     std::mt19937 rng(123);
