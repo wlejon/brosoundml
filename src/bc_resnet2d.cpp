@@ -181,21 +181,18 @@ void conv_forward(Conv2dLayer& c, const bt::Tensor& X, int H, int W,
 
     const int Wp = W + c.padLeftW;
     bt::Tensor padded = bt::Tensor::zeros_on(dev, 1, rows * Wp, bt::Dtype::FP32);
-    for (int r = 0; r < rows; ++r) {
-        if (use_cache && c.cache.size() > 0) {
-            bt::copy_d2d(c.cache, r * c.padLeftW, padded, r * Wp, c.padLeftW);
-        }
-        bt::copy_d2d(X, r * W, padded, r * Wp + c.padLeftW, W);
+    if (use_cache && c.cache.size() > 0) {
+        bt::copy_d2d_strided(c.cache, 0, c.padLeftW, padded, 0, Wp,
+                             c.padLeftW, rows);
     }
+    bt::copy_d2d_strided(X, 0, W, padded, c.padLeftW, Wp, W, rows);
     conv2d_forward(padded, c.W, &c.b, /*N=*/1, c.Cin, H, Wp, c.Cout,
                    c.kH, c.kW, c.sH, /*sw=*/1, c.padH, /*pad_w=*/0,
                    /*dil_h=*/1, c.dilW, c.groups, Y);
 
     if (use_cache && c.cache.size() > 0) {
-        for (int r = 0; r < rows; ++r) {
-            bt::copy_d2d(padded, r * Wp + (Wp - c.padLeftW),
-                         c.cache, r * c.padLeftW, c.padLeftW);
-        }
+        bt::copy_d2d_strided(padded, Wp - c.padLeftW, Wp,
+                             c.cache, 0, c.padLeftW, c.padLeftW, rows);
     }
 }
 
@@ -769,8 +766,7 @@ bt::Tensor left_pad_w(const bt::Tensor& X, int N, int C, int H, int W, int pad) 
     if (pad == 0) return X;
     bt::Tensor Y = bt::Tensor::zeros_on(X.device, N, C * H * (W + pad), bt::Dtype::FP32);
     const int rows = N * C * H;
-    for (int r = 0; r < rows; ++r)
-        bt::copy_d2d(X, r * W, Y, r * (W + pad) + pad, W);
+    bt::copy_d2d_strided(X, 0, W, Y, pad, W + pad, W, rows);
     return Y;
 }
 // Strip the leading `pad` time columns per (n,c,h) row: (N,C*H*(W+pad)) → (N,C*H*W).
@@ -778,8 +774,7 @@ bt::Tensor strip_left_pad_w(const bt::Tensor& X, int N, int C, int H, int W, int
     if (pad == 0) return X;
     bt::Tensor Y = bt::Tensor::empty_on(X.device, N, C * H * W, bt::Dtype::FP32);
     const int rows = N * C * H;
-    for (int r = 0; r < rows; ++r)
-        bt::copy_d2d(X, r * (W + pad) + pad, Y, r * W, W);
+    bt::copy_d2d_strided(X, pad, W + pad, Y, 0, W, W, rows);
     return Y;
 }
 

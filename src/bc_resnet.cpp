@@ -149,14 +149,10 @@ void conv_forward(ConvLayer& c, const bt::Tensor& X_in, int L_in,
     bt::Tensor joined = bt::Tensor::empty_on(X_in.device, 1,
                                              c.in_channels * L_total,
                                              bt::Dtype::FP32);
-    for (int ch = 0; ch < c.in_channels; ++ch) {
-        bt::copy_d2d(c.cache, ch * c.pad_left,
-                     joined,  ch * L_total,
-                     c.pad_left);
-        bt::copy_d2d(X_in,    ch * L_in,
-                     joined,  ch * L_total + c.pad_left,
-                     L_in);
-    }
+    bt::copy_d2d_strided(c.cache, 0, c.pad_left, joined, 0, L_total,
+                         c.pad_left, c.in_channels);
+    bt::copy_d2d_strided(X_in, 0, L_in, joined, c.pad_left, L_total,
+                         L_in, c.in_channels);
 
     // Valid conv (padding=0) over the joined buffer reproduces the causal
     // conv's outputs for the new L_in frames.
@@ -165,11 +161,8 @@ void conv_forward(ConvLayer& c, const bt::Tensor& X_in, int L_in,
                c.dilation, c.groups, Y);
 
     // Update cache to the trailing pad_left columns of joined (per channel).
-    for (int ch = 0; ch < c.in_channels; ++ch) {
-        bt::copy_d2d(joined, ch * L_total + (L_total - c.pad_left),
-                     c.cache, ch * c.pad_left,
-                     c.pad_left);
-    }
+    bt::copy_d2d_strided(joined, L_total - c.pad_left, L_total,
+                         c.cache, 0, c.pad_left, c.pad_left, c.in_channels);
 }
 
 // Apply BN (when still present) channel-wise to an NCL (1, C*L) tensor in
@@ -979,41 +972,23 @@ void bn_train_backward(BatchNorm1d& bn,
 // Left-pad an NCL tensor along L by `pad_left` zeros. Out shape (N, C*(L+pad)).
 // Left-pad an NCL tensor along L by `pad_left` zeros. Output (N, C*(L+pad)).
 //
-// brotensor doesn't have a single op for "pad along the inner axis" yet, and a
-// per-(n,c) copy_d2d loop would launch N*C kernels per call (slow due to
-// launch overhead at our batch sizes). The least-bad workaround on device is:
-//   1. memset-zero the output on device,
-//   2. copy_d2d each (n, c) row from src offset to dst offset + pad.
-// Returns a tensor on X.device. TODO: factor this into a brotensor
-// pad_inner_axis op so it's one launch per call instead of N*C.
+// Returns a tensor on X.device. One strided device copy covers all (n, c)
+// rows.
 bt::Tensor left_pad_ncl(const bt::Tensor& X, int N, int C, int L, int pad) {
     if (pad == 0) return X;                      // deep copy via copy-ctor
     bt::Tensor Y = bt::Tensor::zeros_on(X.device, N, C * (L + pad),
                                          bt::Dtype::FP32);
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const int src_off = (n * C + c) * L;
-            const int dst_off = (n * C + c) * (L + pad) + pad;
-            bt::copy_d2d(X, src_off, Y, dst_off, L);
-        }
-    }
+    bt::copy_d2d_strided(X, 0, L, Y, pad, L + pad, L, N * C);
     return Y;
 }
 
 // Strip the leading `pad` cols per (n,c) row from an NCL (N, C*(L+pad))
-// tensor, returning a fresh NCL (N, C*L) on X.device. Same per-(n,c)
-// copy_d2d pattern as left_pad_ncl; same TODO applies.
+// tensor, returning a fresh NCL (N, C*L) on X.device.
 bt::Tensor strip_left_pad_ncl(const bt::Tensor& X, int N, int C, int L,
                               int pad) {
     if (pad == 0) return X;
     bt::Tensor Y = bt::Tensor::empty_on(X.device, N, C * L, bt::Dtype::FP32);
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const int src_off = (n * C + c) * (L + pad) + pad;
-            const int dst_off = (n * C + c) * L;
-            bt::copy_d2d(X, src_off, Y, dst_off, L);
-        }
-    }
+    bt::copy_d2d_strided(X, pad, L + pad, Y, 0, L, L, N * C);
     return Y;
 }
 
