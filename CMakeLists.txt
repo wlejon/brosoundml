@@ -130,6 +130,7 @@ target_sources(brosoundml PRIVATE
     src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp
+    src/phoneme_data.cpp
     src/bc_resnet.cpp
     src/bc_resnet2d.cpp
     src/mel.cpp

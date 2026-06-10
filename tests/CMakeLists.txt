@@ -26,6 +26,7 @@ target_include_directories(brosoundml_test_kokoro_decoder_backward PRIVATE
     "${CMAKE_SOURCE_DIR}/src")
 brosoundml_add_test(brosoundml_test_wake     test_wake.cpp)
 brosoundml_add_test(brosoundml_test_wake_data test_wake_data.cpp)
+brosoundml_add_test(brosoundml_test_phoneme_data test_phoneme_data.cpp)
 brosoundml_add_test(brosoundml_test_wake_inspect test_wake_inspect.cpp)
 brosoundml_add_test(brosoundml_test_bc_resnet test_bc_resnet.cpp)
 brosoundml_add_test(brosoundml_test_bc_resnet_train test_bc_resnet_train.cpp)
