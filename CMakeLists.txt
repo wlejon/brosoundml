@@ -138,6 +138,8 @@ target_sources(brosoundml PRIVATE
     src/mel.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
+    src/parakeet.cpp
+    src/parakeet_encoder.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
