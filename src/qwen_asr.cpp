@@ -92,6 +92,12 @@ QwenAsrConfig parse_config(const std::string& config_path,
     c.audio_end_token_id   = int_at(tk, "audio_end_token_id", where);
     c.audio_token_id       = int_at(tk, "audio_token_id", where);
 
+    // Latent-tap geometry (the encode() surface): width is the decoder hidden
+    // (= output_dim); rate is the mel frame rate (sample_rate / hop, hop = 160)
+    // after the conv stem's 8x time downsample (three stride-2 convs).
+    c.latent_dim = c.output_dim;
+    c.latent_hz  = static_cast<float>(c.sample_rate) / 160.0f / 8.0f;
+
     // EOS set from generation_config.json when present (eos_token_id is an
     // id array there); the documented Qwen3-ASR pair otherwise.
     c.eos_token_ids = {151643, 151645};   // <|endoftext|>, <|im_end|>
@@ -142,6 +148,24 @@ QwenAsr& QwenAsr::operator=(QwenAsr&&) noexcept = default;
 const QwenAsrConfig& QwenAsr::config() const { return impl_->config; }
 bool QwenAsr::loaded() const { return impl_->loaded; }
 
+bt::Tensor QwenAsr::encode(const AudioBuffer& audio) const {
+    const std::string where = "QwenAsr::encode";
+    if (!impl_->loaded) fail(where, "load() not called");
+    bt::DeviceScope scope(impl_->device);
+    bt::Tensor latents;
+    impl_->encoder.forward(audio, latents);   // (T, latent_dim) on the model device
+    return latents;
+}
+
+int QwenAsr::encode_to_host(const AudioBuffer& audio,
+                            std::vector<float>& out) const {
+    const bt::Tensor latents = encode(audio);
+    const int T = latents.rows;
+    out.resize(static_cast<std::size_t>(T) * latents.cols);
+    qtd::to_host(latents, out.data());
+    return T;
+}
+
 void QwenAsr::load(const std::string& model_dir, bt::Device device) {
     const std::string where = "QwenAsr::load";
     const fs::path dir(model_dir);
@@ -173,8 +197,8 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
     bt::DeviceScope scope(dev);
 
     // ── 1. audio -> encoder hidden states ──
-    bt::Tensor audio_embeds;
-    im.encoder.forward(audio, audio_embeds);   // (n_audio, hidden)
+    // Exactly the latent tap encode() exposes — one encoder path, not two.
+    bt::Tensor audio_embeds = encode(audio);   // (n_audio, latent_dim)
     const int n_audio = audio_embeds.rows;
 
     // ── 2. chat-template prompt around the audio block ──

@@ -85,6 +85,17 @@ struct QwenAsrConfig {
     int audio_end_token_id   = 0;       // 151670  <|audio_end|>
     int audio_token_id       = 0;       // 151676  <|audio_pad|>
     std::vector<int32_t> eos_token_ids; // {151643, 151645}
+
+    // ── latent-tap geometry (the encode() surface) ──
+    // The post-projector latents encode() emits are (T, latent_dim) at
+    // latent_hz frames/second — exactly the rows the decoder consumes over the
+    // <|audio_pad|> block. latent_dim == output_dim (the decoder hidden width);
+    // latent_hz is the encoder's token rate: the mel front-end runs at
+    // sample_rate / 160 frames/s and the Conv2d stem downsamples time 8x
+    // (three stride-2 convs), so latent_hz = sample_rate / 160 / 8 = 12.5 Hz at
+    // 16 kHz. Both are derived by load(); they are 0 before a load.
+    int   latent_dim = 0;               // = output_dim (1024)
+    float latent_hz  = 0.0f;            // 12.5 (latents per second)
 };
 
 // The Qwen3-ASR pipeline. Construct, load() a model directory, then
@@ -146,6 +157,22 @@ public:
     // audio shorter than one mel hop (10 ms).
     Transcription transcribe(const AudioBuffer& audio,
                              const TranscribeOptions& opts = {}) const;
+
+    // Latent tap: run the AuT encoder + projector ONLY (no decoder) and return
+    // the post-projector latents as a (T, config().latent_dim) FP32 tensor on
+    // the model device, at config().latent_hz frames/second. These are exactly
+    // the rows transcribe() splices into the decoder over the <|audio_pad|>
+    // block — transcribe() calls encode() internally, so there is one encoder
+    // path, not two. Throws before load() or on the same audio errors as
+    // transcribe(). Same sample-rate / minimum-length contract.
+    brotensor::Tensor encode(const AudioBuffer& audio) const;
+
+    // Host-copy latent tap: same latents as encode(), copied into `out` as a
+    // row-major (T, latent_dim) FP32 buffer (resized to T*latent_dim) on the
+    // host regardless of the model device, and T returned. A bridge harness
+    // that drives a decoder on a different device/library (e.g. brolm) needs
+    // the latents on the host before re-uploading them to its own device.
+    int encode_to_host(const AudioBuffer& audio, std::vector<float>& out) const;
 
     const QwenAsrConfig& config() const;
     bool loaded() const;

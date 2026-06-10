@@ -203,6 +203,38 @@ static int run() {
                             dev_name, max_d, mean_d);
                 CHECK(max_d < 2e-2f, "encoder output matches upstream");
             }
+
+            // The public latent tap must be the SAME path as the white-box
+            // encoder (encode() just wraps it) — bit-exact, not merely close —
+            // and carry the documented geometry.
+            CHECK(asr.config().latent_dim == fx.enc_dim,
+                  "config.latent_dim == encoder width");
+            CHECK(std::fabs(asr.config().latent_hz - 12.5f) < 1e-4f,
+                  "config.latent_hz == 12.5");
+            bt::Tensor lat = asr.encode(audio);
+            CHECK(lat.rows == fx.n_audio && lat.cols == asr.config().latent_dim,
+                  "encode() shape == (n_audio, latent_dim)");
+            if (lat.rows == out.rows && lat.cols == out.cols) {
+                float max_d = 0.0f, mean_d = 0.0f;
+                bt::Tensor out_host = (out.device == bt::Device::CPU)
+                                          ? out : out.to(bt::Device::CPU);
+                diff_stats(lat, out_host.host_f32(), out_host.size(),
+                           max_d, mean_d);
+                CHECK(max_d == 0.0f, "encode() bit-matches the encoder forward");
+            }
+
+            // Host-copy accessor returns the same rows on the host.
+            std::vector<float> host;
+            const int T = asr.encode_to_host(audio, host);
+            CHECK(T == fx.n_audio, "encode_to_host row count");
+            CHECK(host.size() ==
+                      static_cast<std::size_t>(T) * asr.config().latent_dim,
+                  "encode_to_host buffer size");
+            if (T == out.rows) {
+                float max_d = 0.0f, mean_d = 0.0f;
+                diff_stats(lat, host.data(), host.size(), max_d, mean_d);
+                CHECK(max_d == 0.0f, "encode_to_host matches encode()");
+            }
         }
 
         // 3. prefill logits at the last prompt position.
