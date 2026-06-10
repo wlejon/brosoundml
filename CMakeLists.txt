@@ -181,6 +181,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_qwen_asr_transcribe tools/qwen_asr_transcribe.cpp)
     target_link_libraries(brosoundml_qwen_asr_transcribe PRIVATE brosoundml)
 
+    add_executable(brosoundml_parakeet_transcribe tools/parakeet_transcribe.cpp)
+    target_link_libraries(brosoundml_parakeet_transcribe PRIVATE brosoundml)
+
     add_executable(brosoundml_wake_synth tools/wake_synth.cpp)
     target_link_libraries(brosoundml_wake_synth PRIVATE brosoundml)
 
