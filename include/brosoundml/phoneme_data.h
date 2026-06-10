@@ -291,4 +291,72 @@ bool report_passes(const PhonemeDatasetReport& r, const PhonemeClassMap& cm,
 void print_report(const PhonemeDatasetReport& r, const PhonemeClassMap& cm,
                   std::FILE* out);
 
+// ─── E. Binary mel-feature cache (BPMC) ─────────────────────────────────────
+//
+// Precomputed front-end features: exactly what phoneme_train builds in host
+// memory at startup (per-clip mel (n_mels, n_frames) freq-major + the frame
+// label track), serialized so large corpora load with one sequential read
+// instead of a long per-clip mel pass. Magic 'B''P''M''C' as a u32, first
+// char in the low byte. Version 1:
+//   u32 magic, u32 version, u32 sample_rate, u32 n_fft, u32 win_length,
+//   u32 hop_length, u32 n_mels, u32 compression, <classmap blob>,
+//   u32 clip_count
+// Then `clip_count` clips, each:
+//   i32 n_frames, n_mels*n_frames * f32 mel (freq-major: row m spans
+//   [m*n_frames, (m+1)*n_frames)), n_frames * i16 labels.
+// `compression` mirrors MelCompression (0 = Log, 1 = PCEN). Unlike BPDS there
+// is no PCM and no framing invariant to re-derive — n_frames is authoritative.
+constexpr std::uint32_t kMagicBPMC   = 0x434D5042u;  // 'B''P''M''C'
+constexpr std::uint32_t kBPMCVersion = 1u;
+
+// Incremental writer, mirroring PhonemeDatasetWriter: header up front with a
+// clip-count placeholder patched on finalize(); clips streamed via append()
+// so a corpus-sized cache never has to fit in memory while being built.
+class PhonemeMelCacheWriter {
+ public:
+    PhonemeMelCacheWriter(const std::string& path,
+                          const PhonemeDatasetHeader& header,
+                          std::uint32_t compression,
+                          const PhonemeClassMap& class_map);
+    ~PhonemeMelCacheWriter();
+
+    // Append one clip: freq-major mel of size n_mels*labels.size() + labels.
+    // Throws if the mel size is not an exact n_mels multiple matching labels.
+    void append(const std::vector<float>& mel,
+                const std::vector<int16_t>& labels);
+
+    void finalize();
+
+    int                clips() const { return clips_; }
+    const std::string& path()  const { return path_; }
+
+ private:
+    std::string          path_;
+    void*                fp_ = nullptr;   // FILE*, opaque
+    PhonemeDatasetHeader header_;
+    int                  clips_ = 0;
+    long                 clip_count_pos_ = 0;
+    bool                 finalized_ = false;
+};
+
+struct PhonemeMelClip {
+    std::vector<float>   mel;       // n_mels * n_frames, freq-major
+    std::vector<int16_t> labels;    // n_frames
+};
+
+struct PhonemeMelCache {
+    PhonemeDatasetHeader        header;
+    std::uint32_t               compression = 1;   // MelCompression as u32
+    PhonemeClassMap             class_map;
+    std::vector<PhonemeMelClip> clips;
+};
+
+// Parse + validate a BPMC file. Throws on bad magic/version, truncation, or a
+// mel/label size mismatch.
+PhonemeMelCache read_phoneme_melcache(const std::string& path);
+
+// Leading u32 of a file (0 if it cannot be read) — lets tools sniff BPDS vs
+// BPMC entries in a mixed --dataset list.
+std::uint32_t peek_dataset_magic(const std::string& path);
+
 }  // namespace brosoundml

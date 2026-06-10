@@ -266,79 +266,117 @@ int main(int argc, char** argv) try {
     for (const auto& p : ds_paths)
         if (!fs::exists(p)) fail("phoneme_train", "dataset not found at '" + p + "'");
 
-    auto ds = bsm::read_phoneme_dataset(ds_paths[0]);
-    for (std::size_t i = 1; i < ds_paths.size(); ++i) {
-        auto extra = bsm::read_phoneme_dataset(ds_paths[i]);
-        if (!(extra.class_map == ds.class_map))
-            fail("phoneme_train", "class map mismatch in '" + ds_paths[i] + "'");
-        const auto& h = ds.header; const auto& e = extra.header;
-        if (e.sample_rate != h.sample_rate || e.n_fft != h.n_fft ||
-            e.win_length != h.win_length || e.hop_length != h.hop_length ||
-            e.n_mels != h.n_mels)
-            fail("phoneme_train", "header framing mismatch in '" + ds_paths[i] + "'");
-        std::cout << "               + shard '" << ds_paths[i] << "' (+"
-                  << extra.clips.size() << " clips)\n";
-        for (auto& c : extra.clips) ds.clips.push_back(std::move(c));
+    // Each entry may be a BPDS shard (PCM + labels; PCEN mel computed here) or
+    // a BPMC cache from phoneme_melcache (mel features pre-extracted; loads
+    // with one sequential read). Mixed lists are fine; every shard must share
+    // the SAME class map and mel framing.
+    struct DsMeta { bsm::PhonemeDatasetHeader header; bsm::PhonemeClassMap class_map; };
+    DsMeta ds;
+    bool have_meta = false;
+    std::vector<ClipFeat> feats;
+    std::size_t total_frames = 0;
+    const auto t_load0 = std::chrono::steady_clock::now();
+
+    auto adopt_or_check = [&](const bsm::PhonemeDatasetHeader& h,
+                              const bsm::PhonemeClassMap& cmap,
+                              const std::string& path) {
+        if (!have_meta) { ds.header = h; ds.class_map = cmap; have_meta = true; return; }
+        if (!(cmap == ds.class_map))
+            fail("phoneme_train", "class map mismatch in '" + path + "'");
+        const auto& g = ds.header;
+        if (h.sample_rate != g.sample_rate || h.n_fft != g.n_fft ||
+            h.win_length != g.win_length || h.hop_length != g.hop_length ||
+            h.n_mels != g.n_mels)
+            fail("phoneme_train", "header framing mismatch in '" + path + "'");
+    };
+
+    for (const auto& path : ds_paths) {
+        const std::uint32_t magic = bsm::peek_dataset_magic(path);
+        if (magic == bsm::kMagicBPMC) {
+            auto mc = bsm::read_phoneme_melcache(path);
+            if (mc.compression !=
+                static_cast<std::uint32_t>(bsm::MelCompression::PCEN))
+                fail("phoneme_train",
+                     "'" + path + "' is not a PCEN cache (compression=" +
+                     std::to_string(mc.compression) + ")");
+            adopt_or_check(mc.header, mc.class_map, path);
+            std::cout << "               + cache '" << path << "' (+"
+                      << mc.clips.size() << " clips)\n";
+            feats.reserve(feats.size() + mc.clips.size());
+            for (auto& c : mc.clips) {
+                ClipFeat cf;
+                cf.n_frames = static_cast<int>(c.labels.size());
+                cf.mel = std::move(c.mel);
+                cf.labels.assign(c.labels.begin(), c.labels.end());
+                total_frames += static_cast<std::size_t>(cf.n_frames);
+                feats.push_back(std::move(cf));
+            }
+        } else if (magic == bsm::kMagicBPDS) {
+            auto shard = bsm::read_phoneme_dataset(path);
+            adopt_or_check(shard.header, shard.class_map, path);
+            std::cout << "               + shard '" << path << "' (+"
+                      << shard.clips.size() << " clips)\n";
+
+            bsm::MelConfig mcfg;
+            mcfg.sample_rate = shard.header.sample_rate;
+            mcfg.n_fft       = shard.header.n_fft;
+            mcfg.win_length  = shard.header.win_length;
+            mcfg.hop_length  = shard.header.hop_length;
+            mcfg.n_mels      = shard.header.n_mels;
+            mcfg.compression = bsm::MelCompression::PCEN;
+            bsm::MelFrontend mel(mcfg, bt::Device::CPU);
+            const int nm = shard.header.n_mels;
+
+            feats.reserve(feats.size() + shard.clips.size());
+            for (const auto& clip : shard.clips) {
+                const auto pcm = clip.pcm_float();
+                bt::Tensor out;   // (n_mels, T_mel)
+                mel.reset();
+                mel.compute_offline(pcm.data(), static_cast<int>(pcm.size()), out);
+                const int Tmel = out.cols;
+                ClipFeat cf;
+                cf.n_frames = Tmel;
+                cf.mel.assign(static_cast<std::size_t>(nm) * Tmel, 0.0f);
+                std::memcpy(cf.mel.data(), out.host_f32(),
+                            cf.mel.size() * sizeof(float));
+                // The BPDS label track is already frame-aligned to this framing;
+                // align defensively to the mel frame count (clamp/truncate).
+                cf.labels.resize(static_cast<std::size_t>(Tmel), 0);
+                const int nlab = static_cast<int>(clip.labels.size());
+                for (int t = 0; t < Tmel; ++t) {
+                    cf.labels[static_cast<std::size_t>(t)] = (t < nlab)
+                        ? static_cast<int>(clip.labels[static_cast<std::size_t>(t)])
+                        : 0;
+                }
+                total_frames += static_cast<std::size_t>(Tmel);
+                feats.push_back(std::move(cf));
+            }
+        } else {
+            fail("phoneme_train", "'" + path + "' is neither BPDS nor BPMC");
+        }
     }
+
     const int K = ds.class_map.num_classes;
     const int n_mels = ds.header.n_mels;
     const int T = a.train_frames;
-    if (ds.clips.empty()) fail("phoneme_train", "dataset has no clips");
-    if (K < 2)            fail("phoneme_train", "class map has K<2");
+    if (feats.empty()) fail("phoneme_train", "dataset has no clips");
+    if (K < 2)         fail("phoneme_train", "class map has K<2");
 
-    std::cout << "phoneme_train: dataset='" << a.dataset << "'\n"
-              << "               device=" << dev_name
-              << "  clips=" << ds.clips.size()
-              << "  K=" << K << "  n_mels=" << n_mels
-              << "  train_frames=" << T << "\n";
-
-    // ── PCEN mel front-end from the dataset header ──
-    bsm::MelConfig mcfg;
-    mcfg.sample_rate = ds.header.sample_rate;
-    mcfg.n_fft       = ds.header.n_fft;
-    mcfg.win_length  = ds.header.win_length;
-    mcfg.hop_length  = ds.header.hop_length;
-    mcfg.n_mels      = ds.header.n_mels;
-    mcfg.compression = bsm::MelCompression::PCEN;
-    bsm::MelFrontend mel(mcfg, bt::Device::CPU);
-
-    // ── Extract PCEN mel + labels for every clip ONCE into host memory ──
-    std::vector<ClipFeat> feats(ds.clips.size());
     {
-        const auto t0 = std::chrono::steady_clock::now();
-        std::size_t total_frames = 0;
-        for (std::size_t ci = 0; ci < ds.clips.size(); ++ci) {
-            const auto& clip = ds.clips[ci];
-            const auto pcm = clip.pcm_float();
-            bt::Tensor out;   // (n_mels, T_mel)
-            mel.compute_offline(pcm.data(), static_cast<int>(pcm.size()), out);
-            const int Tmel = out.cols;
-            ClipFeat cf;
-            cf.n_frames = Tmel;
-            cf.mel.assign(static_cast<std::size_t>(n_mels) * Tmel, 0.0f);
-            std::memcpy(cf.mel.data(), out.host_f32(),
-                        cf.mel.size() * sizeof(float));
-            // The BPDS label track is already frame-aligned to this framing;
-            // align defensively to the mel frame count (clamp/truncate).
-            cf.labels.resize(static_cast<std::size_t>(Tmel), 0);
-            const int nlab = static_cast<int>(clip.labels.size());
-            for (int t = 0; t < Tmel; ++t) {
-                cf.labels[static_cast<std::size_t>(t)] = (t < nlab)
-                    ? static_cast<int>(clip.labels[static_cast<std::size_t>(t)])
-                    : 0;
-            }
-            total_frames += static_cast<std::size_t>(Tmel);
-            feats[ci] = std::move(cf);
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        std::cout << "               mel extracted: " << total_frames
+        const auto t_load1 = std::chrono::steady_clock::now();
+        std::cout << "phoneme_train: dataset='" << a.dataset << "'\n"
+                  << "               device=" << dev_name
+                  << "  clips=" << feats.size()
+                  << "  K=" << K << "  n_mels=" << n_mels
+                  << "  train_frames=" << T << "\n"
+                  << "               features ready: " << total_frames
                   << " frames in "
                   << std::chrono::duration_cast<std::chrono::milliseconds>(
-                        t1 - t0).count() << " ms (in-memory)\n";
+                        t_load1 - t_load0).count() << " ms (in-memory)\n";
     }
 
     // ── Deterministic clip-level train/val split ──
-    std::vector<int> all(ds.clips.size());
+    std::vector<int> all(feats.size());
     for (int i = 0; i < static_cast<int>(all.size()); ++i) all[i] = i;
     {
         std::mt19937 rng(static_cast<std::uint32_t>(a.seed) ^ 0xC3C3C3C3u);

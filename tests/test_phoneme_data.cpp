@@ -357,6 +357,62 @@ int main() {
               "validate: length-mismatch dataset fails");
     }
 
+    // ─── 6. BPMC mel-cache round-trip ───────────────────────────────────────
+    {
+        fs::path mc_path = fs::temp_directory_path() / "brosoundml_phoneme.bpmc";
+        // Two synthetic "mel" clips with distinct frame counts; freq-major.
+        const int nm = hdr.n_mels;
+        std::vector<std::vector<float>>   mels(2);
+        std::vector<std::vector<int16_t>> mlabs(2);
+        const int nf[2] = {23, 48};
+        for (int c = 0; c < 2; ++c) {
+            mels[c].resize(static_cast<std::size_t>(nm) * nf[c]);
+            for (std::size_t i = 0; i < mels[c].size(); ++i)
+                mels[c][i] = 0.01f * static_cast<float>(i % 97) + c;
+            mlabs[c].resize(static_cast<std::size_t>(nf[c]));
+            for (int t = 0; t < nf[c]; ++t)
+                mlabs[c][static_cast<std::size_t>(t)] =
+                    static_cast<int16_t>(t % ds_cm.num_classes);
+        }
+        {
+            brosoundml::PhonemeMelCacheWriter w(mc_path.string(), hdr,
+                                                /*compression=*/1u, ds_cm);
+            w.append(mels[0], mlabs[0]);
+            w.append(mels[1], mlabs[1]);
+            w.finalize();
+            CHECK(w.clips() == 2, "melcache writer: clip count tracked");
+
+            bool threw = false;
+            try { w.append(mels[0], mlabs[0]); } catch (...) { threw = true; }
+            CHECK(threw, "melcache writer: append after finalize throws");
+        }
+        CHECK(brosoundml::peek_dataset_magic(mc_path.string()) ==
+              brosoundml::kMagicBPMC, "melcache: magic sniff -> BPMC");
+        CHECK(brosoundml::peek_dataset_magic(ds_path.string()) ==
+              brosoundml::kMagicBPDS, "melcache: magic sniff -> BPDS");
+
+        auto mc = brosoundml::read_phoneme_melcache(mc_path.string());
+        CHECK(mc.header.sample_rate == hdr.sample_rate &&
+              mc.header.n_mels == hdr.n_mels, "melcache: header preserved");
+        CHECK(mc.compression == 1u, "melcache: compression preserved");
+        CHECK(mc.class_map == ds_cm, "melcache: class map preserved");
+        CHECK(mc.clips.size() == 2, "melcache: clip count preserved");
+        bool mel_ok = true, lab_ok = true;
+        for (std::size_t c = 0; c < mc.clips.size(); ++c) {
+            if (mc.clips[c].mel != mels[c])   mel_ok = false;
+            if (mc.clips[c].labels != mlabs[c]) lab_ok = false;
+        }
+        CHECK(mel_ok, "melcache: mel payload bit-exact");
+        CHECK(lab_ok, "melcache: labels bit-exact");
+
+        bool wrong_magic_threw = false;
+        try { brosoundml::read_phoneme_melcache(ds_path.string()); }
+        catch (...) { wrong_magic_threw = true; }
+        CHECK(wrong_magic_threw, "melcache: reading a BPDS as BPMC throws");
+
+        std::error_code ec; fs::remove(mc_path, ec);
+    }
+
     {
         std::error_code ec; fs::remove(ds_path, ec);
     }

@@ -220,6 +220,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_phoneme_align tools/phoneme_align.cpp)
     target_link_libraries(brosoundml_phoneme_align PRIVATE brosoundml)
 
+    add_executable(brosoundml_phoneme_melcache tools/phoneme_melcache.cpp)
+    target_link_libraries(brosoundml_phoneme_melcache PRIVATE brosoundml)
+
+    add_executable(brosoundml_phoneme_aug tools/phoneme_aug.cpp)
+    target_link_libraries(brosoundml_phoneme_aug PRIVATE brosoundml)
+
     add_executable(brosoundml_qwen_tts_bench tools/qwen_tts_bench.cpp)
     target_link_libraries(brosoundml_qwen_tts_bench PRIVATE brosoundml)
 
@@ -228,6 +234,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_qwen_tts_clone tools/qwen_tts_clone.cpp)
     target_link_libraries(brosoundml_qwen_tts_clone PRIVATE brosoundml)
+
+    add_executable(brosoundml_qwen_tts_say tools/qwen_tts_say.cpp)
+    target_link_libraries(brosoundml_qwen_tts_say PRIVATE brosoundml)
 
     add_executable(brosoundml_build_speaker_encoder tools/build_speaker_encoder.cpp)
     target_link_libraries(brosoundml_build_speaker_encoder PRIVATE brosoundml)

@@ -765,4 +765,153 @@ void print_report(const PhonemeDatasetReport& r, const PhonemeClassMap& cm,
     }
 }
 
+// ─── E. BPMC mel-feature cache ──────────────────────────────────────────────
+
+PhonemeMelCacheWriter::PhonemeMelCacheWriter(const std::string& path,
+                                             const PhonemeDatasetHeader& header,
+                                             std::uint32_t compression,
+                                             const PhonemeClassMap& class_map)
+    : path_(path), header_(header) {
+    if (header_.n_mels <= 0)
+        fail("PhonemeMelCacheWriter::PhonemeMelCacheWriter",
+             "n_mels must be positive");
+    std::FILE* f = nullptr;
+#if defined(_MSC_VER)
+    if (fopen_s(&f, path.c_str(), "wb") != 0) f = nullptr;
+#else
+    f = std::fopen(path.c_str(), "wb");
+#endif
+    if (!f) fail("PhonemeMelCacheWriter::PhonemeMelCacheWriter",
+                 "cannot open '" + path + "' for write");
+    fp_ = f;
+
+    w_u32(f, kMagicBPMC);
+    w_u32(f, kBPMCVersion);
+    w_u32(f, static_cast<std::uint32_t>(header_.sample_rate));
+    w_u32(f, static_cast<std::uint32_t>(header_.n_fft));
+    w_u32(f, static_cast<std::uint32_t>(header_.win_length));
+    w_u32(f, static_cast<std::uint32_t>(header_.hop_length));
+    w_u32(f, static_cast<std::uint32_t>(header_.n_mels));
+    w_u32(f, compression);
+    write_classmap(f, class_map);
+    clip_count_pos_ = std::ftell(f);
+    w_u32(f, 0u);   // clip_count placeholder, patched by finalize()
+}
+
+PhonemeMelCacheWriter::~PhonemeMelCacheWriter() {
+    try { finalize(); } catch (...) { /* never throw from a destructor */ }
+    if (fp_) {
+        std::fclose(static_cast<std::FILE*>(fp_));
+        fp_ = nullptr;
+    }
+}
+
+void PhonemeMelCacheWriter::append(const std::vector<float>& mel,
+                                   const std::vector<int16_t>& labels) {
+    if (!fp_ || finalized_)
+        fail("PhonemeMelCacheWriter::append", "writer is closed");
+    std::FILE* f = static_cast<std::FILE*>(fp_);
+
+    const std::size_t n_frames = labels.size();
+    if (mel.size() != static_cast<std::size_t>(header_.n_mels) * n_frames)
+        fail("PhonemeMelCacheWriter::append",
+             "mel size " + std::to_string(mel.size()) + " != n_mels(" +
+             std::to_string(header_.n_mels) + ") * n_frames(" +
+             std::to_string(n_frames) + ")");
+
+    w_i32(f, static_cast<std::int32_t>(n_frames));
+    if (!mel.empty() &&
+        std::fwrite(mel.data(), sizeof(float), mel.size(), f) != mel.size())
+        fail("PhonemeMelCacheWriter::append", "short write (mel)");
+    if (n_frames &&
+        std::fwrite(labels.data(), sizeof(int16_t), n_frames, f) != n_frames)
+        fail("PhonemeMelCacheWriter::append", "short write (labels)");
+    ++clips_;
+}
+
+void PhonemeMelCacheWriter::finalize() {
+    if (finalized_ || !fp_) return;
+    std::FILE* f = static_cast<std::FILE*>(fp_);
+    if (std::fflush(f) != 0)
+        fail("PhonemeMelCacheWriter::finalize", "flush failed");
+    if (std::fseek(f, clip_count_pos_, SEEK_SET) != 0)
+        fail("PhonemeMelCacheWriter::finalize", "seek to clip count failed");
+    w_u32(f, static_cast<std::uint32_t>(clips_));
+    if (std::fflush(f) != 0)
+        fail("PhonemeMelCacheWriter::finalize", "flush after patch failed");
+    finalized_ = true;
+}
+
+PhonemeMelCache read_phoneme_melcache(const std::string& path) {
+    std::FILE* f = nullptr;
+#if defined(_MSC_VER)
+    if (fopen_s(&f, path.c_str(), "rb") != 0) f = nullptr;
+#else
+    f = std::fopen(path.c_str(), "rb");
+#endif
+    if (!f) fail("read_phoneme_melcache", "cannot open '" + path + "'");
+
+    PhonemeMelCache mc;
+    try {
+        const std::uint32_t magic = r_u32(f, "read_phoneme_melcache");
+        if (magic != kMagicBPMC)
+            fail("read_phoneme_melcache", "bad magic (not a BPMC file)");
+        const std::uint32_t version = r_u32(f, "read_phoneme_melcache");
+        if (version != kBPMCVersion)
+            fail("read_phoneme_melcache",
+                 "unsupported version " + std::to_string(version));
+        mc.header.sample_rate = static_cast<int>(r_u32(f, "read_phoneme_melcache"));
+        mc.header.n_fft       = static_cast<int>(r_u32(f, "read_phoneme_melcache"));
+        mc.header.win_length  = static_cast<int>(r_u32(f, "read_phoneme_melcache"));
+        mc.header.hop_length  = static_cast<int>(r_u32(f, "read_phoneme_melcache"));
+        mc.header.n_mels      = static_cast<int>(r_u32(f, "read_phoneme_melcache"));
+        mc.compression        = r_u32(f, "read_phoneme_melcache");
+        if (mc.header.n_mels <= 0)
+            fail("read_phoneme_melcache", "non-positive n_mels");
+        mc.class_map = read_classmap(f);
+        const std::uint32_t clip_count = r_u32(f, "read_phoneme_melcache");
+
+        mc.clips.reserve(clip_count);
+        for (std::uint32_t c = 0; c < clip_count; ++c) {
+            PhonemeMelClip clip;
+            const std::int32_t n_frames = r_i32(f, "read_phoneme_melcache");
+            if (n_frames < 0)
+                fail("read_phoneme_melcache", "negative n_frames");
+            const std::size_t mel_n =
+                static_cast<std::size_t>(mc.header.n_mels) *
+                static_cast<std::size_t>(n_frames);
+            clip.mel.resize(mel_n);
+            if (mel_n &&
+                std::fread(clip.mel.data(), sizeof(float), mel_n, f) != mel_n)
+                fail("read_phoneme_melcache", "truncated mel payload");
+            clip.labels.resize(static_cast<std::size_t>(n_frames));
+            if (n_frames &&
+                std::fread(clip.labels.data(), sizeof(int16_t),
+                           static_cast<std::size_t>(n_frames), f) !=
+                static_cast<std::size_t>(n_frames))
+                fail("read_phoneme_melcache", "truncated label payload");
+            mc.clips.push_back(std::move(clip));
+        }
+    } catch (...) {
+        std::fclose(f);
+        throw;
+    }
+    std::fclose(f);
+    return mc;
+}
+
+std::uint32_t peek_dataset_magic(const std::string& path) {
+    std::FILE* f = nullptr;
+#if defined(_MSC_VER)
+    if (fopen_s(&f, path.c_str(), "rb") != 0) f = nullptr;
+#else
+    f = std::fopen(path.c_str(), "rb");
+#endif
+    if (!f) return 0;
+    std::uint32_t magic = 0;
+    if (std::fread(&magic, sizeof(magic), 1, f) != 1) magic = 0;
+    std::fclose(f);
+    return magic;
+}
+
 }  // namespace brosoundml
