@@ -87,7 +87,29 @@ struct Args {
     int         save_every     = 5;
     bool        small          = false;
     bool        help           = false;
+
+    // Model-capacity overrides (empty/0 = keep PhonemeNetConfig defaults).
+    int         c_stem         = 0;                   // stem channels
+    std::string channels;                            // comma list, len = n_stages
+    std::string blocks;                              // comma list, len = n_stages
 };
+
+// Parse "a,b,c,d" into exactly `n` ints. Throws on a bad count.
+std::vector<int> parse_int_list(const std::string& s, int n,
+                                const std::string& flag) {
+    std::vector<int> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        out.push_back(std::stoi(s.substr(i, j - i)));
+        i = j + 1;
+    }
+    if (static_cast<int>(out.size()) != n)
+        fail("cli", flag + " expects " + std::to_string(n) +
+             " comma-separated values, got " + std::to_string(out.size()));
+    return out;
+}
 
 void print_help() {
     std::cout <<
@@ -106,6 +128,9 @@ void print_help() {
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bpm\n"
         "  --device cpu|cuda    target device (default auto — CUDA if available)\n"
+        "  --c-stem N           stem channels (default 32)\n"
+        "  --channels a,b,c,d   per-stage output channels (default 32,48,64,96)\n"
+        "  --blocks a,b,c,d     blocks per stage incl. transition (default 2,2,2,2)\n"
         "  --small              4 epochs / batch 8 — smoke-test preset\n";
 }
 
@@ -129,6 +154,9 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--seed")           a.seed = std::stoi(next());
         else if (k == "--save-every")     a.save_every = std::stoi(next());
         else if (k == "--resume")         a.resume = next();
+        else if (k == "--c-stem")         a.c_stem = std::stoi(next());
+        else if (k == "--channels")       a.channels = next();
+        else if (k == "--blocks")         a.blocks = next();
         else if (k == "--small")          a.small = true;
         else if (k == "--device")         a.device = next();
         else if (k == "--help" || k == "-h") { a.help = true; return true; }
@@ -356,6 +384,25 @@ int main(int argc, char** argv) try {
     cfg.n_fft       = ds.header.n_fft;
     cfg.win_length  = ds.header.win_length;
     cfg.hop_length  = ds.header.hop_length;
+    if (a.c_stem > 0) cfg.c_stem = a.c_stem;
+    if (!a.channels.empty()) {
+        const auto ch = parse_int_list(a.channels, bsm::PhonemeNetConfig::n_stages,
+                                       "--channels");
+        for (int s = 0; s < bsm::PhonemeNetConfig::n_stages; ++s) cfg.c[s] = ch[s];
+    }
+    if (!a.blocks.empty()) {
+        const auto bl = parse_int_list(a.blocks, bsm::PhonemeNetConfig::n_stages,
+                                       "--blocks");
+        for (int s = 0; s < bsm::PhonemeNetConfig::n_stages; ++s)
+            cfg.n_blocks[s] = bl[s];
+    }
+    if (a.c_stem > 0 || !a.channels.empty() || !a.blocks.empty()) {
+        std::cout << "               model: c_stem=" << cfg.c_stem
+                  << " channels=" << cfg.c[0] << "," << cfg.c[1] << ","
+                  << cfg.c[2] << "," << cfg.c[3]
+                  << " blocks=" << cfg.n_blocks[0] << "," << cfg.n_blocks[1] << ","
+                  << cfg.n_blocks[2] << "," << cfg.n_blocks[3] << "\n";
+    }
     bsm::PhonemeNet model = a.resume.empty()
         ? bsm::PhonemeNet::make(cfg, ds.class_map, device)
         : bsm::PhonemeNet::load(a.resume, device);
