@@ -133,6 +133,7 @@ target_sources(brosoundml PRIVATE
     src/phoneme_data.cpp
     src/bc_resnet.cpp
     src/bc_resnet2d.cpp
+    src/phoneme_model.cpp
     src/mel.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
