@@ -195,6 +195,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_wake_melcmp tools/wake_melcmp.cpp)
     target_link_libraries(brosoundml_wake_melcmp PRIVATE brosoundml)
 
+    add_executable(brosoundml_phoneme_synth tools/phoneme_synth.cpp)
+    target_link_libraries(brosoundml_phoneme_synth PRIVATE brosoundml)
+
+    add_executable(brosoundml_phoneme_inspect tools/phoneme_inspect.cpp)
+    target_link_libraries(brosoundml_phoneme_inspect PRIVATE brosoundml)
+
     add_executable(brosoundml_qwen_tts_bench tools/qwen_tts_bench.cpp)
     target_link_libraries(brosoundml_qwen_tts_bench PRIVATE brosoundml)
 
