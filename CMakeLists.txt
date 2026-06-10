@@ -123,6 +123,9 @@ target_sources(brosoundml PRIVATE
     src/qwen_tts_talker.cpp
     src/qwen_tts_code_predictor.cpp
     src/qwen_tts_generate.cpp
+    src/qwen_asr.cpp
+    src/qwen_asr_encoder.cpp
+    src/qwen_asr_decoder.cpp
     src/rave.cpp
     src/speaker_encoder.cpp
     src/wake.cpp
@@ -169,6 +172,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_transcribe tools/transcribe.cpp)
     target_link_libraries(brosoundml_transcribe PRIVATE brosoundml)
+
+    add_executable(brosoundml_qwen_asr_transcribe tools/qwen_asr_transcribe.cpp)
+    target_link_libraries(brosoundml_qwen_asr_transcribe PRIVATE brosoundml)
 
     add_executable(brosoundml_wake_synth tools/wake_synth.cpp)
     target_link_libraries(brosoundml_wake_synth PRIVATE brosoundml)

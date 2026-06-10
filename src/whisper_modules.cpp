@@ -1,5 +1,7 @@
 #include "brosoundml/whisper_modules.h"
 
+#include "mel_slaney.h"
+
 #include <brotensor/ops.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/detail/dispatch.h>
@@ -96,84 +98,8 @@ void upload(const stf::File& f, const std::string& key,
     }
 }
 
-// ─── Mel-scale conversions (Slaney) ────────────────────────────────────────
-//
-// Slaney mel: linear below 1000 Hz (slope 1/(200/3) = 3/200), logarithmic
-// above. Used by librosa's `mel(..., htk=False)` and by openai/whisper's
-// reference filterbank.
-double hz_to_mel_slaney(double hz) {
-    constexpr double f_min      = 0.0;
-    constexpr double f_sp       = 200.0 / 3.0;          // ≈ 66.667
-    constexpr double min_log_hz = 1000.0;
-    constexpr double min_log_mel = (min_log_hz - f_min) / f_sp;  // == 15
-    constexpr double logstep    = 0.06875177742094911;  // log(6.4) / 27
-
-    if (hz >= min_log_hz) {
-        return min_log_mel + std::log(hz / min_log_hz) / logstep;
-    }
-    return (hz - f_min) / f_sp;
-}
-
-double mel_to_hz_slaney(double mel) {
-    constexpr double f_min      = 0.0;
-    constexpr double f_sp       = 200.0 / 3.0;
-    constexpr double min_log_hz = 1000.0;
-    constexpr double min_log_mel = (min_log_hz - f_min) / f_sp;
-    constexpr double logstep    = 0.06875177742094911;
-
-    if (mel >= min_log_mel) {
-        return min_log_hz * std::exp(logstep * (mel - min_log_mel));
-    }
-    return f_min + f_sp * mel;
-}
-
-// Build the (n_mels, n_fft/2 + 1) Slaney-normalised mel filterbank used by
-// librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_mels,
-// fmin=0, fmax=sample_rate/2, htk=False, norm="slaney"). Returns the buffer
-// flat in row-major order.
-std::vector<float> build_mel_filterbank(int n_mels, int n_fft, int sample_rate) {
-    const int    n_bins = n_fft / 2 + 1;
-    const double f_max  = sample_rate / 2.0;
-    const double f_min  = 0.0;
-
-    // FFT-bin centre frequencies in Hz: 0, sr/n_fft, 2*sr/n_fft, ...
-    std::vector<double> fft_freqs(n_bins);
-    for (int k = 0; k < n_bins; ++k) {
-        fft_freqs[k] = static_cast<double>(k) * sample_rate / n_fft;
-    }
-
-    // n_mels + 2 mel-spaced points, converted back to Hz.
-    const double mel_min = hz_to_mel_slaney(f_min);
-    const double mel_max = hz_to_mel_slaney(f_max);
-    std::vector<double> mel_hz(static_cast<std::size_t>(n_mels) + 2);
-    for (int i = 0; i < n_mels + 2; ++i) {
-        const double m = mel_min + (mel_max - mel_min) * i / (n_mels + 1);
-        mel_hz[static_cast<std::size_t>(i)] = mel_to_hz_slaney(m);
-    }
-
-    std::vector<float> fb(static_cast<std::size_t>(n_mels) * n_bins, 0.0f);
-    for (int m = 0; m < n_mels; ++m) {
-        const double lo = mel_hz[static_cast<std::size_t>(m)];
-        const double ce = mel_hz[static_cast<std::size_t>(m) + 1];
-        const double hi = mel_hz[static_cast<std::size_t>(m) + 2];
-        // Slaney area normalisation: enorm = 2 / (hi - lo).
-        const double enorm = 2.0 / (hi - lo);
-        for (int k = 0; k < n_bins; ++k) {
-            const double f = fft_freqs[static_cast<std::size_t>(k)];
-            double w;
-            if (f <= lo || f >= hi) {
-                w = 0.0;
-            } else if (f <= ce) {
-                w = (f - lo) / (ce - lo);
-            } else {
-                w = (hi - f) / (hi - ce);
-            }
-            fb[static_cast<std::size_t>(m) * n_bins + k] =
-                static_cast<float>(w * enorm);
-        }
-    }
-    return fb;
-}
+// Slaney mel filterbank — shared builder in mel_slaney.h (also used by the
+// Qwen3-ASR encoder front-end).
 
 }  // namespace
 
@@ -198,25 +124,18 @@ void LogMel::build(int n_mels, bt::Device dev) {
     // Mel filterbank — built on CPU; the forward path's matmul consumes it
     // host-side, so we don't pay an upload for tables we only read from the
     // host. Same logic for hann_window below.
-    std::vector<float> fb = build_mel_filterbank(num_mel_bins, n_fft, sample_rate);
+    std::vector<float> fb = melslaney::build_filterbank(num_mel_bins, n_fft, sample_rate);
     mel_filters = bt::Tensor::zeros_on(bt::Device::CPU, num_mel_bins, n_bins,
                                        bt::Dtype::FP32);
     std::memcpy(mel_filters.host_f32_mut(), fb.data(),
                 fb.size() * sizeof(float));
 
-    // Hann window of length win_length (periodic = false matches torch's
-    // default analysis window). Whisper passes `torch.hann_window(N_FFT)`
-    // which is the periodic variant by default — librosa uses sym=True.
-    // OpenAI's whisper/audio.py uses torch.hann_window which defaults to
-    // periodic=True: w[n] = 0.5 * (1 - cos(2*pi*n/N)) with N == win_length.
+    // Periodic Hann analysis window — whisper/audio.py passes
+    // torch.hann_window(N_FFT), which defaults to periodic=True. Shared
+    // builder in mel_slaney.h.
+    std::vector<float> hw = melslaney::build_hann_window(win_length);
     hann_window = bt::Tensor::zeros_on(bt::Device::CPU, 1, win_length, bt::Dtype::FP32);
-    float* w = hann_window.host_f32_mut();
-    constexpr double k_two_pi = 6.283185307179586;
-    for (int n = 0; n < win_length; ++n) {
-        const double phase = k_two_pi * static_cast<double>(n) /
-                             static_cast<double>(win_length);
-        w[n] = static_cast<float>(0.5 * (1.0 - std::cos(phase)));
-    }
+    std::memcpy(hann_window.host_f32_mut(), hw.data(), hw.size() * sizeof(float));
 }
 
 void LogMel::forward(const AudioBuffer& audio, bt::Tensor& out) const {
