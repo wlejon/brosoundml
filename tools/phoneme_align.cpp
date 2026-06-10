@@ -83,12 +83,13 @@ constexpr double kNegInf = -1e30;
 struct Args {
     std::string weights;
     std::string esd_dir;
+    std::string manifest;              // generic TSV mode: wav<TAB>text[<TAB>tag]
     std::string speakers = "0011,0012,0013,0014,0015,0016,0017,0018,0019,0020";
     std::string out;
     std::string kokoro_dir;
     std::string data_dir;
     std::string device = "auto";
-    int   cap_per_emo_speaker = 200;   // clips per (speaker x emotion); 0 = all
+    int   cap_per_emo_speaker = 200;   // clips per (speaker x emotion) / per tag; 0 = all
     float min_score = -3.5f;           // drop clips whose mean path log-posterior < this
     int   seed = 1234;
     bool  help = false;
@@ -96,14 +97,18 @@ struct Args {
 
 void print_help() {
     std::printf(
-        "brosoundml_phoneme_align — force-align real speech (ESD) into a BPDS shard\n\n"
+        "brosoundml_phoneme_align — force-align real speech into a BPDS shard\n\n"
         "  --weights PATH       phoneme checkpoint (.bpm)  [or $BROSOUNDML_PHONEME_WEIGHTS]\n"
         "  --esd-dir DIR        ESD 'Emotion Speech Dataset' root\n"
-        "  --speakers a,b,..    speaker ids (default English 0011..0020)\n"
+        "  --manifest PATH      generic corpus mode: TSV 'wav<TAB>text[<TAB>tag]' per line;\n"
+        "                       relative wav paths resolve against the manifest's dir;\n"
+        "                       wavs must be 16 kHz mono. Overrides --esd-dir.\n"
+        "  --speakers a,b,..    ESD speaker ids (default English 0011..0020)\n"
         "  --out PATH           output BPDS (default build-cuda/esd_real.bpds)\n"
         "  --kokoro-dir DIR     Kokoro model dir (g2p phoneme vocab)\n"
         "  --data-dir DIR       g2p data dir (lexicon + pos_tagger)  [or $BROSOUNDML_DATA_DIR]\n"
-        "  --cap N              max clips per (speaker x emotion), 0=all (default 200)\n"
+        "  --cap N              max clips per (speaker x emotion) / per manifest tag,\n"
+        "                       0=all (default 200)\n"
         "  --min-score F        drop clips with mean path log-posterior < F (default -3.5)\n"
         "  --device auto|cuda|cpu\n  -h --help\n");
 }
@@ -117,6 +122,7 @@ Args parse_args(int argc, char** argv) {
         if (k == "-h" || k == "--help") a.help = true;
         else if (k == "--weights") a.weights = need(i);
         else if (k == "--esd-dir") a.esd_dir = need(i);
+        else if (k == "--manifest") a.manifest = need(i);
         else if (k == "--speakers") a.speakers = need(i);
         else if (k == "--out") a.out = need(i);
         else if (k == "--kokoro-dir") a.kokoro_dir = need(i);
@@ -234,7 +240,7 @@ int main(int argc, char** argv) try {
         : [&]{ std::string e = env_or_empty("BROSOUNDML_DATA_DIR");
                return !e.empty() ? e : std::string("D:/projects/brosoundml-data"); }();
 
-    const std::string esd = first_existing({
+    const std::string esd = !a.manifest.empty() ? std::string() : first_existing({
         a.esd_dir,
         "C:/Users/jonny/Downloads/Emotional Speech Dataset (ESD)/Emotion Speech Dataset",
     });
@@ -266,13 +272,15 @@ int main(int argc, char** argv) try {
         if (!vs.empty()) voice_path = vs.front().string();
     }
 
-    if (checkpoint.empty() || esd.empty() || kokoro_dir.empty() ||
+    const bool manifest_mode = !a.manifest.empty();
+    const bool source_ok = manifest_mode ? fs::exists(a.manifest) : !esd.empty();
+    if (checkpoint.empty() || !source_ok || kokoro_dir.empty() ||
         !fs::exists(kokoro_dir + "/config.json") || lexicon.empty() || pos.empty()) {
         std::fprintf(stderr,
             "SKIP phoneme_align: missing inputs.\n  checkpoint=%s\n  esd=%s\n"
-            "  kokoro=%s\n  lexicon=%s\n  pos=%s\n",
-            checkpoint.c_str(), esd.c_str(), kokoro_dir.c_str(),
-            lexicon.c_str(), pos.c_str());
+            "  manifest=%s\n  kokoro=%s\n  lexicon=%s\n  pos=%s\n",
+            checkpoint.c_str(), esd.c_str(), a.manifest.c_str(),
+            kokoro_dir.c_str(), lexicon.c_str(), pos.c_str());
         return 0;
     }
 
@@ -338,8 +346,104 @@ int main(int argc, char** argv) try {
 
     int kept = 0, dropped_fit = 0, dropped_score = 0, dropped_io = 0, dropped_seq = 0;
     std::vector<float> scores;
-    std::map<std::string,int> kept_by_emo;
+    std::map<std::string,int> kept_by_tag;
 
+    // Align ONE (wav, text) pair and append it under `tag` (ESD emotion /
+    // manifest tag — only used for capping buckets and the kept-by report).
+    auto process_one = [&](const std::string& wav, const std::string& text,
+                           const std::string& tag) {
+        if (!fs::exists(wav)) { ++dropped_io; return; }
+
+        bsm::AudioBuffer ab;
+        try { ab = bsm::read_wav(wav); }
+        catch (...) { ++dropped_io; return; }
+        if (ab.sample_rate != mcfgm.sample_rate) { ++dropped_io; return; }
+        const std::vector<float>& pcm = ab.samples;
+        if (pcm.empty()) { ++dropped_io; return; }
+
+        std::vector<int> S;
+        try { S = to_class_seq(phon.phonemize(text)); }
+        catch (...) { ++dropped_seq; return; }
+        if ((int)S.size() < 1) { ++dropped_seq; return; }
+
+        // PCEN mel -> forward -> log-softmax (T,K).
+        bt::Tensor melt;
+        mel.reset();
+        mel.compute_offline(pcm.data(), (int)pcm.size(), melt);
+        const std::vector<float> mh = melt.to_host_vector();
+        const int Tm = (int)(mh.size() / (std::size_t)n_mels);
+        if (Tm <= 0) { ++dropped_io; return; }
+        bt::Tensor feats = bt::Tensor::from_host_on(device, mh.data(), n_mels, Tm);
+        bt::Tensor logits; model.forward(feats, logits);
+        const int T = logits.rows;
+        std::vector<float> lg = logits.to_host_vector();
+        for (int t = 0; t < T; ++t) {
+            float* row = &lg[(std::size_t)t * K];
+            float mx = row[0];
+            for (int c = 1; c < K; ++c) mx = std::max(mx, row[c]);
+            double s = 0.0;
+            for (int c = 0; c < K; ++c) s += std::exp(row[c] - mx);
+            const float lse = mx + (float)std::log(s > 0 ? s : 1.0);
+            for (int c = 0; c < K; ++c) row[c] -= lse;   // log-softmax in place
+        }
+
+        std::vector<std::int16_t> labels; double mlp = 0.0;
+        if (!viterbi_align(lg, T, K, S, labels, &mlp)) { ++dropped_fit; return; }
+        if (mlp < a.min_score) { ++dropped_score; return; }
+
+        // BPDS wants n_frames == framing(n_samples); the model framed the
+        // SAME pcm, so labels.size()==T already matches read-back framing.
+        try { writer.append(pcm, labels); }
+        catch (...) { ++dropped_io; return; }
+        ++kept; ++kept_by_tag[tag];
+        scores.push_back((float)mlp);
+        if (kept % 500 == 0) std::fprintf(stderr, "  kept %d ...\n", kept);
+    };
+
+    if (manifest_mode) {
+        // Generic TSV: wav<TAB>text[<TAB>tag]; relative wavs resolve against
+        // the manifest's directory. Cap applies per tag.
+        const fs::path mroot = fs::path(a.manifest).parent_path();
+        struct MUtt { std::string wav, text, tag; };
+        std::vector<MUtt> utts;
+        {
+            std::ifstream f(a.manifest);
+            std::string line;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.size() >= 3 && (unsigned char)line[0]==0xEF) line.erase(0,3);
+                if (line.empty()) continue;
+                auto t1 = line.find('\t');
+                if (t1 == std::string::npos) continue;
+                auto t2 = line.find('\t', t1 + 1);
+                MUtt u;
+                u.wav  = line.substr(0, t1);
+                u.text = (t2==std::string::npos) ? line.substr(t1+1)
+                                                 : line.substr(t1+1, t2-t1-1);
+                u.tag  = (t2==std::string::npos) ? std::string("default")
+                                                 : line.substr(t2+1);
+                while (!u.tag.empty() && (u.tag.back()==' '||u.tag.back()=='\t'))
+                    u.tag.pop_back();
+                if (u.wav.empty() || u.text.empty()) continue;
+                fs::path w(u.wav);
+                if (w.is_relative()) u.wav = (mroot / w).string();
+                utts.push_back(std::move(u));
+            }
+        }
+        std::fprintf(stderr, "  manifest: %zu utterances\n", utts.size());
+
+        std::map<std::string,std::vector<int>> by_tag;
+        for (int i = 0; i < (int)utts.size(); ++i) by_tag[utts[i].tag].push_back(i);
+        for (auto& [tag, idxs] : by_tag) {
+            std::shuffle(idxs.begin(), idxs.end(), rng);
+            const int cap = a.cap_per_emo_speaker > 0
+                ? std::min((int)idxs.size(), a.cap_per_emo_speaker) : (int)idxs.size();
+            for (int j = 0; j < cap; ++j) {
+                const MUtt& u = utts[idxs[j]];
+                process_one(u.wav, u.text, tag);
+            }
+        }
+    } else
     for (const auto& spk : speakers) {
         const std::string sdir = esd + "/" + spk;
         const std::string tpath = sdir + "/" + spk + ".txt";
@@ -356,51 +460,7 @@ int main(int argc, char** argv) try {
                 ? std::min((int)idxs.size(), a.cap_per_emo_speaker) : (int)idxs.size();
             for (int j = 0; j < cap; ++j) {
                 const Utt& u = utts[idxs[j]];
-                const std::string wav = sdir + "/" + u.emo + "/" + u.id + ".wav";
-                if (!fs::exists(wav)) { ++dropped_io; continue; }
-
-                std::vector<float> pcm;
-                try { pcm = bsm::read_wav(wav).samples; }
-                catch (...) { ++dropped_io; continue; }
-                if (pcm.empty()) { ++dropped_io; continue; }
-
-                std::vector<int> S;
-                try { S = to_class_seq(phon.phonemize(u.text)); }
-                catch (...) { ++dropped_seq; continue; }
-                if ((int)S.size() < 1) { ++dropped_seq; continue; }
-
-                // PCEN mel -> forward -> log-softmax (T,K).
-                bt::Tensor melt;
-                mel.reset();
-                mel.compute_offline(pcm.data(), (int)pcm.size(), melt);
-                const std::vector<float> mh = melt.to_host_vector();
-                const int Tm = (int)(mh.size() / (std::size_t)n_mels);
-                if (Tm <= 0) { ++dropped_io; continue; }
-                bt::Tensor feats = bt::Tensor::from_host_on(device, mh.data(), n_mels, Tm);
-                bt::Tensor logits; model.forward(feats, logits);
-                const int T = logits.rows;
-                std::vector<float> lg = logits.to_host_vector();
-                for (int t = 0; t < T; ++t) {
-                    float* row = &lg[(std::size_t)t * K];
-                    float mx = row[0];
-                    for (int c = 1; c < K; ++c) mx = std::max(mx, row[c]);
-                    double s = 0.0;
-                    for (int c = 0; c < K; ++c) s += std::exp(row[c] - mx);
-                    const float lse = mx + (float)std::log(s > 0 ? s : 1.0);
-                    for (int c = 0; c < K; ++c) row[c] -= lse;   // log-softmax in place
-                }
-
-                std::vector<std::int16_t> labels; double mlp = 0.0;
-                if (!viterbi_align(lg, T, K, S, labels, &mlp)) { ++dropped_fit; continue; }
-                if (mlp < a.min_score) { ++dropped_score; continue; }
-
-                // BPDS wants n_frames == framing(n_samples); the model framed the
-                // SAME pcm, so labels.size()==T already matches read-back framing.
-                try { writer.append(pcm, labels); }
-                catch (...) { ++dropped_io; continue; }
-                ++kept; ++kept_by_emo[u.emo];
-                scores.push_back((float)mlp);
-                if (kept % 500 == 0) std::fprintf(stderr, "  kept %d ...\n", kept);
+                process_one(sdir + "/" + u.emo + "/" + u.id + ".wav", u.text, u.emo);
             }
         }
     }
@@ -419,8 +479,8 @@ int main(int argc, char** argv) try {
         "  path mean-logp  p05=%.3f  p50=%.3f  p95=%.3f  (min-score=%.2f)\n",
         kept, out.c_str(), dropped_seq, dropped_fit, dropped_score, dropped_io,
         pct(0.05), pct(0.50), pct(0.95), a.min_score);
-    std::fprintf(stderr, "  kept by emotion:");
-    for (auto& [e, n] : kept_by_emo) std::fprintf(stderr, "  %s=%d", e.c_str(), n);
+    std::fprintf(stderr, "  kept by tag:");
+    for (auto& [e, n] : kept_by_tag) std::fprintf(stderr, "  %s=%d", e.c_str(), n);
     std::fprintf(stderr, "\n");
     return 0;
 } catch (const std::exception& e) {
