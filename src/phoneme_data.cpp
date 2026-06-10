@@ -68,6 +68,8 @@ void PhonemeClassMap::rebuild_inverse() const {
         for (int id : class_to_ids[c])
             id_to_class_[id] = static_cast<int>(c);
     }
+    transparent_set_.clear();
+    for (int id : transparent_ids) transparent_set_[id] = true;
     inverse_built_ = true;
 }
 
@@ -79,6 +81,11 @@ int PhonemeClassMap::class_for_id(int phoneme_id) const {
              "phoneme id " + std::to_string(phoneme_id) +
              " is not covered by the class map");
     return it->second;
+}
+
+bool PhonemeClassMap::is_transparent(int phoneme_id) const {
+    if (!inverse_built_) rebuild_inverse();
+    return transparent_set_.find(phoneme_id) != transparent_set_.end();
 }
 
 namespace {
@@ -101,7 +108,7 @@ const std::vector<NamedClass>& english_named_classes() {
         {"AA", {"ɑ", "ɒ", "a", "ɐ"}},        // ɑ ɒ a ɐ
         {"AE", {"æ"}},                                   // æ
         {"AH", {"ʌ"}},                                   // ʌ
-        {"AX", {"ə"}},                                   // ə (schwa)
+        {"AX", {"ə", "ᵊ"}},                         // ə + ᵊ (superscript schwa)
         {"AO", {"ɔ"}},                                   // ɔ
         {"EH", {"ɛ"}},                                   // ɛ
         {"ER", {"ɝ", "ɚ", "ɜ", "˞"}},   // ɝ ɚ ɜ ˞
@@ -153,6 +160,37 @@ const std::vector<NamedClass>& english_named_classes() {
     return kClasses;
 }
 
+// True if `key` is a suprasegmental / diacritic modifier token: stress (ˈ ˌ),
+// length (ː), aspiration (ʰ), palatalization (ʲ), nasalization (̃, combining),
+// or an intonation arrow (↑ ↓ → ↗ ↘). misaki/Kokoro emit these as their own
+// duration-bearing tokens, but they attach to an adjacent segmental phoneme
+// rather than denoting a distinct sound. We route them to the silence class so
+// they neither inflate a spurious "other" bucket nor become a phoneme the model
+// must learn to distinguish acoustically. (The spotter strips silence from
+// enrolled templates, so a stress mark never appears in a keyword's class
+// sequence.) Trade-off: the few frames a length/aspiration token spans are
+// labelled silence rather than merged into the neighbouring phoneme — acceptable
+// at a 10 ms hop given how short these tokens are; revisit with neighbour-merge
+// if the frame-accuracy gate demands it.
+bool is_modifier_key(const std::string& key) {
+    static const char* kMods[] = {
+        "ˈ",  // ˈ primary stress
+        "ˌ",  // ˌ secondary stress
+        "ː",  // ː length
+        "ʰ",  // ʰ aspiration
+        "ʲ",  // ʲ palatalization
+        "̃",  // ̃  nasalization (combining)
+        "↑",  // ↑
+        "↓",  // ↓
+        "→",  // →
+        "↗",  // ↗
+        "↘",  // ↘
+    };
+    for (const char* m : kMods)
+        if (key == m) return true;
+    return false;
+}
+
 // True if `key` is a non-spoken token (punctuation / whitespace / digit /
 // control, or empty) — every byte is ASCII (<0x80) and none is an ASCII letter.
 // Such ids are pauses and route to the silence class. A key with any ASCII
@@ -199,18 +237,25 @@ PhonemeClassMap build_default_english_classmap(
         }
     }
 
-    // Cover every remaining vocab id: non-spoken -> silence, else -> "other".
+    // Cover every remaining vocab id: modifier diacritics and non-spoken
+    // punctuation -> silence; any other spoken-but-unnamed id -> "other".
+    // Modifier diacritics are additionally flagged transparent so their frames
+    // merge into the neighbouring phoneme at label-build time (see build_frame_
+    // labels) instead of silencing voiced onsets.
     for (const auto& kv : vocab) {
         const int id = kv.second;
         if (claimed.count(id)) continue;
-        const int cls = is_non_spoken_key(kv.first) ? 0 : other_class;
+        const bool modifier = is_modifier_key(kv.first);
+        const int  cls = (modifier || is_non_spoken_key(kv.first)) ? 0 : other_class;
         claimed[id] = cls;
         cm.class_to_ids[static_cast<std::size_t>(cls)].push_back(id);
+        if (modifier) cm.transparent_ids.push_back(id);
     }
 
-    // Determinism: sort ids within each class.
+    // Determinism: sort ids within each class and the transparent set.
     for (auto& ids : cm.class_to_ids)
         std::sort(ids.begin(), ids.end());
+    std::sort(cm.transparent_ids.begin(), cm.transparent_ids.end());
 
     cm.rebuild_inverse();
     return cm;
@@ -235,6 +280,8 @@ void write_classmap(std::FILE* f, const PhonemeClassMap& cm) {
         w_u32(f, static_cast<std::uint32_t>(ids.size()));
         for (int id : ids) w_i32(f, id);
     }
+    w_u32(f, static_cast<std::uint32_t>(cm.transparent_ids.size()));
+    for (int id : cm.transparent_ids) w_i32(f, id);
 }
 
 PhonemeClassMap read_classmap(std::FILE* f) {
@@ -257,6 +304,10 @@ PhonemeClassMap read_classmap(std::FILE* f) {
             ids[i] = r_i32(f, "read_classmap");
         cm.class_to_ids[c] = std::move(ids);
     }
+    const std::uint32_t t_count = r_u32(f, "read_classmap");
+    cm.transparent_ids.resize(t_count);
+    for (std::uint32_t i = 0; i < t_count; ++i)
+        cm.transparent_ids[i] = r_i32(f, "read_classmap");
     cm.rebuild_inverse();
     return cm;
 }
@@ -301,11 +352,32 @@ std::vector<int16_t> build_frame_labels(
     // Pin the final boundary exactly (guards against fp rounding at the tail).
     boundary[T] = n_samples_16k;
 
-    // Per-token class: BOS (i==0) and EOS (i==T-1) -> silence; interior token i
-    // carries phoneme_ids[i-1].
-    std::vector<int> token_class(T, silence);
-    for (std::size_t i = 1; i + 1 < T; ++i)
-        token_class[i] = cm.class_for_id(phoneme_ids[i - 1]);
+    // Per-token raw class + transparency: BOS (i==0) and EOS (i==T-1) -> silence
+    // and are never transparent; interior token i carries phoneme_ids[i-1].
+    std::vector<int>  token_class(T, silence);
+    std::vector<char> token_transp(T, 0);
+    for (std::size_t i = 1; i + 1 < T; ++i) {
+        const int id = phoneme_ids[i - 1];
+        token_class[i]  = cm.class_for_id(id);
+        token_transp[i] = cm.is_transparent(id) ? 1 : 0;
+    }
+
+    // Effective class: a transparent modifier token inherits the class of the
+    // nearest interior NON-transparent token (forward first, then backward), so
+    // its frames stay voiced rather than silencing a stressed-vowel onset. No
+    // segmental neighbour -> silence.
+    std::vector<int> eff(T, silence);
+    for (std::size_t i = 0; i < T; ++i) {
+        if (!token_transp[i]) { eff[i] = token_class[i]; continue; }
+        bool got = false;
+        for (std::size_t j = i + 1; j + 1 < T; ++j)
+            if (!token_transp[j]) { eff[i] = token_class[j]; got = true; break; }
+        if (!got)
+            for (std::size_t j = i; j > 1;) {
+                --j;
+                if (!token_transp[j]) { eff[i] = token_class[j]; break; }
+            }
+    }
 
     // Walk frames and tokens in lockstep (both monotone): advance the token
     // cursor until frame_center < boundary[tok+1].
@@ -320,7 +392,7 @@ std::vector<int16_t> build_frame_labels(
                 static_cast<int16_t>(silence);
         else
             labels[static_cast<std::size_t>(t)] =
-                static_cast<int16_t>(token_class[tok]);
+                static_cast<int16_t>(eff[tok]);
     }
     return labels;
 }

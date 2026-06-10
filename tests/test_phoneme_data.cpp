@@ -177,6 +177,70 @@ int main() {
         CHECK(threw, "labels: wrong pred_dur length throws");
     }
 
+    // ─── 3-transparent. modifier merge (stress/length inherit a neighbour) ──
+    {
+        // sil owns a modifier id 999; AA/BB are real phonemes. ids = AA, 999, BB
+        // with the modifier between the two phonemes. pred_dur {5,20,10,20,5},
+        // sum=60; 6000 samples -> spk=100. Framing 1+(6000-400)/160 = 36 frames.
+        // Token sample spans: BOS[0,500) AA[500,2500) mod[2500,3500)
+        // BB[3500,5500) EOS[5500,6000). With center = t*160+200:
+        //   t0-1 BOS, t2-14 AA, t15-20 mod, t21-33 BB, t34-35 EOS.
+        PhonemeClassMap base;
+        base.num_classes  = 3;
+        base.class_names  = {"sil", "AA", "BB"};
+        base.class_to_ids = {{999}, {101}, {202}};   // 999 lives in silence class
+        const std::vector<int32_t> pred_dur = {5, 20, 10, 20, 5};
+        const std::vector<int32_t> ids      = {101, 999, 202};
+        const int n = 6000, win = 400, hop = 160;
+
+        // (a) transparent: the modifier span inherits the following phoneme (BB),
+        // so the interior is silence-free and segmentation stays 3 transitions.
+        PhonemeClassMap cm_t = base;
+        cm_t.transparent_ids = {999};
+        cm_t.rebuild_inverse();
+        auto lt = brosoundml::build_frame_labels(pred_dur, ids, cm_t, n, win, hop);
+        CHECK(lt.size() == 36, "transparent: framing frame count == 36");
+        bool no_inner_sil = lt.size() == 36;
+        for (std::size_t t = 2; t <= 33 && no_inner_sil; ++t)
+            if (lt[t] == 0) no_inner_sil = false;
+        CHECK(no_inner_sil, "transparent: no interior silence across the modifier");
+        bool mod_is_bb = lt.size() == 36;
+        for (std::size_t t = 15; t <= 20 && mod_is_bb; ++t)
+            if (lt[t] != 2) mod_is_bb = false;
+        CHECK(mod_is_bb, "transparent: modifier span inherits following phoneme BB");
+        int tr_t = 0;
+        for (std::size_t i = 1; i < lt.size(); ++i)
+            if (lt[i] != lt[i - 1]) ++tr_t;
+        CHECK(tr_t == 3, "transparent: three clean segment boundaries");
+
+        // (b) same map WITHOUT the transparent flag: the modifier silences its
+        // own frames, punching an interior silence gap between AA and BB.
+        PhonemeClassMap cm_n = base;
+        cm_n.rebuild_inverse();
+        auto ln = brosoundml::build_frame_labels(pred_dur, ids, cm_n, n, win, hop);
+        bool has_inner_sil = false;
+        for (std::size_t t = 15; t <= 20; ++t)
+            if (ln[t] == 0) has_inner_sil = true;
+        CHECK(has_inner_sil,
+              "non-transparent: modifier punches an interior silence gap");
+
+        // (c) transparent_ids survives the serialize round-trip.
+        fs::path tmp = fs::temp_directory_path() / "brosoundml_classmap_t.bin";
+        {
+            std::FILE* f = std::fopen(tmp.string().c_str(), "wb");
+            if (f) { brosoundml::write_classmap(f, cm_t); std::fclose(f); }
+        }
+        PhonemeClassMap rd;
+        {
+            std::FILE* f = std::fopen(tmp.string().c_str(), "rb");
+            if (f) { rd = brosoundml::read_classmap(f); std::fclose(f); }
+        }
+        CHECK(rd == cm_t, "transparent: classmap round-trip preserves transparent_ids");
+        CHECK(rd.is_transparent(999) && !rd.is_transparent(101),
+              "transparent: is_transparent restored after load");
+        std::error_code ec; fs::remove(tmp, ec);
+    }
+
     // ─── 3b. resample_labels_nn + crop_or_pad_labels_centered ──────────────
     {
         std::vector<int16_t> base = {0, 1, 2};

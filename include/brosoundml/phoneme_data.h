@@ -45,6 +45,18 @@ struct PhonemeClassMap {
     std::vector<std::string>      class_names;       // size K; [0] == "sil"
     std::vector<std::vector<int>> class_to_ids;      // size K; partition of ids
 
+    // Suprasegmental / diacritic modifier ids (stress, length, aspiration,
+    // palatalization, nasalization, intonation arrows). These are ALSO members
+    // of the silence class in class_to_ids (so class_for_id maps them to silence
+    // — the spotter strips them from enrolled templates), but they are flagged
+    // here as "transparent": when build_frame_labels paints a dataset's frame
+    // labels, a transparent token's frames are NOT silenced — they inherit the
+    // class of the nearest adjacent segmental phoneme. A stress mark precedes a
+    // stressed vowel, so its frames are voiced speech, and silencing them would
+    // both mislabel vowel onsets and punch spurious mid-word "silence" gaps that
+    // the spotter's entry gate would misread. Empty for hand-built / toy maps.
+    std::vector<int>              transparent_ids;
+
     // Class owning `phoneme_id`. Throws std::runtime_error if `phoneme_id` is
     // not present in the map — a dataset built against a given vocab must be
     // fully covered, so an unmapped id is a bug, not silence. The inverse index
@@ -52,17 +64,23 @@ struct PhonemeClassMap {
     // rebuild_inverse()), so a freshly-deserialized map works directly.
     int class_for_id(int phoneme_id) const;
 
+    // True if `phoneme_id` is a transparent modifier (see transparent_ids). The
+    // lookup set is built lazily alongside the inverse index.
+    bool is_transparent(int phoneme_id) const;
+
     int silence_class() const { return 0; }
 
-    // Force a rebuild of the id -> class inverse index. Call after mutating
-    // class_to_ids by hand; the builder and reader already call it.
+    // Force a rebuild of the id -> class inverse index (and the transparent set).
+    // Call after mutating class_to_ids / transparent_ids by hand; the builder
+    // and reader already call it.
     void rebuild_inverse() const;
 
-    // Structural equality (ignores the cached inverse index).
+    // Structural equality (ignores the cached lookup indices).
     bool operator==(const PhonemeClassMap& o) const {
         return num_classes == o.num_classes &&
                class_names == o.class_names &&
-               class_to_ids == o.class_to_ids;
+               class_to_ids == o.class_to_ids &&
+               transparent_ids == o.transparent_ids;
     }
     bool operator!=(const PhonemeClassMap& o) const { return !(*this == o); }
 
@@ -70,6 +88,7 @@ struct PhonemeClassMap {
     // id -> class inverse, built from class_to_ids. Mutable so class_for_id can
     // populate it lazily on a const map.
     mutable std::unordered_map<int, int> id_to_class_;
+    mutable std::unordered_map<int, bool> transparent_set_;  // id -> transparent
     mutable bool                         inverse_built_ = false;
 };
 
@@ -94,8 +113,9 @@ PhonemeClassMap build_default_english_classmap(
 // ─── Class-map serialization (little-endian) ────────────────────────────────
 //
 // Layout: u32 num_classes, then per class { u32 name_len, name bytes,
-// u32 id_count, id_count * i32 ids }. Embedded verbatim in the dataset header
-// (and, later, in a model checkpoint). The reader rebuilds the inverse index.
+// u32 id_count, id_count * i32 ids }, then u32 transparent_count followed by
+// transparent_count * i32 transparent ids. Embedded verbatim in the dataset
+// header (and, later, in a model checkpoint). The reader rebuilds the indices.
 void            write_classmap(std::FILE* f, const PhonemeClassMap& cm);
 PhonemeClassMap read_classmap (std::FILE* f);
 
@@ -128,6 +148,13 @@ PhonemeClassMap read_classmap (std::FILE* f);
 //     (BOS/EOS -> silence). Because frame_center is always in (0, n_samples_16k)
 //     for a valid framing, every frame lands in some token; the edges fall in
 //     the BOS/EOS spans and so are silent.
+//   * Transparent-modifier merge: a token whose id is cm.is_transparent (a
+//     stress/length/etc. diacritic) does NOT silence its frames — they inherit
+//     the class of the nearest adjacent interior NON-transparent token (scanning
+//     forward first, then backward; silence only if no segmental neighbour
+//     exists). This keeps stressed-vowel onsets voiced and avoids spurious
+//     mid-word silence gaps. Genuine pauses (non-transparent silence-class
+//     tokens, e.g. punctuation) stay silent.
 //   * If sum(pred_dur_wrapped) <= 0 the whole track is silence.
 std::vector<int16_t> build_frame_labels(
     const std::vector<int32_t>& pred_dur_wrapped,
