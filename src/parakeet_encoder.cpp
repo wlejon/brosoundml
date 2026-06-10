@@ -233,10 +233,19 @@ void ParakeetEncoder::load(const sf::File& f, const ParakeetEncoderConfig& c,
                                           kNBins, bt::Dtype::FP32);
         std::memcpy(mel_filter.host_f32_mut(), fb.data(),
                     fb.size() * sizeof(float));
-        std::vector<float> hw = melslaney::build_hann_window(kWinLength);
+        // NeMo builds its analysis window with torch.hann_window(win_length,
+        // periodic=False) — the SYMMETRIC Hann (denominator win_length-1), not
+        // the periodic one torchaudio/Whisper use. w[n] = 0.5 - 0.5*cos(2*pi*n/
+        // (N-1)).
         window = bt::Tensor::zeros_on(bt::Device::CPU, 1, kWinLength,
                                       bt::Dtype::FP32);
-        std::memcpy(window.host_f32_mut(), hw.data(), hw.size() * sizeof(float));
+        constexpr double kTwoPi = 6.283185307179586;
+        float* wp = window.host_f32_mut();
+        for (int n = 0; n < kWinLength; ++n) {
+            wp[n] = static_cast<float>(
+                0.5 - 0.5 * std::cos(kTwoPi * n /
+                                     static_cast<double>(kWinLength - 1)));
+        }
     }
 
     // ── subsampling conv stack ──
@@ -249,10 +258,32 @@ void ParakeetEncoder::load(const sf::File& f, const ParakeetEncoderConfig& c,
     // (rows, cols) per conv weight in OIHW-flat form.
     const int conv_cols[5] = {1 * kk * kk, 1 * kk * kk, ch * 1 * 1,
                               1 * kk * kk, ch * 1 * 1};
+    // The kk×kk convs (indices 0,1,3 here) need their (kh,kw) axes swapped:
+    // NeMo feeds the subsampling stem (B,1,T,F) — time as height, freq as
+    // width — but we lay the mel out (B,1,F,T) so the channel/freq flatten
+    // after the stem matches NeMo's transpose(1,2).reshape. A non-symmetric
+    // kernel applied to transposed axes must itself be transposed across
+    // (kh,kw) to stay equivalent. The 1×1 pointwise convs are unaffected.
+    auto transpose_khw = [](bt::Tensor& w_cpu, int k) {
+        float* d = w_cpu.host_f32_mut();
+        for (int co = 0; co < w_cpu.rows; ++co) {
+            float* r = d + static_cast<std::size_t>(co) * k * k;
+            for (int a = 0; a < k; ++a)
+                for (int b = a + 1; b < k; ++b)
+                    std::swap(r[a * k + b], r[b * k + a]);
+        }
+    };
     for (int i = 0; i < 5; ++i) {
         const std::string base =
             sp + "layers." + std::to_string(conv_idx[i]) + ".";
-        sub_conv_w[i] = up(f, base + "weight", ch, conv_cols[i], dev);
+        const bool is_kxk = (conv_cols[i] == kk * kk);
+        bt::Tensor w = up(f, base + "weight", ch, conv_cols[i],
+                          is_kxk ? bt::Device::CPU : dev);
+        if (is_kxk) {
+            transpose_khw(w, kk);
+            w = (dev == bt::Device::CPU) ? w : w.to(dev);
+        }
+        sub_conv_w[i] = std::move(w);
         sub_conv_b[i] = up_opt(f, base + "bias", ch, 1, dev);
     }
     // Final linear: (channels * freq_out) -> hidden_size. freq_out = mel after
