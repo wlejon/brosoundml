@@ -10,6 +10,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -271,6 +272,128 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
         token = greedy_step(hidden, idx_dev);
     }
     return out;
+}
+
+// ─── QwenAsrStream ──────────────────────────────────────────────────────────
+
+namespace {
+constexpr int kStreamHop = 160;   // mel hop (samples/frame) — matches encoder
+}
+
+struct QwenAsrStream::Impl {
+    QwenAsrConfig  config;
+    QwenAsrEncoder encoder;
+    bt::Device     device = bt::Device::CPU;
+    bool           loaded = false;
+
+    int chunk_frames  = 0;   // mel frames per conv-chunk (n_window*2)
+    int block_chunks  = 1;   // block size in conv-chunks
+    int block_frames  = 0;   // chunk_frames * block_chunks
+    int block_samples = 0;   // block_frames * hop
+
+    std::vector<float> buf;   // raw samples buffered, not yet block-finalized
+    std::vector<float> lat;   // finalized latents, row-major (rows, latent_dim)
+    int rows = 0;
+
+    // Encode one block of `len` buffered samples (from the front of buf): run
+    // the encoder, append host latents, fire the callback, and drop those
+    // samples from buf. Returns the number of latent rows produced.
+    int emit_block(int len, const QwenAsrStream::BlockCallback& on_block) {
+        AudioBuffer ab(std::vector<float>(buf.begin(), buf.begin() + len),
+                       config.sample_rate);
+        bt::Tensor out;
+        encoder.forward(ab, out);             // (nr, latent_dim) on `device`
+        const int nr = out.rows;
+        const std::size_t base = lat.size();
+        lat.resize(base + static_cast<std::size_t>(nr) * out.cols);
+        qtd::to_host(out, lat.data() + base);
+        rows += nr;
+        if (on_block && nr > 0) on_block(lat.data() + base, nr);
+        buf.erase(buf.begin(), buf.begin() + len);
+        return nr;
+    }
+};
+
+QwenAsrStream::QwenAsrStream() : impl_(std::make_unique<Impl>()) {}
+QwenAsrStream::~QwenAsrStream() = default;
+QwenAsrStream::QwenAsrStream(QwenAsrStream&&) noexcept = default;
+QwenAsrStream& QwenAsrStream::operator=(QwenAsrStream&&) noexcept = default;
+
+const QwenAsrConfig& QwenAsrStream::config() const { return impl_->config; }
+bool QwenAsrStream::loaded() const { return impl_->loaded; }
+int  QwenAsrStream::frames() const { return impl_->rows; }
+int  QwenAsrStream::block_chunks() const { return impl_->block_chunks; }
+int  QwenAsrStream::block_frames() const { return impl_->block_frames; }
+const std::vector<float>& QwenAsrStream::latents() const { return impl_->lat; }
+
+void QwenAsrStream::load(const std::string& model_dir, int block_chunks,
+                         bt::Device device) {
+    const std::string where = "QwenAsrStream::load";
+    const fs::path dir(model_dir);
+    const fs::path config_path  = dir / "config.json";
+    const fs::path weights_path = dir / "model.safetensors";
+    if (!fs::exists(config_path))
+        fail(where, "no config.json under '" + model_dir + "'");
+    if (!fs::exists(weights_path))
+        fail(where, "no model.safetensors under '" + model_dir + "'");
+
+    impl_->config = parse_config(config_path.string(),
+                                 (dir / "generation_config.json").string());
+    impl_->device = device;
+
+    auto f = bt::safetensors::File::open(weights_path.string());
+    impl_->encoder.load(f, impl_->config, device);
+
+    // Block size: each conv-chunk is n_window*2 mel frames; clamp the block to
+    // the [1, n_window_infer/chunk] window range so a block is always a single
+    // attention window (the encoder forward then windows exactly at the block).
+    impl_->chunk_frames = impl_->config.n_window * 2;
+    const int max_chunks =
+        std::max(1, impl_->config.n_window_infer / impl_->chunk_frames);
+    impl_->block_chunks  = std::clamp(block_chunks, 1, max_chunks);
+    impl_->block_frames  = impl_->block_chunks * impl_->chunk_frames;
+    impl_->block_samples = impl_->block_frames * kStreamHop;
+    impl_->buf.clear();
+    impl_->lat.clear();
+    impl_->rows   = 0;
+    impl_->loaded = true;
+}
+
+int QwenAsrStream::feed(const float* samples, int n,
+                        const BlockCallback& on_block) {
+    const std::string where = "QwenAsrStream::feed";
+    if (!impl_->loaded) fail(where, "load() not called");
+    if (n < 0) fail(where, "negative sample count");
+    Impl& im = *impl_;
+    if (n > 0 && samples) im.buf.insert(im.buf.end(), samples, samples + n);
+
+    int new_rows = 0;
+    while (static_cast<int>(im.buf.size()) >= im.block_samples &&
+           im.block_samples > 0) {
+        new_rows += im.emit_block(im.block_samples, on_block);
+    }
+    return new_rows;
+}
+
+int QwenAsrStream::finish(const BlockCallback& on_block) {
+    const std::string where = "QwenAsrStream::finish";
+    if (!impl_->loaded) fail(where, "load() not called");
+    Impl& im = *impl_;
+
+    // Drain any full blocks first (a feed() may have left them if block_samples
+    // was 0, but normally none remain), then flush the partial tail. A tail
+    // shorter than one mel hop cannot form a frame — it is dropped.
+    int new_rows = 0;
+    while (static_cast<int>(im.buf.size()) >= im.block_samples &&
+           im.block_samples > 0) {
+        new_rows += im.emit_block(im.block_samples, on_block);
+    }
+    if (static_cast<int>(im.buf.size()) >= kStreamHop) {
+        new_rows += im.emit_block(static_cast<int>(im.buf.size()), on_block);
+    } else {
+        im.buf.clear();
+    }
+    return new_rows;
 }
 
 }  // namespace brosoundml

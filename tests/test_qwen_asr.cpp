@@ -17,6 +17,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -138,6 +140,16 @@ static int run() {
                   a.transcribe(buf);
               }),
               "transcribe() before load() throws");
+
+        brosoundml::QwenAsrStream s;
+        CHECK(!s.loaded(), "a fresh QwenAsrStream is not loaded");
+        CHECK(throws_runtime_error([&] {
+                  std::vector<float> x(16000, 0.0f);
+                  s.feed(x.data(), static_cast<int>(x.size()));
+              }),
+              "feed() before load() throws");
+        CHECK(throws_runtime_error([&] { s.finish(); }),
+              "finish() before load() throws");
     }
 
     // ─── Fixture-driven parity vs the genuine upstream model ──────────────
@@ -295,6 +307,100 @@ static int run() {
                                      i, res.token_ids[i], fx.gen_ids[i]);
                         break;
                     }
+                }
+            }
+        }
+
+        // 5. streaming encode (QwenAsrStream) parity + incrementality.
+        {
+            using brosoundml::QwenAsrStream;
+
+            // (a) Single-block parity: a clip shorter than one block streams
+            // bit-identically to encode() over the same clip — block-local mel
+            // normalization equals the global one for a single block, and the
+            // block is the single attention window.
+            {
+                QwenAsrStream st;
+                st.load(model_dir.string(), /*block_chunks=*/8, dev);
+                CHECK(st.loaded(), "stream load() succeeds");
+                CHECK(st.block_chunks() >= 1 && st.block_chunks() <= 8,
+                      "block_chunks clamped into range");
+                const int block_samples = st.block_frames() * 160;
+                const int clip_s = std::min<int>(
+                    static_cast<int>(fx.audio.size()), block_samples - 160);
+                std::vector<float> clip(fx.audio.begin(),
+                                        fx.audio.begin() + clip_s);
+                const AudioBuffer ab(clip, 16000);
+
+                int produced = st.feed(clip.data(), clip_s);
+                CHECK(produced == 0,
+                      "no full block completes for a sub-block clip");
+                produced += st.finish();
+                CHECK(produced == st.frames(), "finish() emits the tail block");
+                CHECK(st.frames() > 0, "stream produced latents");
+
+                bt::Tensor ref = asr.encode(ab);
+                CHECK(st.frames() == ref.rows,
+                      "stream row count == encode() row count");
+                if (st.frames() == ref.rows && !st.latents().empty()) {
+                    float max_d = 0.0f, mean_d = 0.0f;
+                    diff_stats(ref, st.latents().data(), st.latents().size(),
+                               max_d, mean_d);
+                    std::printf("    [%s stream] one-block max|Δ|=%.2e\n",
+                                dev_name, max_d);
+                    CHECK(max_d == 0.0f,
+                          "stream latents bit-match encode() for one block");
+                }
+            }
+
+            // (b) Incrementality: feeding the same clip in different chunkings
+            // yields the identical latent sequence (block boundaries depend only
+            // on cumulative sample offset, not on how feed() is sliced).
+            {
+                QwenAsrStream all, split;
+                all.load(model_dir.string(), /*block_chunks=*/1, dev);
+                split.load(model_dir.string(), /*block_chunks=*/1, dev);
+
+                all.feed(fx.audio.data(), static_cast<int>(fx.audio.size()));
+                all.finish();
+
+                const int sizes[] = {777, 16000, 123, 40000, 9, 250000};
+                int off = 0, si = 0;
+                const int N = static_cast<int>(fx.audio.size());
+                while (off < N) {
+                    int take = std::min(sizes[si % 6], N - off);
+                    split.feed(fx.audio.data() + off, take);
+                    off += take;
+                    ++si;
+                }
+                split.finish();
+
+                CHECK(all.frames() == split.frames(),
+                      "stream row count is feed-chunking invariant");
+                CHECK(all.latents() == split.latents(),
+                      "stream latents are feed-chunking invariant (bit-exact)");
+            }
+
+            // (c) Per-block encode time (informational; CUDA is the realtime
+            // target). Time the steady-state full blocks over the clip.
+            {
+                QwenAsrStream st;
+                st.load(model_dir.string(), /*block_chunks=*/1, dev);
+                const int block_samples = st.block_frames() * 160;
+                const int n_blocks =
+                    static_cast<int>(fx.audio.size()) / std::max(1, block_samples);
+                if (n_blocks > 0) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    st.feed(fx.audio.data(), n_blocks * block_samples);
+                    bt::sync_all();
+                    const auto t1 = std::chrono::steady_clock::now();
+                    const double ms =
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    CHECK(st.frames() > 0, "timed stream produced latents");
+                    std::printf("    [%s stream] %d block(s), %.2f ms/block "
+                                "(%.0f latents/block)\n",
+                                dev_name, n_blocks, ms / n_blocks,
+                                static_cast<double>(st.frames()) / n_blocks);
                 }
             }
         }

@@ -182,4 +182,79 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ─── QwenAsrStream ──────────────────────────────────────────────────────────
+//
+// Incremental, mic-feed encoding over the AuT encoder + projector — the
+// streaming counterpart of QwenAsr::encode(). feed() buffers samples to the
+// next block boundary, runs the encoder over each completed block, and appends
+// that block's projected latents. A block's latents are FINAL the moment the
+// block completes: the encoder's attention is windowed within a block and never
+// crosses block boundaries, so no later audio can revise an emitted latent and
+// nothing is ever re-encoded.
+//
+// Block size is a config knob of `block_chunks` conv-chunks. One conv-chunk is
+// n_window*2 mel frames (100 = ~1 s at 16 kHz) and yields ~13 latents, so a
+// block is 1–8 s of audio (clamped into the [1, n_window_infer/chunk] range the
+// model's dynamic attention windows support); the default 1 chunk emits ~13
+// latents per ~1 s with the lowest latency.
+//
+// Each block is encoded exactly as one-shot encode() over that block of audio —
+// block-local log-mel normalization and a single block-wide attention window —
+// so a clip that fits in one block streams bit-identically to encode(). Over
+// several blocks the stream diverges from a global encode() only by per-block
+// mel normalization and the block-bounded attention window; that is the
+// inherent, intended cost of bounded-latency streaming, and the same dynamic
+// windowing the model was trained for. The encoder runs on the chosen device;
+// latents are accumulated on the host (where a cross-device/library decoder
+// bridge consumes them).
+//
+// Poll-free, single-producer (like WakeWord::feed): feed()/finish() return the
+// number of newly finalized latent rows; no two threads may call feed()
+// concurrently.
+class QwenAsrStream {
+public:
+    QwenAsrStream();
+    ~QwenAsrStream();
+    QwenAsrStream(QwenAsrStream&&) noexcept;
+    QwenAsrStream& operator=(QwenAsrStream&&) noexcept;
+    QwenAsrStream(const QwenAsrStream&) = delete;
+    QwenAsrStream& operator=(const QwenAsrStream&) = delete;
+
+    // Load the encoder ONLY (config.json + the thinker.audio_tower.* weights —
+    // no decoder) from `model_dir`, placing weights on `device`. `block_chunks`
+    // is the block size in conv-chunks, clamped to [1, n_window_infer/chunk].
+    // Throws std::runtime_error on a missing / malformed model.
+    void load(const std::string& model_dir, int block_chunks = 1,
+              brotensor::Device device = brotensor::Device::CPU);
+
+    // Optional per-block sink: invoked once per finalized block with a host
+    // pointer to that block's (n_rows, latent_dim) FP32 latents (row-major).
+    // The pointer is valid only for the duration of the call.
+    using BlockCallback = std::function<void(const float* rows, int n_rows)>;
+
+    // Feed `n` mono 16 kHz samples. Encodes every block that completed on this
+    // call and appends its latents, returning the number of newly finalized
+    // latent rows (0 if no block boundary was crossed). Throws before load().
+    int feed(const float* samples, int n, const BlockCallback& on_block = {});
+
+    // Flush the trailing partial block (the buffered audio shorter than one full
+    // block) as a final, shorter block. Returns the number of newly finalized
+    // latent rows (0 if nothing is buffered). Idempotent once drained.
+    int finish(const BlockCallback& on_block = {});
+
+    // All finalized latents so far, row-major (frames(), config().latent_dim) on
+    // the host. Grows as feed()/finish() finalize blocks.
+    const std::vector<float>& latents() const;
+    int frames() const;          // total finalized latent rows
+    int block_chunks() const;    // block size in conv-chunks
+    int block_frames() const;    // mel frames per full block (block_chunks*chunk)
+
+    const QwenAsrConfig& config() const;
+    bool loaded() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace brosoundml
