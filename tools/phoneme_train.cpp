@@ -470,17 +470,28 @@ int main(int argc, char** argv) try {
             }
         }
 
+        using prof_clock = std::chrono::steady_clock;
+        auto ms = [](prof_clock::time_point a2, prof_clock::time_point b2) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b2 - a2)
+                       .count() / 1000.0; };
+        double t_pack = 0, t_train = 0, t_val = 0;
+
         double train_loss_sum = 0.0; int train_seen = 0;
         for (int step = 0; step < n_train_batches; ++step) {
             bt::Tensor mel_batch, labels;
+            const auto p0 = prof_clock::now();
             pack_batch(feats, train_idx, train_off, step * B, B, n_mels, T,
                        device, mel_batch, labels);
+            const auto p1 = prof_clock::now();
             const float loss = model.train_step(mel_batch, labels, B, T, lr,
                                                  class_weights);
+            const auto p2 = prof_clock::now();
+            t_pack += ms(p0, p1); t_train += ms(p1, p2);
             train_loss_sum += loss; ++train_seen;
         }
 
         // ── Val eval (centered window per clip) ──
+        const auto vstart = prof_clock::now();
         double v_loss = 0.0, v_acc = 0.0, v_nonsil = 0.0;
         long long v_frames = 0; int v_batches = 0;
         std::vector<int> val_off(val_idx.size(), 0);
@@ -510,6 +521,16 @@ int main(int argc, char** argv) try {
             ? static_cast<float>(v_acc / static_cast<double>(v_frames)) : 0.0f;
         const float val_nonsil = v_frames > 0
             ? static_cast<float>(v_nonsil / static_cast<double>(v_frames)) : 0.0f;
+        t_val = ms(vstart, prof_clock::now());
+
+        if (std::getenv("BROSOUNDML_PHONEME_PROFILE")) {
+            std::cout << "  [profile] pack=" << (long long)t_pack
+                      << "ms train_step=" << (long long)t_train
+                      << "ms val=" << (long long)t_val
+                      << "ms  (" << n_train_batches << " steps, B=" << B
+                      << ", " << (long long)(t_train / std::max(1, n_train_batches))
+                      << "ms/step)\n";
+        }
 
         std::cout << "epoch " << (epoch + 1) << "/" << a.epochs
                   << "  train_loss=" << train_loss
