@@ -20,9 +20,16 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace brosoundml {
+
+// Persistent decode-session state for the captured single-token step: the
+// fixed-capacity KV cache, valid-length mask, per-layer scratch, generation
+// RoPE table, and (on CUDA) the captured step graph. Defined in
+// qwen_tts_talker.cpp.
+struct QwenTtsTalkerStepState;
 
 // One Qwen3 decoder layer: RMSNorm, GQA self-attention with per-head QK-norm and
 // interleaved M-RoPE, then a SwiGLU MLP. All projections are bias-free; the two
@@ -76,6 +83,14 @@ struct QwenTtsTalker {
     brotensor::Tensor final_norm;       // (hidden,1) RMSNorm
     std::vector<QwenTtsTalkerLayer> layers;
 
+    // Lazily-built captured-decode session (CUDA AR loop); see decode_begin().
+    mutable std::unique_ptr<QwenTtsTalkerStepState> step_state;
+
+    QwenTtsTalker();
+    ~QwenTtsTalker();
+    QwenTtsTalker(QwenTtsTalker&&) noexcept;
+    QwenTtsTalker& operator=(QwenTtsTalker&&) noexcept;
+
     // Build from the talker.* tensors of model.safetensors (BF16 -> FP32 on
     // `device`). q/k projections and q/k_norm are permuted into brotensor's
     // adjacent-pair RoPE layout at load (see qwen_tts_talker.cpp).
@@ -105,6 +120,35 @@ struct QwenTtsTalker {
     // a host buffer — the AR loop assembles each next-frame embedding on-device.
     void run_dev(const brotensor::Tensor& embeds, int n, const int32_t* pos3n,
                  QwenTtsTalkerCache* cache, brotensor::Tensor& hidden_out) const;
+
+    // ── Captured decode session (CUDA) ──────────────────────────────────────
+    //
+    // The AR loop's single-token step re-issues ~430 tiny kernels per frame;
+    // these three calls replace it with one CUDA-graph replay over persistent
+    // buffers. The session owns a FIXED-capacity KV cache plus a valid-length
+    // key mask: the masked windowed attention always sees the full (cap, kd)
+    // cache, with rows >= len masked out — masked keys are skipped before the
+    // dot product and softmax to exact zeros, so the result is bit-identical
+    // to the growing-cache eager path. The per-layer KV append goes through
+    // scatter_rows with a device-resident row index, so the same captured
+    // kernels append to a new row every replay.
+    //
+    // decode_begin(min_cap) — (re)allocate the session to hold >= min_cap rows
+    //   (bucketed so repeat utterances reuse the captured graph) and reset
+    //   len. Returns false when the Talker is not CUDA-resident — the caller
+    //   keeps the run_dev path.
+    // decode_prefill(...) — run() the prefill eagerly into the session cache
+    //   (rows [0, T)) and set the mask; hidden_out as run().
+    // decode_step(embed, pos, hidden_view) — one generation step: stage the
+    //   (1, hidden) embedding + scalar position, replay (or first capture)
+    //   the step graph, advance len. hidden_view aliases the session's
+    //   persistent post-final-norm hidden row — valid until the next step.
+    //   Grows + re-captures transparently if len reaches capacity.
+    bool decode_begin(int min_cap) const;
+    void decode_prefill(const float* embeds, int T, const int32_t* pos3T,
+                        brotensor::Tensor& hidden_out) const;
+    void decode_step(const brotensor::Tensor& embed, int pos,
+                     brotensor::Tensor& hidden_view) const;
 
     // codec_head over `n` hidden rows (n*hidden row-major) -> (n,vocab) logits.
     void codec_logits(const float* hidden_rows, int n,

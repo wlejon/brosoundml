@@ -4,9 +4,14 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#ifdef BROSOUNDML_HAS_CUDA
+#include <brotensor/cuda_graph.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -47,10 +52,47 @@ bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
     return up(f, name, n, 1, dev);
 }
 
+// Per-step scratch — every intermediate of one captured (n=1) decoder pass.
+// Persisting these lets the step run with no allocation, which is what makes
+// it CUDA-graph-capturable (capture forbids mid-capture allocation).
+struct StepScratch {
+    bt::Tensor normed, q, k, v, qn, kn, qr, kr, ctx, attn, n2, g, u, dn;
+};
+
 }  // namespace
+
+// Captured decode-session state. The KV cache lives here at FIXED capacity so
+// every device pointer the step graph bakes stays stable across replays; the
+// per-frame variables (append row, valid-key mask, RoPE row, input embedding)
+// are staged into persistent device buffers by tiny d2d copies before launch.
+struct QwenTtsTalkerStepState {
+    int cap = 0;            // allocated cache rows
+    int len = 0;            // valid rows (prefill + steps so far)
+    std::vector<bt::Tensor> k, v;     // [layers] (cap, n_kv*head_dim) FP32
+    bt::Tensor mask;        // (cap, 1) FP32 — 1 valid / 0 invalid key rows
+    bt::Tensor ones;        // (1, 1) FP32 constant 1.0 (d2d mask updates)
+    bt::Tensor ramp;        // (cap, 1) INT32 0..cap-1 (d2d index updates)
+    bt::Tensor idx;         // (1, 1) INT32 — the step's append row
+    bt::Tensor in;          // (1, hidden) staged input embedding
+    bt::Tensor hs;          // (1, hidden) residual stream
+    bt::Tensor hidden;      // (1, hidden) post-final-norm output
+    bt::Tensor rope_cos, rope_sin;    // (cap, half) generation-phase tables
+    bt::Tensor cos_step, sin_step;    // (1, half) the step's RoPE row
+    StepScratch sc;
+#ifdef BROSOUNDML_HAS_CUDA
+    bt::CudaGraph graph;
+#endif
+    bool captured = false;
+};
+
+QwenTtsTalker::QwenTtsTalker() = default;
+QwenTtsTalker::~QwenTtsTalker() = default;
+QwenTtsTalker::QwenTtsTalker(QwenTtsTalker&&) noexcept = default;
+QwenTtsTalker& QwenTtsTalker::operator=(QwenTtsTalker&&) noexcept = default;
 
 void QwenTtsTalker::load(const sf::File& f, const QwenTtsTalkerConfig& cfg,
                          bt::Device dev) {
+    step_state.reset();   // drop any stale decode session on reload
     num_layers   = cfg.transformer.num_hidden_layers;
     hidden       = cfg.transformer.hidden_size;
     intermediate = cfg.transformer.intermediate_size;
@@ -225,6 +267,207 @@ void QwenTtsTalker::run_dev(const bt::Tensor& embeds, int n, const int32_t* pos3
 
     if (cache) cache->len = offset + n;
     bt::rms_norm_forward(hs, final_norm, rms_eps, hidden_out);   // (n, hidden)
+}
+
+namespace {
+
+// One fixed-shape decode step over the session state: the exact op sequence of
+// run_dev with n == 1, but over persistent buffers (no allocation), a
+// device-resident append row (scatter_rows), and full-capacity masked
+// attention. Masked-out keys are skipped before the dot product and softmax to
+// exact zeros, so the result is bit-identical to run_dev's growing-cache call;
+// allocation-free means the whole body is CUDA-graph-capturable.
+void talker_step_body(const QwenTtsTalker& t, QwenTtsTalkerStepState& st) {
+    StepScratch& sc = st.sc;
+    bt::copy_d2d(st.in, 0, st.hs, 0, t.hidden);
+
+    for (int l = 0; l < t.num_layers; ++l) {
+        const QwenTtsTalkerLayer& tl = t.layers[l];
+
+        bt::rms_norm_forward(st.hs, tl.in_ln, t.rms_eps, sc.normed);
+        qtd::linear(tl.qw, nullptr, sc.normed, sc.q);
+        qtd::linear(tl.kw, nullptr, sc.normed, sc.k);
+        qtd::linear(tl.vw, nullptr, sc.normed, sc.v);
+        qtd::head_rms_norm(sc.q, 1, t.n_q_heads,  t.head_dim, tl.q_norm, t.rms_eps, sc.qn);
+        qtd::head_rms_norm(sc.k, 1, t.n_kv_heads, t.head_dim, tl.k_norm, t.rms_eps, sc.kn);
+        bt::rope_apply(sc.qn, st.cos_step, st.sin_step, t.head_dim, t.n_q_heads,  sc.qr);
+        bt::rope_apply(sc.kn, st.cos_step, st.sin_step, t.head_dim, t.n_kv_heads, sc.kr);
+
+        bt::scatter_rows(sc.kr, st.idx, st.k[l]);
+        bt::scatter_rows(sc.v,  st.idx, st.v[l]);
+        qtd::flash_attn_masked(sc.qr, st.k[l], st.v[l],
+                               static_cast<const float*>(st.mask.data),
+                               t.n_q_heads, sc.ctx);
+        qtd::linear(tl.ow, nullptr, sc.ctx, sc.attn);
+        bt::add_inplace_batched(st.hs, sc.attn);
+
+        bt::rms_norm_forward(st.hs, tl.post_ln, t.rms_eps, sc.n2);
+        qtd::linear(tl.gate, nullptr, sc.n2, sc.g);
+        qtd::linear(tl.up,   nullptr, sc.n2, sc.u);
+        qtd::swiglu(sc.g, sc.u);
+        qtd::linear(tl.down, nullptr, sc.g, sc.dn);
+        bt::add_inplace_batched(st.hs, sc.dn);
+    }
+
+    bt::rms_norm_forward(st.hs, t.final_norm, t.rms_eps, st.hidden);
+}
+
+// (Re)allocate the session to `cap` rows, preserving the first `keep` valid
+// rows of K/V and the mask (the grow-mid-utterance path; keep == 0 on a fresh
+// session). Invalidates any captured graph — the cache pointers change.
+void talker_state_alloc(const QwenTtsTalker& t, QwenTtsTalkerStepState& st,
+                        int cap, int keep) {
+    const bt::Device dev = t.final_norm.device;
+    const int kd = t.n_kv_heads * t.head_dim;
+    const int half = t.head_dim / 2;
+
+    std::vector<bt::Tensor> nk(t.num_layers), nv(t.num_layers);
+    for (int l = 0; l < t.num_layers; ++l) {
+        nk[l] = bt::Tensor::zeros_on(dev, cap, kd, bt::Dtype::FP32);
+        nv[l] = bt::Tensor::zeros_on(dev, cap, kd, bt::Dtype::FP32);
+        if (keep > 0) {
+            bt::copy_d2d(st.k[l], 0, nk[l], 0, keep * kd);
+            bt::copy_d2d(st.v[l], 0, nv[l], 0, keep * kd);
+        }
+    }
+    st.k = std::move(nk);
+    st.v = std::move(nv);
+
+    // Mask: 1 for the kept rows, 0 beyond (host rebuild — one tiny upload).
+    std::vector<float> hmask(static_cast<std::size_t>(cap), 0.0f);
+    std::fill(hmask.begin(), hmask.begin() + keep, 1.0f);
+    st.mask = bt::Tensor::from_host_on(dev, hmask.data(), cap, 1);
+
+    std::vector<std::int32_t> hramp(static_cast<std::size_t>(cap));
+    for (int i = 0; i < cap; ++i) hramp[i] = i;
+    st.ramp = qtd::upload_idx(dev, hramp.data(), cap);
+
+    const float one = 1.0f;
+    st.ones = bt::Tensor::from_host_on(dev, &one, 1, 1);
+    st.idx  = bt::Tensor::empty_on(dev, 1, 1, bt::Dtype::INT32);
+    st.in     = bt::Tensor::empty_on(dev, 1, t.hidden, bt::Dtype::FP32);
+    st.hs     = bt::Tensor::empty_on(dev, 1, t.hidden, bt::Dtype::FP32);
+    st.hidden = bt::Tensor::empty_on(dev, 1, t.hidden, bt::Dtype::FP32);
+    st.cos_step = bt::Tensor::empty_on(dev, 1, half, bt::Dtype::FP32);
+    st.sin_step = bt::Tensor::empty_on(dev, 1, half, bt::Dtype::FP32);
+
+    // Generation-phase RoPE rows 0..cap-1. In the generation phase all three
+    // M-RoPE axes carry the same scalar position, so the axis interleave is
+    // irrelevant and the table is plain RoPE — built with the same float
+    // expressions as run_dev's per-step host build, so the rows are bitwise
+    // identical to what the eager path uploads.
+    std::vector<float> cb(static_cast<std::size_t>(cap) * half);
+    std::vector<float> sb(static_cast<std::size_t>(cap) * half);
+    for (int i = 0; i < half; ++i) {
+        const float inv_freq = std::pow(t.rope_theta, -(2.0f * i) / t.head_dim);
+        for (int p = 0; p < cap; ++p) {
+            const float ang = static_cast<float>(p) * inv_freq;
+            cb[static_cast<std::size_t>(p) * half + i] = std::cos(ang);
+            sb[static_cast<std::size_t>(p) * half + i] = std::sin(ang);
+        }
+    }
+    st.rope_cos = bt::Tensor::from_host_on(dev, cb.data(), cap, half);
+    st.rope_sin = bt::Tensor::from_host_on(dev, sb.data(), cap, half);
+
+    st.cap = cap;
+#ifdef BROSOUNDML_HAS_CUDA
+    st.graph.reset();
+#endif
+    st.captured = false;
+}
+
+}  // namespace
+
+bool QwenTtsTalker::decode_begin(int min_cap) const {
+    if (final_norm.device != bt::Device::CUDA) return false;
+    bt::DeviceScope scope(final_norm.device);
+    if (!step_state) step_state = std::make_unique<QwenTtsTalkerStepState>();
+    QwenTtsTalkerStepState& st = *step_state;
+    // Bucket the capacity so back-to-back utterances of similar length reuse
+    // the captured graph; only grow (a bigger session serves smaller calls).
+    const int bucket = ((std::max(min_cap, 256) + 511) / 512) * 512;
+    if (st.cap < bucket) talker_state_alloc(*this, st, bucket, /*keep=*/0);
+    st.len = 0;
+    return true;
+}
+
+void QwenTtsTalker::decode_prefill(const float* embeds, int T,
+                                   const int32_t* pos3T,
+                                   bt::Tensor& hidden_out) const {
+    QwenTtsTalkerStepState& st = *step_state;
+    const bt::Device dev = final_norm.device;
+    bt::DeviceScope scope(dev);
+    const int kd = n_kv_heads * head_dim;
+    if (T > st.cap) {
+        throw std::runtime_error(
+            "brosoundml: QwenTtsTalker::decode_prefill: prefill exceeds session capacity");
+    }
+
+    // Run the ordinary prefill into the session's fixed buffers via a cache of
+    // views — same compute as run(), same K/V rows, no growth (cap covers T).
+    QwenTtsTalkerCache tmp;
+    tmp.reset(num_layers);
+    tmp.cap = st.cap;
+    for (int l = 0; l < num_layers; ++l) {
+        tmp.k[l] = bt::Tensor::view(dev, st.k[l].data, st.cap, kd, bt::Dtype::FP32);
+        tmp.v[l] = bt::Tensor::view(dev, st.v[l].data, st.cap, kd, bt::Dtype::FP32);
+    }
+    run(embeds, T, pos3T, &tmp, hidden_out);
+    st.len = T;
+
+    // Valid-key mask: rows [0, T) on, the rest off.
+    std::vector<float> hmask(static_cast<std::size_t>(st.cap), 0.0f);
+    std::fill(hmask.begin(), hmask.begin() + T, 1.0f);
+    bt::detail::alloc_for(dev).memcpy_h2d(
+        st.mask.data, hmask.data(), static_cast<std::size_t>(st.cap) * sizeof(float));
+}
+
+void QwenTtsTalker::decode_step(const bt::Tensor& embed, int pos,
+                                bt::Tensor& hidden_view) const {
+    QwenTtsTalkerStepState& st = *step_state;
+    const bt::Device dev = final_norm.device;
+    bt::DeviceScope scope(dev);
+    const int half = head_dim / 2;
+
+    // Out of room (cache row or RoPE table row): grow + re-capture. Keeps the
+    // valid rows and mask; one-time cost, amortized over the longer utterance.
+    if (st.len >= st.cap || pos >= st.cap) {
+        const int need = std::max(st.len + 1, pos + 1);
+        talker_state_alloc(*this, st, std::max(st.cap * 2, ((need + 511) / 512) * 512),
+                           /*keep=*/st.len);
+    }
+
+    // Stage the step's variables into the captured buffers — all device-side
+    // copies, stream-ordered ahead of the replay.
+    bt::copy_d2d(st.ramp, st.len, st.idx, 0, 1);              // append row
+    bt::copy_d2d(st.ones, 0, st.mask, st.len, 1);             // mask[len] = 1
+    bt::copy_d2d(st.rope_cos, pos * half, st.cos_step, 0, half);
+    bt::copy_d2d(st.rope_sin, pos * half, st.sin_step, 0, half);
+    bt::copy_d2d(embed, 0, st.in, 0, hidden);
+
+#ifdef BROSOUNDML_HAS_CUDA
+    if (!st.captured) {
+        // Warm-up sizes every scratch buffer (capture must not allocate). The
+        // step body is idempotent over the staged inputs — the capture re-run
+        // recomputes the identical row — so no state reset is needed between
+        // the warm-up and the captured run.
+        talker_step_body(*this, st);
+        bt::sync_all();
+        {
+            bt::CudaGraphCapture cap;
+            talker_step_body(*this, st);
+            st.graph = cap.finish();
+        }
+        st.captured = true;
+    } else {
+        st.graph.launch();
+    }
+#else
+    talker_step_body(*this, st);
+#endif
+
+    st.len += 1;
+    hidden_view = bt::Tensor::view(dev, st.hidden.data, 1, hidden, bt::Dtype::FP32);
 }
 
 void QwenTtsTalker::codec_logits(const float* hidden_rows, int n,

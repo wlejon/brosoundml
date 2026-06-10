@@ -81,11 +81,28 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     ArProfiler prof;
 
     // ── Talker prefill: seed the KV cache, keep the last token's hidden ──
+    //
+    // On CUDA the per-token step goes through the captured decode session
+    // (fixed-capacity KV + masked attention + one graph replay per frame, see
+    // decode_begin) — bit-identical to the eager run_dev path, which remains
+    // for CPU and as the BROSOUNDML_QWEN_NO_GRAPH escape hatch.
+    static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
+    // Session horizon: enough for ~80 s of audio up front (max_frames is a
+    // 4096-frame hard cap, far beyond typical utterances — reserving it fully
+    // would pin ~1 GB of KV); a longer generation grows + re-captures once.
+    // (rope_delta < 0 would index the session's [0, cap) RoPE table negatively
+    // — no current caller does that, but the eager path handles it, so gate.)
+    const bool captured = !no_graph && params.rope_delta >= 0 &&
+        talker.decode_begin(T + std::min(params.max_frames, 1024) + 8);   // false off-CUDA
     QwenTtsTalkerCache cache;
-    cache.reset(talker.num_layers);
     bt::Tensor hidden;
     auto tp = prof.tick();
-    talker.run(prefill_embeds, T, pos3T, &cache, hidden);   // (T, H) device
+    if (captured) {
+        talker.decode_prefill(prefill_embeds, T, pos3T, hidden);   // (T, H) device
+    } else {
+        cache.reset(talker.num_layers);
+        talker.run(prefill_embeds, T, pos3T, &cache, hidden);      // (T, H) device
+    }
     prof.add(prof.prefill, tp);
     bt::Tensor hcur = bt::Tensor::empty_on(dev, 1, H, bt::Dtype::FP32);
     bt::copy_d2d(hidden, (T - 1) * H, hcur, 0, H);           // last row
@@ -213,11 +230,17 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         // step the Talker (single token, KV-cached). Generation-phase M-RoPE
         // uses one scalar position on all three axes (T + step + rope_delta).
         const int pos = T + step + params.rope_delta;
-        const int32_t pos3[3] = {pos, pos, pos};
         auto tt = prof.tick();
-        bt::Tensor hstep;
-        talker.run_dev(e, 1, pos3, &cache, hstep);
-        hcur = std::move(hstep);
+        if (captured) {
+            bt::Tensor hview;
+            talker.decode_step(e, pos, hview);   // graph replay; hview aliases
+            hcur = std::move(hview);             // the session's hidden buffer
+        } else {
+            const int32_t pos3[3] = {pos, pos, pos};
+            bt::Tensor hstep;
+            talker.run_dev(e, 1, pos3, &cache, hstep);
+            hcur = std::move(hstep);
+        }
         prof.add(prof.talker, tt);
     }
 

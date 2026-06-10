@@ -121,6 +121,19 @@ inline void flash_attn(const bt::Tensor& Q, const bt::Tensor& K,
                                          /*window=*/0, O);
 }
 
+// flash_attn over a FIXED-capacity K/V buffer with a (Lk) valid-key mask —
+// the captured-decode form: shapes (and so the compiled graph) never change
+// while the valid length advances through the mask. Masked keys are skipped
+// before the dot product and underflow to exact softmax zeros, so the output
+// is bit-identical to flash_attn over only the valid rows (the unwritten tail
+// must hold finite values — the zero-initialized cache does).
+inline void flash_attn_masked(const bt::Tensor& Q, const bt::Tensor& K,
+                              const bt::Tensor& V, const float* d_mask,
+                              int num_heads, bt::Tensor& O) {
+    bt::flash_attention_windowed_forward(Q, K, V, d_mask, num_heads,
+                                         /*window=*/0, O);
+}
+
 // SwiGLU gate: g <- silu(g) * u, in place on g. Both (n, inter).
 inline void swiglu(bt::Tensor& g, const bt::Tensor& u) {
     bt::silu_forward(g, g);
