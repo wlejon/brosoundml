@@ -114,7 +114,8 @@ std::vector<int> parse_int_list(const std::string& s, int n,
 void print_help() {
     std::cout <<
         "brosoundml_phoneme_train — per-frame phoneme-posterior trainer\n"
-        "  --dataset PATH       BPDS dataset (default <data>/phoneme/english.bpds)\n"
+        "  --dataset PATH[,...] BPDS dataset(s), comma-separated; clips concatenated\n"
+        "                       (same class map + framing). default <data>/phoneme/english.bpds\n"
         "  --out-checkpoint P   final fused .bpm (default weights/phoneme/english.bpm)\n"
         "  --val-frac F         held-out split (default 0.1)\n"
         "  --epochs N           training epochs (default 50)\n"
@@ -234,8 +235,6 @@ int main(int argc, char** argv) try {
 
     if (a.dataset.empty())
         a.dataset = default_data_dir() + "/phoneme/english.bpds";
-    if (!fs::exists(a.dataset))
-        fail("phoneme_train", "dataset not found at '" + a.dataset + "'");
     if (fs::path(a.out_checkpoint).has_parent_path())
         fs::create_directories(fs::path(a.out_checkpoint).parent_path());
 
@@ -252,8 +251,35 @@ int main(int argc, char** argv) try {
     const char* dev_name = (device == bt::Device::CUDA)  ? "CUDA"  :
                            (device == bt::Device::Metal) ? "Metal" : "CPU";
 
-    // ── Dataset ──
-    auto ds = bsm::read_phoneme_dataset(a.dataset);
+    // ── Dataset(s) ──
+    // --dataset may be a comma-separated list; clips are concatenated. Every
+    // shard must share the SAME class map and mel framing (e.g. a synthetic
+    // Kokoro shard mixed with a real-speech force-aligned shard).
+    std::vector<std::string> ds_paths;
+    { std::string cur;
+      for (char ch : a.dataset) {
+          if (ch == ',') { if (!cur.empty()) ds_paths.push_back(cur); cur.clear(); }
+          else cur.push_back(ch);
+      }
+      if (!cur.empty()) ds_paths.push_back(cur); }
+    if (ds_paths.empty()) fail("phoneme_train", "no dataset given");
+    for (const auto& p : ds_paths)
+        if (!fs::exists(p)) fail("phoneme_train", "dataset not found at '" + p + "'");
+
+    auto ds = bsm::read_phoneme_dataset(ds_paths[0]);
+    for (std::size_t i = 1; i < ds_paths.size(); ++i) {
+        auto extra = bsm::read_phoneme_dataset(ds_paths[i]);
+        if (!(extra.class_map == ds.class_map))
+            fail("phoneme_train", "class map mismatch in '" + ds_paths[i] + "'");
+        const auto& h = ds.header; const auto& e = extra.header;
+        if (e.sample_rate != h.sample_rate || e.n_fft != h.n_fft ||
+            e.win_length != h.win_length || e.hop_length != h.hop_length ||
+            e.n_mels != h.n_mels)
+            fail("phoneme_train", "header framing mismatch in '" + ds_paths[i] + "'");
+        std::cout << "               + shard '" << ds_paths[i] << "' (+"
+                  << extra.clips.size() << " clips)\n";
+        for (auto& c : extra.clips) ds.clips.push_back(std::move(c));
+    }
     const int K = ds.class_map.num_classes;
     const int n_mels = ds.header.n_mels;
     const int T = a.train_frames;

@@ -217,6 +217,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_phoneme_calibrate tools/phoneme_calibrate.cpp)
     target_link_libraries(brosoundml_phoneme_calibrate PRIVATE brosoundml)
 
+    add_executable(brosoundml_phoneme_align tools/phoneme_align.cpp)
+    target_link_libraries(brosoundml_phoneme_align PRIVATE brosoundml)
+
     add_executable(brosoundml_qwen_tts_bench tools/qwen_tts_bench.cpp)
     target_link_libraries(brosoundml_qwen_tts_bench PRIVATE brosoundml)
 
