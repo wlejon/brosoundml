@@ -791,6 +791,7 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
                           0.40f, 0.45f, 0.50f, 0.55f, 0.60f, 0.62f, 0.65f,
                           0.68f, 0.70f, 0.75f, 0.80f};
     std::map<std::string, std::pair<int, int>> target_tp;  // at grid[0]
+    std::map<std::string, int> target_fp;                  // at thr 0.50
     for (float thr : grid) {
         spotter.clear();
         bsm::SpotterConfig pol = spotter.config();
@@ -813,6 +814,8 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
                 if (e.name == c.target) own = true;
                 else if (family_of(e.name) == family_of(c.target)) same = true;
                 else other = true;
+                if (c.target.empty() && std::fabs(thr - 0.50f) < 1e-6f)
+                    ++target_fp[e.name];
             }
             if (c.target.empty()) { if (any) ++fp_neg; continue; }
             if (own)   ++tp;
@@ -841,7 +844,8 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
 
     // Per-target report — template length after collapse plus detection at the
     // floor threshold, so plateau-misses point at their targets directly.
-    std::printf("# per-target: len, det @ thr=%.2f:\n", grid[0]);
+    std::printf("# per-target: len, det @ thr=%.2f, neg fire-count @ thr=0.50:\n",
+                grid[0]);
     {
         bsm::SpotterConfig pol = spotter.config();
         pol.min_phonemes = 1;
@@ -849,8 +853,8 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
             spotter.remove(name);
             const int len = spotter.enroll_from_classes(name, seq, &pol);
             const auto& t = target_tp[name];
-            std::printf("#   %-14s len %-3d  det %d/%d\n", name.c_str(), len,
-                        t.first, t.second);
+            std::printf("#   %-14s len %-3d  det %d/%d  negfp %d\n",
+                        name.c_str(), len, t.first, t.second, target_fp[name]);
         }
     }
 }

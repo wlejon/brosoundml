@@ -228,6 +228,32 @@ int main(int argc, char** argv) {
         CHECK(fired_named(evs_kw2, KW),
               "POSITIVE: audio-enrolled template fires on a re-rendered keyword");
 
+        // ─ D. enroll_from_audio is trim-invariant ─
+        // A reference HARD-TRIMMED to the sound must enroll the same template
+        // as one arriving out of ambient quiet. PCEN's smoother seeds on the
+        // first frame, so without the internal lead pad a trimmed reference
+        // produces a different feature stream — measured on real recordings:
+        // churn templates that missed their own sound in context and
+        // false-fired on speech.
+        {
+            std::size_t a = 0, b = ref_pcm.size();
+            while (a < b && std::abs(ref_pcm[a]) < 1e-3f) ++a;
+            while (b > a && std::abs(ref_pcm[b - 1]) < 1e-3f) --b;
+            const std::vector<float> trimmed(
+                ref_pcm.begin() + static_cast<std::ptrdiff_t>(a),
+                ref_pcm.begin() + static_cast<std::ptrdiff_t>(b));
+            std::vector<float> ambient(trimmed.size() + 12800, 0.0f);
+            std::copy(trimmed.begin(), trimmed.end(), ambient.begin() + 6400);
+            const int Lt = spotter.enroll_from_audio(
+                "trimmed", trimmed.data(), static_cast<int>(trimmed.size()), &pol);
+            const int La = spotter.enroll_from_audio(
+                "ambient", ambient.data(), static_cast<int>(ambient.size()), &pol);
+            std::fprintf(stderr, "  trim-invariance: trimmed len %d, ambient len %d\n",
+                         Lt, La);
+            CHECK(Lt == La, "enroll_from_audio: trimmed and ambient references "
+                            "enroll the same template length");
+        }
+
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: exception: %s\n", e.what());
         ++g_fail;

@@ -448,11 +448,30 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
 
     // Run the reference audio through the front-end + model offline (a fresh
     // streaming pass, isolated from the live stream's caches).
+    //
+    // The reference is padded with lead/tail silence first. PCEN's smoother
+    // seeds on the first frame's energy: a reference TRIMMED to the sound
+    // (the common case for a file-based enroll) seeds at full energy and
+    // yields a different feature stream — and therefore a different unit/class
+    // path — than the same sound arriving out of ambient quiet, which is the
+    // only way the live stream ever sees it. Measured on real recordings
+    // (trimmed click/whistle enrolls): unpadded templates were churn that
+    // neither matched their own sound in context nor stayed quiet on speech.
+    // The lead also lets the matcher's entry-silence gate see a boundary when
+    // the template is replayed for verification. Tail pad flushes the final
+    // frames through the model's receptive field.
+    const int pad = impl_->mel->config().sample_rate * 2 / 5;   // 0.4 s
+    std::vector<float> padded(static_cast<std::size_t>(pad) * 2 +
+                                  static_cast<std::size_t>(std::max(0, n)),
+                              0.0f);
+    if (n > 0) std::copy(samples, samples + n, padded.begin() + pad);
+
     impl_->mel->reset();
     impl_->model->reset_streaming_state();
 
     bt::Tensor frames;   // (n_mels, T)
-    const int T = impl_->mel->consume(samples, n, frames);
+    const int T = impl_->mel->consume(padded.data(),
+                                      static_cast<int>(padded.size()), frames);
     std::vector<int> class_ids;
     if (T > 0) {
         bt::Tensor logits;   // (T, K)
