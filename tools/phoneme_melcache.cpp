@@ -13,6 +13,7 @@
 //
 //   --dataset PATH[,...]  input BPDS shard(s); class maps + framing must match
 //   --out PATH            output BPMC (default: first input with .bpmc ext)
+//   --device cuda|cpu     mel compute device (default: cuda if available)
 
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_data.h"
@@ -48,18 +49,20 @@ std::vector<std::string> split_csv(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-    std::string dataset, out;
+    std::string dataset, out, device;
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto need = [&]() -> std::string {
             if (i + 1 >= argc) fail("missing value for " + k); return argv[++i]; };
         if      (k == "--dataset") dataset = need();
         else if (k == "--out")     out = need();
+        else if (k == "--device")  device = need();
         else if (k == "-h" || k == "--help") {
             std::printf(
                 "brosoundml_phoneme_melcache — precompute PCEN mels: BPDS -> BPMC\n\n"
                 "  --dataset PATH[,...]  input BPDS shard(s), comma-separated\n"
-                "  --out PATH            output BPMC (default: first input, .bpmc)\n");
+                "  --out PATH            output BPMC (default: first input, .bpmc)\n"
+                "  --device cuda|cpu     mel compute device (default: cuda if available)\n");
             return 0;
         }
         else if (!k.empty() && k[0] != '-' && dataset.empty()) dataset = k;
@@ -74,6 +77,17 @@ int main(int argc, char** argv) try {
     }
 
     bt::init();
+    bt::Device dev = bt::Device::CPU;
+    if (device.empty()) {
+        if (bt::is_available(bt::Device::CUDA)) dev = bt::Device::CUDA;
+    } else if (device == "cuda") {
+        if (!bt::is_available(bt::Device::CUDA)) fail("--device cuda: not available");
+        dev = bt::Device::CUDA;
+    } else if (device != "cpu") {
+        fail("--device must be cuda or cpu");
+    }
+    std::fprintf(stderr, "phoneme_melcache: mel device %s\n",
+                 dev == bt::Device::CUDA ? "CUDA" : "CPU");
 
     auto ds = bsm::read_phoneme_dataset(paths[0]);
     for (std::size_t i = 1; i < paths.size(); ++i) {
@@ -98,7 +112,7 @@ int main(int argc, char** argv) try {
     mcfg.hop_length  = ds.header.hop_length;
     mcfg.n_mels      = ds.header.n_mels;
     mcfg.compression = bsm::MelCompression::PCEN;
-    bsm::MelFrontend mel(mcfg, bt::Device::CPU);
+    bsm::MelFrontend mel(mcfg, dev);
 
     bsm::PhonemeMelCacheWriter writer(
         out, ds.header, static_cast<std::uint32_t>(mcfg.compression),
@@ -113,8 +127,8 @@ int main(int argc, char** argv) try {
         mel.reset();
         mel.compute_offline(pcm.data(), static_cast<int>(pcm.size()), m);
         const int Tmel = m.cols;
-        std::vector<float> mh(static_cast<std::size_t>(n_mels) * Tmel);
-        std::memcpy(mh.data(), m.host_f32(), mh.size() * sizeof(float));
+        // to_host_vector, not host_f32: the tensor is device-resident on CUDA.
+        std::vector<float> mh = m.to_host_vector();
         // BPDS labels are frame-aligned to this framing; clamp defensively to
         // the mel frame count exactly like the trainer does.
         std::vector<std::int16_t> labels(static_cast<std::size_t>(Tmel), 0);

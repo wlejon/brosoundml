@@ -123,6 +123,10 @@ private:
 
     // (n_mels, n_fft/2 + 1) mel filterbank, FP32, resident on `device_`.
     brotensor::Tensor mel_filter_;
+    // (n_fft/2 + 1, n_mels) transpose of mel_filter_, resident on `device_`.
+    // The projection matmul wants this orientation; cached at construction so
+    // the per-call path never round-trips the filterbank through the host.
+    brotensor::Tensor mel_filter_T_;
     // (1, win_length) analysis window, FP32, resident on `device_`.
     brotensor::Tensor window_;
 

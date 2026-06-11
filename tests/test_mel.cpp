@@ -229,6 +229,35 @@ static void test_no_nan_on_noise(bt::Device dev, const char* dev_name) {
     }
 }
 
+// ─── Cross-device parity ──────────────────────────────────────────────────
+// The corpus tools (melcache, sound_units) pick CUDA when available while the
+// CPU path remains the reference; outputs feed the same checkpoints/centroid
+// files, so the two devices must agree to FP32 STFT noise — not just be
+// individually self-consistent.
+static void test_cross_device_parity(bt::Device dev, const char* dev_name) {
+    for (int pcen = 0; pcen <= 1; ++pcen) {
+        MelConfig cfg;
+        cfg.compression = pcen ? brosoundml::MelCompression::PCEN
+                               : brosoundml::MelCompression::Log;
+        MelFrontend ref(cfg, bt::Device::CPU);
+        MelFrontend alt(cfg, dev);
+        const auto sig = make_test_signal(2 * cfg.sample_rate, cfg.sample_rate);
+        bt::Tensor a, b;
+        ref.compute_offline(sig.data(), static_cast<int>(sig.size()), a);
+        alt.compute_offline(sig.data(), static_cast<int>(sig.size()), b);
+        CHECK(a.rows == b.rows && a.cols == b.cols,
+              tag(pcen ? "parity PCEN: shape matches CPU"
+                       : "parity Log: shape matches CPU", dev_name).c_str());
+        const float d = max_abs_diff(a.to_host_vector(), b.to_host_vector());
+        std::fprintf(stderr, "[%s] cross-device %s max-abs-diff vs CPU: %g\n",
+                     dev_name, pcen ? "PCEN" : "Log", d);
+        CHECK(d < 2e-3f,
+              tag(pcen ? "parity PCEN: matches CPU within FP32 noise"
+                       : "parity Log: matches CPU within FP32 noise",
+                  dev_name).c_str());
+    }
+}
+
 // ─── Device runner ────────────────────────────────────────────────────────
 static void run_all(bt::Device dev, const char* dev_name) {
     test_filter_shape(dev, dev_name);
@@ -247,9 +276,11 @@ int main() {
         run_all(bt::Device::CPU, "CPU");
         if (bt::is_available(bt::Device::CUDA)) {
             run_all(bt::Device::CUDA, "CUDA");
+            test_cross_device_parity(bt::Device::CUDA, "CUDA");
         }
         if (bt::is_available(bt::Device::Metal)) {
             run_all(bt::Device::Metal, "Metal");
+            test_cross_device_parity(bt::Device::Metal, "Metal");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());

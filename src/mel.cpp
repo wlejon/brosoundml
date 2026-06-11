@@ -94,7 +94,7 @@ std::vector<float> build_hann_window(int win_length) {
 // MelFrontend member that owns the streaming state. Returns T.
 int compute_frames(const float* signal_host, int signal_len,
                    const MelConfig& cfg,
-                   const bt::Tensor& mel_filter,
+                   const bt::Tensor& mel_filter_T,
                    const bt::Tensor& window,
                    bt::Device device,
                    std::vector<float>& out_linear_TM) {
@@ -102,11 +102,7 @@ int compute_frames(const float* signal_host, int signal_len,
     if (signal_len < cfg.win_length) {
         fail(where, "signal_len < win_length — caller must filter this out");
     }
-    const int T      = 1 + (signal_len - cfg.win_length) / cfg.hop_length;
-    const int n_bins = cfg.n_fft / 2 + 1;
-
-    // Upload signal to `device`. brotensor's stft expects (N, signal_len).
-    bt::Tensor signal = bt::Tensor::from_host_on(device, signal_host, 1, signal_len);
+    const int T = 1 + (signal_len - cfg.win_length) / cfg.hop_length;
 
     // STFT (center=false): frames = 1 + (L - n_fft)/hop. We're using
     // win_length <= n_fft framing with center=false — the op centres the
@@ -129,6 +125,7 @@ int compute_frames(const float* signal_host, int signal_len,
     // signal_len) = (n_fft - win_length)/2 = pad_lo.
     const int pad_lo   = (cfg.n_fft - cfg.win_length) / 2;
     const int L_padded = (T - 1) * cfg.hop_length + cfg.n_fft;
+    bt::Tensor signal;  // (1, L_padded) on `device` — stft expects (N, len)
     {
         std::vector<float> padded(static_cast<std::size_t>(L_padded), 0.0f);
         // Clip the copy to the destination capacity. signal_len may exceed
@@ -163,28 +160,10 @@ int compute_frames(const float* signal_host, int signal_len,
                     " != expected " + std::to_string(T));
     }
 
-    // Mel projection: (T, n_bins) @ (n_bins, n_mels) = (T, n_mels). We hold
-    // mel_filter as (n_mels, n_bins) so build the transpose host-side once
-    // per call and upload — same approach as src/whisper_modules.cpp. The
-    // alternative (a transpose op) doesn't exist in brotensor and we're not
-    // adding one here.
-    bt::Tensor mel_filter_T;
-    {
-        // mel_filter is device-resident; download → transpose → reupload.
-        // For typical KWS sizes (40 × 257) this is ~10 KB and fires once per
-        // streaming chunk — cheap relative to the STFT.
-        std::vector<float> fb_host = mel_filter.to_host_vector();
-        std::vector<float> fb_T_host(
-            static_cast<std::size_t>(n_bins) * cfg.n_mels);
-        for (int m = 0; m < cfg.n_mels; ++m) {
-            for (int k = 0; k < n_bins; ++k) {
-                fb_T_host[static_cast<std::size_t>(k) * cfg.n_mels + m] =
-                    fb_host[static_cast<std::size_t>(m) * n_bins + k];
-            }
-        }
-        mel_filter_T = bt::Tensor::from_host_on(
-            device, fb_T_host.data(), n_bins, cfg.n_mels);
-    }
+    // Mel projection: (T, n_bins) @ (n_bins, n_mels) = (T, n_mels). The
+    // transposed filterbank is built once at construction and lives on
+    // `device` — corpus tools call this per clip, so a per-call host
+    // round-trip of the filterbank is pure overhead.
     bt::Tensor mel_T;  // (T, n_mels) linear
     bt::matmul(mag, mel_filter_T, mel_T);
 
@@ -230,6 +209,15 @@ MelFrontend::MelFrontend(const MelConfig& cfg, bt::Device device)
     const int n_bins = cfg_.n_fft / 2 + 1;
     mel_filter_ = bt::Tensor::from_host_on(device_, fb.data(),
                                            cfg_.n_mels, n_bins);
+    std::vector<float> fb_T(static_cast<std::size_t>(n_bins) * cfg_.n_mels);
+    for (int m = 0; m < cfg_.n_mels; ++m) {
+        for (int k = 0; k < n_bins; ++k) {
+            fb_T[static_cast<std::size_t>(k) * cfg_.n_mels + m] =
+                fb[static_cast<std::size_t>(m) * n_bins + k];
+        }
+    }
+    mel_filter_T_ = bt::Tensor::from_host_on(device_, fb_T.data(),
+                                             n_bins, cfg_.n_mels);
 
     std::vector<float> w = build_hann_window(cfg_.win_length);
     window_ = bt::Tensor::from_host_on(device_, w.data(), 1, cfg_.win_length);
@@ -314,7 +302,7 @@ int MelFrontend::consume(const float* samples, int n,
     const int chunk_len = (T_new - 1) * cfg_.hop_length + cfg_.win_length;
 
     std::vector<float> linear_TM;
-    compute_frames(ring_.data(), chunk_len, cfg_, mel_filter_, window_,
+    compute_frames(ring_.data(), chunk_len, cfg_, mel_filter_T_, window_,
                    device_, linear_TM);
     bt::Tensor frames;  // (n_mels, T_new) after compression
     compress_and_emit(linear_TM, T_new, frames);
@@ -381,7 +369,7 @@ void MelFrontend::compute_offline(const float* samples, int n,
     // prior streaming state). No-op for Log.
     pcen_init_ = false;
     std::vector<float> linear_TM;
-    const int T = compute_frames(samples, n, cfg_, mel_filter_, window_,
+    const int T = compute_frames(samples, n, cfg_, mel_filter_T_, window_,
                                  device_, linear_TM);
     compress_and_emit(linear_TM, T, out);
 }
