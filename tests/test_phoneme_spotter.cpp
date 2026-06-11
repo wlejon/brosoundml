@@ -230,6 +230,54 @@ static void test_score_norm() {
     }
 }
 
+// ── 5c. Proportional coverage gate. ──────────────────────────────────────────
+static void test_coverage_frac() {
+    // A 5-phoneme template where only the first THREE phonemes are actually
+    // spoken: the trailing D,E are "matched" on silence frames at the emission
+    // floor. covered=3 satisfies the absolute min_phonemes=3, so without the
+    // proportional gate this fragment FIRES (conf ~0.63 — the floor keeps the
+    // geometric mean afloat). That is the long-template hole: 3-of-5 is only
+    // 60% real evidence, and it shrinks as templates grow.
+    const std::vector<int> ABCDE = {1, 2, 3, 4, 5};
+    {
+        auto s = make_spotter();
+        s.enroll_from_classes("abcde", ABCDE);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word({1, 2, 3}, 4, 0.8f);   // A,B,C spoken; D,E never occur
+        ps.add_silence(6);
+        CHECK(feed(s, ps).size() == 1,
+              "coverage_frac off: 3-of-5 fragment fires (the hole)");
+    }
+    // min_coverage_frac=0.8 demands ceil(0.8*5)=4 covered -> the fragment is
+    // rejected ...
+    {
+        auto s = make_spotter();
+        bsm::SpotterConfig ov = s.config();
+        ov.min_coverage_frac = 0.8f;
+        s.enroll_from_classes("abcde", ABCDE, &ov);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word({1, 2, 3}, 4, 0.8f);
+        ps.add_silence(6);
+        CHECK(feed(s, ps).empty(),
+              "coverage_frac 0.8: 3-of-5 fragment does NOT fire");
+    }
+    // ... while the fully spoken word still fires under the same gate.
+    {
+        auto s = make_spotter();
+        bsm::SpotterConfig ov = s.config();
+        ov.min_coverage_frac = 0.8f;
+        s.enroll_from_classes("abcde", ABCDE, &ov);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word(ABCDE, 4, 0.8f);
+        ps.add_silence(6);
+        CHECK(feed(s, ps).size() == 1,
+              "coverage_frac 0.8: fully spoken word still fires");
+    }
+}
+
 // ── 6. Refractory debounce. ──────────────────────────────────────────────────
 static void test_refractory() {
     // refractory_ms 600 @ 16 kHz / 160 hop = 60 frames. Two utterances inside
@@ -329,6 +377,7 @@ int main() {
     test_negative();
     test_threshold();
     test_score_norm();
+    test_coverage_frac();
     test_refractory();
     test_prefix_progress();
     test_enroll_collapse();

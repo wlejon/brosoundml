@@ -156,6 +156,7 @@ struct Args {
     float emission_floor = 0.15f;
     float score_norm     = 0.0f;
     float score_norm_ref = 0.5f;
+    float coverage_frac  = 0.0f;
     int   min_phonemes   = 3;
     int   smoothing_hits = 2;
     int   smoothing_window = 3;
@@ -177,6 +178,7 @@ void print_help() {
         "  --floor F            emission_floor (default 0.15; 0 = strict citation match)\n"
         "  --score-norm S       competition-normalization strength (default 0 = off)\n"
         "  --score-norm-ref R   competition denominator floor (default 0.5)\n"
+        "  --coverage-frac F    proportional coverage gate (default 0 = absolute only)\n"
         "  --min-phonemes N     template length floor (default 3)\n"
         "  --smoothing-hits M   M-of-N smoother hits (default 2)\n"
         "  --smoothing-window N M-of-N smoother window (default 3)\n"
@@ -204,6 +206,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--floor") a.emission_floor = std::stof(need(i));
         else if (k == "--score-norm") a.score_norm = std::stof(need(i));
         else if (k == "--score-norm-ref") a.score_norm_ref = std::stof(need(i));
+        else if (k == "--coverage-frac") a.coverage_frac = std::stof(need(i));
         else if (k == "--min-phonemes") a.min_phonemes = std::stoi(need(i));
         else if (k == "--smoothing-hits") a.smoothing_hits = std::stoi(need(i));
         else if (k == "--smoothing-window") a.smoothing_window = std::stoi(need(i));
@@ -418,6 +421,7 @@ int main(int argc, char** argv) try {
         pol.emission_floor   = a.emission_floor;
         pol.score_norm       = a.score_norm;
         pol.score_norm_ref   = a.score_norm_ref;
+        pol.min_coverage_frac = a.coverage_frac;
         pol.min_phonemes     = a.min_phonemes;
         pol.smoothing_hits   = a.smoothing_hits;
         pol.smoothing_window = a.smoothing_window;

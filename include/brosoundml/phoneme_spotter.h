@@ -76,6 +76,21 @@ struct SpotterConfig {
                                     // a weak-but-WINNING emission scores ~1 regardless of
                                     // class, while a class that is losing the frame is
                                     // punished — putting all templates on one scale.
+    float min_coverage_frac = 0.0f; // proportional coverage gate: a completion must
+                                    // have at least max(min_phonemes,
+                                    // ceil(min_coverage_frac * L)) template phonemes
+                                    // with real (raw above-floor) evidence. The
+                                    // absolute min_phonemes alone protects SHORT
+                                    // templates well (3 of 4 = 75% evidence) but
+                                    // long ones barely (3 of 9 = 33%): on dense
+                                    // speech the DP can stitch a few genuinely-
+                                    // occurring common classes into a "completion"
+                                    // of a long template whose other phonemes all
+                                    // ride the emission floor — measured on
+                                    // LibriSpeech test-clean, a 6-phoneme nonsense
+                                    // word ("boolooroo") false-fired on 17.6% of
+                                    // negative clips at its EER threshold. 0
+                                    // disables (absolute gate only).
     float score_norm_ref = 0.5f;    // denominator floor for score_norm. Pure ratio
                                     // (dividing by p_argmax itself) would inflate MUSHY
                                     // frames — in babble/noise the winner may hold only

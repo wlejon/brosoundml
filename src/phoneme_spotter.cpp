@@ -175,12 +175,20 @@ struct TemplateMatcher {
         // Completion confidence: geometric-mean posterior over the matched span.
         const bool complete = (S[L] != kNegInf) && (N[L] > 0);
         const int  covered  = Cov[L] + (Cur[L] ? 1 : 0);  // phonemes actually emitted
+        // Coverage requirement: absolute floor, scaled up proportionally for
+        // long templates (see SpotterConfig::min_coverage_frac).
+        int need_cov = policy.min_phonemes;
+        if (policy.min_coverage_frac > 0.0f) {
+            const int frac_cov = static_cast<int>(std::ceil(
+                static_cast<double>(policy.min_coverage_frac) * L));
+            if (frac_cov > need_cov) need_cov = frac_cov;
+        }
         float conf = 0.0f;
         if (complete) {
             conf = static_cast<float>(std::exp(S[L] / static_cast<double>(N[L])));
             if (conf > 1.0f) conf = 1.0f;   // guard FP overshoot
         }
-        const bool frame_pos = complete && (covered >= policy.min_phonemes) &&
+        const bool frame_pos = complete && (covered >= need_cov) &&
                                (conf > policy.threshold);
 
         // Update the smoothing ring.
@@ -192,10 +200,10 @@ struct TemplateMatcher {
 
         // Fire test. The template must be long enough (min_phonemes), fully
         // aligned (complete), and — crucially for citation templates under the
-        // emission floor — at least min_phonemes of its phonemes must have been
+        // emission floor — at least need_cov of its phonemes must have been
         // ACTUALLY emitted (covered), so a fragment whose missing phonemes are
         // merely floored cannot complete a spurious match.
-        if (L >= policy.min_phonemes && complete && covered >= policy.min_phonemes &&
+        if (L >= policy.min_phonemes && complete && covered >= need_cov &&
             refractory_frames == 0) {
             int hits = 0;
             for (int i = 0; i < ring_len; ++i)
