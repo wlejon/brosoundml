@@ -154,6 +154,8 @@ struct Args {
     std::string keywords;            // CSV; empty -> kDefaultKeywords
     std::string thresholds;          // CSV; empty -> default grid
     float emission_floor = 0.15f;
+    float score_norm     = 0.0f;
+    float score_norm_ref = 0.5f;
     int   min_phonemes   = 3;
     int   smoothing_hits = 2;
     int   smoothing_window = 3;
@@ -173,6 +175,8 @@ void print_help() {
         "  --keywords a,b,c     keywords to enroll (default: a curated jl_corpus set)\n"
         "  --thresholds t,...   detection thresholds to sweep (default 0.18..0.60)\n"
         "  --floor F            emission_floor (default 0.15; 0 = strict citation match)\n"
+        "  --score-norm S       competition-normalization strength (default 0 = off)\n"
+        "  --score-norm-ref R   competition denominator floor (default 0.5)\n"
         "  --min-phonemes N     template length floor (default 3)\n"
         "  --smoothing-hits M   M-of-N smoother hits (default 2)\n"
         "  --smoothing-window N M-of-N smoother window (default 3)\n"
@@ -198,6 +202,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--keywords") a.keywords = need(i);
         else if (k == "--thresholds") a.thresholds = need(i);
         else if (k == "--floor") a.emission_floor = std::stof(need(i));
+        else if (k == "--score-norm") a.score_norm = std::stof(need(i));
+        else if (k == "--score-norm-ref") a.score_norm_ref = std::stof(need(i));
         else if (k == "--min-phonemes") a.min_phonemes = std::stoi(need(i));
         else if (k == "--smoothing-hits") a.smoothing_hits = std::stoi(need(i));
         else if (k == "--smoothing-window") a.smoothing_window = std::stoi(need(i));
@@ -382,8 +388,10 @@ int main(int argc, char** argv) try {
     const int n_clips = (int)clips.size();
 
     std::fprintf(stderr, "\nemission_floor=%.2f  min_phonemes=%d  smoothing=%d/%d"
-                 "  entry_silence=%d\n", a.emission_floor, a.min_phonemes,
-                 a.smoothing_hits, a.smoothing_window, a.entry_silence);
+                 "  entry_silence=%d  score_norm=%.2f/ref=%.2f\n",
+                 a.emission_floor, a.min_phonemes,
+                 a.smoothing_hits, a.smoothing_window, a.entry_silence,
+                 a.score_norm, a.score_norm_ref);
     std::printf("\n# keyword positives (each negative pool = %d clips):\n", n_clips);
     for (const auto& kw : keywords)
         std::printf("#   %-10s pos=%d neg=%d\n", kw.c_str(), n_pos[kw], n_clips - n_pos[kw]);
@@ -408,6 +416,8 @@ int main(int argc, char** argv) try {
         bsm::SpotterConfig pol = spotter.config();
         pol.threshold        = thr;
         pol.emission_floor   = a.emission_floor;
+        pol.score_norm       = a.score_norm;
+        pol.score_norm_ref   = a.score_norm_ref;
         pol.min_phonemes     = a.min_phonemes;
         pol.smoothing_hits   = a.smoothing_hits;
         pol.smoothing_window = a.smoothing_window;

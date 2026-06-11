@@ -60,6 +60,31 @@ struct SpotterConfig {
                                     // < threshold (a garbage span where every template
                                     // class is absent scores ~emission_floor, so the
                                     // threshold still rejects it). 0 disables.
+    float score_norm = 0.0f;        // competition-normalization strength in [0,1]. At 0
+                                    // (off) a frame contributes its RAW log-posterior, so
+                                    // the geometric-mean confidence rides each class's
+                                    // absolute calibration — and that calibration varies
+                                    // systematically by phoneme type (long vowels/nasals
+                                    // post near 0.9 when present; stop bursts/fricatives
+                                    // peak far lower). Templates therefore live on
+                                    // DIFFERENT score scales (measured on CAMEO: at one
+                                    // fixed threshold, per-keyword FAR spans 0.000 to
+                                    // 0.29), so no single threshold transfers across
+                                    // words. At s > 0 the contribution becomes
+                                    //   log p[c] − s · log max(p_argmax, score_norm_ref)
+                                    // i.e. the posterior RATIO against the frame's winner:
+                                    // a weak-but-WINNING emission scores ~1 regardless of
+                                    // class, while a class that is losing the frame is
+                                    // punished — putting all templates on one scale.
+    float score_norm_ref = 0.5f;    // denominator floor for score_norm. Pure ratio
+                                    // (dividing by p_argmax itself) would inflate MUSHY
+                                    // frames — in babble/noise the winner may hold only
+                                    // ~0.2, and any template class near it scores ~1, so
+                                    // everything false-fires. Capping the denominator at
+                                    // this reference ("what a confidently-emitted phoneme
+                                    // posts") keeps low-evidence frames scored near their
+                                    // absolute posterior while confident frames get the
+                                    // full ratio treatment.
 };
 
 struct SpotEvent {

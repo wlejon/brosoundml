@@ -175,6 +175,61 @@ static void test_threshold() {
     }
 }
 
+// ── 5b. Competition (posterior-ratio) score normalization. ──────────────────
+static void test_score_norm() {
+    // A weak-but-WINNING word: mass 0.35 on the right class each frame (others
+    // get ~0.13). Raw geometric-mean confidence ~0.35 < default threshold 0.40
+    // -> no fire. With score_norm=1 each frame scores p/max(p_argmax, 0.5) =
+    // 0.35/0.5 = 0.70 -> fires at the SAME default threshold. This is the
+    // per-template scale fix: a confidently-WON frame qualifies regardless of
+    // the class's absolute posterior calibration.
+    {
+        auto s = make_spotter();
+        s.enroll_from_classes("abcd", ABCD);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word(ABCD, 4, 0.35f);
+        ps.add_silence(4);
+        CHECK(feed(s, ps).empty(), "score_norm off: weak-winning word below 0.40 -> no fire");
+    }
+    {
+        auto s = make_spotter();
+        bsm::SpotterConfig ov = s.config();
+        ov.score_norm   = 1.0f;      // ref stays at the 0.5 default
+        ov.min_phonemes = 4;         // toy K=6 spreads 0.13 on absent classes —
+                                     // close enough to the 0.15 floor that a
+                                     // 3-of-4 coverage completion can fire one
+                                     // phoneme early; demand all four so the
+                                     // fire lands on the true D-frame finish.
+        s.enroll_from_classes("abcd", ABCD, &ov);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word(ABCD, 4, 0.35f);
+        ps.add_silence(4);
+        auto ev = feed(s, ps);
+        CHECK(ev.size() == 1, "score_norm on: same weak-winning word fires");
+        if (ev.size() == 1) {
+            CHECK(ev[0].confidence > 0.6f, "score_norm: confidence lifted to ~0.70");
+            std::fprintf(stderr, "    (confidence=%.3f)\n", ev[0].confidence);
+        }
+    }
+    // Normalization must NOT inflate a LOSING template: a confident E,D,C,B
+    // utterance gives the abcd classes only ~0.07 each while the winner holds
+    // 0.8, so the per-frame ratio (~0.08) is floored and never covered ->
+    // coverage gate rejects the match.
+    {
+        auto s = make_spotter();
+        bsm::SpotterConfig ov = s.config();
+        ov.score_norm = 1.0f;
+        s.enroll_from_classes("abcd", ABCD, &ov);
+        PostStream ps;
+        ps.add_silence(6);
+        ps.add_word({5, 4, 3, 2}, 4, 0.8f);
+        ps.add_silence(4);
+        CHECK(feed(s, ps).empty(), "score_norm on: losing template still does not fire");
+    }
+}
+
 // ── 6. Refractory debounce. ──────────────────────────────────────────────────
 static void test_refractory() {
     // refractory_ms 600 @ 16 kHz / 160 hop = 60 frames. Two utterances inside
@@ -273,6 +328,7 @@ int main() {
     test_min_phonemes();
     test_negative();
     test_threshold();
+    test_score_norm();
     test_refractory();
     test_prefix_progress();
     test_enroll_collapse();

@@ -91,10 +91,12 @@ struct TemplateMatcher {
     }
 
     // Advance one frame. `lp` is the length-K per-class log-posterior buffer,
+    // `pmax` the frame's max posterior (linear, for competition normalization),
     // `gate_open` whether a fresh entry may begin this frame. On a completed +
     // qualified + un-refractory alignment, writes the event and returns true
     // (and resets this template's DP so it must re-enter from silence).
-    bool step(const std::vector<float>& lp, bool gate_open, SpotEvent& out_ev) {
+    bool step(const std::vector<float>& lp, float pmax, bool gate_open,
+              SpotEvent& out_ev) {
         const int L = this->L();
 
         // Per-frame emission floor: a template phoneme's contribution is clamped
@@ -102,6 +104,19 @@ struct TemplateMatcher {
         // (~0) can't multiplicatively underflow the geometric-mean confidence.
         const double log_floor = (policy.emission_floor > 0.0f)
             ? std::log(static_cast<double>(policy.emission_floor)) : kNegInf;
+
+        // Competition normalization: subtract score_norm * log of the frame's
+        // winning posterior (denominator capped below at score_norm_ref so
+        // low-evidence frames aren't inflated — see SpotterConfig).
+        double log_comp = 0.0;
+        if (policy.score_norm > 0.0f) {
+            const float ref   = policy.score_norm_ref > 0.0f
+                                    ? policy.score_norm_ref : 0.5f;
+            const float denom = pmax > ref ? pmax : ref;
+            log_comp = static_cast<double>(policy.score_norm) *
+                       std::log(static_cast<double>(denom > kLogEps ? denom
+                                                                    : kLogEps));
+        }
 
         // Launch pad for this frame.
         S[0]   = gate_open ? 0.0 : kNegInf;
@@ -125,10 +140,16 @@ struct TemplateMatcher {
             }
             const bool   advance = (s_adv > s_stay);
             const int    prevN    = advance ? N[j - 1] : N[j];
-            const double raw_emit = static_cast<double>(lp[static_cast<std::size_t>(
+            const double raw_lp   = static_cast<double>(lp[static_cast<std::size_t>(
                        classes[static_cast<std::size_t>(j - 1)])]);
-            const bool   above    = raw_emit > log_floor;   // phoneme actually emitted
-            const double emit     = (raw_emit < log_floor) ? log_floor : raw_emit;
+            // Coverage asks "was this phoneme actually emitted" — an ABSOLUTE
+            // evidence question, so it tests the RAW posterior. Normalization
+            // applies only to the DP score; otherwise a losing-but-nonzero
+            // class (ratio above the floor) would count as covered and let a
+            // template complete on frames where its phonemes never occurred.
+            const bool   above    = raw_lp > log_floor;
+            const double norm_emit = raw_lp - log_comp;
+            const double emit     = (norm_emit < log_floor) ? log_floor : norm_emit;
             S[j] = best + emit;
             N[j] = prevN + 1;
             if (advance) {
@@ -505,7 +526,7 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
             const int L = m.L();
             const bool gate = impl_->silence_run >= m.policy.entry_silence_frames;
             SpotEvent ev;
-            const bool fired = (L > 0) && m.step(lp, gate, ev);
+            const bool fired = (L > 0) && m.step(lp, pmax, gate, ev);
             if (fired) {
                 m.refractory_frames = impl_->refractory_frames_for(m.policy);
                 events.push_back(ev);
