@@ -86,6 +86,13 @@ struct QwenAsrConfig {
     int audio_token_id       = 0;       // 151676  <|audio_pad|>
     std::vector<int32_t> eos_token_ids; // {151643, 151645}
 
+    // <asr_text> — the separator the generated stream places between the
+    // language ID and the transcript. A tokenizer-level invariant of the model
+    // family (like sample_rate), not present in config.json — callers split
+    // the id stream on it rather than on detokenized text (BPE decoders that
+    // don't carry the added-tokens table render it as an empty string).
+    int asr_text_token_id = 151704;
+
     // ── latent-tap geometry (the encode() surface) ──
     // The post-projector latents encode() emits are (T, latent_dim) at
     // latent_hz frames/second — exactly the rows the decoder consumes over the
@@ -119,8 +126,9 @@ public:
     // Result of a transcribe() call. `token_ids` is the GENERATED id stream
     // only (the chat-template prompt and the audio placeholder tokens are
     // not echoed; the trailing EOS is stripped). The stream is the model's
-    // "language <Language><asr_text>transcript" format — callers detokenize
-    // via brolm::qwen::Tokenizer::decode and split on <asr_text> (id 151704).
+    // "language <Language><asr_text>transcript" format — callers split the
+    // id stream on config().asr_text_token_id, then detokenize each side via
+    // brolm::qwen::Tokenizer::decode.
     struct Transcription {
         std::vector<int32_t> token_ids;
     };

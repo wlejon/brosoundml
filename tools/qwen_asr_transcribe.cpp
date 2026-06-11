@@ -52,8 +52,6 @@ void print_usage() {
         "                                 [--max-new-tokens N] [--stream] [--ids]\n");
 }
 
-constexpr std::int32_t kAsrTextId = 151704;   // <asr_text>
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -139,7 +137,7 @@ int main(int argc, char** argv) {
         std::vector<std::int32_t> head, tail;
         bool seen_asr_text = false;
         for (std::int32_t id : res.token_ids) {
-            if (id == kAsrTextId) { seen_asr_text = true; continue; }
+            if (id == asr.config().asr_text_token_id) { seen_asr_text = true; continue; }
             (seen_asr_text ? tail : head).push_back(id);
         }
         if (seen_asr_text) {
