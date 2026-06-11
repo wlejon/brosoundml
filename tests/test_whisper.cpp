@@ -3,14 +3,18 @@
 // std::runtime_error naming the stage.
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
+#include "brosoundml/whisper_modules.h"   // white-box CPU↔CUDA logits parity
 
 #include <brolm/whisper_tokenizer.h>
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
+#include <brotensor/tensor.h>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -217,8 +221,19 @@ static int run() {
     // <repo>/weights/whisper/. Run on CPU and (if available) CUDA. Token
     // argmax can tip differently between devices on FP noise, so the
     // filename-target substring check is CPU-only.
+    //
+    // `out` (optional) captures the run for the cross-device parity block
+    // below: the generated token ids, the decoded transcript, and the wall
+    // time of the main transcribe() call.
+    struct RealRun {
+        bool                 ran = false;
+        std::vector<int32_t> generated;
+        std::string          transcript;
+        double               seconds = 0.0;
+    };
     auto run_real_smoke = [&](brotensor::Device dev, const char* dev_name,
-                              bool enforce_filename_target) {
+                              bool enforce_filename_target,
+                              RealRun* out = nullptr) {
         const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "whisper";
         const fs::path real_model = real_root / "model.safetensors";
         const fs::path vocab_path = real_root / "vocab.json";
@@ -265,7 +280,10 @@ static int run() {
             ++failures;
         }
 
+        const auto t0 = std::chrono::steady_clock::now();
         auto result = real.transcribe(audio, prompt);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
         if (!(result.token_ids.size() > prompt.size())) {
             std::fprintf(stderr,
                          "FAIL: [%s] real Whisper: transcribe generated at "
@@ -297,6 +315,16 @@ static int run() {
         }
         std::printf("    [%s] real Whisper transcript: %s\n",
                     dev_name, transcript.c_str());
+        std::printf("    [%s] transcribe: %.2f s (%zu tokens, %.1f tok/s)\n",
+                    dev_name, secs, generated.size(),
+                    secs > 0.0 ? static_cast<double>(generated.size()) / secs
+                               : 0.0);
+        if (out) {
+            out->ran        = true;
+            out->generated  = generated;
+            out->transcript = transcript;
+            out->seconds    = secs;
+        }
 
         if (enforce_filename_target) {
             const std::string stem = test_wav.stem().string();
@@ -327,15 +355,108 @@ static int run() {
     // CPU enforces the filename-target substring (the deterministic baseline);
     // CUDA only checks that the pipeline runs and produces a well-formed
     // transcript — token argmax may tip on FP noise.
+    RealRun cpu_run, cuda_run;
     run_real_smoke(brotensor::Device::CPU, "CPU",
-                   /*enforce_filename_target=*/true);
+                   /*enforce_filename_target=*/true, &cpu_run);
     if (brotensor::is_available(brotensor::Device::CUDA)) {
         run_real_smoke(brotensor::Device::CUDA, "CUDA",
-                       /*enforce_filename_target=*/false);
+                       /*enforce_filename_target=*/false, &cuda_run);
     }
     if (brotensor::is_available(brotensor::Device::Metal)) {
         run_real_smoke(brotensor::Device::Metal, "Metal",
                        /*enforce_filename_target=*/false);
+    }
+
+    // ─── CPU↔CUDA parity (opt-in: real weights + a CUDA device) ────────────
+    //
+    // Two levels, mirroring how test_qwen_asr pins its cross-device contract:
+    //
+    //  1. End-to-end: the greedy transcripts must agree. The decoder runs
+    //     FP32 on both devices, so the only divergence source is the
+    //     encoder's FP16 flash-attention core — far below greedy-argmax
+    //     margins on real speech.
+    //  2. White-box: encode + prompt prefill on each device and compare the
+    //     last-position logits within an FP16-attention tolerance (the same
+    //     5e-2 bound test_qwen_asr uses for its upstream-logits check).
+    if (cpu_run.ran && cuda_run.ran) {
+        std::printf("  [parity] CPU %.2f s vs CUDA %.2f s (%.1fx)\n",
+                    cpu_run.seconds, cuda_run.seconds,
+                    cuda_run.seconds > 0.0 ? cpu_run.seconds / cuda_run.seconds
+                                           : 0.0);
+        CHECK(cpu_run.transcript == cuda_run.transcript,
+              "CPU and CUDA transcripts match");
+        std::printf("  [parity] token streams %s (%zu vs %zu tokens)\n",
+                    cpu_run.generated == cuda_run.generated ? "identical"
+                                                            : "differ",
+                    cpu_run.generated.size(), cuda_run.generated.size());
+
+        // White-box prefill-logits parity over the real checkpoint.
+        const fs::path real_root =
+            fs::path(BROSOUNDML_REPO_DIR) / "weights" / "whisper";
+        const fs::path test_wav = real_root / "test_audio_en.wav";
+        Whisper cfg_probe;
+        cfg_probe.load(real_root.string(), brotensor::Device::CPU);
+        const brosoundml::WhisperConfig& c = cfg_probe.config();
+
+        auto tok = brolm::whisper::Tokenizer::load(
+            (real_root / "vocab.json").string(),
+            (real_root / "merges.txt").string());
+        const std::vector<int32_t> prompt =
+            tok.build_prompt("en", "transcribe", /*with_timestamps=*/false);
+        AudioBuffer audio = brosoundml::read_wav(test_wav.string());
+
+        auto prefill_last_logits = [&](brotensor::Device dev) {
+            namespace bt = brotensor;
+            auto f = bt::safetensors::File::open(
+                (real_root / "model.safetensors").string());
+            brosoundml::LogMel mel;
+            mel.build(c.num_mel_bins, dev);
+            brosoundml::WhisperEncoder enc;
+            enc.load_from(f, c.num_mel_bins, c.d_model, c.max_source_positions,
+                          c.encoder_layers, c.encoder_ffn_dim,
+                          c.encoder_attention_heads, dev);
+            brosoundml::WhisperDecoder dec;
+            dec.load_from(f, c.d_model, c.decoder_layers, c.decoder_ffn_dim,
+                          c.decoder_attention_heads, c.vocab_size,
+                          c.max_target_positions, c.max_source_positions, dev);
+            brosoundml::WhisperKVCache cache;
+            cache.allocate(c.decoder_layers, c.d_model,
+                           c.max_target_positions, c.max_source_positions, dev);
+
+            bt::Tensor m = bt::Tensor::empty_on(bt::Device::CPU, 0, 0,
+                                                bt::Dtype::FP32);
+            mel.forward(audio, m);
+            bt::Tensor hidden = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+            enc.forward(m, hidden);
+            dec.prime_cross(hidden, cache);
+            bt::Tensor logits = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+            dec.forward(prompt.data(), static_cast<int>(prompt.size()),
+                        /*pos_offset=*/0, cache, logits);
+
+            bt::Tensor host = (logits.device == bt::Device::CPU)
+                                  ? std::move(logits)
+                                  : logits.to(bt::Device::CPU);
+            const int V = host.cols;
+            const float* last =
+                host.host_f32() +
+                static_cast<std::size_t>(host.rows - 1) * V;
+            return std::vector<float>(last, last + V);
+        };
+
+        const std::vector<float> lc = prefill_last_logits(brotensor::Device::CPU);
+        const std::vector<float> lg = prefill_last_logits(brotensor::Device::CUDA);
+        CHECK(lc.size() == lg.size(), "parity: logits width matches");
+        float max_d = 0.0f;
+        double sum_d = 0.0;
+        for (std::size_t i = 0; i < lc.size(); ++i) {
+            const float d = std::fabs(lc[i] - lg[i]);
+            if (d > max_d) max_d = d;
+            sum_d += d;
+        }
+        std::printf("  [parity] prefill logits max|Δ|=%.2e  mean|Δ|=%.2e\n",
+                    max_d, lc.empty() ? 0.0 : sum_d / static_cast<double>(lc.size()));
+        CHECK(max_d < 5e-2f,
+              "CPU vs CUDA prefill logits within FP16-attention tolerance");
     }
 
     if (failures) {

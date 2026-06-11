@@ -45,9 +45,10 @@ namespace brosoundml {
 // brotensor op coverage: stft + a host power loop + matmul (mel front-end),
 // conv1d, gelu, layer_norm, embedding_lookup. Encoder self-attention uses
 // brosoundml's FP32 MHA module (modules.h); the decoder's causal self- and
-// cross-attention are free functions over flash_attention_forward with a KV
-// cache (FP16-cast Q/K/V on CUDA). Greedy token selection is a host argmax. No
-// new brotensor op is required.
+// cross-attention are free functions over a KV cache —
+// flash_attention_forward on CPU, FP32 flash_attention_windowed_forward on
+// GPU (no FP16 round-trip of the cache). Greedy token selection is a host
+// argmax. No new brotensor op is required.
 //
 // STATUS: complete. load() reads config.json + the safetensors weights onto
 // the requested device; transcribe() runs the full log-mel ▶ encoder ▶

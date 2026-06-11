@@ -44,8 +44,11 @@ both.
 `stft` + a host power loop + `matmul` (mel front-end), `conv1d`, `gelu`,
 `layer_norm`, `embedding_lookup`. Encoder self-attention uses brosoundml's FP32
 `MHA` module (`modules.h`); the decoder's causal self-attention and cross-
-attention are free functions over `brotensor::flash_attention_forward` with a KV
-cache (FP16-cast Q/K/V on CUDA). Greedy token selection is a host argmax, not a
+attention are free functions over a KV cache — `flash_attention_forward` on
+CPU, FP32 `flash_attention_windowed_forward` on GPU so the cached K/V never
+round-trips through FP16. Device-neutral CPU + CUDA: weights load to the
+requested device and the encoder/decoder forwards stay on-device (one logits
+download per decode step). Greedy token selection is a host argmax, not a
 `sample_logits` op.
 
 ## Tools

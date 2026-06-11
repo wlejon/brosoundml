@@ -591,25 +591,22 @@ void mha_causal_cached_fp32(const bt::Tensor& X,
     //  - single-step (T==1): one query attends to every key in the cache; no
     //    mask needed, causal=false.
     const bool causal = (cache.self_len == 0);
-    // CUDA flash_attention_forward requires FP16/BF16; on non-CPU devices,
-    // cast Q/K/V to FP16, run the flash core, then cast the (T, D) output back
-    // to FP32 before the Wo + bo projection. Mirrors mha_attention_fp32 in
-    // modules.cpp.
     bt::Tensor ctx = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
     if (X.device == bt::Device::CPU) {
         bt::flash_attention_forward(Q, K_live, V_live,
                                     /*d_mask=*/nullptr, num_heads, causal, ctx);
     } else {
-        bt::Tensor Qh = bt::Tensor::empty_on(X.device, T,        D, bt::Dtype::FP16);
-        bt::Tensor Kh = bt::Tensor::empty_on(X.device, Lk_total, D, bt::Dtype::FP16);
-        bt::Tensor Vh = bt::Tensor::empty_on(X.device, Lk_total, D, bt::Dtype::FP16);
-        bt::cast(Q,      Qh, bt::Dtype::FP16);
-        bt::cast(K_live, Kh, bt::Dtype::FP16);
-        bt::cast(V_live, Vh, bt::Dtype::FP16);
-        bt::Tensor ctx_h = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP16);
-        bt::flash_attention_forward(Qh, Kh, Vh, /*d_mask=*/nullptr,
-                                    num_heads, causal, ctx_h);
-        bt::cast(ctx_h, ctx, bt::Dtype::FP32);
+        // GPU: flash_attention_windowed_forward runs FP32 directly (the
+        // qwen_tts_talker pattern), so the cache never round-trips through
+        // FP16 — the previous path re-cast the whole live K/V prefix every
+        // decode step. window <= 0 is unbounded causal with the Lq queries
+        // occupying the LAST Lq positions of the Lk sequence:
+        //  - prefill: Lq == Lk_total, query r attends [0, r] (== causal=true);
+        //  - single-step: the one query sits at position Lk_total-1 and
+        //    attends the whole cache (== the causal=false full-cache case).
+        bt::flash_attention_windowed_forward(Q, K_live, V_live,
+                                             /*d_mask=*/nullptr, num_heads,
+                                             /*window=*/0, ctx);
     }
 
     // Pre-allocate `out` on X.device too — same reasoning.
@@ -657,25 +654,39 @@ void cross_attn_cached_fp32(const bt::Tensor& X,
     // not causal. K/V already live in the cache (pre-projected by
     // prime_cross_cache_fp32). flash_attention_forward handles per-head
     // scaled-dot-product softmax + V-mix in one device-dispatched op.
-    // CUDA flash_attention_forward requires FP16/BF16; on non-CPU devices,
-    // cast Q + cached K/V to FP16, run the flash core, then cast the (T, D)
-    // output back to FP32 before the Wo + bo projection.
     bt::Tensor ctx = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP32);
     if (X.device == bt::Device::CPU) {
         bt::flash_attention_forward(Q, cache.cross_k, cache.cross_v,
                                     /*d_mask=*/nullptr, num_heads,
                                     /*causal=*/false, ctx);
     } else {
-        bt::Tensor Qh = bt::Tensor::empty_on(X.device, T,  D, bt::Dtype::FP16);
-        bt::Tensor Kh = bt::Tensor::empty_on(X.device, Lk, D, bt::Dtype::FP16);
-        bt::Tensor Vh = bt::Tensor::empty_on(X.device, Lk, D, bt::Dtype::FP16);
-        bt::cast(Q,             Qh, bt::Dtype::FP16);
-        bt::cast(cache.cross_k, Kh, bt::Dtype::FP16);
-        bt::cast(cache.cross_v, Vh, bt::Dtype::FP16);
-        bt::Tensor ctx_h = bt::Tensor::empty_on(X.device, T, D, bt::Dtype::FP16);
-        bt::flash_attention_forward(Qh, Kh, Vh, /*d_mask=*/nullptr,
-                                    num_heads, /*causal=*/false, ctx_h);
-        bt::cast(ctx_h, ctx, bt::Dtype::FP32);
+        // GPU: flash_attention_windowed_forward runs FP32 directly, so the
+        // (Lk, D) encoder K/V never re-casts to FP16 — the previous path paid
+        // that full-cache cast on EVERY decode step. The windowed op is
+        // implicitly causal with the Lq queries occupying the last Lq
+        // positions, so a single query (Lq == 1) attends all Lk keys — exactly
+        // non-causal full attention. T == 1 on every decode step; the
+        // prompt-length prefill (once per 30 s window) issues one Lq == 1 call
+        // per query row, since a multi-row windowed call would causally clip
+        // the earlier rows' view of the encoder.
+        if (T == 1) {
+            bt::flash_attention_windowed_forward(Q, cache.cross_k, cache.cross_v,
+                                                 /*d_mask=*/nullptr, num_heads,
+                                                 /*window=*/0, ctx);
+        } else {
+            bt::Tensor ctx_row = bt::Tensor::empty_on(X.device, 1, D, bt::Dtype::FP32);
+            for (int t = 0; t < T; ++t) {
+                bt::Tensor q_row = bt::Tensor::view(
+                    X.device,
+                    static_cast<float*>(Q.data) + static_cast<std::size_t>(t) * D,
+                    1, D, bt::Dtype::FP32);
+                bt::flash_attention_windowed_forward(q_row, cache.cross_k,
+                                                     cache.cross_v,
+                                                     /*d_mask=*/nullptr, num_heads,
+                                                     /*window=*/0, ctx_row);
+                bt::copy_d2d(ctx_row, 0, ctx, t * D, D);
+            }
+        }
     }
 
     if (out.device != X.device || out.rows != T || out.cols != D ||
@@ -866,6 +877,14 @@ void WhisperDecoder::load_from(const stf::File& f,
     } else {
         proj_out_weight = bt::Tensor{};  // empty signals tied mode
     }
+
+    // Build the matmul-ready LM head once: (vocab, d_model) -> (d_model,
+    // vocab). nchw_to_sequence with N=1, C=vocab, H=1, W=d_model is the
+    // device-dispatched transpose. forward() consumes this directly, so the
+    // per-token decode loop never re-transposes the table.
+    const bt::Tensor& Wlm = proj_out_explicit ? proj_out_weight : embed_tokens;
+    lm_head_T = bt::Tensor::empty_on(Wlm.device, 0, 0, bt::Dtype::FP32);
+    bt::nchw_to_sequence(Wlm, /*N=*/1, /*C=*/vocab, /*H=*/1, /*W=*/dm, lm_head_T);
 }
 
 void WhisperDecoder::prime_cross(const bt::Tensor& encoder_hidden,
@@ -965,22 +984,19 @@ void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
 
     // ─── LM head: tied (default) or explicit proj_out ──────────────────────
     // For both paths the math is the same: logits = hidden (T, D) @ W^T,
-    // where W is (vocab, D). brotensor::matmul has no transpose flag, so we
-    // build a (D, vocab) view by transposing the embedding table at call
-    // time. nchw_to_sequence with N=1, C=vocab, H=1, W=d_model maps the
-    // (vocab, d_model) buffer to (d_model, vocab) — same transpose, but
-    // device-dispatched. Allocation per forward() is acceptable for stage 4;
-    // can be cached / fused later.
-    const bt::Tensor& W = proj_out_explicit ? proj_out_weight : embed_tokens;
-    bt::Tensor W_T = bt::Tensor::empty_on(W.device, 0, 0, bt::Dtype::FP32);
-    bt::nchw_to_sequence(W, /*N=*/1, /*C=*/vocab_size, /*H=*/1, /*W=*/d_model, W_T);
+    // where W is (vocab, D). brotensor::matmul has no transpose flag, so
+    // load_from pre-transposed the table into lm_head_T ((d_model, vocab)) —
+    // the decode loop only pays the (T, D) @ (D, vocab) matmul per step.
+    if (lm_head_T.rows != d_model || lm_head_T.cols != vocab_size) {
+        fail(where, "lm_head_T not built — load_from() must run first");
+    }
     // Pre-allocate logits on the same device too; the caller's logits tensor
     // is default-constructed (CPU) and matmul resizes but preserves device.
     if (logits.device != hidden.device || logits.rows != T ||
         logits.cols != vocab_size || logits.dtype != bt::Dtype::FP32) {
         logits = bt::Tensor::empty_on(hidden.device, T, vocab_size, bt::Dtype::FP32);
     }
-    bt::matmul(hidden, W_T, logits);        // (T, vocab_size)
+    bt::matmul(hidden, lm_head_T, logits);  // (T, vocab_size)
 }
 
 }  // namespace brosoundml

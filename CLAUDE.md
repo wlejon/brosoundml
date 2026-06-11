@@ -14,7 +14,8 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
 - **Qwen3-TTS** — text-to-speech (12 Hz multi-codebook, end-to-end discrete
   token, 24 kHz). Device-neutral CPU + CUDA; CustomVoice presets, VoiceDesign
   instruct prompts, Base-variant zero-shot voice cloning.
-- **Whisper** — speech-to-text (HF checkpoints, tiny → large-v3).
+- **Whisper** — speech-to-text (HF checkpoints, tiny → large-v3). Device-neutral
+  CPU + CUDA; CPU↔CUDA transcript + logits parity pinned in test_whisper.
 - **Parakeet-TDT** — speech-to-text (NVIDIA FastConformer encoder + TDT
   transducer decoder, multilingual 0.6B-v3). Device-neutral CPU + CUDA;
   validated bit-faithful against the reference checkpoint.

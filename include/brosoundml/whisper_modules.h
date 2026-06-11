@@ -341,6 +341,12 @@ struct WhisperDecoder {
     brotensor::Tensor                proj_out_weight;    // (vocab_size, d_model) — empty when tied
     bool                             proj_out_explicit = false;
 
+    // LM head transposed once at load: (d_model, vocab_size), the matmul-ready
+    // layout of the tied embed_tokens (or explicit proj_out) table. Built by
+    // load_from so forward() never re-transposes the (vocab_size, d_model)
+    // table inside the per-token decode loop.
+    brotensor::Tensor                lm_head_T;
+
     // Load every decoder weight from the HF state dict (key prefix
     // model.decoder.*). Throws on a missing required key; `proj_out.weight`
     // is optional (tied LM head is the default).
