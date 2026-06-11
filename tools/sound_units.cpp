@@ -16,11 +16,15 @@
 // "these few sounds in this order" instead of "these phonemes in this order".
 //
 // Subcommands:
-//   gen     --out DIR [--count N] [--seed S]
+//   gen     --out DIR [--count N] [--seed S] [--variants V]
 //           Synthesize labelled non-word target sounds (clicks, whistles,
 //           hums) with controlled variation, as 16 kHz mono WAVs. Guarantees
 //           the unit inventory has coverage of the sound families the spotter
 //           must enroll, independent of what the corpora happen to contain.
+//           --variants > 1 draws each sound's parameters ONCE and emits V
+//           jittered renditions (small pitch/duration/amplitude perturbation,
+//           fresh phase/noise/silence placement) named <fam>_<i>_v<v>.wav —
+//           the same gesture performed again, for enroll-by-example evals.
 //   kmeans  --inputs DIR[,...] --out centroids.bsuc [--units K]
 //           [--max-frames N] [--stack S]
 //           Fit K unit centroids on PCEN-mel frames (stacked +/-S frames of
@@ -45,6 +49,8 @@
 #include "brosoundml/audio.h"
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_data.h"
+#include "brosoundml/phoneme_model.h"
+#include "brosoundml/phoneme_spotter.h"
 #include "brosoundml/wake_data.h"
 
 #include <brotensor/runtime.h>
@@ -56,6 +62,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -216,16 +223,6 @@ int nearest_centroid(const Centroids& C, const float* x) {
 
 // ─── gen: synthetic non-word target sounds ───────────────────────────────────
 
-void write_clip(const std::string& dir, const std::string& name, int idx,
-                std::vector<float> pcm) {
-    bsm::AudioBuffer ab;
-    ab.sample_rate = 16000;
-    ab.samples     = std::move(pcm);
-    char fn[64];
-    std::snprintf(fn, sizeof(fn), "%s_%03d.wav", name.c_str(), idx);
-    ab.write_wav(dir + "/" + fn);
-}
-
 void fade_edges(std::vector<float>& x, int n_fade) {
     const int n = static_cast<int>(x.size());
     for (int i = 0; i < n_fade && i < n; ++i) {
@@ -248,83 +245,168 @@ std::vector<float> embed_in_silence(const std::vector<float>& sound,
     return out;
 }
 
-void cmd_gen(const std::string& out_dir, int count, unsigned seed) {
+// A "target sound" is one draw of a parameter set; a VARIANT re-renders the
+// SAME parameters with small jitter plus fresh phase/noise/placement — the
+// same gesture performed again, which is what enroll-by-example must survive.
+struct ClickParams   { int n; float fres, decay, amp; };
+struct WhistleParams { int n; float f0, sweep, vib_hz, vib, amp; bool bend; };
+struct HumParams     { int n; float f0, drift, amp; int harmonics; };
+
+float jit(std::mt19937& rng, float lo, float hi) {
+    std::uniform_real_distribution<float> u(lo, hi);
+    return u(rng);
+}
+
+// click: a 3-12 ms decaying burst — white noise + a damped resonance, the
+// shape of mouth clicks / key taps / finger snaps.
+ClickParams draw_click(std::mt19937& rng) {
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    ClickParams p;
+    p.n     = 48 + static_cast<int>(uni(rng) * 144);
+    p.fres  = 1500.0f + uni(rng) * 3500.0f;
+    p.decay = 600.0f + uni(rng) * 1400.0f;
+    p.amp   = 0.3f + uni(rng) * 0.5f;
+    return p;
+}
+ClickParams jitter(const ClickParams& p, std::mt19937& rng) {
+    ClickParams q = p;
+    q.n     = std::max(32, static_cast<int>(p.n * jit(rng, 0.9f, 1.1f)));
+    q.fres  = p.fres  * jit(rng, 0.98f, 1.02f);
+    q.decay = p.decay * jit(rng, 0.9f, 1.1f);
+    q.amp   = p.amp   * jit(rng, 0.8f, 1.2f);
+    return q;
+}
+std::vector<float> render_click(const ClickParams& p, std::mt19937& rng) {
+    std::vector<float> s(static_cast<std::size_t>(p.n));
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    for (int t = 0; t < p.n; ++t) {
+        const float tt  = static_cast<float>(t) / 16000.0f;
+        const float env = std::exp(-p.decay * tt);
+        s[static_cast<std::size_t>(t)] = p.amp * env *
+            (0.5f * g(rng) +
+             0.5f * std::sin(2.0f * 3.14159265f * p.fres * tt));
+    }
+    return s;
+}
+
+// whistle: a pure tone 0.3-1.0 s with a pitch contour (flat / up / down /
+// up-down) and light vibrato.
+WhistleParams draw_whistle(std::mt19937& rng) {
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    WhistleParams p;
+    p.n      = 4800 + static_cast<int>(uni(rng) * 11200);
+    p.f0     = 800.0f + uni(rng) * 2000.0f;
+    p.sweep  = (uni(rng) * 2.0f - 1.0f) * 0.6f;   // +/-60% by end
+    p.bend   = uni(rng) < 0.4f;                   // up-down arc
+    p.vib_hz = 4.0f + uni(rng) * 3.0f;
+    p.vib    = 0.01f + uni(rng) * 0.02f;
+    p.amp    = 0.25f + uni(rng) * 0.35f;
+    return p;
+}
+WhistleParams jitter(const WhistleParams& p, std::mt19937& rng) {
+    WhistleParams q = p;            // contour shape (bend) is identity — keep
+    q.n      = std::max(3200, static_cast<int>(p.n * jit(rng, 0.9f, 1.1f)));
+    q.f0     = p.f0     * jit(rng, 0.98f, 1.02f);
+    q.sweep  = p.sweep  * jit(rng, 0.9f, 1.1f);
+    q.vib_hz = p.vib_hz * jit(rng, 0.9f, 1.1f);
+    q.vib    = p.vib    * jit(rng, 0.9f, 1.1f);
+    q.amp    = p.amp    * jit(rng, 0.8f, 1.2f);
+    return q;
+}
+std::vector<float> render_whistle(const WhistleParams& p, std::mt19937&) {
+    std::vector<float> s(static_cast<std::size_t>(p.n));
+    double phase = 0.0;
+    for (int t = 0; t < p.n; ++t) {
+        const float u = static_cast<float>(t) / p.n;
+        float f = p.f0 * (1.0f + p.sweep * (p.bend ? 4.0f * u * (1.0f - u)
+                                                   : u));
+        f *= 1.0f + p.vib * std::sin(2.0f * 3.14159265f * p.vib_hz * t /
+                                     16000.0f);
+        phase += 2.0 * 3.14159265358979 * f / 16000.0;
+        s[static_cast<std::size_t>(t)] =
+            p.amp * static_cast<float>(std::sin(phase));
+    }
+    fade_edges(s, 160);
+    return s;
+}
+
+// hum: low f0 with a 1/k harmonic stack and slow drift — closed-mouth voicing
+// without phonetic structure.
+HumParams draw_hum(std::mt19937& rng) {
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    HumParams p;
+    p.n         = 6400 + static_cast<int>(uni(rng) * 12800);
+    p.f0        = 110.0f + uni(rng) * 150.0f;
+    p.drift     = (uni(rng) * 2.0f - 1.0f) * 0.12f;
+    p.harmonics = 4 + static_cast<int>(uni(rng) * 4.0f);
+    p.amp       = 0.2f + uni(rng) * 0.3f;
+    return p;
+}
+HumParams jitter(const HumParams& p, std::mt19937& rng) {
+    HumParams q = p;                // harmonic count is identity — keep
+    q.n     = std::max(4800, static_cast<int>(p.n * jit(rng, 0.9f, 1.1f)));
+    q.f0    = p.f0    * jit(rng, 0.98f, 1.02f);
+    q.drift = p.drift * jit(rng, 0.9f, 1.1f);
+    q.amp   = p.amp   * jit(rng, 0.8f, 1.2f);
+    return q;
+}
+std::vector<float> render_hum(const HumParams& p, std::mt19937&) {
+    std::vector<float> s(static_cast<std::size_t>(p.n), 0.0f);
+    std::vector<double> phase(static_cast<std::size_t>(p.harmonics), 0.0);
+    for (int t = 0; t < p.n; ++t) {
+        const float u = static_cast<float>(t) / p.n;
+        const float f = p.f0 * (1.0f + p.drift * u);
+        float v = 0.0f;
+        for (int h = 0; h < p.harmonics; ++h) {
+            phase[static_cast<std::size_t>(h)] +=
+                2.0 * 3.14159265358979 * f * (h + 1) / 16000.0;
+            v += std::sin(static_cast<float>(
+                     phase[static_cast<std::size_t>(h)])) / (h + 1);
+        }
+        s[static_cast<std::size_t>(t)] = p.amp * v / 1.5f;
+    }
+    fade_edges(s, 320);
+    return s;
+}
+
+void write_named(const std::string& dir, const char* fam, int idx, int variant,
+                 bool with_variant, std::vector<float> pcm) {
+    bsm::AudioBuffer ab;
+    ab.sample_rate = 16000;
+    ab.samples     = std::move(pcm);
+    char fn[80];
+    if (with_variant)
+        std::snprintf(fn, sizeof(fn), "%s_%03d_v%02d.wav", fam, idx, variant);
+    else
+        std::snprintf(fn, sizeof(fn), "%s_%03d.wav", fam, idx);
+    ab.write_wav(dir + "/" + fn);
+}
+
+void cmd_gen(const std::string& out_dir, int count, unsigned seed,
+             int variants) {
     fs::create_directories(out_dir);
     std::mt19937 rng(seed);
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    const int  V    = std::max(1, variants);
+    const bool vsfx = variants > 1;
 
     for (int i = 0; i < count; ++i) {
-        // click: a 3-12 ms decaying burst — white noise + a damped resonance,
-        // the shape of mouth clicks / key taps / finger snaps.
-        {
-            const int   n     = 48 + static_cast<int>(uni(rng) * 144);
-            const float fres  = 1500.0f + uni(rng) * 3500.0f;
-            const float decay = 600.0f + uni(rng) * 1400.0f;
-            const float amp   = 0.3f + uni(rng) * 0.5f;
-            std::vector<float> s(static_cast<std::size_t>(n));
-            std::normal_distribution<float> g(0.0f, 1.0f);
-            for (int t = 0; t < n; ++t) {
-                const float tt  = static_cast<float>(t) / 16000.0f;
-                const float env = std::exp(-decay * tt);
-                s[static_cast<std::size_t>(t)] = amp * env *
-                    (0.5f * g(rng) +
-                     0.5f * std::sin(2.0f * 3.14159265f * fres * tt));
-            }
-            write_clip(out_dir, "click", i, embed_in_silence(s, rng));
-        }
-        // whistle: a pure tone 0.3-1.0 s with a pitch contour (flat / up /
-        // down / up-down) and light vibrato.
-        {
-            const int   n  = 4800 + static_cast<int>(uni(rng) * 11200);
-            const float f0 = 800.0f + uni(rng) * 2000.0f;
-            const float sweep = (uni(rng) * 2.0f - 1.0f) * 0.6f;  // +/-60% by end
-            const bool  bend  = uni(rng) < 0.4f;                  // up-down arc
-            const float vib_hz = 4.0f + uni(rng) * 3.0f;
-            const float vib    = 0.01f + uni(rng) * 0.02f;
-            const float amp    = 0.25f + uni(rng) * 0.35f;
-            std::vector<float> s(static_cast<std::size_t>(n));
-            double phase = 0.0;
-            for (int t = 0; t < n; ++t) {
-                const float u = static_cast<float>(t) / n;
-                float f = f0 * (1.0f + sweep * (bend ? 4.0f * u * (1.0f - u)
-                                                     : u));
-                f *= 1.0f + vib * std::sin(2.0f * 3.14159265f * vib_hz * t /
-                                           16000.0f);
-                phase += 2.0 * 3.14159265358979 * f / 16000.0;
-                s[static_cast<std::size_t>(t)] =
-                    amp * static_cast<float>(std::sin(phase));
-            }
-            fade_edges(s, 160);
-            write_clip(out_dir, "whistle", i, embed_in_silence(s, rng));
-        }
-        // hum: low f0 with a 1/k harmonic stack and slow drift — closed-mouth
-        // voicing without phonetic structure.
-        {
-            const int   n  = 6400 + static_cast<int>(uni(rng) * 12800);
-            const float f0 = 110.0f + uni(rng) * 150.0f;
-            const float drift = (uni(rng) * 2.0f - 1.0f) * 0.12f;
-            const int   harmonics = 4 + static_cast<int>(uni(rng) * 4.0f);
-            const float amp = 0.2f + uni(rng) * 0.3f;
-            std::vector<float> s(static_cast<std::size_t>(n), 0.0f);
-            std::vector<double> phase(static_cast<std::size_t>(harmonics), 0.0);
-            for (int t = 0; t < n; ++t) {
-                const float u = static_cast<float>(t) / n;
-                const float f = f0 * (1.0f + drift * u);
-                float v = 0.0f;
-                for (int h = 0; h < harmonics; ++h) {
-                    phase[static_cast<std::size_t>(h)] +=
-                        2.0 * 3.14159265358979 * f * (h + 1) / 16000.0;
-                    v += std::sin(static_cast<float>(
-                             phase[static_cast<std::size_t>(h)])) / (h + 1);
-                }
-                s[static_cast<std::size_t>(t)] = amp * v / 1.5f;
-            }
-            fade_edges(s, 320);
-            write_clip(out_dir, "hum", i, embed_in_silence(s, rng));
+        const ClickParams   cp = draw_click(rng);
+        const WhistleParams wp = draw_whistle(rng);
+        const HumParams     hp = draw_hum(rng);
+        for (int v = 0; v < V; ++v) {
+            const ClickParams   cv = (v == 0) ? cp : jitter(cp, rng);
+            const WhistleParams wv = (v == 0) ? wp : jitter(wp, rng);
+            const HumParams     hv = (v == 0) ? hp : jitter(hp, rng);
+            write_named(out_dir, "click", i, v, vsfx,
+                        embed_in_silence(render_click(cv, rng), rng));
+            write_named(out_dir, "whistle", i, v, vsfx,
+                        embed_in_silence(render_whistle(wv, rng), rng));
+            write_named(out_dir, "hum", i, v, vsfx,
+                        embed_in_silence(render_hum(hv, rng), rng));
         }
     }
-    std::printf("sound_units gen: %d x {click,whistle,hum} -> %s\n", count,
-                out_dir.c_str());
+    std::printf("sound_units gen: %d x {click,whistle,hum} x %d variant(s) -> %s\n",
+                count, V, out_dir.c_str());
 }
 
 // ─── kmeans: fit the unit inventory ──────────────────────────────────────────
@@ -553,16 +635,240 @@ void cmd_label(const std::vector<std::string>& dirs,
                 C.K, out.c_str());
 }
 
+// ─── spot-eval: enroll-by-example detection eval ─────────────────────────────
+//
+// Measures the headline capability: enroll a non-word sound from ONE example
+// clip (variant v00 of a gen --variants set), then spot the SAME sound
+// performed again (v01..) while staying quiet on negatives (real speech /
+// music) and on OTHER enrolled sounds. Posteriors are computed once per clip
+// (forward == streaming), then the offline matcher is swept over a threshold
+// grid — the phoneme_calibrate approach, because the live spotter fires at
+// its configured threshold and would under-record confidences for a sweep.
+
+struct EvalClip {
+    std::string        target;   // owning target name; "" for negatives
+    std::vector<float> post;     // (T, K) row-major posteriors
+    int                T = 0;
+};
+
+// PCEN mel -> model forward -> row-softmax. 0.3 s of silence is appended so
+// completions at the clip edge can fire (matcher needs the trailing frames).
+void clip_posteriors(bsm::PhonemeNet& model, bsm::MelFrontend& mel,
+                     int K, int n_mels, bt::Device dev,
+                     std::vector<float> pcm, std::vector<float>& post,
+                     int& T_out) {
+    pcm.resize(pcm.size() + 4800, 0.0f);
+    bt::Tensor melt;
+    mel.reset();
+    mel.compute_offline(pcm.data(), static_cast<int>(pcm.size()), melt);
+    const std::vector<float> mh = melt.to_host_vector();
+    const int T = static_cast<int>(mh.size() / static_cast<std::size_t>(n_mels));
+    T_out = 0;
+    if (T <= 0) return;
+    bt::Tensor feats = bt::Tensor::from_host_on(dev, mh.data(), n_mels, T);
+    bt::Tensor logits;                       // (T, K)
+    model.forward(feats, logits);
+    std::vector<float> lg = logits.to_host_vector();
+    const int Tout = logits.rows;
+    post.assign(static_cast<std::size_t>(Tout) * K, 0.0f);
+    for (int t = 0; t < Tout; ++t) {
+        float* row = &lg[static_cast<std::size_t>(t) * K];
+        float mx = row[0];
+        for (int j = 1; j < K; ++j) mx = std::max(mx, row[j]);
+        double sum = 0.0;
+        for (int j = 0; j < K; ++j) { row[j] = std::exp(row[j] - mx); sum += row[j]; }
+        const float inv = static_cast<float>(1.0 / (sum > 0 ? sum : 1.0));
+        float* o = &post[static_cast<std::size_t>(t) * K];
+        for (int j = 0; j < K; ++j) o[j] = row[j] * inv;
+    }
+    T_out = Tout;
+}
+
+// Per-frame argmax class sequence — enroll_from_classes applies the same
+// silence-drop + duplicate-collapse that enroll_from_audio would.
+std::vector<int> argmax_classes(const std::vector<float>& post, int T, int K) {
+    std::vector<int> seq(static_cast<std::size_t>(T));
+    for (int t = 0; t < T; ++t) {
+        const float* row = &post[static_cast<std::size_t>(t) * K];
+        int best = 0;
+        for (int j = 1; j < K; ++j) if (row[j] > row[best]) best = j;
+        seq[static_cast<std::size_t>(t)] = best;
+    }
+    return seq;
+}
+
+std::string family_of(const std::string& name) {
+    const auto us = name.find('_');
+    return us == std::string::npos ? name : name.substr(0, us);
+}
+
+void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
+                   const std::vector<std::string>& neg_dirs, int neg_cap,
+                   float neg_max_dur, float score_norm, float score_norm_ref,
+                   float coverage_frac, int min_phonemes, bt::Device dev) {
+    bsm::PhonemeNet model = bsm::PhonemeNet::load(model_path, dev);
+    bsm::PhonemeClassMap cm = model.class_map();
+    cm.rebuild_inverse();
+    const auto& mc = model.config();
+    const int K      = cm.num_classes;
+    const int n_mels = mc.n_mels;
+
+    bsm::MelConfig mcfg;
+    mcfg.sample_rate = mc.sample_rate;
+    mcfg.n_fft       = mc.n_fft;
+    mcfg.win_length  = mc.win_length;
+    mcfg.hop_length  = mc.hop_length;
+    mcfg.n_mels      = mc.n_mels;
+    mcfg.compression = bsm::MelCompression::PCEN;
+    bsm::MelFrontend mel(mcfg, dev);
+
+    // Group <name>_v<NN>.wav by <name>; v00 enrolls, the rest are positives.
+    std::map<std::string, std::vector<std::string>> groups;
+    for (const auto& w : collect_wavs({sounds_dir})) {
+        std::string stem = fs::path(w).stem().string();
+        const auto vp = stem.rfind("_v");
+        if (vp == std::string::npos) continue;
+        groups[stem.substr(0, vp)].push_back(w);   // collect_wavs sorts: v00 first
+    }
+    if (groups.empty()) fail("no <name>_v<NN>.wav files under " + sounds_dir);
+
+    // Enrollment class sequences from each target's v00.
+    std::map<std::string, std::vector<int>> enroll_seq;
+    std::vector<EvalClip> clips;
+    std::vector<float> post;
+    int T = 0;
+    for (auto& [name, files] : groups) {
+        std::vector<float> pcm = load_16k(files[0]);
+        clip_posteriors(model, mel, K, n_mels, dev, pcm, post, T);
+        if (T <= 0) { std::fprintf(stderr, "  %s: no frames, skipped\n", name.c_str()); continue; }
+        enroll_seq[name] = argmax_classes(post, T, K);
+        for (std::size_t i = 1; i < files.size(); ++i) {
+            EvalClip c;
+            c.target = name;
+            clip_posteriors(model, mel, K, n_mels, dev, load_16k(files[i]),
+                            c.post, c.T);
+            if (c.T > 0) clips.push_back(std::move(c));
+        }
+    }
+    const int n_pos = static_cast<int>(clips.size());
+
+    // Negatives: spread the cap evenly over each dir's files; truncate long
+    // files (whole songs) to neg_max_dur.
+    int n_neg = 0;
+    for (const auto& d : neg_dirs) {
+        const auto wavs = collect_wavs({d});
+        const int cap = neg_cap > 0 ? neg_cap / static_cast<int>(neg_dirs.size())
+                                    : static_cast<int>(wavs.size());
+        const std::size_t stride = std::max<std::size_t>(1, wavs.size() / cap);
+        int taken = 0;
+        for (std::size_t i = 0; i < wavs.size() && taken < cap; i += stride) {
+            std::vector<float> pcm;
+            try { pcm = load_16k(wavs[i]); } catch (...) { continue; }
+            const std::size_t max_n = static_cast<std::size_t>(
+                neg_max_dur * mcfg.sample_rate);
+            if (pcm.size() > max_n) pcm.resize(max_n);
+            if (static_cast<int>(pcm.size()) < mcfg.win_length) continue;
+            EvalClip c;
+            clip_posteriors(model, mel, K, n_mels, dev, std::move(pcm),
+                            c.post, c.T);
+            if (c.T <= 0) continue;
+            clips.push_back(std::move(c));
+            ++taken; ++n_neg;
+            if ((n_pos + n_neg) % 200 == 0)
+                std::fprintf(stderr, "  %d clips cached ...\n", n_pos + n_neg);
+        }
+    }
+    std::fprintf(stderr, "spot-eval: %zu targets, %d positives, %d negatives\n",
+                 enroll_seq.size(), n_pos, n_neg);
+
+    // Offline matcher sweep.
+    bsm::PhonemeSpotter spotter;
+    spotter.set_class_map(cm);
+    std::printf("# score_norm=%.2f/ref=%.2f coverage_frac=%.2f min_phonemes=%d\n",
+                score_norm, score_norm_ref, coverage_frac, min_phonemes);
+    std::printf("#  thr    det      far_neg  cross_same  cross_other   det/family...   (TP/P, FPclips/N)\n");
+    const float grid[] = {0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f, 0.35f,
+                          0.40f, 0.45f, 0.50f, 0.55f, 0.60f, 0.62f, 0.65f,
+                          0.68f, 0.70f, 0.75f, 0.80f};
+    std::map<std::string, std::pair<int, int>> target_tp;  // at grid[0]
+    for (float thr : grid) {
+        spotter.clear();
+        bsm::SpotterConfig pol = spotter.config();
+        pol.threshold         = thr;
+        pol.score_norm        = score_norm;
+        pol.score_norm_ref    = score_norm_ref;
+        pol.min_coverage_frac = coverage_frac;
+        pol.min_phonemes      = min_phonemes;
+        for (const auto& [name, seq] : enroll_seq)
+            spotter.enroll_from_classes(name, seq, &pol);
+
+        int tp = 0, fp_neg = 0, cross_same = 0, cross_other = 0;
+        std::map<std::string, std::pair<int, int>> fam_tp;  // family -> (tp, p)
+        for (const auto& c : clips) {
+            spotter.reset();
+            const auto evs = spotter.feed_posteriors(c.post.data(), c.T);
+            bool own = false, same = false, other = false, any = false;
+            for (const auto& e : evs) {
+                any = true;
+                if (e.name == c.target) own = true;
+                else if (family_of(e.name) == family_of(c.target)) same = true;
+                else other = true;
+            }
+            if (c.target.empty()) { if (any) ++fp_neg; continue; }
+            if (own)   ++tp;
+            if (same)  ++cross_same;
+            if (other) ++cross_other;
+            auto& f = fam_tp[family_of(c.target)];
+            f.first += own ? 1 : 0;
+            ++f.second;
+            if (thr == grid[0]) {
+                auto& t = target_tp[c.target];
+                t.first += own ? 1 : 0;
+                ++t.second;
+            }
+        }
+        std::printf("  %.2f   %.4f   %.4f   %.4f      %.4f      ",
+                    thr,
+                    n_pos ? static_cast<double>(tp) / n_pos : 0.0,
+                    n_neg ? static_cast<double>(fp_neg) / n_neg : 0.0,
+                    n_pos ? static_cast<double>(cross_same) / n_pos : 0.0,
+                    n_pos ? static_cast<double>(cross_other) / n_pos : 0.0);
+        for (const auto& [fam, f] : fam_tp)
+            std::printf(" %s %.3f", fam.c_str(),
+                        f.second ? static_cast<double>(f.first) / f.second : 0.0);
+        std::printf("   (%d/%d, %d/%d)\n", tp, n_pos, fp_neg, n_neg);
+    }
+
+    // Per-target report — template length after collapse plus detection at the
+    // floor threshold, so plateau-misses point at their targets directly.
+    std::printf("# per-target: len, det @ thr=%.2f:\n", grid[0]);
+    {
+        bsm::SpotterConfig pol = spotter.config();
+        pol.min_phonemes = 1;
+        for (const auto& [name, seq] : enroll_seq) {
+            spotter.remove(name);
+            const int len = spotter.enroll_from_classes(name, seq, &pol);
+            const auto& t = target_tp[name];
+            std::printf("#   %-14s len %-3d  det %d/%d\n", name.c_str(), len,
+                        t.first, t.second);
+        }
+    }
+}
+
 void print_help() {
     std::printf(
         "brosoundml_sound_units — self-supervised acoustic-unit class space\n\n"
-        "  gen    --out DIR [--count N=200] [--seed S=1234]\n"
+        "  gen    --out DIR [--count N=200] [--seed S=1234] [--variants V=1]\n"
         "  kmeans --inputs DIR[,...] --out centroids.bsuc [--units K=64]\n"
         "         [--max-frames N=1500000] [--stack S=1] [--seed S=1234]\n"
         "  label  --inputs DIR[,...] --centroids FILE --out shard.bpds\n"
         "         [--max-clips N=0] [--min-dur 0.3] [--max-dur 20] [--smooth 1]\n"
         "         [--chunk-dur S=0  slice over-long files instead of dropping]\n"
-        "  kmeans/label also take --device cuda|cpu (default: cuda if available)\n");
+        "  spot-eval --model units.bpm --inputs VARIANTS_DIR --neg DIR[,...]\n"
+        "         [--neg-clips N=1500] [--neg-max-dur 10]\n"
+        "         [--score-norm 1.0] [--score-norm-ref 0.5]\n"
+        "         [--coverage-frac 0.75] [--min-phonemes 1]\n"
+        "  kmeans/label/spot-eval take --device cuda|cpu (default: cuda if available)\n");
 }
 
 }  // namespace
@@ -570,10 +876,13 @@ void print_help() {
 int main(int argc, char** argv) try {
     if (argc < 2) { print_help(); return 1; }
     const std::string cmd = argv[1];
-    std::string inputs, out, centroids, device;
+    std::string inputs, out, centroids, device, model, neg;
     int count = 200, units = 64, stack = 1, max_clips = 0, smooth = 1;
+    int variants = 1, neg_clips = 1500, min_phonemes = 1;
     long long max_frames = 1500000;
     float min_dur = 0.3f, max_dur = 20.0f, chunk_dur = 0.0f;
+    float neg_max_dur = 10.0f;
+    float score_norm = 1.0f, score_norm_ref = 0.5f, coverage_frac = 0.75f;
     unsigned seed = 1234;
     auto need = [&](int& i) -> std::string {
         if (i + 1 >= argc) fail("missing value for " + std::string(argv[i]));
@@ -595,10 +904,19 @@ int main(int argc, char** argv) try {
         else if (k == "--chunk-dur") chunk_dur = std::stof(need(i));
         else if (k == "--smooth") smooth = std::stoi(need(i));
         else if (k == "--device") device = need(i);
+        else if (k == "--variants") variants = std::stoi(need(i));
+        else if (k == "--model") model = need(i);
+        else if (k == "--neg") neg = need(i);
+        else if (k == "--neg-clips") neg_clips = std::stoi(need(i));
+        else if (k == "--neg-max-dur") neg_max_dur = std::stof(need(i));
+        else if (k == "--score-norm") score_norm = std::stof(need(i));
+        else if (k == "--score-norm-ref") score_norm_ref = std::stof(need(i));
+        else if (k == "--coverage-frac") coverage_frac = std::stof(need(i));
+        else if (k == "--min-phonemes") min_phonemes = std::stoi(need(i));
         else if (k == "--seed") seed = static_cast<unsigned>(std::stoul(need(i)));
         else fail("unknown arg: " + k);
     }
-    if (out.empty()) fail("--out is required");
+    if (out.empty() && cmd != "spot-eval") fail("--out is required");
 
     bt::init();
     bt::Device dev = bt::Device::CPU;
@@ -610,16 +928,24 @@ int main(int argc, char** argv) try {
     } else if (device != "cpu") {
         fail("--device must be cuda or cpu");
     }
-    if (cmd == "kmeans" || cmd == "label")
+    if (cmd == "kmeans" || cmd == "label" || cmd == "spot-eval")
         std::fprintf(stderr, "sound_units: mel device %s\n",
                      dev == bt::Device::CUDA ? "CUDA" : "CPU");
 
-    if (cmd == "gen")         cmd_gen(out, count, seed);
+    if (cmd == "gen")         cmd_gen(out, count, seed, variants);
     else if (cmd == "kmeans") cmd_kmeans(split_csv(inputs), out, units,
                                          max_frames, stack, seed, dev);
     else if (cmd == "label")  cmd_label(split_csv(inputs), centroids, out,
                                         max_clips, min_dur, max_dur,
                                         smooth != 0, chunk_dur, dev);
+    else if (cmd == "spot-eval") {
+        if (model.empty())  fail("spot-eval: --model is required");
+        if (inputs.empty()) fail("spot-eval: --inputs is required");
+        if (neg.empty())    fail("spot-eval: --neg is required");
+        cmd_spot_eval(model, inputs, split_csv(neg), neg_clips, neg_max_dur,
+                      score_norm, score_norm_ref, coverage_frac, min_phonemes,
+                      dev);
+    }
     else fail("unknown subcommand: " + cmd);
     return 0;
 } catch (const std::exception& e) {
