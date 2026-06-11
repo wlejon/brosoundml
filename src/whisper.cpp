@@ -273,8 +273,20 @@ int Whisper::Impl::decode_window(const AudioBuffer& window,
         device, 0, 0, brotensor::Dtype::FP32);
     decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
 
+    // Captured decode session (CUDA): replay the whole single-token step as
+    // one cudaGraphLaunch instead of ~300 individual kernel launches. The
+    // prefill above already filled cache rows [0, prompt_len); the session
+    // just needs its valid-key mask to match. Falls back to the eager
+    // decode_step on CPU/Metal or when BROSOUNDML_DISABLE_STEP_GRAPH is set.
+    const bool use_step_graph = decoder.step_begin(cache);
+    if (use_step_graph) decoder.step_mask_prefill(prompt_len);
+
     // 3. Greedy loop. `logits` is mutated in-place by decode_step (no fresh
-    // tensor per step, per project memory: Tensor copy ctor is deep).
+    // tensor per step, per project memory: Tensor copy ctor is deep). On the
+    // captured path step_decode instead rebinds `logits` to a (1, vocab) view
+    // over the session's persistent logits buffer — argmax_last_row only
+    // reads it, so both paths feed the loop identically (first argmax comes
+    // from the prefill logits' LAST row, subsequent from the step logits).
     const std::size_t gen_start = generated.size();
     int last_ts_rel = -1;  // offset into this window's run, or -1
     for (int step = 0; step < budget; ++step) {
@@ -292,7 +304,11 @@ int Whisper::Impl::decode_window(const AudioBuffer& window,
             >= config.max_target_positions) {
             break;
         }
-        decode_step(next_id, logits);
+        if (use_step_graph) {
+            decoder.step_decode(next_id, cache.size(), cache, logits);
+        } else {
+            decode_step(next_id, logits);
+        }
     }
     return last_ts_rel;
 }

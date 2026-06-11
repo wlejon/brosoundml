@@ -1,14 +1,21 @@
 #include "brosoundml/whisper_modules.h"
 
 #include "mel_slaney.h"
+#include "qwen_tts_device.h"
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/detail/dispatch.h>
+#ifdef BROSOUNDML_HAS_CUDA
+#include <brotensor/cuda_graph.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -997,6 +1004,309 @@ void WhisperDecoder::forward(const std::int32_t* token_ids, int T,
         logits = bt::Tensor::empty_on(hidden.device, T, vocab_size, bt::Dtype::FP32);
     }
     bt::matmul(hidden, lm_head_T, logits);  // (T, vocab_size)
+}
+
+// ─── Captured decode session ───────────────────────────────────────────────
+//
+// The greedy loop's single-token forward() issues ~300 tiny kernel launches
+// per generated token; per-launch overhead dominates on CUDA. The session
+// below replays the whole step as ONE cudaGraphLaunch: every buffer the step
+// touches is persistent (the caller's fixed-capacity WhisperKVCache plus the
+// scratch here), the per-step variables (token row, positional row, append
+// index, mask bit) are staged by tiny stream-ordered d2d copies before the
+// launch, and the masked full-capacity attention keeps every shape — and so
+// the compiled graph — constant while the valid length advances.
+
+// Per-step scratch — every intermediate of one captured (T == 1) decoder
+// pass. Persisting these lets the step run with no allocation, which is what
+// makes it CUDA-graph-capturable (capture forbids mid-capture allocation).
+struct WhisperStepScratch {
+    bt::Tensor x_ln, q, k, v, ctx, attn_out;        // self-attention sublayer
+    bt::Tensor ca_ln, cq, cctx, cross_out;          // cross-attention sublayer
+    bt::Tensor ffn_ln, h1, h1_act, h2;              // FFN sublayer
+};
+
+// Captured decode-session state. The KV cache itself stays with the caller
+// (it is already fixed-capacity); the session holds the staged inputs, the
+// valid-key mask, the scratch, and the captured graph, plus the device
+// pointers the graph baked — if any of those change (e.g. a re-allocated
+// cache), the graph is dropped and re-captured.
+struct WhisperDecoderStepState {
+    int cap = 0;                 // mask/ramp rows == max_target_positions
+    bt::Tensor mask;             // (cap, 1) FP32 — 1 valid / 0 invalid key rows
+    bt::Tensor ones;             // (1, 1) FP32 constant 1.0 (d2d mask updates)
+    bt::Tensor ramp;             // (cap, 1) INT32 0..cap-1 (d2d index updates)
+    bt::Tensor idx;              // (1, 1) INT32 — the step's append row
+    bt::Tensor in_tok;           // (1, d_model) staged token-embedding row
+    bt::Tensor in_pos;           // (1, d_model) staged positional-embedding row
+    bt::Tensor hs;               // (1, d_model) residual stream
+    bt::Tensor hidden_n;         // (1, d_model) post-final-LN output
+    bt::Tensor logits;           // (1, vocab_size) LM-head output
+    WhisperStepScratch sc;
+#ifdef BROSOUNDML_HAS_CUDA
+    bt::CudaGraph graph;
+#endif
+    bool captured = false;
+    // Device pointers baked into the captured graph: per-layer self/cross K/V
+    // slabs + embed_tokens (the token-row staging source). Checked per step.
+    std::vector<const void*> keys;
+};
+
+WhisperDecoder::WhisperDecoder() = default;
+WhisperDecoder::~WhisperDecoder() = default;
+WhisperDecoder::WhisperDecoder(WhisperDecoder&&) noexcept = default;
+WhisperDecoder& WhisperDecoder::operator=(WhisperDecoder&&) noexcept = default;
+
+namespace {
+
+// The device pointers the captured step graph depends on. Pointer equality is
+// the invalidation test: prime_cross writes IN PLACE into the pre-allocated
+// cross_k/cross_v slabs, so a re-primed 30 s window keeps the same keys and
+// the same captured graph.
+std::vector<const void*> whisper_step_keys(const WhisperDecoder& d,
+                                           const WhisperKVCache& cache) {
+    std::vector<const void*> k;
+    k.reserve(cache.layers.size() * 4 + 1);
+    for (const auto& l : cache.layers) {
+        k.push_back(l.self_k.data);
+        k.push_back(l.self_v.data);
+        k.push_back(l.cross_k.data);
+        k.push_back(l.cross_v.data);
+    }
+    k.push_back(d.embed_tokens.data);
+    return k;
+}
+
+// One fixed-shape decode step over the session state: the exact op sequence
+// of WhisperDecoder::forward + WhisperDecoderLayer::forward with T == 1, but
+// over persistent buffers (no allocation), a device-resident append row
+// (scatter_rows), and full-capacity masked self-attention. Masked-out keys
+// are skipped before the dot product and softmax to exact zeros, so the
+// result is bit-identical to the eager growing-prefix call; allocation-free
+// means the whole body is CUDA-graph-capturable.
+//
+// Residual order note: the eager layer does add_inplace(sublayer_out,
+// residual); here the residual stream `hs` is the in-place accumulator, so
+// the body does add_inplace(hs, sublayer_out). add_inplace is an elementwise
+// a + b — commutative in IEEE-754 — so the sums are bitwise identical.
+void whisper_step_body(const WhisperDecoder& d, WhisperKVCache& cache,
+                       WhisperDecoderStepState& st) {
+    WhisperStepScratch& sc = st.sc;
+    const int D = d.d_model;
+
+    // hs is mutated by the residual adds, so rebuild it from the staged
+    // inputs every replay: hs = embed_tokens[token] + embed_positions[pos].
+    bt::copy_d2d(st.in_tok, 0, st.hs, 0, D);
+    bt::add_inplace(st.hs, st.in_pos);
+
+    for (int l = 0; l < d.decoder_layers; ++l) {
+        const WhisperDecoderLayer& dl = d.layers[static_cast<std::size_t>(l)];
+        WhisperLayerCache& lc = cache.layers[static_cast<std::size_t>(l)];
+
+        // ── causal self-attention (full-capacity K/V + valid-key mask) ──
+        dl.self_attn_layer_norm.forward(st.hs, sc.x_ln);
+        bt::linear_forward_batched(dl.self_Wq, dl.self_bq, sc.x_ln, sc.q);
+        bt::linear_forward_batched(dl.self_Wk, dl.self_bk, sc.x_ln, sc.k);
+        bt::linear_forward_batched(dl.self_Wv, dl.self_bv, sc.x_ln, sc.v);
+        bt::scatter_rows(sc.k, st.idx, lc.self_k);   // append at device row idx
+        bt::scatter_rows(sc.v, st.idx, lc.self_v);
+        qtd::flash_attn_masked(sc.q, lc.self_k, lc.self_v,
+                               static_cast<const float*>(st.mask.data),
+                               dl.num_heads, sc.ctx);
+        bt::linear_forward_batched(dl.self_Wo, dl.self_bo, sc.ctx, sc.attn_out);
+        bt::add_inplace(st.hs, sc.attn_out);
+
+        // ── cross-attention (pre-projected encoder K/V, fixed shape) ──
+        dl.encoder_attn_layer_norm.forward(st.hs, sc.ca_ln);
+        bt::linear_forward_batched(dl.cross_Wq, dl.cross_bq, sc.ca_ln, sc.cq);
+        bt::flash_attention_windowed_forward(sc.cq, lc.cross_k, lc.cross_v,
+                                             /*d_mask=*/nullptr, dl.num_heads,
+                                             /*window=*/0, sc.cctx);
+        bt::linear_forward_batched(dl.cross_Wo, dl.cross_bo, sc.cctx,
+                                   sc.cross_out);
+        bt::add_inplace(st.hs, sc.cross_out);
+
+        // ── FFN ──
+        dl.final_layer_norm.forward(st.hs, sc.ffn_ln);
+        dl.fc1.forward_batched(sc.ffn_ln, sc.h1);
+        bt::gelu_forward(sc.h1, sc.h1_act);
+        dl.fc2.forward_batched(sc.h1_act, sc.h2);
+        bt::add_inplace(st.hs, sc.h2);
+    }
+
+    d.layer_norm.forward(st.hs, st.hidden_n);
+    bt::matmul(st.hidden_n, d.lm_head_T, st.logits);   // (1, vocab_size)
+}
+
+}  // namespace
+
+bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
+    // Env hatch: force the eager path (tests / debugging).
+    if (const char* dis = std::getenv("BROSOUNDML_DISABLE_STEP_GRAPH")) {
+        if (dis[0] != '\0' && std::string(dis) != "0") return false;
+    }
+    const bt::Device dev = layer_norm.gamma.device;
+    if (dev != bt::Device::CUDA) return false;
+    if (static_cast<int>(cache.layers.size()) != decoder_layers) return false;
+    bt::DeviceScope scope(dev);
+
+    if (!step_state) step_state = std::make_unique<WhisperDecoderStepState>();
+    WhisperDecoderStepState& st = *step_state;
+
+    // Capacity is FIXED at max_target_positions — the cache slabs are already
+    // that size and the decoder rejects pos_offset + T beyond it, so there is
+    // no grow path. (Re)allocate the session buffers only on first use.
+    const int cap = max_target_positions;
+    if (st.cap != cap) {
+        st.mask = bt::Tensor::zeros_on(dev, cap, 1, bt::Dtype::FP32);
+        std::vector<std::int32_t> hramp(static_cast<std::size_t>(cap));
+        for (int i = 0; i < cap; ++i) hramp[static_cast<std::size_t>(i)] = i;
+        st.ramp = upload_int32_idx(dev, hramp.data(), cap);
+        const float one = 1.0f;
+        st.ones = bt::Tensor::from_host_on(dev, &one, 1, 1);
+        st.idx  = bt::Tensor::empty_on(dev, 1, 1, bt::Dtype::INT32);
+        st.in_tok   = bt::Tensor::empty_on(dev, 1, d_model, bt::Dtype::FP32);
+        st.in_pos   = bt::Tensor::empty_on(dev, 1, d_model, bt::Dtype::FP32);
+        st.hs       = bt::Tensor::empty_on(dev, 1, d_model, bt::Dtype::FP32);
+        st.hidden_n = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+        st.logits   = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+        // Scratch: (0, 0) on the device — the warm-up run sizes each one to
+        // its high-water shape; capacity-aware resize keeps the pointers
+        // stable from then on.
+        for (bt::Tensor* t : {&st.sc.x_ln, &st.sc.q, &st.sc.k, &st.sc.v,
+                              &st.sc.ctx, &st.sc.attn_out, &st.sc.ca_ln,
+                              &st.sc.cq, &st.sc.cctx, &st.sc.cross_out,
+                              &st.sc.ffn_ln, &st.sc.h1, &st.sc.h1_act,
+                              &st.sc.h2}) {
+            *t = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+        }
+        st.cap = cap;
+#ifdef BROSOUNDML_HAS_CUDA
+        st.graph.reset();
+#endif
+        st.captured = false;
+    } else {
+        // Reuse the existing mask storage (its pointer is baked into the
+        // graph): zero it in place for the new decode session.
+        std::vector<float> zeros(static_cast<std::size_t>(cap), 0.0f);
+        bt::detail::alloc_for(dev).memcpy_h2d(
+            st.mask.data, zeros.data(),
+            static_cast<std::size_t>(cap) * sizeof(float));
+    }
+
+    // Validate the baked device pointers; a mismatch (first session, or a
+    // re-allocated cache) drops the captured graph so step_decode re-captures.
+    std::vector<const void*> keys = whisper_step_keys(*this, cache);
+    if (keys != st.keys) {
+        st.keys = std::move(keys);
+#ifdef BROSOUNDML_HAS_CUDA
+        st.graph.reset();
+#endif
+        st.captured = false;
+    }
+    return true;
+}
+
+void WhisperDecoder::step_mask_prefill(int T) const {
+    const std::string where = "WhisperDecoder::step_mask_prefill";
+    if (!step_state || step_state->cap == 0) {
+        fail(where, "no decode session — call step_begin first");
+    }
+    WhisperDecoderStepState& st = *step_state;
+    if (T < 0 || T > st.cap) {
+        fail(where, "prefill length " + std::to_string(T) +
+                    " out of range [0, " + std::to_string(st.cap) + "]");
+    }
+    const bt::Device dev = layer_norm.gamma.device;
+    bt::DeviceScope scope(dev);
+
+    // Valid-key mask: rows [0, T) on, the rest off — one host build + upload.
+    std::vector<float> hmask(static_cast<std::size_t>(st.cap), 0.0f);
+    std::fill(hmask.begin(), hmask.begin() + T, 1.0f);
+    bt::detail::alloc_for(dev).memcpy_h2d(
+        st.mask.data, hmask.data(),
+        static_cast<std::size_t>(st.cap) * sizeof(float));
+}
+
+void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
+                                 WhisperKVCache& cache,
+                                 bt::Tensor& logits_view) const {
+    const std::string where = "WhisperDecoder::step_decode";
+    if (!step_state || step_state->cap == 0) {
+        fail(where, "no decode session — call step_begin first");
+    }
+    WhisperDecoderStepState& st = *step_state;
+    const bt::Device dev = layer_norm.gamma.device;
+    bt::DeviceScope scope(dev);
+
+    if (token_id < 0 || token_id >= vocab_size) {
+        fail(where, "token_id " + std::to_string(token_id) +
+                    " out of vocab range");
+    }
+    if (pos < 0 || pos >= max_target_positions) {
+        fail(where, "pos " + std::to_string(pos) +
+                    " exceeds max_target_positions=" +
+                    std::to_string(max_target_positions));
+    }
+    if (static_cast<int>(cache.layers.size()) != decoder_layers) {
+        fail(where, "cache layer count " + std::to_string(cache.layers.size()) +
+                    " != decoder_layers=" + std::to_string(decoder_layers));
+    }
+    for (int i = 0; i < decoder_layers; ++i) {
+        const auto& l = cache.layers[static_cast<std::size_t>(i)];
+        if (!l.cross_primed) {
+            fail(where, "cache layer " + std::to_string(i) +
+                        " cross-attn not primed; call prime_cross first");
+        }
+        if (l.self_len != pos) {
+            fail(where, "cache layer " + std::to_string(i) +
+                        " self_len=" + std::to_string(l.self_len) +
+                        " != pos=" + std::to_string(pos));
+        }
+    }
+
+    // The graph bakes the cache's device pointers; if they moved since the
+    // last step (e.g. cross K/V primed into fresh buffers), re-capture.
+    std::vector<const void*> keys = whisper_step_keys(*this, cache);
+    if (keys != st.keys) {
+        st.keys = std::move(keys);
+#ifdef BROSOUNDML_HAS_CUDA
+        st.graph.reset();
+#endif
+        st.captured = false;
+    }
+
+    // Stage the step's variables into the captured buffers — all device-side
+    // copies, stream-ordered ahead of the replay.
+    bt::copy_d2d(st.ramp, pos, st.idx, 0, 1);              // append row
+    bt::copy_d2d(st.ones, 0, st.mask, pos, 1);             // mask[pos] = 1
+    bt::copy_d2d(embed_tokens, token_id * d_model, st.in_tok, 0, d_model);
+    bt::copy_d2d(embed_positions, pos * d_model, st.in_pos, 0, d_model);
+
+#ifdef BROSOUNDML_HAS_CUDA
+    if (!st.captured) {
+        // Warm-up sizes every scratch buffer (capture must not allocate). The
+        // step body is idempotent over the staged inputs — the capture re-run
+        // recomputes the identical row — so no state reset is needed between
+        // the warm-up and the captured run.
+        whisper_step_body(*this, cache, st);
+        bt::sync_all();
+        {
+            bt::CudaGraphCapture capture;
+            whisper_step_body(*this, cache, st);
+            st.graph = capture.finish();
+        }
+        st.captured = true;
+    } else {
+        st.graph.launch();
+    }
+#else
+    whisper_step_body(*this, cache, st);
+#endif
+
+    for (auto& l : cache.layers) l.self_len = pos + 1;
+    logits_view = bt::Tensor::view(dev, st.logits.data, 1, vocab_size,
+                                   bt::Dtype::FP32);
 }
 
 }  // namespace brosoundml

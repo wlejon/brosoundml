@@ -17,8 +17,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -78,6 +80,96 @@ static void write_stub_weights(const fs::path& p) {
     e.bytes     = w.size() * sizeof(float);
     brotensor::safetensors::write_file(p.string(), {e});
 }
+
+// ─── Synthetic decoder fixture (captured-vs-eager step test) ───────────────
+//
+// A tiny but complete model.decoder.* checkpoint, mirroring the generator in
+// test_whisper_decoder.cpp: random projections + biases, identity LayerNorms,
+// and NO k_proj biases on disk (the Whisper quirk load_from must zero-fill).
+namespace stepstub {
+
+namespace stf = brotensor::safetensors;
+
+struct StubBuffers {
+    std::vector<std::vector<float>> bufs;
+    std::vector<stf::WriteEntry>    entries;
+
+    void add(const std::string& name, const std::vector<std::int64_t>& shape,
+             std::vector<float>&& payload) {
+        bufs.push_back(std::move(payload));
+        stf::WriteEntry e;
+        e.name      = name;
+        e.dtype     = stf::Dtype::F32;
+        e.shape     = shape;
+        e.host_data = bufs.back().data();
+        e.bytes     = bufs.back().size() * sizeof(float);
+        entries.push_back(std::move(e));
+    }
+};
+
+static std::vector<float> rand_vec(std::mt19937& rng, std::size_t n,
+                                   float scale = 0.05f) {
+    std::uniform_real_distribution<float> dist(-scale, scale);
+    std::vector<float> v(n);
+    for (auto& x : v) x = dist(rng);
+    return v;
+}
+
+static void write_stub_decoder(const fs::path& path,
+                               int d_model, int max_tgt,
+                               int n_layers, int ffn, int vocab) {
+    std::mt19937 rng(20260611);
+    StubBuffers sb;
+    const std::string p = "model.decoder.";
+    auto ones  = [](std::size_t n) { return std::vector<float>(n, 1.0f); };
+    auto zeros = [](std::size_t n) { return std::vector<float>(n, 0.0f); };
+    const std::size_t dd = static_cast<std::size_t>(d_model) * d_model;
+
+    sb.add(p + "embed_tokens.weight", {vocab, d_model},
+           rand_vec(rng, static_cast<std::size_t>(vocab) * d_model));
+    sb.add(p + "embed_positions.weight", {max_tgt, d_model},
+           rand_vec(rng, static_cast<std::size_t>(max_tgt) * d_model, 0.02f));
+
+    for (int i = 0; i < n_layers; ++i) {
+        const std::string lp = p + "layers." + std::to_string(i) + ".";
+        sb.add(lp + "self_attn_layer_norm.weight", {d_model}, ones(d_model));
+        sb.add(lp + "self_attn_layer_norm.bias",   {d_model}, zeros(d_model));
+        sb.add(lp + "self_attn.q_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "self_attn.q_proj.bias",   {d_model}, rand_vec(rng, d_model));
+        sb.add(lp + "self_attn.k_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        // NB: NO self_attn.k_proj.bias on disk — load_from zero-fills it.
+        sb.add(lp + "self_attn.v_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "self_attn.v_proj.bias",   {d_model}, rand_vec(rng, d_model));
+        sb.add(lp + "self_attn.out_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "self_attn.out_proj.bias",   {d_model}, rand_vec(rng, d_model));
+
+        sb.add(lp + "encoder_attn_layer_norm.weight", {d_model}, ones(d_model));
+        sb.add(lp + "encoder_attn_layer_norm.bias",   {d_model}, zeros(d_model));
+        sb.add(lp + "encoder_attn.q_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "encoder_attn.q_proj.bias",   {d_model}, rand_vec(rng, d_model));
+        sb.add(lp + "encoder_attn.k_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        // NB: NO encoder_attn.k_proj.bias on disk.
+        sb.add(lp + "encoder_attn.v_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "encoder_attn.v_proj.bias",   {d_model}, rand_vec(rng, d_model));
+        sb.add(lp + "encoder_attn.out_proj.weight", {d_model, d_model}, rand_vec(rng, dd));
+        sb.add(lp + "encoder_attn.out_proj.bias",   {d_model}, rand_vec(rng, d_model));
+
+        sb.add(lp + "final_layer_norm.weight", {d_model}, ones(d_model));
+        sb.add(lp + "final_layer_norm.bias",   {d_model}, zeros(d_model));
+        sb.add(lp + "fc1.weight", {ffn, d_model},
+               rand_vec(rng, static_cast<std::size_t>(ffn) * d_model));
+        sb.add(lp + "fc1.bias",   {ffn}, rand_vec(rng, ffn));
+        sb.add(lp + "fc2.weight", {d_model, ffn},
+               rand_vec(rng, static_cast<std::size_t>(d_model) * ffn));
+        sb.add(lp + "fc2.bias",   {d_model}, rand_vec(rng, d_model));
+    }
+
+    sb.add(p + "layer_norm.weight", {d_model}, ones(d_model));
+    sb.add(p + "layer_norm.bias",   {d_model}, zeros(d_model));
+    stf::write_file(path.string(), sb.entries);
+}
+
+}  // namespace stepstub
 
 static int run();
 int main() {
@@ -215,6 +307,132 @@ static int run() {
 
     fs::remove_all(root);
 
+    // ─── Captured vs eager decode step (structural, synthetic weights) ─────
+    //
+    // Drives the DECODER directly (no encoder needed — a synthetic
+    // (max_src, d_model) "encoder hidden" feeds prime_cross): prefill 4
+    // prompt tokens eagerly, then generate 8 fixed steps twice over identical
+    // inputs — run A through the eager forward(), run B through the captured
+    // session (step_begin / step_mask_prefill / step_decode) — and compare
+    // the FULL (1, vocab) logits of every step bit-exactly. On CPU (or with
+    // BROSOUNDML_DISABLE_STEP_GRAPH) step_begin returns false and run B falls
+    // back to the eager path, so the case degrades to eager == eager.
+    {
+        namespace bt = brotensor;
+        const int D = 64, NL = 2, NH = 4, V = 128, FFN = 128;
+        const int MAX_TGT = 32, MAX_SRC = 16;
+        const fs::path stub_path =
+            fs::temp_directory_path() / "brosoundml_whisper_stepgraph.safetensors";
+        stepstub::write_stub_decoder(stub_path, D, MAX_TGT, NL, FFN, V);
+
+        auto fetch = [](const bt::Tensor& t) {
+            std::vector<float> out(static_cast<std::size_t>(t.rows) * t.cols);
+            if (t.device == bt::Device::CPU) {
+                std::memcpy(out.data(), t.host_f32(), out.size() * sizeof(float));
+            } else {
+                bt::Tensor h = t.to(bt::Device::CPU);
+                std::memcpy(out.data(), h.host_f32(), out.size() * sizeof(float));
+            }
+            return out;
+        };
+
+        auto run_case = [&](bt::Device dev, const char* dev_name) {
+            auto f = bt::safetensors::File::open(stub_path.string());
+            brosoundml::WhisperDecoder dec;
+            dec.load_from(f, D, NL, FFN, NH, V, MAX_TGT, MAX_SRC, dev);
+            brosoundml::WhisperKVCache cache;
+            cache.allocate(NL, D, MAX_TGT, MAX_SRC, dev);
+
+            std::mt19937 rng(424242);
+            std::vector<float> henc = stepstub::rand_vec(
+                rng, static_cast<std::size_t>(MAX_SRC) * D, 0.5f);
+            bt::Tensor enc_hidden =
+                bt::Tensor::from_host_on(dev, henc.data(), MAX_SRC, D);
+
+            const std::vector<int32_t> prompt = {1, 2, 3, 4};
+            std::vector<int32_t> steps(8);
+            for (int i = 0; i < 8; ++i) steps[i] = (7 * i + 3) % V;
+
+            // ── run A: eager forward() per token ──
+            std::vector<std::vector<float>> eager;
+            {
+                cache.reset();
+                dec.prime_cross(enc_hidden, cache);
+                bt::Tensor logits = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+                dec.forward(prompt.data(), static_cast<int>(prompt.size()),
+                            /*pos_offset=*/0, cache, logits);
+                for (int i = 0; i < 8; ++i) {
+                    dec.forward(&steps[static_cast<std::size_t>(i)], 1,
+                                cache.size(), cache, logits);   // (1, V)
+                    eager.push_back(fetch(logits));
+                }
+            }
+
+            // ── run B: captured session over the same inputs ──
+            std::vector<std::vector<float>> captured;
+            bool used_graph = false;
+            {
+                cache.reset();
+                dec.prime_cross(enc_hidden, cache);
+                bt::Tensor logits = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+                dec.forward(prompt.data(), static_cast<int>(prompt.size()),
+                            /*pos_offset=*/0, cache, logits);
+                used_graph = dec.step_begin(cache);
+                if (used_graph) {
+                    dec.step_mask_prefill(static_cast<int>(prompt.size()));
+                }
+                for (int i = 0; i < 8; ++i) {
+                    if (used_graph) {
+                        dec.step_decode(steps[static_cast<std::size_t>(i)],
+                                        cache.size(), cache, logits);
+                    } else {
+                        dec.forward(&steps[static_cast<std::size_t>(i)], 1,
+                                    cache.size(), cache, logits);
+                    }
+                    captured.push_back(fetch(logits));
+                }
+            }
+
+            if (dev == bt::Device::CUDA) {
+                CHECK(used_graph,
+                      "step_begin returns true on a CUDA-resident decoder");
+            } else {
+                CHECK(!used_graph,
+                      "step_begin returns false off CUDA (eager fallback)");
+            }
+
+            int mismatched = -1;
+            for (int i = 0; i < 8; ++i) {
+                const auto& a = eager[static_cast<std::size_t>(i)];
+                const auto& b = captured[static_cast<std::size_t>(i)];
+                if (a.size() != static_cast<std::size_t>(V) ||
+                    b.size() != static_cast<std::size_t>(V) ||
+                    std::memcmp(a.data(), b.data(),
+                                a.size() * sizeof(float)) != 0) {
+                    mismatched = i;
+                    break;
+                }
+            }
+            if (mismatched >= 0) {
+                std::fprintf(stderr,
+                             "FAIL: [%s] captured decode step %d logits are "
+                             "not bit-identical to eager\n",
+                             dev_name, mismatched);
+                ++failures;
+            } else {
+                std::printf("    [%s] captured-vs-eager step logits "
+                            "bit-identical over 8 steps (graph %s)\n",
+                            dev_name, used_graph ? "captured" : "fallback");
+            }
+        };
+
+        run_case(brotensor::Device::CPU, "CPU");
+        if (brotensor::is_available(brotensor::Device::CUDA)) {
+            run_case(brotensor::Device::CUDA, "CUDA");
+        }
+        fs::remove(stub_path);
+    }
+
     // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
     //
     // Runs only if a converted Whisper checkpoint is present under
@@ -319,6 +537,42 @@ static int run() {
                     dev_name, secs, generated.size(),
                     secs > 0.0 ? static_cast<double>(generated.size()) / secs
                                : 0.0);
+        // Warm repeat (GPU only): the first transcribe pays one-time costs —
+        // on CUDA the captured decode session's warm-up + graph instantiate —
+        // so a second identical run shows the steady-state rate the long-form
+        // (multi-window) path actually sees.
+        if (dev != brotensor::Device::CPU) {
+            const auto w0 = std::chrono::steady_clock::now();
+            auto warm = real.transcribe(audio, prompt);
+            const auto w1 = std::chrono::steady_clock::now();
+            const double wsecs = std::chrono::duration<double>(w1 - w0).count();
+            const std::size_t wtoks =
+                warm.token_ids.size() > prompt.size()
+                    ? warm.token_ids.size() - prompt.size() : 0;
+            std::printf("    [%s] transcribe (warm): %.2f s (%zu tokens, %.1f tok/s)\n",
+                        dev_name, wsecs, wtoks,
+                        wsecs > 0.0 ? static_cast<double>(wtoks) / wsecs : 0.0);
+
+            // Decode-only rate: a 1-token run pays the same fixed costs
+            // (mel + encoder + prefill) as the full run, so the delta divided
+            // by the extra tokens isolates the per-step decode-loop rate that
+            // the whole-pipeline tok/s above dilutes on short clips.
+            Whisper::TranscribeOptions one_opts;
+            one_opts.max_new_tokens = 1;
+            const auto d0 = std::chrono::steady_clock::now();
+            auto one = real.transcribe(audio, prompt, one_opts);
+            const auto d1 = std::chrono::steady_clock::now();
+            const double one_secs = std::chrono::duration<double>(d1 - d0).count();
+            const std::size_t one_toks =
+                one.token_ids.size() > prompt.size()
+                    ? one.token_ids.size() - prompt.size() : 0;
+            if (wtoks > one_toks && wsecs > one_secs) {
+                const double dt = wsecs - one_secs;
+                const double dn = static_cast<double>(wtoks - one_toks);
+                std::printf("    [%s] decode loop: %.1f tok/s (%.2f ms/step)\n",
+                            dev_name, dn / dt, 1e3 * dt / dn);
+            }
+        }
         if (out) {
             out->ran        = true;
             out->generated  = generated;

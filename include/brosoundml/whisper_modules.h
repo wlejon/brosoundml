@@ -22,10 +22,16 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace brosoundml {
+
+// Persistent decode-session state for the CUDA-graph-captured single-token
+// decoder step: staged input rows, valid-key mask, per-step scratch, and the
+// captured step graph. Defined in whisper_modules.cpp.
+struct WhisperDecoderStepState;
 
 // ─── LogMel ────────────────────────────────────────────────────────────────
 //
@@ -347,6 +353,14 @@ struct WhisperDecoder {
     // table inside the per-token decode loop.
     brotensor::Tensor                lm_head_T;
 
+    // Lazily-built captured-decode session (CUDA greedy loop); see step_begin().
+    mutable std::unique_ptr<WhisperDecoderStepState> step_state;
+
+    WhisperDecoder();
+    ~WhisperDecoder();
+    WhisperDecoder(WhisperDecoder&&) noexcept;
+    WhisperDecoder& operator=(WhisperDecoder&&) noexcept;
+
     // Load every decoder weight from the HF state dict (key prefix
     // model.decoder.*). Throws on a missing required key; `proj_out.weight`
     // is optional (tied LM head is the default).
@@ -375,6 +389,41 @@ struct WhisperDecoder {
                  int pos_offset,
                  WhisperKVCache& cache,
                  brotensor::Tensor& logits) const;
+
+    // ── Captured decode session (CUDA) ──────────────────────────────────────
+    //
+    // The greedy loop's single-token forward() re-issues ~300 tiny kernels per
+    // token; these three calls replace it with one CUDA-graph replay over
+    // persistent buffers. The session shares the caller's fixed-capacity
+    // WhisperKVCache (self-K/V are already pre-allocated at
+    // max_target_positions rows) plus a valid-key mask: the masked windowed
+    // attention always sees the full-capacity cache with rows >= the current
+    // length masked out — masked keys are skipped before the dot product and
+    // softmax to exact zeros, so the result is bit-identical to the eager
+    // growing-prefix path. The per-layer KV append goes through scatter_rows
+    // with a device-resident row index, so the same captured kernels append to
+    // a new row every replay.
+    //
+    // step_begin(cache) — lazily build the session (capacity fixed at
+    //   max_target_positions), zero the valid-key mask, and (re)validate the
+    //   baked device pointers (cache K/V slabs + embed_tokens) — a mismatch
+    //   drops any captured graph so the next step re-captures. Does NOT touch
+    //   the cache contents. Returns false when the decoder is not
+    //   CUDA-resident or BROSOUNDML_DISABLE_STEP_GRAPH is set — the caller
+    //   keeps the eager forward() path.
+    // step_mask_prefill(T) — after the eager prefill filled cache rows [0, T),
+    //   mark mask rows [0, T) valid (one host build + h2d upload).
+    // step_decode(token_id, pos, cache, logits_view) — one generation step at
+    //   append row `pos` (== the cache's current self_len): stage the token /
+    //   positional embedding rows + append index + mask bit by device-side
+    //   copies, replay (or first warm-up + capture) the step graph, bump every
+    //   layer's self_len, and return a (1, vocab_size) view over the session's
+    //   persistent logits buffer — valid until the next step.
+    bool step_begin(WhisperKVCache& cache) const;
+    void step_mask_prefill(int T) const;
+    void step_decode(std::int32_t token_id, int pos,
+                     WhisperKVCache& cache,
+                     brotensor::Tensor& logits_view) const;
 };
 
 }  // namespace brosoundml
