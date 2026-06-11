@@ -290,6 +290,10 @@ void Parakeet::load(const std::string& model_dir, bt::Device device) {
     impl_->loaded = true;
 }
 
+Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio) const {
+    return transcribe(audio, TranscribeOptions{});
+}
+
 Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
                                              const TranscribeOptions& opts) const {
     if (!impl_->loaded)

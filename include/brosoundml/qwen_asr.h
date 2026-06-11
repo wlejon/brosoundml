@@ -156,7 +156,12 @@ public:
     // on a sample-rate mismatch (resampling is the caller's problem) or on
     // audio shorter than one mel hop (10 ms).
     Transcription transcribe(const AudioBuffer& audio,
-                             const TranscribeOptions& opts = {}) const;
+                             const TranscribeOptions& opts) const;
+
+    // Default-options overload. (A separate overload rather than a defaulted
+    // `opts = {}` argument: GCC 12 rejects a brace-init default argument for a
+    // nested struct that has default member initializers — CWG2335.)
+    Transcription transcribe(const AudioBuffer& audio) const;
 
     // Latent tap: run the AuT encoder + projector ONLY (no decoder) and return
     // the post-projector latents as a (T, config().latent_dim) FP32 tensor on

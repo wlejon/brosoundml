@@ -142,7 +142,12 @@ public:
 
     // Run the full pipeline: 16 kHz mono PCM -> token ids + frame positions.
     Transcription transcribe(const AudioBuffer& audio,
-                             const TranscribeOptions& opts = {}) const;
+                             const TranscribeOptions& opts) const;
+
+    // Default-options overload. (A separate overload rather than a defaulted
+    // `opts = {}` argument: GCC 12 rejects a brace-init default argument for a
+    // nested struct that has default member initializers — CWG2335.)
+    Transcription transcribe(const AudioBuffer& audio) const;
 
     const ParakeetConfig& config() const;
     bool loaded() const;

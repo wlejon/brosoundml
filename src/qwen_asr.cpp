@@ -188,6 +188,10 @@ void QwenAsr::load(const std::string& model_dir, bt::Device device) {
     impl_->loaded = true;
 }
 
+QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio) const {
+    return transcribe(audio, TranscribeOptions{});
+}
+
 QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
                                            const TranscribeOptions& opts) const {
     const std::string where = "QwenAsr::transcribe";
