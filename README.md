@@ -2,42 +2,39 @@
 
 Audio-ML model inference. brosoundml is the **expression layer** for neural
 audio models — it composes the FP32 audio op family in `brotensor` (FFT/STFT,
-1D convolution, vocoder/codec activations, codec quantization, resampling,
+1D/2D convolution, vocoder/codec activations, codec quantization, resampling,
 autoregressive sampling) into runnable text-to-speech, speech-to-text,
-neural-codec, neural-autoencoder, and wake-word models.
+neural-codec, neural-autoencoder, and keyword-spotting models.
 
-It is to audio what [`brodiffusion`](https://github.com/wlejon/brodiffusion) is to images and
-[`brolm`](https://github.com/wlejon/brolm) is to text: a sibling library that turns a tensor op
-surface into a model. One flat namespace, `brosoundml::`.
+It is to audio what [`brodiffusion`](https://github.com/wlejon/brodiffusion) is
+to images and [`brolm`](https://github.com/wlejon/brolm) is to text: a sibling
+library that turns a tensor op surface into a model. One flat namespace,
+`brosoundml::`. brosoundml writes **no kernels** — every model is a graph of
+`brotensor` op calls plus weight loading and pre/post-processing. If an op is
+genuinely missing it goes into `brotensor` (mirrored across CPU/CUDA/Metal),
+not here.
 
-Models implemented (all complete, CPU FP32; CUDA where noted):
+## Models
 
-- **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz output).
-- **Qwen3-TTS** — text-to-speech (12 Hz multi-codebook, end-to-end discrete
-  token, 24 kHz output; CustomVoice presets, VoiceDesign instruct prompts, and
-  Base-variant zero-shot voice cloning). Device-neutral CPU + CUDA.
-- **Whisper** — speech-to-text (HF transformers checkpoints, tiny → large-v3).
-- **Parakeet-TDT** — speech-to-text (NVIDIA FastConformer encoder + a
-  Token-and-Duration Transducer decoder; multilingual 0.6B-v3). Device-neutral
-  CPU + CUDA; emits token ids plus per-token encoder-frame positions for word
-  timestamps.
-- **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ low-rate
-  PCA-sorted latent that the lab edits per-dimension. Device-neutral (CPU /
-  CUDA / Metal); deterministic encode/decode plus the optional stochastic
-  noise-synth and per-channel stereo decode.
-- **Wake-word** — a small BC-ResNet streaming keyword spotter for an always-on
-  mic loop, plus its Kokoro-driven training toolchain.
+All models are complete and run FP32 on CPU; the device-neutral ones place
+weights on the chosen backend and dispatch the whole forward pass through
+`brotensor` device ops, so a CUDA build reproduces the CPU result (bit-identical
+discrete-token stream for token models, ~1e-5 for the continuous codec/vocoder
+tail).
 
-brosoundml also ships an in-tree English **G2P** (`brosoundml::g2p::`) so Kokoro
-can phonemize text with no misaki/Python dependency.
+| Model | Task | Device | Notes |
+|---|---|---|---|
+| [Kokoro-82M](docs/kokoro.md) | text → speech | CPU + CUDA | StyleTTS 2 derivative, 24 kHz; in-tree English G2P |
+| [Qwen3-TTS](docs/qwen-tts.md) | text → speech | CPU + CUDA | 12 Hz multi-codebook discrete-token, 24 kHz; presets, VoiceDesign, zero-shot clone |
+| [Whisper](docs/whisper.md) | speech → text | CPU | encoder-decoder; HF checkpoints tiny → large-v3 |
+| [Parakeet-TDT](docs/parakeet.md) | speech → text | CPU + CUDA | FastConformer + TDT transducer; multilingual 0.6B-v3 + timestamps |
+| [Qwen3-ASR](docs/qwen-asr.md) | speech → text | CPU + CUDA | AuT encoder + Qwen3 decoder; 52-language + language ID, context biasing |
+| [RAVE](docs/rave.md) | waveform ⇄ latent | CPU + CUDA + Metal | ACIDS/IRCAM v2 neural audio autoencoder; editable PCA latent |
+| [Wake-word](docs/wake-word.md) | keyword spotting | CPU | BC-ResNet single-keyword streaming spotter + training toolchain |
+| [Phoneme spotter](docs/phoneme-spotter.md) | open-vocab spotting | CPU + CUDA | PhonemeNet posteriors + streaming template matcher; "type a word, spot it" |
 
-CLI tools drive each model end-to-end — `brosoundml_synth` (Kokoro),
-`brosoundml_transcribe` (Whisper), `brosoundml_parakeet_transcribe` (Parakeet),
-the `brosoundml_qwen_tts_*` tools
-(bench / roundtrip / clone), `brosoundml_build_speaker_encoder` (pack the
-standalone Qwen voice-clone enroller), and the `brosoundml_wake_*` toolchain
-(synth / inspect / train / test / probe / melcmp). RAVE is a library-only model
-(no CLI driver), exercised by `test_rave`.
+The in-tree English **[G2P](docs/g2p.md)** (`brosoundml::g2p::`) lets Kokoro
+phonemize text with no misaki/Python dependency.
 
 ## Dependencies
 
@@ -48,7 +45,11 @@ GPU kernels of its own — GPU work happens inside `brotensor`.
 |---|---|
 | [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
 | [`brotensor`](https://github.com/wlejon/brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) |
-| [`brolm`](https://github.com/wlejon/brolm) | tokenizers used by the speech models (`brolm::whisper::Tokenizer`, the Qwen BPE tokenizer) |
+| [`brolm`](https://github.com/wlejon/brolm) | tokenizers used by the speech models (`brolm::whisper::Tokenizer`, the Qwen BPE tokenizer, `brolm::t5::Tokenizer`) |
+
+Siblings resolve by the standard multi-repo pattern: a standalone repo at
+`../<name>`, else a `third_party/` submodule fallback (see
+`bro/docs/multi-repo-workflow.md`).
 
 ## Data and weights
 
@@ -56,11 +57,13 @@ brosoundml ships **code only** — no trained weights, no packed data, no
 voice packs are checked into this repo. Anything that gets built (POS tagger
 weights, the packed English lexicon, Kokoro voice packs, wake-word
 checkpoints, …) lives in the sibling
-[`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) repo. Loaders take file paths;
-the application (or the CLI tools in this repo) is responsible for resolving
-them — conventionally caller-supplied path > `BROSOUNDML_DATA_DIR` env var
-> `../brosoundml-data`. See `brosoundml-data/README.md` for the artifact
-inventory and per-file licenses.
+[`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) repo.
+Loaders take file paths; the application (or the CLI tools in this repo) is
+responsible for resolving them — conventionally caller-supplied path >
+`BROSOUNDML_DATA_DIR` env var > `../brosoundml-data`. The library itself never
+touches the filesystem beyond the paths handed to it. The `scripts/` directory
+holds the upstream-checkpoint converters and downloaders
+(`convert-kokoro.py`, `convert-rave.py`, `download-qwen-tts.sh`, …).
 
 ## Build
 
@@ -78,346 +81,35 @@ cmake --build build --config Release
 On Windows use the Visual Studio multi-config generator (`--config` picks the
 config); on Linux/macOS use a separate build dir per config. brosoundml builds
 no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` only forward
-the backend choice so a standalone GPU build resolves brotensor's backend.
+the backend choice so a standalone GPU build resolves brotensor's backend. The
+CLI tools and tests build only when brosoundml is the top-level project
+(`BROSOUNDML_TOOLS` / `BROSOUNDML_TESTS`, both ON by default standalone).
 
-## Kokoro
+## Conventions
 
-Kokoro-82M is an 82M-parameter TTS model derived from **StyleTTS 2**. Unlike
-StyleTTS 2 it does not sample a style with a diffusion model — the "voice" is a
-precomputed embedding (a *voice pack*), so synthesis is a single deterministic
-forward pass.
+- **`AudioBuffer` is the waveform currency** — mono FP32 PCM nominally in
+  [-1, 1], carrying its `sample_rate`. Synthesis returns one; file I/O consumes
+  one. Long-running loops poll a `CancelCheck` (see `include/brosoundml/audio.h`).
+- **Heavy model state lives behind a pImpl** so public headers stay free of
+  brotensor module internals.
+- **Errors throw `std::runtime_error`** with a `"brosoundml: <where>: <reason>"`
+  message — matching the brotensor convention.
 
-### Pipeline
+## Documentation
 
-```
-text ──▶ [G2P]──▶ phonemes ──▶ [token ids]
-                                    │
-                    ┌───────────────┘
-                    ▼
-   1. plBERT          phoneme-level BERT (ALBERT-style, weight-shared layers)
-                      encodes the phoneme sequence into context features.
-   2. Text encoder    embedding ▶ 3× (conv1d + LayerNorm + LeakyReLU)
-                      ▶ bidirectional LSTM ▶ per-phoneme features.
-   3. Predictor       conditioned on the voice embedding: a duration
-                      predictor (LSTM + projection) gives per-phoneme frame
-                      counts; a length regulator expands features to frame
-                      rate; F0 (pitch) and energy are predicted at frame rate.
-   4. Decoder         iSTFTNet generator: AdaIN residual blocks + transposed-
-                      conv upsampling + a harmonic/noise source excitation,
-                      a final layer emitting an STFT magnitude/phase pair,
-                      and an iSTFT head ─▶ 24 kHz waveform.
-```
+Per-architecture detail (pipeline, voice/decode control, brotensor op map, CLI
+tools, caveats) lives in [`docs/`](docs):
 
-**G2P.** Kokoro upstream uses the [misaki](https://github.com/hexgrad/misaki)
-(Apache 2.0) grapheme-to-phoneme frontend. brosoundml ships an in-tree English
-G2P at `brosoundml::g2p::` that removes that runtime dependency for embedded /
-no-Python deployments. The byte-level Transformer POS tagger (`PosTagger`,
-weights in [`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) under
-`pos_tagger/`), the lexicon loader (`Lexicon`), morphology fallback
-(`Morphology`), special-case overrides (`SpecialCases`), text normalizer
-(`Normalizer`), and the Kokoro phoneme-id adapter (`PhonemeAdapter`) are tied
-together by `Phonemizer` — so callers can phonemize English text in-tree with no
-misaki/Python dependency. `Kokoro::synthesize()` still accepts phoneme ids
-directly for callers that supply their own.
+- [Kokoro-82M](docs/kokoro.md) · [Qwen3-TTS](docs/qwen-tts.md) — text-to-speech
+- [Whisper](docs/whisper.md) · [Parakeet-TDT](docs/parakeet.md) · [Qwen3-ASR](docs/qwen-asr.md) — speech-to-text
+- [RAVE](docs/rave.md) — neural audio autoencoder
+- [Wake-word](docs/wake-word.md) · [Phoneme spotter](docs/phoneme-spotter.md) — keyword spotting
+- [G2P](docs/g2p.md) — in-tree English grapheme-to-phoneme
 
-Kokoro is a single non-autoregressive forward pass, so there is no growing token
-prefix to stream the way Qwen3-TTS does. `synthesize_stream()` instead chunks the
-*input*: the caller passes phoneme chunks split at sentence/clause boundaries,
-each is synthesized independently and its 24 kHz audio is handed to an `on_chunk`
-sink the moment it finishes (first-chunk latency for a long script), with the
-full concatenation also returned (each chunk also reports its own per-phoneme
-frame durations so a caller can align words to the streamed audio). The
-`synth --stream` CLI drives this, one `--ids-file` line per chunk.
-
-### Authoring, introspection, and a trainable decoder
-
-A handful of seams open Kokoro up beyond one-shot synthesis:
-
-- **`make_voice()`** builds a `Voice` from raw style data in memory (rather than
-  a voice-pack file) — for authoring, blending, or otherwise constructing a
-  voice the application holds itself.
-- **`decode_from()`** re-runs only the decoder from the intermediate stages of a
-  prior synthesis (the `asr` / `F0_pred` / `N_pred` tensors), so an edited
-  pitch/energy curve can be re-rendered without re-running the front half.
-- **`KokoroTrace`** — passing a `KokoroTrace*` to `synthesize()` fills a
-  per-stage host copy of the intermediates for introspection / visualization. A
-  normal `synthesize()` with no trace requested pays nothing.
-- **Trainable decoder LoRA** (`decoder_lora.h`). The iSTFTNet decoder's AdaIN
-  style→(γ,β) projections are made trainable: a backward pass over the decoder
-  back half (`kokoro_decoder_backward.{h,cpp}`) plus a conditioned LoRA
-  (`DecoderLora`) with Adam, checkpoint I/O, and a conditioning gate that is
-  exactly identity at condition 0 (so cond = 0 reproduces the base voice). The
-  condition vector is generic — any small control signal (e.g. a style/affect
-  coordinate) can drive it.
-
-### brotensor op coverage
-
-Most of Kokoro maps straight onto the existing op surface:
-
-| Kokoro component | brotensor ops |
-|---|---|
-| Phoneme embedding, plBERT | `embedding_lookup`, `self_attention`, `layernorm`, `gelu` |
-| Text encoder CNN | `conv1d`, `pad1d`, `layernorm`, `leaky_relu` |
-| iSTFTNet decoder | `conv1d`, `conv_transpose1d`, `leaky_relu`, `snake`, `group_norm` (instance norm via `num_groups == C`) + `modulate` (the AdaIN affine) |
-| iSTFT head | `istft` (and `stft` / `complex_*` for the magnitude/phase pair) |
-| Resampling | `resample1d` |
-
-The text encoder and both predictors use bidirectional LSTMs and `brotensor`
-has no recurrent primitive, so brosoundml composes the LSTM cell from `matmul`
-+ `sigmoid` + `tanh` per timestep. A fused `brotensor` LSTM op is a later
-performance optimisation.
-
-### Caveat
-
-The harmonic-source branch (SineGen / SourceModuleHnNSF in upstream Kokoro)
-uses a deterministic approximation that drops torch's random initial phases
-and additive noise. Output is intelligible but not bit-equal to upstream.
-
-## Qwen3-TTS
-
-Qwen3-TTS is Alibaba's open-weight TTS series (Jan 2026). brosoundml targets the
-12 Hz multi-codebook track — an end-to-end discrete-token model, no diffusion,
-no external vocoder. The whole pipeline runs device-neutrally on **CPU and
-CUDA**: `load(device)` places the weights on the chosen backend, and because
-compute is FP32 on both, CUDA reproduces the CPU/upstream discrete-code stream
-bit-for-bit (the codec tail then matches to ~1e-5).
-
-`load(dir, device, QwenTtsWeightPrecision::BF16)` keeps the Talker / Code
-Predictor projection, MLP and head weights at the checkpoint's native BF16
-instead of widening them (activations, accumulation, norms, embeddings and the
-KV cache stay FP32) — halving the weight-read bandwidth that floors the
-autoregressive decode, ~1.3-1.4× end-to-end. The kernels widen each BF16
-weight to FP32 in register and accumulate in the same order as the FP32 path,
-so the output has matched FP32 mode byte-for-byte in practice; FP32 stays the
-fixture-gated reference. The `BROSOUNDML_QWEN_BF16` env var switches the
-qwen-tts tools to this mode.
-
-### Pipeline
-
-```
-   1. Text         text -> Qwen BPE token ids (brolm Qwen tokenizer; the
-                   vocab.json + merges.txt ship in the model dir).
-   2. Talker       a 28-layer Qwen3 decoder backbone over a dual stream: text-
-                   token embeddings (projected to the Talker hidden) interleaved
-                   with codec-token embeddings, GQA + QK-norm + interleaved
-                   M-RoPE. Per frame it emits a hidden state and, via codec_head,
-                   acoustic codebook 0.
-   3. Code         a 5-layer depth transformer that, conditioned on the Talker
-      Predictor    hidden, autoregressively emits acoustic codebooks 1..15.
-   4. Codec        the bundled 12 Hz codec (speech_tokenizer/): 16 RVQ codes per
-      decoder      frame ─▶ dequantize ─▶ windowed pre-transformer ─▶ ConvNeXt
-                   upsample ─▶ a SEANet causal-conv decoder with Snake activations
-                   ─▶ 24 kHz. Total upsample 1920; 12.5 Hz · 1920 = 24 kHz.
-```
-
-### Variants and voice control
-
-`QwenTts::synthesize()` picks the voice by checkpoint variant:
-
-- **CustomVoice** — pass a preset `speaker` name (see `speakers()`). The 1.7B
-  checkpoint also honours an `instruct` style prompt.
-- **VoiceDesign** — pass a natural-language `instruct` describing the voice
-  (e.g. *"a warm, low-pitched elderly storyteller"*); there are no presets.
-- **Base** — zero-shot voice cloning. `synthesize_clone()` encodes a reference
-  clip into an ECAPA-TDNN speaker x-vector and splices it into the Talker prefill
-  where a CustomVoice preset token would sit ("x-vector-only" enrollment, no
-  reference transcript). `embed_speaker()` exposes that enrollment step on its
-  own — the honest audio→identity front-end for training an adapter into another
-  model's style space — and `synthesize_with_xvector()` renders straight from a
-  supplied x-vector, so a caller can enroll real voices and then interpolate /
-  morph / steer in that 1024-d identity space before speaking.
-
-**Standalone speaker encoder.** The Base ECAPA-TDNN extractor is also liftable
-out of the ~2.5 GB checkpoint: `brosoundml_build_speaker_encoder` packs it into a
-~18 MB two-file artifact, and the `SpeakerEncoder` class (`speaker_encoder.h`)
-loads just that to enroll a clip — bit-identical to `QwenTts::embed_speaker` —
-without touching the Talker, codec, or tokenizer it never needs.
-
-**Streaming, steering, and tracing.** `synthesize_stream()` decodes the growing
-code stream as the AR loop runs and hands each new 24 kHz chunk to an `on_chunk`
-sink (the codec is causal, so delivered samples never change). `QwenTtsSampling`
-exposes optional seeded sampling (temperature/top-p, reproducible per `seed`) and
-codebook-0 logit steering (repetition penalty, a logit bias, and an adaptive
-temperature that nudges only the frames where the model hedged); the default
-(temperature 0) stays the greedy, bit-exact upstream policy. Passing a
-`QwenTtsTrace*` to `synthesize()` captures the per-frame codes and codebook-0
-confidence for visualization at near-zero cost.
-
-The bundled codec is reachable directly: `encode_audio()` (waveform → RVQ codes)
-and `decode_codes()` (RVQ codes → 24 kHz waveform) are inverses that round-trip,
-useful on their own once a caller holds a code stream. The autoregressive loop
-polls a `CancelCheck` once per generated frame so a long synthesis can be
-aborted.
-
-### brotensor op coverage
-
-`rms_norm`, `rope`, `silu`/SwiGLU, GQA self-attention (CUDA via
-`flash_attention_varlen_forward`'s FP32 kernel), `conv1d` / `conv_transpose1d`,
-`snake`, `embedding_lookup`, `softmax`, `sample_logits` / `argmax` — all already
-on the op surface. Qwen3-TTS adds no op brotensor lacks. See
-`docs/qwen-tts-weights.md` for the full tensor map.
-
-## Whisper
-
-OpenAI's encoder-decoder speech-to-text model. brosoundml targets the HF
-transformers checkpoints (`whisper-tiny` / `-base` / `-small` / `-medium` /
-`-large-v3`) — `config.json` + `model.safetensors` in a model directory.
-Tokenization is delegated to `brolm::whisper::Tokenizer`; brosoundml itself
-takes already-tokenized prompts and emits token ids.
-
-### Pipeline
-
-```
-   1. Log-mel front-end  16 kHz mono PCM ─▶ log-mel spectrogram
-                         (num_mel_bins × 3000 frames, 30 s padded/truncated).
-                         stft + mel-filterbank matmul + log.
-   2. Encoder            two strided conv1d stems + sinusoidal positional
-                         embeddings + a pre-LN Transformer stack.
-   3. Decoder            cross-attention Transformer with a KV cache,
-                         autoregressive greedy decode.
-   4. Tokenizer          brolm::whisper::Tokenizer (external) maps id ─▶ text.
-```
-
-`transcribe()` has a `TranscribeOptions` overload for realtime use:
-`on_token` fires per decoded id so a caller can emit partial text mid-utterance
-instead of waiting for the whole clip, and `timestamp_begin_id` opts into
-sequential long-form decode — audio past the fixed 30 s log-mel window is split
-into 30 s segments and advanced by each segment's last emitted timestamp
-(falling back to full-30 s hops) instead of being truncated. Only that single
-int crosses the tokenizer boundary; the caller still owns `build_prompt`/`decode`
-(`brolm::whisper::Tokenizer::first_timestamp_id()` supplies it). The CLI's
-`--stream` flag and its automatic long-form for >30 s clips drive both.
-
-### brotensor op coverage
-
-`stft` + `complex_abs` + `matmul` (mel front-end), `conv1d`, `gelu`,
-`layer_norm`, MHA (composed via brosoundml's FP32 MHA / CrossAttention
-modules — see `modules.h`), `embedding_lookup`, `sample_logits` / `argmax`.
-
-## Parakeet
-
-[NVIDIA Parakeet-TDT](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) is a
-FastConformer encoder feeding a Token-and-Duration Transducer (TDT) decoder —
-the v3 0.6B model is multilingual (25 European languages). brosoundml targets
-the HF `transformers` `ParakeetForTDT` checkpoint (`config.json` +
-`model.safetensors`); the unified SentencePiece tokenizer (`tokenizer.json`,
-loaded by `brolm::t5::Tokenizer`) is the caller's, as with Whisper — brosoundml
-emits token ids plus their encoder-frame positions (×0.08 s) for word
-timestamps. `scripts/download-parakeet.sh` fetches the weights.
-
-### Pipeline
-
-```
-   1. Log-mel front-end  16 kHz mono PCM ─▶ (128-mel × T) log-mel. NeMo recipe:
-                         pre-emphasis 0.97, STFT (n_fft 512, win 400, hop 160,
-                         symmetric Hann), power, Slaney mel, log(x + 2^-24),
-                         per-feature mean/var normalization.
-   2. FastConformer enc  8x depthwise-separable conv2d subsampling, then 24
-                         Conformer blocks (½-FFN macaron, Transformer-XL
-                         relative-position attention, conv module
-                         [pointwise ▶ GLU ▶ depthwise k=9 ▶ BatchNorm ▶ SiLU ▶
-                         pointwise], ½-FFN, LayerNorm); a projector to width 640.
-   3. TDT decoder        a prediction network (token embedding + 2-layer LSTM +
-                         projection) and a joint network (relu(enc + dec) ▶
-                         token+duration logits). Greedy TDT decode emits a token
-                         and a frame-duration per step, skipping `duration`
-                         encoder frames at once — TDT's speed-up.
-```
-
-The relative-position attention rides `brotensor::self_attention_bias_forward`:
-the Transformer-XL content bias `pos_bias_u` folds into the Q-projection bias
-and the position term `rel_shift(Q_v · p)` is supplied as the additive
-attention bias. FP32 on CPU and CUDA — both reproduce the reference transcript.
-
-### brotensor op coverage
-
-`stft` + `complex_abs` + `matmul` (mel front-end), `conv2d` (subsampling +
-conv module, depthwise via groups), `silu`, `sigmoid`, `layer_norm`,
-`batch_norm_inference`, `self_attention_bias_forward` (rel-pos attention),
-`embedding_lookup`, `matmul`, `argmax`. No op brotensor lacks; the LSTM
-prediction network composes the cell from `matmul`/`sigmoid`/`tanh`.
-
-## RAVE
-
-[RAVE](https://github.com/acids-ircam/RAVE) (Realtime Audio Variational
-autoEncoder, ACIDS/IRCAM) is a small (<20M-param), faster-than-realtime neural
-audio autoencoder. A multiband (PQMF) variational convolutional encoder
-compresses a waveform to a low-rate latent `z` of shape `(n_latent × frames)`; a
-residual upsampling decoder synthesises the waveform back. The latent axes are
-PCA-sorted by variance — dim 0 tracks loudness, dim 1 pitch/centroid, the rest
-timbre — so editing the per-dimension time series (the lab's use case) morphs the
-audio in musically meaningful ways. brosoundml runs **inference** of an exported
-RAVE v2 model; the whole forward pass composes brotensor's existing op surface,
-so a CUDA / Metal build runs on the GPU with no model-specific kernels.
-
-### Pipeline
-
-```
-   1. Convert   the exported streaming `.ts` (the cached_conv build used by the
-                nn~/VST) -> safetensors + config.json, offline, by
-                scripts/convert-rave.py. The loader reads that layout.
-   2. Encode    waveform -> PQMF analysis -> variational conv encoder -> PCA
-                crop -> latent (cropped_latent_size × frames). Deterministic:
-                the posterior mean, no reparameterisation sampling.
-   3. Decode    latent -> residual upsampling decoder -> deterministic waveform +
-                loudness branches -> PQMF synthesis -> waveform (sampling_rate Hz).
-                A single fresh-cache (offline causal) pass.
-```
-
-### Editing, noise, and stereo
-
-`encode()` / `decode()` round-trip a clip reproducibly — the right default for
-editing the latent curves. Two options extend the decoder:
-
-- **Stochastic noise synth** — `RaveDecodeOptions{add_noise = true}` adds RAVE's
-  third synthesis branch, an FFT filtered-noise synthesizer for breathy /
-  unvoiced / textural energy. Its white noise is redrawn each call, so pin it
-  with a `seed` (or inject a `noise` buffer) when you need reproducibility.
-- **Stereo decode** — RAVE has no stereo decoder; the VST runs the mono decoder
-  once per channel and the channels decorrelate only because the discarded latent
-  dims are padded with *independent* N(0,1) noise per channel. `decode_multi()`
-  reproduces that exactly: `latent_pad_std` is the per-channel pad std (RAVE-native
-  1.0; it doubles as the "stereo width" knob, 0 = identical to mono), each channel
-  drawn reproducibly from `seed`. Output is interleaved, dropping straight into an
-  interleaved sink.
-
-### brotensor op coverage
-
-PQMF analysis/synthesis and every encoder/decoder block are `conv1d` /
-`conv_transpose1d` + `batch_norm` + `leaky_relu` + `snake`; the waveform and
-loudness heads use `tanh` / `sigmoid` / `exp`; the optional noise branch is an
-`rfft` / `irfft` filtered-noise synth. RAVE adds no op brotensor lacks.
-
-## Wake-word
-
-A small streaming convolutional keyword spotter that fires once when a target
-keyword (`"computer"` is the first target) is spoken. The model is BC-ResNet-
-style: log-mel front-end ▶ depthwise-separable Conv1d residual blocks ▶ global
-average pool ▶ linear head ▶ a single logit. It is designed for an always-on mic
-loop — feature extract and forward pass are each a low-millisecond per-frame
-cost — and `WakeWord::feed()` buffers arbitrary chunk sizes, advancing the
-streaming front-end and model one 10 ms frame at a time, returning true exactly
-once per detected event (2-of-3 smoothing, then a `refractory_ms` debounce).
-Detector policy (threshold / smoothing / refractory) is caller-tunable at
-runtime; the front-end and model hyperparameters come from the weights file.
-
-The full training toolchain lives in `tools/`:
-
-| Tool | Role |
-|---|---|
-| `brosoundml_wake_synth` | Kokoro-driven dataset builder (positive/negative clips) |
-| `brosoundml_wake_inspect` | dataset validator |
-| `brosoundml_wake_train` | backward + Adam + BCE-with-logits |
-| `brosoundml_wake_test` | held-out evaluation |
-| `brosoundml_wake_probe` / `_melcmp` | front-end / mel diagnostics |
-
-### brotensor op coverage
-
-`stft` + `complex_abs` + mel matmul + log (the streaming front-end), `conv1d`
-(depthwise + pointwise) + `relu`, and global average pool. Batch norm is folded
-into the preceding conv at inference, so it costs no runtime op; the training
-toolchain composes BN inline and uses brotensor's `*_backward` ops, a fused
-BCE-with-logits, and Adam — all on the existing op surface.
+Reference dumps: [Qwen3-TTS weight map](docs/qwen-tts-weights.md). G2P component
+specs: [pos_tagger](docs/pos_tagger.md), [lexicon](docs/lexicon.md),
+[morphology](docs/morphology.md), [special_cases](docs/special_cases.md),
+[phonemizer](docs/phonemizer.md).
 
 ## License
 
