@@ -90,6 +90,8 @@ public:
     const PhonemeClassMap& class_map() const;
     bool loaded() const;          // model present (feed(samples) usable)
     bool has_class_map() const;   // enroll()/feed_posteriors() usable
+    int  sample_rate() const;     // feed()'s expected PCM rate (the loaded
+                                  // model's front-end rate; 16000 before load)
 
     // ── Enrollment ──
     // Enroll a template from a Kokoro PHONEME-ID sequence (e.g. a phonemizer's

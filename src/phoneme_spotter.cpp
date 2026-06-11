@@ -337,6 +337,7 @@ void PhonemeSpotter::load(const std::string& weights_path, brotensor::Device dev
 const PhonemeClassMap& PhonemeSpotter::class_map() const { return impl_->class_map; }
 bool PhonemeSpotter::loaded()        const { return impl_->loaded; }
 bool PhonemeSpotter::has_class_map() const { return impl_->has_class_map; }
+int  PhonemeSpotter::sample_rate()   const { return impl_->sample_rate; }
 
 // ─── Enrollment helpers ──────────────────────────────────────────────────────
 
