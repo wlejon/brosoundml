@@ -13,10 +13,16 @@ namespace brosoundml {
 // ─── Wake-word detector ────────────────────────────────────────────────────
 //
 // A small streaming convolutional classifier that fires when a target keyword
-// ("computer" is the first target) is spoken. The model is BC-ResNet-style:
-// log-mel front-end → 4 depthwise-separable Conv1d residual blocks → global
-// average pool over time → linear head → single logit. Designed for an
-// always-on mic loop with a per-frame inference cost in the low milliseconds.
+// ("computer" is the first target) is spoken. The shipped model is a 2D
+// BC-ResNet (BcResnet2d): a PCEN mel front-end feeds a single-channel
+// (freq x time) image into Broadcasted-Residual conv2d blocks (weights shared
+// across frequency, strictly causal in time), then a frequency-average-pool →
+// temporal global-average-pool → linear head → single logit. The earlier 1D
+// model (mel bins as conv channels) keyed on the TTS training spectral envelope
+// and collapsed on real microphones, so load() rejects the legacy 'BWAK'
+// checkpoint and requires the 2D 'BWK2' model. Designed for an always-on mic
+// loop with a per-frame inference cost in the low milliseconds; device-neutral
+// (load() takes a brotensor::Device, CPU or CUDA).
 //
 // Latency budget (the design constraint everything below is sized to):
 //
@@ -34,18 +40,21 @@ namespace brosoundml {
 // debounced by `refractory_ms`.
 //
 // STATUS: complete — the full streaming runtime and its training toolchain
-// have landed. load() reads the BC-ResNet weights; feed() runs the streaming
-// log-mel front-end (stft → magnitude → mel → log) ▶ model ▶ 2-of-3 smoothing
-// ▶ refractory debounce, returning true once per detected event.
+// have landed. load() reads the 2D BC-ResNet weights; feed() runs the streaming
+// PCEN mel front-end (stft → magnitude → mel → PCEN) ▶ model ▶ a GAP-ring warmup
+// guard ▶ 2-of-3 smoothing ▶ refractory debounce, returning true once per
+// detected event.
 //
 // Supporting tools (built under tools/):
-//   brosoundml_wake_synth     Kokoro-driven dataset builder
-//   brosoundml_wake_inspect   dataset validator
-//   brosoundml_wake_train     backward + Adam + BCE-with-logits
-//   brosoundml_wake_test      held-out evaluation
+//   brosoundml_wake_synth      Kokoro-driven dataset builder
+//   brosoundml_wake_inspect    dataset validator
+//   brosoundml_wake_train      backward + Adam + BCE-with-logits
+//   brosoundml_wake_test       held-out evaluation
+//   brosoundml_wake_probe      front-end diagnostics
+//   brosoundml_wake_melcmp     mel front-end comparison
 
 // Front-end + model + detector hyperparameters. The defaults match the
-// "computer" recipe: 16 kHz, 10 ms hop, 25 ms window, 40-bin log-mel,
+// "computer" recipe: 16 kHz, 10 ms hop, 25 ms window, 40-bin PCEN mel,
 // 1-second receptive field, 2-of-3 smoothing with a 500 ms refractory.
 // Loading a trained model overwrites the front-end / model fields from the
 // weights file's header — only the detector-policy fields (threshold,

@@ -64,9 +64,10 @@ caller buffer so a bridge harness can drive a decoder on another device/library.
 ## brotensor op coverage
 
 Same Qwen3-transformer op set as Qwen3-TTS — `rms_norm`, `rope`, `silu`/SwiGLU,
-GQA self-attention (FP32 kernel), `embedding_lookup`, `softmax`,
-`sample_logits` / `argmax` — plus `stft` + `complex_abs` + `matmul` (mel
-front-end) and `conv2d` (the AuT stem). No op brotensor lacks.
+GQA self-attention (`flash_attention_varlen_forward`'s FP32 kernel),
+`embedding_lookup`, `softmax`, and `argmax_rows` for the greedy step — plus
+`stft` + a host power loop + `matmul` (mel front-end) and `conv2d` (the AuT
+stem). No op brotensor lacks.
 
 ## Tools
 

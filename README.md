@@ -1,18 +1,15 @@
 # brosoundml
 
-Audio-ML model inference. brosoundml is the **expression layer** for neural
-audio models — it composes the FP32 audio op family in `brotensor` (FFT/STFT,
-1D/2D convolution, vocoder/codec activations, codec quantization, resampling,
-autoregressive sampling) into runnable text-to-speech, speech-to-text,
-neural-codec, neural-autoencoder, and keyword-spotting models.
+brosoundml is a C++ library that runs neural audio models: text-to-speech,
+speech-to-text, a neural audio autoencoder, and keyword spotting. You hand it a
+converted model directory and either text or an `AudioBuffer` of PCM, and it
+gives you back synthesized audio or token ids.
 
-It is to audio what [`brodiffusion`](https://github.com/wlejon/brodiffusion) is
-to images and [`brolm`](https://github.com/wlejon/brolm) is to text: a sibling
-library that turns a tensor op surface into a model. One flat namespace,
-`brosoundml::`. brosoundml writes **no kernels** — every model is a graph of
-`brotensor` op calls plus weight loading and pre/post-processing. If an op is
-genuinely missing it goes into `brotensor` (mirrored across CPU/CUDA/Metal),
-not here.
+Each model is built by composing the audio operations in
+[`brotensor`](https://github.com/wlejon/brotensor) FFT/STFT, 1D/2D convolution,
+vocoder/codec activations, codec quantization, resampling, autoregressive
+sampling. A model here is a graph of brotensor op calls plus weight loading and pre/post-processing.
+Everything lives in one flat namespace, `brosoundml::`.
 
 ## Models
 
@@ -30,7 +27,7 @@ tail).
 | [Parakeet-TDT](docs/parakeet.md) | speech → text | CPU + CUDA | FastConformer + TDT transducer; multilingual 0.6B-v3 + timestamps |
 | [Qwen3-ASR](docs/qwen-asr.md) | speech → text | CPU + CUDA | AuT encoder + Qwen3 decoder; 52-language + language ID, context biasing |
 | [RAVE](docs/rave.md) | waveform ⇄ latent | CPU + CUDA + Metal | ACIDS/IRCAM v2 neural audio autoencoder; editable PCA latent |
-| [Wake-word](docs/wake-word.md) | keyword spotting | CPU | BC-ResNet single-keyword streaming spotter + training toolchain |
+| [Wake-word](docs/wake-word.md) | keyword spotting | CPU + CUDA | 2D BC-ResNet (PCEN) single-keyword streaming spotter + training toolchain |
 | [Phoneme spotter](docs/phoneme-spotter.md) | open-vocab spotting | CPU + CUDA | PhonemeNet posteriors + streaming template matcher; "type a word, spot it" |
 
 The in-tree English **[G2P](docs/g2p.md)** (`brosoundml::g2p::`) lets Kokoro
@@ -38,17 +35,17 @@ phonemize text with no misaki/Python dependency.
 
 ## Dependencies
 
-brosoundml is a standalone sibling repo. It links three siblings and ships no
-GPU kernels of its own — GPU work happens inside `brotensor`.
+brosoundml ships no GPU kernels of its own — all compute (and all GPU work)
+happens inside `brotensor`. It depends on three libraries:
 
 | Library | Role |
 |---|---|
-| [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
-| [`brotensor`](https://github.com/wlejon/brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) |
+| [`brotensor`](https://github.com/wlejon/brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) — where every model's compute runs |
 | [`brolm`](https://github.com/wlejon/brolm) | tokenizers used by the speech models (`brolm::whisper::Tokenizer`, the Qwen BPE tokenizer, `brolm::t5::Tokenizer`) |
+| [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
 
-Siblings resolve by the standard multi-repo pattern: a standalone repo at
-`../<name>`, else a `third_party/` submodule fallback (see
+Each resolves either to a standalone repo at `../<name>` or to a `third_party/`
+submodule fallback (the standard multi-repo pattern — see
 `bro/docs/multi-repo-workflow.md`).
 
 ## Data and weights
@@ -56,8 +53,8 @@ Siblings resolve by the standard multi-repo pattern: a standalone repo at
 brosoundml ships **code only** — no trained weights, no packed data, no
 voice packs are checked into this repo. Anything that gets built (POS tagger
 weights, the packed English lexicon, Kokoro voice packs, wake-word
-checkpoints, …) lives in the sibling
-[`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data) repo.
+checkpoints, …) lives in a separate data repo,
+[`brosoundml-data`](https://huggingface.co/datasets/wlejon/brosoundml-data).
 Loaders take file paths; the application (or the CLI tools in this repo) is
 responsible for resolving them — conventionally caller-supplied path >
 `BROSOUNDML_DATA_DIR` env var > `../brosoundml-data`. The library itself never

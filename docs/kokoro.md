@@ -81,11 +81,13 @@ Most of Kokoro maps straight onto the existing op surface:
 
 | Kokoro component | brotensor ops |
 |---|---|
-| Phoneme embedding, plBERT | `embedding_lookup`, `self_attention`, `layernorm`, `gelu` |
+| Phoneme embedding, plBERT | `embedding_lookup`, `flash_attention_forward`, `layernorm`, `gelu` |
 | Text encoder CNN | `conv1d`, `pad1d`, `layernorm`, `leaky_relu` |
 | iSTFTNet decoder | `conv1d`, `conv_transpose1d`, `leaky_relu`, `snake`, `group_norm` (instance norm via `num_groups == C`) |
 | iSTFT head | `istft` (and `stft` / `complex_*` for the magnitude/phase pair) |
-| Resampling | `resample1d` |
+
+F0 / harmonic-source upsampling is host-side nearest-neighbour plus a depthwise
+`conv_transpose1d` (an all-ones-weight 2× upsample), not a resampling op.
 
 Two compositions carry the recurrent and style-conditioned parts:
 

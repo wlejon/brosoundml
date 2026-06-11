@@ -20,7 +20,8 @@ pipeline); the module graph is in `src/parakeet_modules.h`.
                          pre-emphasis 0.97, STFT (n_fft 512, win 400, hop 160,
                          symmetric Hann), power, Slaney mel, log(x + 2^-24),
                          per-feature mean/var normalization.
-   2. FastConformer enc  8x depthwise-separable conv2d subsampling, then 24
+   2. FastConformer enc  8x conv2d subsampling (a full conv2d then depthwise-
+                         separable convs), then 24
                          Conformer blocks (½-FFN macaron, Transformer-XL
                          relative-position attention, conv module
                          [pointwise ▶ GLU ▶ depthwise k=9 ▶ BatchNorm ▶ SiLU ▶
@@ -39,11 +40,12 @@ attention bias.
 
 ## brotensor op coverage
 
-`stft` + `complex_abs` + `matmul` (mel front-end), `conv2d` (subsampling +
+`stft` + a host power loop + `matmul` (mel front-end), `conv2d` (subsampling +
 conv module, depthwise via groups), `silu`, `sigmoid`, `layer_norm`,
 `batch_norm_inference`, `self_attention_bias_forward` (rel-pos attention),
-`embedding_lookup`, `matmul`, `argmax`. No op brotensor lacks; the LSTM
-prediction network composes the cell from `matmul` / `sigmoid` / `tanh`.
+`matmul`. The prediction network embeds tokens by a row gather and composes its
+LSTM cell from `matmul` / `sigmoid` / `tanh`; greedy TDT selection is a host
+argmax. No op brotensor lacks.
 
 ## Tools
 

@@ -46,11 +46,14 @@ struct Generator;
 //                   that returns the waveform.
 //
 // brotensor op coverage: conv1d / conv_transpose1d / pad1d, leaky_relu, snake,
-// stft / istft, group_norm (instance norm via num_groups == C) + modulate (the
-// AdaIN affine), embedding_lookup, and self-attention all map directly onto the
-// existing op surface. The one missing primitive is a recurrent (LSTM) op;
-// brosoundml composes the LSTM cell from matmul + sigmoid + tanh per timestep
-// for now — a fused brotensor lstm op is a later performance optimisation.
+// stft / istft, group_norm (instance norm via num_groups == C), flash_attention
+// (plBERT), and embedding_lookup all map directly onto the existing op surface.
+// The AdaIN/AdaLN affine is not a separate op: the style-conditioned (1+gamma)/
+// beta ride the norm call itself (ada_in_1d_styled / ada_layernorm). The one
+// missing primitive is a recurrent (LSTM) op; brosoundml composes the LSTM cell
+// from brotensor ops, with the input projection hoisted into one batched GEMM
+// and the per-step recurrent body captured once as a CUDA graph and replayed
+// per timestep (LstmGraphPlan).
 //
 // STATUS: complete. load() reads config.json + the safetensors weights;
 // synthesize() runs the full plBERT ▶ text-encoder ▶ duration/F0/energy

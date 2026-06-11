@@ -29,8 +29,9 @@ namespace brosoundml {
 //                         log. The 16 kHz / 25 ms / 10 ms / 80 (or 128) mels
 //                         parameters are Whisper-fixed; only num_mel_bins
 //                         varies (large-v3 uses 128).
-//   2. Encoder            two strided conv1d stems + sinusoidal positional
-//                         embeddings + a Transformer stack (pre-LN MHA + FFN).
+//   2. Encoder            two conv1d stems (the second strided x2) + sinusoidal
+//                         positional embeddings + a Transformer stack (pre-LN
+//                         MHA + FFN).
 //                         Outputs (1, max_source_positions, d_model).
 //   3. Decoder            cross-attention Transformer with a KV cache.
 //                         Autoregressively emits token ids conditioned on the
@@ -41,10 +42,12 @@ namespace brosoundml {
 //                         plus a decoded transcript when the tokenizer is
 //                         attached at the call site.
 //
-// brotensor op coverage: stft + complex_abs + matmul (mel front-end), conv1d,
-// gelu, layer_norm, mha (composed via brosoundml's FP32 MHA / CrossAttention
-// modules — see modules.h), embedding_lookup, sample_logits / argmax. No new
-// brotensor op is required for an FP32 CPU first cut.
+// brotensor op coverage: stft + a host power loop + matmul (mel front-end),
+// conv1d, gelu, layer_norm, embedding_lookup. Encoder self-attention uses
+// brosoundml's FP32 MHA module (modules.h); the decoder's causal self- and
+// cross-attention are free functions over flash_attention_forward with a KV
+// cache (FP16-cast Q/K/V on CUDA). Greedy token selection is a host argmax. No
+// new brotensor op is required.
 //
 // STATUS: complete. load() reads config.json + the safetensors weights onto
 // the requested device; transcribe() runs the full log-mel ▶ encoder ▶

@@ -93,10 +93,11 @@ useful on their own once a caller holds a code stream.
 ## brotensor op coverage
 
 `rms_norm`, `rope`, `silu`/SwiGLU, GQA self-attention (CUDA via
-`flash_attention_varlen_forward`'s FP32 kernel), `conv1d` / `conv_transpose1d`,
-`snake`, `embedding_lookup`, `softmax`, `sample_logits` / `argmax` — all already
-on the op surface. Qwen3-TTS adds no op brotensor lacks. The full tensor map is
-in [qwen-tts-weights.md](qwen-tts-weights.md).
+`flash_attention_windowed_forward`'s FP32 kernel), `conv1d` / `conv_transpose1d`,
+`snake`, `embedding_lookup`, `softmax`, `sample_logits` (the seeded sampler;
+the greedy default is a host argmax) — all already on the op surface. Qwen3-TTS
+adds no op brotensor lacks. The full tensor map is in
+[qwen-tts-weights.md](qwen-tts-weights.md).
 
 ## Tools
 

@@ -16,8 +16,8 @@ the cross-attention decoder).
    1. Log-mel front-end  16 kHz mono PCM ─▶ log-mel spectrogram
                          (num_mel_bins × 3000 frames, 30 s padded/truncated).
                          stft + mel-filterbank matmul + log.
-   2. Encoder            two strided conv1d stems + sinusoidal positional
-                         embeddings + a pre-LN Transformer stack.
+   2. Encoder            two conv1d stems (the second strided ×2) + sinusoidal
+                         positional embeddings + a pre-LN Transformer stack.
    3. Decoder            cross-attention Transformer with a KV cache,
                          autoregressive greedy decode.
    4. Tokenizer          brolm::whisper::Tokenizer (external) maps id ─▶ text.
@@ -41,9 +41,12 @@ both.
 
 ## brotensor op coverage
 
-`stft` + `complex_abs` + `matmul` (mel front-end), `conv1d`, `gelu`,
-`layer_norm`, MHA (composed via brosoundml's FP32 MHA / CrossAttention modules —
-see `modules.h`), `embedding_lookup`, `sample_logits` / `argmax`.
+`stft` + a host power loop + `matmul` (mel front-end), `conv1d`, `gelu`,
+`layer_norm`, `embedding_lookup`. Encoder self-attention uses brosoundml's FP32
+`MHA` module (`modules.h`); the decoder's causal self-attention and cross-
+attention are free functions over `brotensor::flash_attention_forward` with a KV
+cache (FP16-cast Q/K/V on CUDA). Greedy token selection is a host argmax, not a
+`sample_logits` op.
 
 ## Tools
 

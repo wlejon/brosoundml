@@ -6,10 +6,11 @@ TTS / STT / neural-codec / wake-word models, the same way `brodiffusion`
 composes the diffusion ops and `brolm` composes the text-model ops. One flat
 namespace, `brosoundml::`.
 
-**Status: operational.** Five model families are complete (CPU FP32; CUDA where
+**Status: operational.** Eight model families are complete (CPU FP32; CUDA where
 noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
 
-- **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz).
+- **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz). Device-neutral
+  CPU + CUDA.
 - **Qwen3-TTS** — text-to-speech (12 Hz multi-codebook, end-to-end discrete
   token, 24 kHz). Device-neutral CPU + CUDA; CustomVoice presets, VoiceDesign
   instruct prompts, Base-variant zero-shot voice cloning.
@@ -17,10 +18,20 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
 - **Parakeet-TDT** — speech-to-text (NVIDIA FastConformer encoder + TDT
   transducer decoder, multilingual 0.6B-v3). Device-neutral CPU + CUDA;
   validated bit-faithful against the reference checkpoint.
-- **Wake-word** — BC-ResNet streaming keyword spotter + its training toolchain.
+- **Qwen3-ASR** — speech-to-text (AuT audio encoder + Qwen3 decoder, 52-language
+  + language ID, context biasing). Device-neutral CPU + CUDA.
+- **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ editable
+  PCA-sorted latent. Device-neutral CPU / CUDA / Metal; library-only (no CLI).
+- **Wake-word** — a 2D BC-ResNet (PCEN) streaming single-keyword spotter + its
+  training toolchain. (The legacy 1D `bc_resnet` is retained for tests only; the
+  runtime requires the 2D 'BWK2' model.)
+- **Phoneme spotter** — open-vocabulary streaming keyword spotting: PhonemeNet
+  per-frame phoneme posteriors + a streaming template matcher ("type a word,
+  spot it"). Device-neutral CPU + CUDA.
 
 Plus an in-tree English **G2P** (`brosoundml::g2p::`) so Kokoro phonemizes with
-no misaki/Python dependency. Full per-model detail is in `README.md`.
+no misaki/Python dependency. Full per-model detail is in `README.md` and the
+per-architecture docs under `docs/`.
 
 ## Layout
 
@@ -34,14 +45,22 @@ include/brosoundml/
   kokoro_modules.h   Kokoro-specific module graph (plBERT, iSTFTNet, AdaIN)
   qwen_tts.h         Qwen3-TTS: QwenTts pipeline, Talker/CodePredictor/codec
                      configs, synthesize / synthesize_clone / encode/decode
+  speaker_encoder.h  standalone ECAPA voice-clone enroller (lifted from Qwen3-TTS)
   whisper.h          Whisper: WhisperConfig + the encoder/decoder pipeline
   whisper_modules.h  Whisper-specific modules (conv stems, cross-attn decoder)
   parakeet.h         Parakeet-TDT: ParakeetConfig + the FastConformer/TDT
                      pipeline (src/parakeet_modules.h holds the module graph)
+  qwen_asr.h         Qwen3-ASR: QwenAsrConfig + AuT encoder / Qwen3 decoder
+                     (src/qwen_asr_encoder.h + qwen_asr_decoder.h)
+  rave.h             RAVE: encode/decode, stereo decode_multi, noise synth
   wake.h             WakeWord streaming detector (front-end + model + policy)
-  bc_resnet.h        BC-ResNet wake model: forward, streaming, train_step
-  bc_resnet2d.h      2D BC-ResNet variant (freq×time) + training surface
-  mel.h              shared log-mel front-end helpers
+  bc_resnet2d.h      2D BC-ResNet (freq×time) — the shipped wake model
+  bc_resnet.h        legacy 1D BC-ResNet (tests only; not the runtime model)
+  phoneme_model.h    PhonemeNet: 2D BC-ResNet per-frame phoneme posteriors
+  phoneme_spotter.h  open-vocab streaming template matcher over PhonemeNet
+  phoneme_data.h     phoneme class map, frame labels, BPDS dataset format
+  decoder_lora.h     trainable conditioned LoRA over Kokoro's decoder AdaIN
+  mel.h              shared log-mel / PCEN mel front-end helpers
   wake_data.h        wake training-dataset binary format
   g2p/               in-tree English G2P: pos_tagger, lexicon, morphology,
                      special_cases, normalizer, phoneme_adapter, phonemizer
