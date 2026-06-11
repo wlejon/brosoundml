@@ -1,6 +1,10 @@
 #include "brosoundml/modules.h"
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
+#ifdef BROSOUNDML_HAS_CUDA
+#include <brotensor/cuda_graph.h>
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -104,13 +108,22 @@ void Conv1d::forward(const bt::Tensor& X, int N, int L, bt::Tensor& Y) const {
 }
 
 // ─── LSTM cell (composed) ──────────────────────────────────────────────────
+//
+// The input-side projection for every timestep is hoisted into one batched
+// GEMM (gates_all = X @ W_ih^T + b_ih), leaving only the recurrent body —
+// W_hh GEMV + gate activations + state update — inside the time loop. On
+// CUDA that body is captured as a CUDA graph once per cell and replayed per
+// step (the Qwen Talker launch-overhead fix); a step is then a staging copy
+// in, one graph launch, and a row copy out instead of ~15 kernel launches.
 
 namespace {
 
-// Allocate the per-step scratch tensors a single LSTM cell needs. Reused
-// across timesteps so the time loop is allocation-free.
-struct LSTMScratch {
-    bt::Tensor gates_ih;   // (4H, 1)
+// Per-direction step state. The tensors are the fixed buffers a captured
+// graph replays over, so they must stay alive (and unmoved) for the life of
+// the plan; gates holds the staged pre-activation row (input projection) on
+// entry to a step and the summed gate stack after it.
+struct LstmDirState {
+    bt::Tensor gates;      // (4H, 1) — staged input-gate row, then the gate stack
     bt::Tensor gates_hh;   // (4H, 1)
     bt::Tensor i_t;        // (H, 1)
     bt::Tensor f_t;        // (H, 1)
@@ -122,7 +135,7 @@ struct LSTMScratch {
 
     void init(int hidden, bt::Device device, bt::Dtype dtype) {
         const int H = hidden;
-        gates_ih = bt::Tensor::zeros_on(device, 4 * H, 1, dtype);
+        gates    = bt::Tensor::zeros_on(device, 4 * H, 1, dtype);
         gates_hh = bt::Tensor::zeros_on(device, 4 * H, 1, dtype);
         i_t      = bt::Tensor::zeros_on(device, H, 1, dtype);
         f_t      = bt::Tensor::zeros_on(device, H, 1, dtype);
@@ -132,49 +145,66 @@ struct LSTMScratch {
         h_prev   = bt::Tensor::zeros_on(device, H, 1, dtype);
         c_prev   = bt::Tensor::zeros_on(device, H, 1, dtype);
     }
+
+    void zero_state() {
+        bt::scale_inplace(h_prev, 0.0f);
+        bt::scale_inplace(c_prev, 0.0f);
+    }
 };
 
-// Run one direction of an LSTM over X:(L, input). On entry s.h_prev / s.c_prev
-// hold h0 / c0 (typically zero). On exit they hold h_L / c_L. Y must already
-// be sized to (L, hidden), and every row r of Y is overwritten with h_r.
+// One recurrent step over the staged buffers: s.gates holds the timestep's
+// input projection (W_ih @ x_t + b_ih) on entry; on exit s.h_prev / s.c_prev
+// hold h_t / c_t. Allocation-free after the first run, so it is capturable.
+void lstm_step_body(const LSTMCellWeights& w, int H, LstmDirState& s) {
+    bt::linear_forward(w.W_hh, w.b_hh, s.h_prev, s.gates_hh);
+    bt::add_inplace(s.gates, s.gates_hh);
+
+    // s.gates now holds the pre-activation gate stack; slice it into four
+    // (H, 1) windows.
+    bt::Tensor gi = element_view(s.gates, 0 * H, H, 1);
+    bt::Tensor gf = element_view(s.gates, 1 * H, H, 1);
+    bt::Tensor gg = element_view(s.gates, 2 * H, H, 1);
+    bt::Tensor go = element_view(s.gates, 3 * H, H, 1);
+
+    bt::sigmoid_forward(gi, s.i_t);
+    bt::sigmoid_forward(gf, s.f_t);
+    bt::tanh_forward   (gg, s.g_t);
+    bt::sigmoid_forward(go, s.o_t);
+
+    // c_new = f * c_prev + i * g — accumulate into f_t (reused as c_new).
+    bt::mul_inplace(s.i_t, s.g_t);     // i_t <- i * g
+    bt::mul_inplace(s.f_t, s.c_prev);  // f_t <- f * c_prev
+    bt::add_inplace(s.f_t, s.i_t);     // f_t <- c_new
+    // h = o * tanh(c_new).
+    bt::tanh_forward(s.f_t, s.tanh_c);
+    bt::mul_inplace(s.o_t, s.tanh_c);  // o_t <- h
+
+    // Persist c_prev <- c_new, h_prev <- h.
+    bt::copy_d2d(s.f_t, 0, s.c_prev, 0, H);
+    bt::copy_d2d(s.o_t, 0, s.h_prev, 0, H);
+}
+
+// Input-side projection for the whole sequence in one batched GEMM:
+// gates_all[t, :] = W_ih @ x_t + b_ih, shape (L, 4H).
+void lstm_input_proj(const LSTMCellWeights& w, const bt::Tensor& X,
+                     bt::Tensor& gates_all) {
+    gates_all = bt::Tensor::empty_on(X.device, X.rows, w.W_ih.rows, X.dtype);
+    bt::linear_forward_batched(w.W_ih, w.b_ih, X, gates_all);
+}
+
+// Run one direction over the pre-projected gates_all:(L, 4H), writing row t
+// of Y at column offset y_col (0 for a plain/forward direction, H for the
+// reverse half of a BiLSTM's (L, 2H) output). y_stride is Y's row width.
 void lstm_run(const LSTMCellWeights& w,
-              const bt::Tensor& X, int L, int input_size, int hidden,
-              bt::Tensor& Y, LSTMScratch& s,
+              const bt::Tensor& gates_all, int L, int hidden,
+              bt::Tensor& Y, int y_col, int y_stride, LstmDirState& s,
               bool reverse) {
     const int H = hidden;
     for (int step = 0; step < L; ++step) {
         const int t = reverse ? (L - 1 - step) : step;
-        bt::Tensor x_t = element_view(X, static_cast<std::size_t>(t) * input_size,
-                                      input_size, 1);
-
-        bt::linear_forward(w.W_ih, w.b_ih, x_t,        s.gates_ih);
-        bt::linear_forward(w.W_hh, w.b_hh, s.h_prev,   s.gates_hh);
-        bt::add_inplace(s.gates_ih, s.gates_hh);
-
-        // gates_ih now holds the pre-activation gate stack; slice it into
-        // four (H, 1) windows.
-        bt::Tensor gi = element_view(s.gates_ih, 0 * H, H, 1);
-        bt::Tensor gf = element_view(s.gates_ih, 1 * H, H, 1);
-        bt::Tensor gg = element_view(s.gates_ih, 2 * H, H, 1);
-        bt::Tensor go = element_view(s.gates_ih, 3 * H, H, 1);
-
-        bt::sigmoid_forward(gi, s.i_t);
-        bt::sigmoid_forward(gf, s.f_t);
-        bt::tanh_forward   (gg, s.g_t);
-        bt::sigmoid_forward(go, s.o_t);
-
-        // c_new = f * c_prev + i * g — accumulate into f_t (reused as c_new).
-        bt::mul_inplace(s.i_t, s.g_t);     // i_t <- i * g
-        bt::mul_inplace(s.f_t, s.c_prev);  // f_t <- f * c_prev
-        bt::add_inplace(s.f_t, s.i_t);     // f_t <- c_new
-        // h = o * tanh(c_new).
-        bt::tanh_forward(s.f_t, s.tanh_c);
-        bt::mul_inplace(s.o_t, s.tanh_c);  // o_t <- h
-
-        // Persist c_prev <- c_new, h_prev <- h, and copy h into Y[t,:].
-        bt::copy_d2d(s.f_t, 0, s.c_prev, 0, H);
-        bt::copy_d2d(s.o_t, 0, s.h_prev, 0, H);
-        bt::copy_d2d(s.o_t, 0, Y,        t * H, H);
+        bt::copy_d2d(gates_all, t * 4 * H, s.gates, 0, 4 * H);
+        lstm_step_body(w, H, s);
+        bt::copy_d2d(s.h_prev, 0, Y, t * y_stride + y_col, H);
     }
 }
 
@@ -196,6 +226,71 @@ void check_lstm_weights(const LSTMCellWeights& w, int input_size, int hidden,
 
 }  // namespace
 
+// The opaque per-cell plan declared in modules.h: persistent step state for
+// up to two directions plus the captured CUDA graph that replays their step
+// bodies. L-independent — the time loop stages each step's inputs into the
+// fixed buffers, so one capture serves every utterance length.
+struct LstmGraphPlan {
+    LstmDirState fwd;
+    LstmDirState rev;        // initialised only for a BiLSTM plan
+    bool         captured = false;
+#ifdef BROSOUNDML_HAS_CUDA
+    bt::CudaGraph graph;
+#endif
+};
+
+#ifdef BROSOUNDML_HAS_CUDA
+namespace {
+
+// Capture-or-replay driver for one direction (fwd) or two (fwd + rev in a
+// single graph). gates_all_r may be null for unidirectional. Per step: stage
+// the per-timestep gate rows, replay the captured step, copy the hidden rows
+// out. The first call warms the step body up (sizing every scratch buffer so
+// the capture run never allocates), then captures.
+void lstm_graph_forward(const LSTMCellWeights& w_f, const LSTMCellWeights* w_r,
+                        const bt::Tensor& gates_all_f,
+                        const bt::Tensor* gates_all_r,
+                        int L, int H,
+                        bt::Tensor& Y, int y_stride,
+                        LstmGraphPlan& p) {
+    if (!p.captured) {
+        p.fwd.init(H, gates_all_f.device, gates_all_f.dtype);
+        if (w_r) p.rev.init(H, gates_all_f.device, gates_all_f.dtype);
+        // Warm-up: run the body once so every output buffer is allocated;
+        // the capture re-run reuses those exact tensors.
+        lstm_step_body(w_f, H, p.fwd);
+        if (w_r) lstm_step_body(*w_r, H, p.rev);
+        bt::sync_all();
+        {
+            bt::CudaGraphCapture cap;
+            lstm_step_body(w_f, H, p.fwd);
+            if (w_r) lstm_step_body(*w_r, H, p.rev);
+            p.graph = cap.finish();
+        }
+        p.captured = true;
+    }
+
+    p.fwd.zero_state();
+    if (w_r) p.rev.zero_state();
+
+    for (int step = 0; step < L; ++step) {
+        bt::copy_d2d(gates_all_f, step * 4 * H, p.fwd.gates, 0, 4 * H);
+        if (w_r) {
+            const int t_r = L - 1 - step;
+            bt::copy_d2d(*gates_all_r, t_r * 4 * H, p.rev.gates, 0, 4 * H);
+        }
+        p.graph.launch();
+        bt::copy_d2d(p.fwd.h_prev, 0, Y, step * y_stride, H);
+        if (w_r) {
+            const int t_r = L - 1 - step;
+            bt::copy_d2d(p.rev.h_prev, 0, Y, t_r * y_stride + H, H);
+        }
+    }
+}
+
+}  // namespace
+#endif  // BROSOUNDML_HAS_CUDA
+
 void LSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     if (X.cols != input_size) {
         fail("LSTM::forward",
@@ -209,9 +304,21 @@ void LSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     // a mixed-device copy_d2d below and crash on CUDA.
     Y = bt::Tensor::empty_on(X.device, L, hidden_size, X.dtype);
 
-    LSTMScratch s;
+    bt::Tensor gates_all;
+    lstm_input_proj(cell, X, gates_all);
+
+#ifdef BROSOUNDML_HAS_CUDA
+    if (X.device == bt::Device::CUDA) {
+        if (!plan) plan = std::make_shared<LstmGraphPlan>();
+        lstm_graph_forward(cell, nullptr, gates_all, nullptr,
+                           L, hidden_size, Y, hidden_size, *plan);
+        return;
+    }
+#endif
+    LstmDirState s;
     s.init(hidden_size, X.device, X.dtype);
-    lstm_run(cell, X, L, input_size, hidden_size, Y, s, /*reverse=*/false);
+    lstm_run(cell, gates_all, L, hidden_size, Y,
+             /*y_col=*/0, /*y_stride=*/hidden_size, s, /*reverse=*/false);
 }
 
 void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
@@ -227,21 +334,28 @@ void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     // Allocate Y on X's device (same reasoning as LSTM::forward above).
     Y = bt::Tensor::empty_on(X.device, L, 2 * H, X.dtype);
 
-    bt::Tensor H_fwd = bt::Tensor::empty_on(X.device, L, H, X.dtype);
-    bt::Tensor H_rev = bt::Tensor::empty_on(X.device, L, H, X.dtype);
+    bt::Tensor gates_all_f, gates_all_r;
+    lstm_input_proj(forward_cell, X, gates_all_f);
+    lstm_input_proj(reverse_cell, X, gates_all_r);
 
-    LSTMScratch s_fwd, s_rev;
+#ifdef BROSOUNDML_HAS_CUDA
+    if (X.device == bt::Device::CUDA) {
+        if (!plan) plan = std::make_shared<LstmGraphPlan>();
+        lstm_graph_forward(forward_cell, &reverse_cell,
+                           gates_all_f, &gates_all_r,
+                           L, H, Y, /*y_stride=*/2 * H, *plan);
+        return;
+    }
+#endif
+    LstmDirState s_fwd, s_rev;
     s_fwd.init(H, X.device, X.dtype);
     s_rev.init(H, X.device, X.dtype);
-
-    lstm_run(forward_cell, X, L, input_size, H, H_fwd, s_fwd, /*reverse=*/false);
-    lstm_run(reverse_cell, X, L, input_size, H, H_rev, s_rev, /*reverse=*/true);
-
-    // Concat per-row: Y[t, :H] = H_fwd[t,:], Y[t, H:] = H_rev[t,:].
-    for (int t = 0; t < L; ++t) {
-        bt::copy_d2d(H_fwd, t * H, Y, t * 2 * H,     H);
-        bt::copy_d2d(H_rev, t * H, Y, t * 2 * H + H, H);
-    }
+    // Each direction writes its half of every (L, 2H) row directly — no
+    // separate H_fwd/H_rev buffers, no concat pass.
+    lstm_run(forward_cell, gates_all_f, L, H, Y,
+             /*y_col=*/0, /*y_stride=*/2 * H, s_fwd, /*reverse=*/false);
+    lstm_run(reverse_cell, gates_all_r, L, H, Y,
+             /*y_col=*/H, /*y_stride=*/2 * H, s_rev, /*reverse=*/true);
 }
 
 // ─── Multi-head attention (CPU FP32, with Q/K/V/O biases) ─────────────────
@@ -372,36 +486,19 @@ void ada_in_1d(const bt::Tensor& X,
              " elements (any (C,1) or (1,C) layout)");
     }
 
-    // Instance norm = GroupNorm with num_groups == C. Pass unit gamma / zero
-    // beta so the affine step is left for the per-channel modulate below.
-    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
-    bt::Tensor unit_gamma = bt::Tensor::from_host_on(X.device, unit_host.data(),
-                                                    C, 1);
-    bt::Tensor zero_beta  = bt::Tensor::zeros_on(X.device, C, 1, bt::Dtype::FP32);
-
-    bt::Tensor X_norm = bt::Tensor::empty_on(X.device, N, C * L, bt::Dtype::FP32);
-    bt::group_norm_forward(X, unit_gamma, zero_beta,
+    // Instance norm = GroupNorm with num_groups == C, and group_norm_forward's
+    // gamma/beta are already the per-channel affine — exactly ada_in_1d's
+    // Y = X_norm*scale + shift contract. One fused pass; no transpose chain.
+    // scale/shift may arrive as (1,C) row vectors; group_norm expects (C,1) —
+    // same C contiguous elements, so view them at the right shape.
+    bt::Tensor scale_c = bt::Tensor::view(scale.device, scale.data, C, 1, scale.dtype);
+    bt::Tensor shift_c = bt::Tensor::view(shift.device, shift.data, C, 1, shift.dtype);
+    if (Y.device != X.device) {
+        Y = bt::Tensor::empty_on(X.device, 0, 0, bt::Dtype::FP32);
+    }
+    bt::group_norm_forward(X, scale_c, shift_c,
                            N, C, /*H=*/1, /*W=*/L,
-                           /*num_groups=*/C, /*eps=*/1e-5f, X_norm);
-
-    // Per-channel affine Y[n,c,l] = X_norm[n,c,l] * scale[c] + shift[c],
-    // composed via NCL -> (N*L, C) -> modulate -> NCL. nchw_to_sequence with
-    // H=1 and W=L gives exactly the (N*L, C) layout modulate consumes.
-    //
-    // brotensor::modulate is AdaLN-style — it computes Y = X*(1+scale)+shift,
-    // baking a "+1" into the scale to centre learned deltas around identity.
-    // ada_in_1d's contract is the plain Y = X*scale + shift, so pre-subtract 1
-    // from a clone of `scale` (kept on the input device) before the call.
-    bt::Tensor scale_shifted = scale.clone();
-    bt::add_scalar_inplace(scale_shifted, -1.0f);
-
-    bt::Tensor X_seq;
-    bt::nchw_to_sequence(X_norm, N, C, /*H=*/1, /*W=*/L, X_seq);
-
-    bt::Tensor Y_seq;
-    bt::modulate(X_seq, scale_shifted, shift, Y_seq);
-
-    bt::sequence_to_nchw(Y_seq, N, C, /*H=*/1, /*W=*/L, Y);
+                           /*num_groups=*/C, /*eps=*/1e-5f, Y);
 }
 
 }  // namespace brosoundml

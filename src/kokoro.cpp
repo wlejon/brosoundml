@@ -29,6 +29,12 @@ namespace brosoundml {
 // load block and reset to CPU after it.
 void set_kokoro_load_device(brotensor::Device d);
 
+// Forward decl — implemented in kokoro_modules.cpp. Env-gated
+// (BROSOUNDML_KOKORO_PROFILE=1) sequential stage timing: each named mark
+// prints the wall time since the previous mark (device-synced); a nullptr
+// name resets the origin without printing.
+void kokoro_profile_mark(brotensor::Device dev, const char* name);
+
 namespace fs = std::filesystem;
 namespace j  = detail::json;
 
@@ -355,6 +361,7 @@ AudioBuffer Kokoro::Impl::decode_back_half(const brotensor::Tensor& ref_s,
     // Decoder backbone -> generator input.
     brotensor::Tensor gen_in = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     decoder.forward(asr, F0_pred, N_pred, ref_s, total, gen_in);
+    kokoro_profile_mark(dev, "decoder_backbone");
     const int L_gen = 2 * total;
     debug_stats("09_gen_in", gen_in);
     if (trace_out) trace_out->add("gen_in", config.hidden_dim, L_gen, gen_in);
@@ -368,6 +375,7 @@ AudioBuffer Kokoro::Impl::decode_back_half(const brotensor::Tensor& ref_s,
     brotensor::Tensor har_stub = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     int sig_len = 0, hframes = 0;
     hsource.forward(F0_pred, /*frame_count=*/2 * total, sig_len, hframes, har_stub);
+    kokoro_profile_mark(dev, "harmonic_source");
     if (hframes != har_frames) {
         fail("Kokoro::decode",
              "har_frames mismatch: hsource=" + std::to_string(hframes) +
@@ -387,12 +395,14 @@ AudioBuffer Kokoro::Impl::decode_back_half(const brotensor::Tensor& ref_s,
 
     brotensor::Tensor audio_t = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     generator.forward(gen_in, L_gen, har_stub, har_frames, style_dec, audio_t, cancel);
+    kokoro_profile_mark(dev, "generator");
     debug_stats("11_audio", audio_t);
     if (trace_out) trace_out->add("audio", 1, static_cast<int>(audio_t.size()), audio_t);
 
     AudioBuffer out;
     out.sample_rate = config.sample_rate;
     out.samples = audio_t.to_host_vector();
+    kokoro_profile_mark(dev, "audio_to_host");
     return out;
 }
 
@@ -431,20 +441,24 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     // default-constructed brotensor::Tensor lives on CPU and brotensor's CUDA
     // dispatch refuses mixed-device calls (Tensor::resize preserves device).
     const brotensor::Device dev = impl_->device;
+    kokoro_profile_mark(dev, nullptr);   // reset the interval origin
     brotensor::Tensor bert_dur = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert.forward(ids, /*attention_mask=*/{}, bert_dur);
+    kokoro_profile_mark(dev, "bert");
     debug_stats("01_bert_dur", bert_dur);
     if (trace_out) trace_out->add("bert_dur", L, impl_->config.plbert.hidden_size, bert_dur);
 
     // 2. bert_encoder.
     brotensor::Tensor d_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->bert_encoder.forward(bert_dur, d_en);
+    kokoro_profile_mark(dev, "bert_encoder");
     debug_stats("02_d_en", d_en);
     if (trace_out) trace_out->add("d_en", impl_->config.hidden_dim, L, d_en);
 
     // 3. text_encoder (StyleTTS2 phoneme CNN+BiLSTM).
     brotensor::Tensor t_en = brotensor::Tensor::empty_on(dev, 0, 0, brotensor::Dtype::FP32);
     impl_->text_encoder.forward(ids, /*text_mask=*/{}, t_en);
+    kokoro_profile_mark(dev, "text_encoder");
     debug_stats("06_t_en", t_en);
     if (trace_out) trace_out->add("t_en", impl_->config.hidden_dim, L, t_en);
 
@@ -494,6 +508,7 @@ AudioBuffer Kokoro::synthesize(const std::vector<int32_t>& phoneme_ids,
     }
     brotensor::Tensor asr = brotensor::Tensor::from_host_on(
         impl_->device, asr_host.data(), 1, C_hidden * total);
+    kokoro_profile_mark(dev, "length_regulate");
 
     debug_stats("07_asr", asr);
     if (trace_out) trace_out->add("asr", C_hidden, total, asr);

@@ -22,6 +22,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <memory>
 #include <vector>
 
 namespace brosoundml {
@@ -100,6 +101,16 @@ struct LSTMCellWeights {
     brotensor::Tensor b_hh;   // (4*hidden, 1)
 };
 
+// Opaque per-cell CUDA step-graph cache (defined in modules.cpp). The input
+// projection for all timesteps is hoisted into one GEMM; on CUDA the
+// remaining per-step recurrent body (W_hh GEMV + gate activations + state
+// update) is captured as a CUDA graph on first use and replayed per step —
+// the same launch-overhead fix as the Qwen Talker decode step. The plan is
+// shape-bound to (input_size, hidden_size) and pointer-bound to the cell
+// weights, both fixed after load; it is L-independent, so one capture serves
+// every utterance length.
+struct LstmGraphPlan;
+
 // Single-direction LSTM: read X:(L, input_size) left-to-right, write
 // Y:(L, hidden_size). h0 / c0 default to zero. Inference-only — no per-step
 // cache; per-step intermediates are stack-allocated brotensor tensors.
@@ -109,6 +120,9 @@ struct LSTM {
     LSTMCellWeights cell;
 
     void forward(const brotensor::Tensor& X, brotensor::Tensor& Y) const;
+
+    // Lazily built on the first CUDA forward; null on CPU/Metal paths.
+    mutable std::shared_ptr<LstmGraphPlan> plan;
 };
 
 // Bidirectional LSTM: a forward cell over X plus a reverse cell over the
@@ -121,6 +135,11 @@ struct BiLSTM {
     LSTMCellWeights reverse_cell;
 
     void forward(const brotensor::Tensor& X, brotensor::Tensor& Y) const;
+
+    // Lazily built on the first CUDA forward — both directions are captured
+    // in a single graph, so a step is two staging copies in, one launch, two
+    // row copies out. Null on CPU/Metal paths.
+    mutable std::shared_ptr<LstmGraphPlan> plan;
 };
 
 // ─── Multi-head self-attention (with Q/K/V/O biases) ──────────────────────

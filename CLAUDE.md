@@ -121,21 +121,27 @@ the application resolves them:
 Per-model architecture and the brotensor op map live in `README.md`. Two
 brotensor-level notes that recur in the code:
 
-**LSTM is composed, not a brotensor op.** Kokoro's text encoder and predictors
-are bidirectional-LSTM-based, and brotensor has no recurrent primitive, so
-`brosoundml::LSTM` / `BiLSTM` (in `modules.h`) compose the cell from `matmul` +
-`sigmoid` + `tanh` per timestep — correct and sufficient. A fused `brotensor`
-`lstm` op is a deferred optimisation; do not add it speculatively — specify it
-once the real cell shapes are pinned down by a working model (north-star vs.
-task).
+**LSTM is composed, not a brotensor op — but the composition is fast.**
+Kokoro's text encoder and predictors are bidirectional-LSTM-based, and
+brotensor has no recurrent inference primitive, so `brosoundml::LSTM` /
+`BiLSTM` (in `modules.h`/`modules.cpp`) compose the cell from brotensor ops.
+The input-side projection for the whole sequence is hoisted into one batched
+GEMM; on CUDA the remaining per-step recurrent body is captured as a CUDA
+graph once per cell (lazily, cached on the module via `LstmGraphPlan`) and
+replayed per timestep — the same launch-overhead fix as the Qwen Talker
+decode step. A step is then a staging copy in, one graph launch, and a row
+copy out. (brotensor does have `lstm_forward_train` — a CPU training forward
+with BPTT caches — but it is not the inference path here.)
 
-**The AdaIN affine now rides a brotensor op.** Earlier this was a hand-rolled
-CPU loop; `ada_in_1d` (in `modules.cpp`, used by every iSTFTNet AdaIN1d resblock)
-now composes `nchw_to_sequence` → `brotensor::modulate` → `sequence_to_nchw`, so
-it runs on whatever device the weights live on. `modulate` is AdaLN-style
-(`Y = X*(1+scale)+shift`), so `ada_in_1d`'s plain `Y = X*scale+shift` contract
-pre-subtracts 1 from the scale before the call — keep that in mind when touching
-either side.
+**The AdaIN/AdaLN affine rides the norm op directly.** `group_norm_forward`'s
+gamma/beta are per-channel and `layernorm_forward_inference_batched`'s are
+per-feature, so the style-conditioned affine is passed straight into the norm
+call: `ada_in_1d_styled` / `ada_layernorm` (kokoro_modules.cpp) hand the norm
+`(1 + gamma)` / `beta`, and the public `ada_in_1d` (modules.cpp, plain
+`Y = X*scale + shift` contract) hands it `scale` / `shift` unchanged. One
+fused pass — no `nchw_to_sequence`/`modulate` transpose chain, no unit-gamma
+upload. The earlier modulate-based composition (and its ±1 scale fix-ups) is
+gone; don't reintroduce it.
 
 ## Adding a model
 
@@ -161,6 +167,9 @@ CLI drivers, built when brosoundml is the top-level project
 (`BROSOUNDML_TOOLS`, ON by default standalone):
 
 - `brosoundml_synth` — Kokoro text → WAV.
+- `brosoundml_kokoro_bench` — Kokoro throughput benchmark (in-tree G2P, no
+  Python): reports per-iteration wall time and the realtime factor. Set
+  `BROSOUNDML_KOKORO_PROFILE=1` for the library's per-stage breakdown.
 - `brosoundml_transcribe` — Whisper WAV → text.
 - `brosoundml_parakeet_transcribe` — Parakeet-TDT WAV → text (+ `--timestamps`).
 - `brosoundml_qwen_tts_bench` / `_roundtrip` / `_clone` — Qwen3-TTS synthesis,

@@ -1,12 +1,16 @@
 #include "brosoundml/kokoro_modules.h"
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -28,6 +32,35 @@ namespace stf = brotensor::safetensors;
 bt::Device g_kokoro_load_device = bt::Device::CPU;
 
 void set_kokoro_load_device(bt::Device d) { g_kokoro_load_device = d; }
+
+// ─── Stage profiler ─────────────────────────────────────────────────────────
+//
+// Env-gated (BROSOUNDML_KOKORO_PROFILE=1) sequential interval stamps: each
+// mark prints the wall time since the previous mark on this thread, syncing
+// the device first so async backends attribute cost to the stage that ran.
+// A nullptr name resets the interval origin without printing (call it at the
+// top of synthesize). Shared by kokoro.cpp via forward declaration.
+bool kokoro_profile_enabled() {
+    static const bool on = []() {
+        const char* v = std::getenv("BROSOUNDML_KOKORO_PROFILE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
+void kokoro_profile_mark(bt::Device dev, const char* name) {
+    if (!kokoro_profile_enabled()) return;
+    bt::sync(dev);
+    static thread_local std::chrono::steady_clock::time_point last =
+        std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (name) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - last).count();
+        std::fprintf(stderr, "[kokoro-prof] %-24s %9.2f ms\n", name, ms);
+    }
+    last = now;
+}
 
 namespace {
 
@@ -540,42 +573,35 @@ void compute_style_affine(const Linear& fc, int C,
 
 // AdaLayerNorm forward on (L, C):
 //   y = (1 + gamma) * LayerNorm_no_affine(x_row, C) + beta
-// Composed as `layernorm_forward_inference_batched` (with unit gamma / zero
-// beta to leave the affine for the modulate step) + `modulate` — both
-// dispatched on x_lc's device.
+// layernorm_forward_inference_batched's gamma/beta are already the per-feature
+// affine, so the style affine rides the norm op directly: pass (1 + gamma) as
+// the LayerNorm scale — one op instead of norm + modulate.
 void ada_layernorm(const AdaLayerNormWeights& w, int L,
                    const bt::Tensor& x_lc, const bt::Tensor& style,
                    bt::Tensor& y_lc) {
     const int C = w.channels;
     const bt::Device dev = x_lc.device;
+    (void)L;
 
     bt::Tensor gamma, beta;
     compute_style_affine(w.fc, C, style, gamma, beta);
+    bt::add_scalar_inplace(gamma, 1.0f);   // LayerNorm scale = 1 + gamma
 
-    // LayerNorm pass with unit gamma / zero beta so the per-row affine is
-    // exactly the identity inside the op — the modulate step below applies
-    // the style-conditioned scale + shift.
-    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
-    bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
-                                                    C, 1);
-    bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
-    bt::Tensor x_norm = bt::Tensor::empty_on(dev, L, C, bt::Dtype::FP32);
-    bt::layernorm_forward_inference_batched(x_lc, unit_gamma, zero_beta,
-                                            x_norm, w.eps);
-    // modulate is AdaLN-style (Y = X*(1+scale)+shift); upstream Kokoro
-    // multiplies by (1 + gamma) which matches exactly — no -1 fix-up needed.
     if (y_lc.device != dev) {
         y_lc = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
-    bt::modulate(x_norm, gamma, beta, y_lc);
+    bt::layernorm_forward_inference_batched(x_lc, gamma, beta, y_lc, w.eps);
 }
 
 // AdaIN1d forward on (1, C*L) NCL:
 //   per channel c: y[n,c,l] = (1 + gamma[c]) * (x[n,c,l] - mean_c)/std_c + beta[c]
 //   where mean_c / std_c are taken over the L axis (instance norm).
-// Composed via group_norm_forward (num_groups == C → instance norm, unit
-// gamma / zero beta) + per-channel affine using the existing device-aware
-// ada_in_1d composition (nchw_to_sequence + modulate + sequence_to_nchw).
+// Instance norm = GroupNorm with num_groups == C, and group_norm_forward's
+// gamma/beta are already the per-channel affine — so the style affine rides
+// the norm op directly: pass (1 + gamma) as the GroupNorm scale. One fused
+// pass instead of the earlier norm ▸ nchw_to_sequence ▸ modulate ▸
+// sequence_to_nchw chain (two full-tensor transposes and a unit-gamma H2D
+// upload per call, in the generator's hottest loop).
 void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
                       const bt::Tensor& x_ncl, const bt::Tensor& style,
                       bt::Tensor& y_ncl) {
@@ -583,29 +609,14 @@ void ada_in_1d_styled(const AdaIN1dWeights& w, int N, int C, int L,
 
     bt::Tensor gamma, beta;
     compute_style_affine(w.fc, C, style, gamma, beta);
+    bt::add_scalar_inplace(gamma, 1.0f);   // GroupNorm scale = 1 + gamma
 
-    // Instance norm = GroupNorm(C). Unit gamma + zero beta leaves the affine
-    // for the modulate composition below.
-    std::vector<float> unit_host(static_cast<std::size_t>(C), 1.0f);
-    bt::Tensor unit_gamma = bt::Tensor::from_host_on(dev, unit_host.data(),
-                                                    C, 1);
-    bt::Tensor zero_beta  = bt::Tensor::zeros_on(dev, C, 1, bt::Dtype::FP32);
-    bt::Tensor x_norm = bt::Tensor::empty_on(dev, N, C * L, bt::Dtype::FP32);
-    bt::group_norm_forward(x_ncl, unit_gamma, zero_beta,
-                           N, C, /*H=*/1, /*W=*/L,
-                           /*num_groups=*/C, w.eps, x_norm);
-
-    // Per-channel affine y = x_norm * (1 + gamma) + beta. modulate's AdaLN
-    // contract (Y = X*(1+scale)+shift) is exactly this — pass gamma directly.
-    // Composed on the (N*L, C) sequence layout.
-    bt::Tensor x_seq = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
-    bt::nchw_to_sequence(x_norm, N, C, /*H=*/1, /*W=*/L, x_seq);
-    bt::Tensor y_seq = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
-    bt::modulate(x_seq, gamma, beta, y_seq);
     if (y_ncl.device != dev) {
         y_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
-    bt::sequence_to_nchw(y_seq, N, C, /*H=*/1, /*W=*/L, y_ncl);
+    bt::group_norm_forward(x_ncl, gamma, beta,
+                           N, C, /*H=*/1, /*W=*/L,
+                           /*num_groups=*/C, w.eps, y_ncl);
 }
 
 // Per-(L) leaky_relu on NCL.
@@ -616,34 +627,23 @@ void leaky_relu_ncl(bt::Tensor& y, float slope) {
 }
 
 // Nearest-neighbour 2x upsample along L: (1, C*L_in) NCL -> (1, C*(2*L_in)) NCL.
-// upsample_nearest_2x is the spatial NCHW (H, W) op; modelling our 1D case as
-// (H=1, W=L_in) gives an output of (H=2, W=2*L_in) — which is one row of dup
-// in H plus the dup in W we actually want. The composition we use instead:
-// nchw_to_sequence with H=1, W=L_in to land at (L_in, C); brotensor has no
-// 1D upsample so we cycle through host. Cheap (one (N*L_in, C) buffer) and
-// only runs for the upsampling AdaIN res block branch.
+// Composed device-side as a depthwise ConvTranspose1d with k=2, stride=2 and
+// an all-ones weight — each input element scatters identically into output
+// positions 2l and 2l+1, which is exactly the nearest-neighbour duplication.
+// No host round-trip (the earlier composition downloaded x, gathered on host,
+// and re-uploaded — a device sync stall per call inside the F0/N and decoder
+// stacks).
 void upsample_nearest_2x_ncl(const bt::Tensor& x, int N, int C, int L_in,
                              bt::Tensor& y) {
-    const int L_out = 2 * L_in;
     const bt::Device dev = x.device;
-    // upsample_nearest_2x duplicates along BOTH H and W; with H=1, W=L_in it
-    // returns (N, C * 2 * (2*L_in)). Take just the H=0 row by slicing 2D —
-    // but that's two ops + a slice; the host-side gather is simpler and
-    // device-agnostic (round-trip via host).
-    std::vector<float> xh = x.to_host_vector();
-    std::vector<float> yh(static_cast<std::size_t>(N) * C * L_out);
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const std::size_t bx = (static_cast<std::size_t>(n) * C + c) * L_in;
-            const std::size_t by = (static_cast<std::size_t>(n) * C + c) * L_out;
-            for (int l = 0; l < L_in; ++l) {
-                const float v = xh[bx + l];
-                yh[by + 2 * l + 0] = v;
-                yh[by + 2 * l + 1] = v;
-            }
-        }
-    }
-    y = bt::Tensor::from_host_on(dev, yh.data(), N, C * L_out);
+    bt::Tensor ones = bt::Tensor::zeros_on(dev, C, 2, bt::Dtype::FP32);
+    bt::add_scalar_inplace(ones, 1.0f);
+    bt::conv_transpose1d_forward(x, ones, /*bias=*/nullptr,
+                                 N, /*C_in=*/C, /*L=*/L_in,
+                                 /*C_out=*/C, /*kL=*/2,
+                                 /*stride=*/2, /*padding=*/0,
+                                 /*output_padding=*/0, /*dilation=*/1,
+                                 /*groups=*/C, y);
 }
 
 // AdainResBlk1d forward: residual + shortcut, both / sqrt(2). x in NCL with
@@ -789,20 +789,26 @@ void DurationEncoder::forward(const bt::Tensor& d_en, const bt::Tensor& style,
     bt::Tensor x = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     ncl_to_lc(d_en, C, L, x);
 
-    // Concat style across L: (L, C) -> (L, C + S). Each row's first C columns
-    // are copied from xs[l]; the next S columns are the (broadcast) style.
-    // Performed via copy_d2d per row — device-to-device, no host roundtrip.
+    // Concat style across L: (L, C) -> (L, C + S). The style tile is built
+    // once per forward — modulate with zero X and scale = -1 broadcasts the
+    // style row across L in one launch (Y = 0*(1+(-1)) + shift = shift) —
+    // then each concat is a single batched column-block op instead of the
+    // earlier 2*L copy_d2d storm.
+    bt::Tensor style_tile = bt::Tensor::zeros_on(dev, L, S, bt::Dtype::FP32);
+    {
+        bt::Tensor minus_one = bt::Tensor::zeros_on(dev, S, 1, bt::Dtype::FP32);
+        bt::add_scalar_inplace(minus_one, -1.0f);
+        bt::Tensor tile = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+        bt::modulate(style_tile, minus_one, style, tile);
+        style_tile = std::move(tile);
+    }
     auto cat_with_style = [&](const bt::Tensor& xs, bt::Tensor& out) {
         // out may have been default-constructed on first call; migrate to dev
         // before resize since Tensor::resize preserves device.
         if (out.device != dev) {
             out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         }
-        out.resize(L, C + S, bt::Dtype::FP32);
-        for (int l = 0; l < L; ++l) {
-            bt::copy_d2d(xs,    l * C,         out, l * (C + S),     C);
-            bt::copy_d2d(style, 0,             out, l * (C + S) + C, S);
-        }
+        bt::concat_batched_rows({&xs, &style_tile}, out);
     };
 
     bt::Tensor cat = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
@@ -913,10 +919,12 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
     if (out.lstm_x.device != dev) out.lstm_x   = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     if (out.duration.device != dev) out.duration = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     text_encoder.forward(d_en, style, L, out.d);  // (L, C + S)
+    kokoro_profile_mark(dev, "pred:dur_encoder");
 
     // ─── Duration LSTM + projection ──────────────────────────────────────
     lstm.forward(out.d, out.lstm_x);              // (L, C)
     duration_proj.forward_batched(out.lstm_x, out.duration);  // (L, max_dur)
+    kokoro_profile_mark(dev, "pred:dur_lstm+proj");
 
     // sigmoid + sum over the max_dur axis, / speed, round, clamp to >= 1.
     // The integer output is inherently host-side control flow — round-trip
@@ -960,6 +968,7 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
         out.en = bt::Tensor::from_host_on(dev, en_host.data(),
                                           1, (C + S) * total);
     }
+    kokoro_profile_mark(dev, "pred:length_reg");
 
     // ─── F0Ntrain ────────────────────────────────────────────────────────
     // shared LSTM input = en.T  -> (total, C+S) -> (total, C). Then split into
@@ -969,6 +978,7 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
 
     bt::Tensor shared_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     shared.forward(en_lc, shared_out);        // (total, C)
+    kokoro_profile_mark(dev, "pred:shared_lstm");
 
     bt::Tensor shared_ncl = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     lc_to_ncl(shared_out, total, C, shared_ncl);  // (1, C*total) NCL
@@ -988,6 +998,7 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
         out.F0_pred = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
     F0_proj.forward(F0_x, /*N=*/1, /*L=*/F0_L, out.F0_pred);
+    kokoro_profile_mark(dev, "pred:F0_stack");
 
     // N stack.
     bt::Tensor N_x = shared_ncl;
@@ -1002,6 +1013,7 @@ void Predictor::forward(const bt::Tensor& d_en, const bt::Tensor& ref_s,
         out.N_pred = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     }
     N_proj.forward(N_x, /*N=*/1, /*L=*/N_L, out.N_pred);
+    kokoro_profile_mark(dev, "pred:N_stack");
 }
 
 // ─── DecoderBackbone ───────────────────────────────────────────────────────
@@ -1421,6 +1433,8 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         // x_source = noise_res[i](x_source, s)
         adain_resblock1_forward(noise_res[i], x_source, ups_C_out[i], L_src, style);
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_noise_res", i); gdbg(b, x_source); }
+        { char b[32]; std::snprintf(b, sizeof(b), "gen:noise[%d]", i);
+          kokoro_profile_mark(dev, b); }
 
         // x = ups[i](x). Compute output length: L_up = (L-1)*stride - 2*pad + (kL-1) + 1
         const int kL = ups_k[i];
@@ -1456,6 +1470,8 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         }
         bt::add_inplace(x, x_source);
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_after_add", i); gdbg(b, x); }
+        { char b[32]; std::snprintf(b, sizeof(b), "gen:ups[%d]", i);
+          kokoro_profile_mark(dev, b); }
 
         // resblocks i*num_kernels..(i+1)*num_kernels -> averaged residual sum.
         bt::Tensor xs = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
@@ -1475,6 +1491,8 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
         L = L_x;
         C = ups_C_out[i];
         { char b[32]; std::snprintf(b, sizeof(b), "ups%d_out", i); gdbg(b, x); }
+        { char b[32]; std::snprintf(b, sizeof(b), "gen:resblocks[%d]", i);
+          kokoro_profile_mark(dev, b); }
     }
 
     // x = leaky_relu(x); x = conv_post(x); split into spec / phase; iSTFT.
@@ -1486,34 +1504,34 @@ void Generator::forward(const bt::Tensor& gen_in, int L_in,
     bt::Tensor post = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     conv_post.forward(x, /*N=*/1, /*L=*/L, post);
     gdbg("conv_post", post);
+    kokoro_profile_mark(dev, "gen:conv_post");
 
     // post is (1, (n_fft+2)*L). The first (n_fft/2+1) channels are log-magnitude;
     // the next (n_fft/2+1) channels are pre-sin phase.
     //
-    // brotensor has no sin op on its current surface (exp is there, but that
-    // alone doesn't help us avoid the phase = sin(...) host pass), so the
-    // mag / phase assembly runs on host: download `post`, apply exp / sin
-    // and the NCL -> frame-major transpose at the same time, then upload the
-    // two (L, n_freq) frame-major tensors that complex_from_polar consumes.
-    // The buffers are small (a few hundred kB at most); the heavy lifting is
-    // the device-side complex_from_polar + istft that follow.
+    // Device-side assembly: the two channel blocks are contiguous in NCL, so
+    // view each half in place, apply exp / sin elementwise, then transpose
+    // NCL -> frame-major (L, n_freq) via nchw_to_sequence — the layout
+    // complex_from_polar consumes. No host round-trip.
     const int n_freq = n_fft / 2 + 1;
     // `dev` already declared at the top of Generator::forward — reuse it.
-    bt::Tensor mag_frames;
-    bt::Tensor pha_frames;
+    bt::Tensor mag_frames = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor pha_frames = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
     {
-        const std::vector<float> ph = post.to_host_vector();
-        std::vector<float> mag_host(static_cast<std::size_t>(L) * n_freq);
-        std::vector<float> pha_host(static_cast<std::size_t>(L) * n_freq);
-        for (int c = 0; c < n_freq; ++c) {
-            for (int l = 0; l < L; ++l) {
-                mag_host[l * n_freq + c] = std::exp(ph[c * L + l]);
-                pha_host[l * n_freq + c] = std::sin(ph[(n_freq + c) * L + l]);
-            }
-        }
-        mag_frames = bt::Tensor::from_host_on(dev, mag_host.data(), L, n_freq);
-        pha_frames = bt::Tensor::from_host_on(dev, pha_host.data(), L, n_freq);
+        float* base = static_cast<float*>(post.data);
+        bt::Tensor logmag = bt::Tensor::view(dev, base,
+                                             1, n_freq * L, bt::Dtype::FP32);
+        bt::Tensor phin   = bt::Tensor::view(
+            dev, base + static_cast<std::size_t>(n_freq) * L,
+            1, n_freq * L, bt::Dtype::FP32);
+        bt::Tensor mag_ncl = bt::Tensor::empty_on(dev, 1, n_freq * L, bt::Dtype::FP32);
+        bt::Tensor sin_ncl = bt::Tensor::empty_on(dev, 1, n_freq * L, bt::Dtype::FP32);
+        bt::exp_forward(logmag, mag_ncl);
+        bt::sin_forward(phin, sin_ncl);
+        bt::nchw_to_sequence(mag_ncl, /*N=*/1, n_freq, /*H=*/1, /*W=*/L, mag_frames);
+        bt::nchw_to_sequence(sin_ncl, /*N=*/1, n_freq, /*H=*/1, /*W=*/L, pha_frames);
     }
+    kokoro_profile_mark(dev, "gen:magphase");
 
     // Build complex spectrogram on `dev`; istft consumes the same layout.
     bt::Tensor spec_complex = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);  // (frames, 2*n_freq) interleaved
