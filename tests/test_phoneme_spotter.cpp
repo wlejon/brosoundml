@@ -369,6 +369,76 @@ static void test_reset() {
     CHECK(ev.empty(), "reset: dangling second half does not fire");
 }
 
+// ── 13. Soft states: enrollment alternates absorb unit-identity flips. ──────
+// Self-supervised units are k-means cells; a re-performance flips frames
+// between neighbouring cells. Enroll a stream whose frames carry a strong
+// runner-up class, then detect a rendition where primary and runner-up have
+// SWAPPED: soft templates (enroll_alts=2) must fire, hard ones must not.
+static void test_soft_states() {
+    // Frame with two designated masses; remainder spread over the rest.
+    auto add_frame2 = [](PostStream& ps, int cls, float mass,
+                         int alt, float alt_mass) {
+        const float other = (1.0f - mass - alt_mass) / static_cast<float>(K - 2);
+        for (int k = 0; k < K; ++k)
+            ps.data.push_back(k == cls ? mass : (k == alt ? alt_mass : other));
+        ++ps.frames;
+    };
+
+    // Enrollment: word [A,B,C], each state's frames hold 0.55 on the primary
+    // and 0.30 on a non-template runner-up (A~D, B~E, C~D).
+    PostStream en;
+    en.add_silence(4);
+    for (int i = 0; i < 3; ++i) add_frame2(en, 1, 0.55f, 4, 0.30f);
+    for (int i = 0; i < 3; ++i) add_frame2(en, 2, 0.55f, 5, 0.30f);
+    for (int i = 0; i < 3; ++i) add_frame2(en, 3, 0.55f, 4, 0.30f);
+    en.add_silence(4);
+
+    // Detection: the same word re-performed with the cells FLIPPED — frames
+    // now win on the runner-up (0.70) with the enrolled primary at 0.12.
+    PostStream det;
+    det.add_silence(4);
+    for (int i = 0; i < 3; ++i) add_frame2(det, 4, 0.70f, 1, 0.12f);
+    for (int i = 0; i < 3; ++i) add_frame2(det, 5, 0.70f, 2, 0.12f);
+    for (int i = 0; i < 3; ++i) add_frame2(det, 4, 0.70f, 3, 0.12f);
+    det.add_silence(4);
+
+    {   // Hard template (control): the flip sinks every emission -> no fire.
+        auto s = make_spotter();
+        bsm::SpotterConfig pol = s.config();
+        pol.enroll_alts = 0;
+        CHECK(s.enroll_from_posteriors("word", en.data.data(), en.frames,
+                                       &pol) == 3,
+              "soft: hard enroll from posteriors -> len 3");
+        CHECK(feed(s, det).empty(), "soft: hard template misses the flipped take");
+    }
+    {   // Soft template: state mass = primary + alternate -> fires.
+        auto s = make_spotter();
+        bsm::SpotterConfig pol = s.config();
+        pol.enroll_alts = 2;
+        CHECK(s.enroll_from_posteriors("word", en.data.data(), en.frames,
+                                       &pol) == 3,
+              "soft: soft enroll from posteriors -> len 3");
+        auto ev = feed(s, det);
+        CHECK(ev.size() == 1, "soft: soft template fires on the flipped take");
+        if (ev.size() == 1)
+            CHECK(ev[0].confidence > 0.6f, "soft: flipped-take confidence > 0.6");
+    }
+    {   // Confidence gate: low-confidence churn frames are dropped at enroll.
+        PostStream churn;
+        churn.add_silence(4);
+        churn.add_run(4, 2, 0.30f);   // churn below the gate
+        churn.add_word({1, 2, 3}, 3, 0.85f);
+        churn.add_run(5, 2, 0.30f);   // churn below the gate
+        churn.add_silence(4);
+        auto s = make_spotter();
+        bsm::SpotterConfig pol = s.config();
+        pol.enroll_conf_gate = 0.5f;
+        CHECK(s.enroll_from_posteriors("word", churn.data.data(), churn.frames,
+                                       &pol) == 3,
+              "soft: conf gate strips churn -> len 3 (not 5)");
+    }
+}
+
 int main() {
     brotensor::init();
     test_positive();
@@ -383,6 +453,7 @@ int main() {
     test_enroll_collapse();
     test_template_admin();
     test_reset();
+    test_soft_states();
 
     if (g_fail == 0) std::fprintf(stderr, "test_phoneme_spotter: all checks passed\n");
     else             std::fprintf(stderr, "test_phoneme_spotter: %d FAILED\n", g_fail);

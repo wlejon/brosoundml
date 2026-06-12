@@ -91,6 +91,32 @@ struct SpotterConfig {
                                     // word ("boolooroo") false-fired on 17.6% of
                                     // negative clips at its EER threshold. 0
                                     // disables (absolute gate only).
+    int   enroll_alts = 0;          // per-state ALTERNATE classes kept when enrolling
+                                    // from audio/posteriors. Self-supervised units are
+                                    // k-means cells; a re-performance of the same sound
+                                    // lands near the same cell BOUNDARIES and its frames
+                                    // flip between neighbouring units take-to-take
+                                    // (measured on AVP re-takes: cores share order but
+                                    // ~half the unit ids differ). Each enrolled state
+                                    // then also records up to this many runner-up
+                                    // classes from its defining frame, and the matcher
+                                    // scores the frame's SUMMED mass over the state's
+                                    // class set. OFF (0, hard argmax states) by default:
+                                    // measured on AVP re-takes + LibriSpeech/VocalSound
+                                    // negatives, the extra mass lifted negatives as much
+                                    // as re-takes (no ROC gain) and wrecked short
+                                    // templates' FAR (a 3-state click: 7% -> 96% of
+                                    // speech clips at thr 0.50). Available for unit
+                                    // spaces with better-separated cells.
+    float enroll_alt_mass = 0.10f;  // a runner-up must hold at least this posterior
+                                    // mass on the state's defining frame to be kept.
+    float enroll_conf_gate = 0.0f;  // frames whose argmax posterior is below this are
+                                    // treated as SILENCE at enrollment: room tone above
+                                    // the silence-RMS floor and PCEN onset transients
+                                    // label as low-confidence unit churn (~0.3-0.6 vs
+                                    // ~0.8+ for the sound itself) that re-takes can
+                                    // never reproduce; gating keeps only the sound's
+                                    // confident core in the template. 0 disables.
     float score_norm_ref = 0.5f;    // denominator floor for score_norm. Pure ratio
                                     // (dividing by p_argmax itself) would inflate MUSHY
                                     // frames — in babble/noise the winner may hold only
@@ -151,8 +177,18 @@ public:
     // Enroll by running reference AUDIO through the model: feeds the samples,
     // takes per-frame argmax, collapses runs, drops silence -> the class
     // sequence becomes the template. Requires load(). Returns template len.
+    // Honors enroll_conf_gate / enroll_alts (see SpotterConfig).
     int enroll_from_audio(const std::string& name, const float* samples, int n,
                           const SpotterConfig* policy_override = nullptr);
+
+    // Enroll from a per-frame POSTERIOR stream (n_frames rows of K, row-major,
+    // each row summing to ~1) — the same representation feed_posteriors()
+    // consumes. Applies enroll_conf_gate, drops silence, collapses runs, and
+    // records up to enroll_alts runner-up classes per state (the soft-state
+    // mechanism enroll_from_audio uses internally). Requires a class map.
+    int enroll_from_posteriors(const std::string& name, const float* posteriors,
+                               int n_frames,
+                               const SpotterConfig* policy_override = nullptr);
 
     bool remove(const std::string& name);
     void clear();                 // drop all templates

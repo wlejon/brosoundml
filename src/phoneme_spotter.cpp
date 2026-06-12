@@ -10,6 +10,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -46,6 +48,12 @@ constexpr float  kLogEps = 1e-8f;
 struct TemplateMatcher {
     std::string          name;
     std::vector<int>     classes;   // c[0..L-1], distinct adjacent phoneme classes
+    // Per-state alternate classes (soft states): alts[j] holds up to kMaxAlts
+    // runner-up class ids from the state's defining enrollment frame, -1 padded.
+    // Empty vector = hard template (enroll_from_classes / enroll()), emission
+    // reads the single class posterior exactly as before.
+    static constexpr int kMaxAlts = 2;
+    std::vector<std::array<int, kMaxAlts>> alts;
     SpotterConfig        policy;
     bool                 has_override = false;
 
@@ -91,12 +99,13 @@ struct TemplateMatcher {
     }
 
     // Advance one frame. `lp` is the length-K per-class log-posterior buffer,
-    // `pmax` the frame's max posterior (linear, for competition normalization),
+    // `p` the same frame's LINEAR posteriors (for soft-state mass sums), `pmax`
+    // the frame's max posterior (linear, for competition normalization),
     // `gate_open` whether a fresh entry may begin this frame. On a completed +
     // qualified + un-refractory alignment, writes the event and returns true
     // (and resets this template's DP so it must re-enter from silence).
-    bool step(const std::vector<float>& lp, float pmax, bool gate_open,
-              SpotEvent& out_ev) {
+    bool step(const std::vector<float>& lp, const float* p, float pmax,
+              bool gate_open, SpotEvent& out_ev) {
         const int L = this->L();
 
         // Per-frame emission floor: a template phoneme's contribution is clamped
@@ -140,8 +149,20 @@ struct TemplateMatcher {
             }
             const bool   advance = (s_adv > s_stay);
             const int    prevN    = advance ? N[j - 1] : N[j];
-            const double raw_lp   = static_cast<double>(lp[static_cast<std::size_t>(
-                       classes[static_cast<std::size_t>(j - 1)])]);
+            const int    cls      = classes[static_cast<std::size_t>(j - 1)];
+            // Soft states: the emission is the frame's summed mass over the
+            // state's class set (primary + alternates), absorbing identity
+            // flips between confusable units. Hard templates (no alts) read
+            // the single class log-posterior exactly as before.
+            double raw_lp;
+            if (alts.empty()) {
+                raw_lp = static_cast<double>(lp[static_cast<std::size_t>(cls)]);
+            } else {
+                double mass = static_cast<double>(p[cls]);
+                for (int a : alts[static_cast<std::size_t>(j - 1)])
+                    if (a >= 0) mass += static_cast<double>(p[a]);
+                raw_lp = std::log(mass > kLogEps ? mass : kLogEps);
+            }
             // Coverage asks "was this phoneme actually emitted" — an ABSOLUTE
             // evidence question, so it tests the RAW posterior. Normalization
             // applies only to the DP score; otherwise a losing-but-nonzero
@@ -417,6 +438,86 @@ int PhonemeSpotter::enroll_from_classes(const std::string& name,
     return static_cast<int>(tmpl.size());
 }
 
+int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
+                                           const float* posteriors, int n_frames,
+                                           const SpotterConfig* policy_override) {
+    if (!impl_->has_class_map) {
+        fail("PhonemeSpotter::enroll_from_posteriors",
+             "no class map; call load() or set_class_map() first");
+    }
+    if (n_frames < 0 || (n_frames > 0 && posteriors == nullptr)) {
+        fail("PhonemeSpotter::enroll_from_posteriors", "invalid posteriors");
+    }
+    const int K = impl_->K();
+    const SpotterConfig& pol = policy_override ? *policy_override
+                                               : impl_->config;
+    const int n_alts = std::min(std::max(pol.enroll_alts, 0),
+                                TemplateMatcher::kMaxAlts);
+
+    // Argmax each frame; frames below the confidence gate become silence.
+    // Collapse runs of equal primary class, dropping silence runs; each kept
+    // run's DEFINING frame (its max-posterior frame) contributes the state's
+    // alternate classes: runner-ups holding >= enroll_alt_mass, excluding
+    // silence.
+    std::vector<int> classes;
+    std::vector<std::array<int, TemplateMatcher::kMaxAlts>> alts;
+    int run_cls = -1, def_frame = -1;
+    float def_conf = 0.0f;
+    auto flush_run = [&] {
+        if (run_cls <= 0) return;                  // silence / no run
+        // Match collapse_classes(): silence is dropped BEFORE duplicate
+        // collapse, so a class repeated across a silence gap is one state.
+        if (!classes.empty() && classes.back() == run_cls) return;
+        std::array<int, TemplateMatcher::kMaxAlts> a;
+        a.fill(-1);
+        if (n_alts > 0 && def_frame >= 0) {
+            const float* row =
+                posteriors + static_cast<std::size_t>(def_frame) * K;
+            // Top n_alts classes besides the primary, by mass, gated.
+            for (int slot = 0; slot < n_alts; ++slot) {
+                int   best   = -1;
+                float best_p = pol.enroll_alt_mass;
+                for (int k = 1; k < K; ++k) {       // never silence (class 0)
+                    if (k == run_cls) continue;
+                    bool taken = false;
+                    for (int s = 0; s < slot; ++s) taken |= (a[s] == k);
+                    if (taken) continue;
+                    if (row[k] >= best_p) { best = k; best_p = row[k]; }
+                }
+                if (best < 0) break;
+                a[static_cast<std::size_t>(slot)] = best;
+            }
+        }
+        classes.push_back(run_cls);
+        alts.push_back(a);
+    };
+    for (int t = 0; t < n_frames; ++t) {
+        const float* row = posteriors + static_cast<std::size_t>(t) * K;
+        int arg = 0; float pa = row[0];
+        for (int k = 1; k < K; ++k)
+            if (row[k] > pa) { pa = row[k]; arg = k; }
+        if (pol.enroll_conf_gate > 0.0f && pa < pol.enroll_conf_gate) arg = 0;
+        if (arg != run_cls) {
+            flush_run();
+            run_cls = arg; def_frame = t; def_conf = pa;
+        } else if (pa > def_conf) {
+            def_frame = t; def_conf = pa;
+        }
+    }
+    flush_run();
+
+    remove(name);
+    TemplateMatcher m;
+    m.name         = name;
+    m.classes      = classes;
+    if (n_alts > 0) m.alts = std::move(alts);
+    m.policy       = pol;
+    m.has_override = (policy_override != nullptr);
+    m.reset_dp();
+    impl_->matchers.push_back(std::move(m));
+    return static_cast<int>(classes.size());
+}
+
 int PhonemeSpotter::enroll(const std::string& name,
                            const std::vector<int>& phoneme_ids,
                            const SpotterConfig* policy_override) {
@@ -472,27 +573,34 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
     bt::Tensor frames;   // (n_mels, T)
     const int T = impl_->mel->consume(padded.data(),
                                       static_cast<int>(padded.size()), frames);
-    std::vector<int> class_ids;
+    std::vector<float> post;   // (T, K) row-major softmax
+    int T_post = 0;
     if (T > 0) {
         bt::Tensor logits;   // (T, K)
         impl_->model->forward_streaming(frames, logits);
         std::vector<float> lh = logits.to_host_vector();   // (T, K) row-major
         const int K = impl_->K();
-        class_ids.reserve(static_cast<std::size_t>(T));
-        for (int t = 0; t < T; ++t) {
-            int arg = 0; float best = lh[static_cast<std::size_t>(t) * K];
-            for (int k = 1; k < K; ++k) {
-                const float v = lh[static_cast<std::size_t>(t) * K + k];
-                if (v > best) { best = v; arg = k; }
+        T_post = logits.rows;
+        post.resize(static_cast<std::size_t>(T_post) * K);
+        for (int t = 0; t < T_post; ++t) {
+            const float* row = &lh[static_cast<std::size_t>(t) * K];
+            float mx = row[0];
+            for (int k = 1; k < K; ++k) mx = std::max(mx, row[k]);
+            double sum = 0.0;
+            float* o = &post[static_cast<std::size_t>(t) * K];
+            for (int k = 0; k < K; ++k) {
+                o[k] = std::exp(row[k] - mx);
+                sum += o[k];
             }
-            class_ids.push_back(arg);
+            const float inv = static_cast<float>(1.0 / (sum > 0 ? sum : 1.0));
+            for (int k = 0; k < K; ++k) o[k] *= inv;
         }
     }
     // Restore the live stream's clean state (the probe disturbed the caches).
     impl_->mel->reset();
     impl_->model->reset_streaming_state();
 
-    return enroll_from_classes(name, class_ids, policy_override);
+    return enroll_from_posteriors(name, post.data(), T_post, policy_override);
 }
 
 bool PhonemeSpotter::remove(const std::string& name) {
@@ -553,7 +661,7 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
             const int L = m.L();
             const bool gate = impl_->silence_run >= m.policy.entry_silence_frames;
             SpotEvent ev;
-            const bool fired = (L > 0) && m.step(lp, pmax, gate, ev);
+            const bool fired = (L > 0) && m.step(lp, p, pmax, gate, ev);
             if (fired) {
                 m.refractory_frames = impl_->refractory_frames_for(m.policy);
                 events.push_back(ev);
