@@ -59,6 +59,20 @@ refractory are caller-tunable at runtime (`set_threshold` / `set_smoothing` /
 
 The full Kokoro-driven training toolchain lives in `tools/`:
 
+**AGC-free recipe.** Every dataset clip is written at a random presentation
+level (peak uniform in dB over [-45, -3], `brosoundml::random_level`, drawn
+after the channel sim's level-sensitive DRC and the SNR mix) — never at a
+fixed normalized peak. The model must therefore be level-invariant, which is
+what lets `WakeWord` consume the listen bus's raw (no-AGC) stream; PCEN
+carries the static-gain cancellation, the level draw covers the quiet regime
+where PCEN's normalization fades toward `pcen_eps`. Measured (streaming
+detector, threshold 0.55, 46.5k clips): the raw-level model scores
+FRR 0.57% / FPR 1.99% on raw-level data where the peak-norm model scored
+FRR 3.57% / FPR 1.38% — and at threshold 0.95 (FRR 0.71% / FPR 1.19%) it
+dominates the old model on both axes. The same positive clip rendered at
+-3 through -40 dBFS fires at score 1.0000 at every level
+(`scripts/level_probe.py`).
+
 | Tool | Role |
 |---|---|
 | `brosoundml_wake_synth` | Kokoro-driven dataset builder (positive/negative clips) |
