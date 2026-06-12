@@ -651,12 +651,16 @@ struct EvalClip {
     int                T = 0;
 };
 
-// PCEN mel -> model forward -> row-softmax. 0.3 s of silence is appended so
-// completions at the clip edge can fire (matcher needs the trailing frames).
+// PCEN mel -> model forward -> row-softmax. 0.3 s of silence is PREPENDED so
+// PCEN's smoother seeds on quiet the way a live stream does (a clip trimmed
+// tight to the sound otherwise seeds at full energy and yields a feature
+// stream detection never sees — same mechanism enroll_from_audio pads for),
+// and 0.3 s is appended so completions at the clip edge can fire.
 void clip_posteriors(bsm::PhonemeNet& model, bsm::MelFrontend& mel,
                      int K, int n_mels, bt::Device dev,
                      std::vector<float> pcm, std::vector<float>& post,
                      int& T_out) {
+    pcm.insert(pcm.begin(), 4800, 0.0f);
     pcm.resize(pcm.size() + 4800, 0.0f);
     bt::Tensor melt;
     mel.reset();
