@@ -23,6 +23,7 @@
 #   g2p/lexicon_en_us.bin   ~6.8 MB  brosoundml::g2p::Lexicon::load()
 #   pos_tagger/model.bin    ~7.6 MB  brosoundml::g2p::PosTagger::load()
 #   wake/computer.bw        ~64 KB   brosoundml::WakeWord::load()
+#   phoneme/english.bpm     ~1.1 MB  brosoundml::PhonemeSpotter::load()
 # With --kokoro, additionally:
 #   kokoro/config.json              brosoundml::Kokoro::load() (+ phoneme vocab)
 #   kokoro/model.safetensors ~327MB brosoundml::Kokoro::load()
@@ -99,6 +100,7 @@ download() {
 download "g2p/lexicon_en_us.bin"
 download "pos_tagger/model.bin"
 download "wake/computer.bw"
+download "phoneme/english.bpm"
 
 # --- Kokoro synth weights (opt-in: maintainer-published converted artifacts) -
 if [ "$KOKORO" -eq 1 ]; then
@@ -110,7 +112,7 @@ fi
 # --- provenance / licence (best-effort: never block a checkout on these) ----
 for doc in LICENSE README.md \
            g2p/NOTICE g2p/LICENSE-APACHE-2.0 g2p/README.md \
-           pos_tagger/README.md wake/README.md; do
+           pos_tagger/README.md wake/README.md phoneme/README.md; do
     download "$doc" || echo "  ($doc absent — fine)"
 done
 
