@@ -444,8 +444,10 @@ static void test_gap_templates() {
         std::fprintf(stderr, "    (rhythm confidence=%.3f)\n", ev[0].confidence);
     }
 
-    // No gap at all (one long contiguous burst): the gap state only ever
-    // rides the emission floor, so it is never covered -> rejected.
+    // No gap at all (one long contiguous burst): the gap state can only be
+    // entered at the floor during the burst (silence never holds), a floored
+    // entry must be paid off within kMaxFloorRun frames, and the trailing
+    // silence is shorter than gap_lo anyway -> rejected.
     s.reset();
     PostStream nogap;
     nogap.add_silence(6);
@@ -486,6 +488,37 @@ static void test_gap_templates() {
     auto ps = s.progress_snapshot();
     CHECK(ps.count == 1 && ps.templates[0].matched == 2,
           "gaps: progress reads 2/3 while holding the gap");
+
+    // Onset drift: the live front-end adapts to what it heard seconds ago
+    // while enrollment ran on a fresh pass, so a re-performance's first
+    // frames can be mush — some other class winning, the template's class
+    // still under the floor — before the sound becomes legible (measured on
+    // the real model: a take ~2 s after a fire missed entry entirely under a
+    // strict advance-on-evidence rule). Entry may precede evidence: the path
+    // enters at the floor while the word boundary is still open and must be
+    // paid off with real evidence within kMaxFloorRun frames.
+    s.reset();
+    PostStream drift;
+    drift.add_silence(6);
+    drift.add_run(5, 2, 0.40f);    // 2 mush frames: junk class wins, A floored
+    drift.add_run(1, 4, 0.85f);    // A becomes legible inside the floor bound
+    drift.add_silence(30);
+    drift.add_run(1, 4, 0.85f);
+    drift.add_silence(6);
+    auto evd = feed(s, drift);
+    CHECK(evd.size() == 1, "gaps: onset mush within the floor bound still fires");
+
+    // ... but mush past the bound stays rejected (the entered path dies and
+    // the boundary has closed behind it, so there is no second chance).
+    s.reset();
+    PostStream drift2;
+    drift2.add_silence(6);
+    drift2.add_run(5, 5, 0.40f);   // 5 mush frames > kMaxFloorRun
+    drift2.add_run(1, 4, 0.85f);
+    drift2.add_silence(30);
+    drift2.add_run(1, 4, 0.85f);
+    drift2.add_silence(6);
+    CHECK(feed(s, drift2).empty(), "gaps: onset mush past the floor bound rejected");
 }
 
 // ── 8. enroll collapse + silence-drop. ───────────────────────────────────────

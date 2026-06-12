@@ -210,25 +210,33 @@ struct TemplateMatcher {
                 R[j - 1] < gap_lo[static_cast<std::size_t>(j - 2)]) {
                 s_adv = kNegInf;
             }
-            // Rhythm templates: transitions happen ON evidence, idling is
-            // bounded. The emission floor exists so an unreliable transient
-            // phoneme can't veto a speech template, but in a TIMED template
-            // unlimited floor-riding breaks the timing two ways (measured in
-            // the unit tests): a floor-anchored fresh entry exploits the raw
-            // log-score length bias to displace the genuine path mid-gap,
-            // and a sound state idling on the floor after the gap stretches
-            // the window until a late sound "completes" the rhythm. So for
-            // has_gap templates only: (1) ADVANCING into any state requires
-            // this frame's raw evidence above the floor — a sound state is
-            // entered when its sound is actually heard, a gap when silence
-            // actually starts; (2) STAYING on floored frames is legal only
-            // for kMaxFloorRun in a row — enough to absorb intra-sound unit
-            // churn or a one-frame blip inside a gap, far too short to bend
-            // the rhythm. Sound-only templates keep the legacy behavior
-            // (their tuned recall/FAR numbers are untouched).
-            if (has_gap && !above) {
-                s_adv = kNegInf;
-                if (s_stay != kNegInf && F[j] >= kMaxFloorRun) s_stay = kNegInf;
+            // Rhythm templates: a state must be HEARD before the path may
+            // move past it, and floor-idling is bounded. The emission floor
+            // exists so an unreliable transient phoneme can't veto a speech
+            // template, but in a TIMED template unlimited floor-riding breaks
+            // the timing two ways (measured in the unit tests): a
+            // floor-anchored fresh entry exploits the raw log-score length
+            // bias to displace the genuine path mid-gap, and a sound state
+            // idling on the floor after the gap stretches the window until a
+            // late sound "completes" the rhythm. So for has_gap templates
+            // only: (1) advancing PAST state j-1 requires that its evidence
+            // was actually heard on this path (Cur — a mid-gap phantom entry
+            // whose sound never occurred can't hop into the gap state and
+            // ride its high silence scores, and a pure-floor ladder can't
+            // pass ANY state); (2) STAYING floored is legal only for
+            // kMaxFloorRun frames in a row — enough to absorb intra-sound
+            // unit churn or a one-frame blip inside a gap, far too short to
+            // bend the rhythm. Entering a state on floored frames IS legal
+            // (bounded by (2)): the live front-end adapts to what it heard
+            // seconds ago while enrollment ran on a fresh pass (measured:
+            // a re-performance ~2 s after a fire missed entry entirely under
+            // a strict advance-on-evidence rule), so each transition gets
+            // kMaxFloorRun frames of onset-drift slack before its sound must
+            // appear. Sound-only templates keep the legacy behavior (their
+            // tuned recall/FAR numbers are untouched).
+            if (has_gap) {
+                if (s_adv != kNegInf && j >= 2 && !Cur[j - 1]) s_adv = kNegInf;
+                if (s_stay != kNegInf && !above && F[j] >= kMaxFloorRun) s_stay = kNegInf;
             }
             const double best = s_stay > s_adv ? s_stay : s_adv;
             if (best == kNegInf) {
@@ -247,7 +255,7 @@ struct TemplateMatcher {
             S[j] = best + emit;
             N[j] = prevN + 1;
             R[j] = advance ? 1 : R[j] + 1;
-            F[j] = (advance || above) ? 0 : F[j] + 1;
+            F[j] = above ? 0 : (advance ? 1 : F[j] + 1);
             if (advance) {
                 // Entered phoneme j fresh: bank phoneme j-1's coverage, start j.
                 Cov[j] = Cov[j - 1] + (Cur[j - 1] ? 1 : 0);
@@ -259,10 +267,14 @@ struct TemplateMatcher {
             }
         }
 
-        // Prefix progress: furthest finite state.
+        // Prefix progress: furthest finite state. Rhythm templates may carry
+        // short-lived floored probe paths (entry precedes evidence by up to
+        // kMaxFloorRun frames), so count a state as reached only once its
+        // evidence was actually heard — telemetry reports what matched, not
+        // what is being speculatively held at the floor.
         furthest = 0;
         for (int j = L; j >= 1; --j) {
-            if (S[j] != kNegInf) { furthest = j; break; }
+            if (S[j] != kNegInf && (!has_gap || Cur[j])) { furthest = j; break; }
         }
 
         // Refractory ticks down every frame (matches WakeWord's per-frame decay).
