@@ -7,7 +7,8 @@
 //
 // Coverage: positive match, entry-silence gate, min-phoneme floor, wrong
 // sequence, threshold + per-template override, refractory debounce, prefix
-// progress, enroll collapse/silence-drop, remove/clear/templates, reset.
+// progress, per-template progress snapshot, enroll collapse/silence-drop,
+// remove/clear/templates, reset.
 
 #include "brosoundml/phoneme_spotter.h"
 #include "brosoundml/phoneme_data.h"
@@ -15,6 +16,7 @@
 #include <brotensor/runtime.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -314,6 +316,91 @@ static void test_prefix_progress() {
     CHECK(std::fabs(p - 0.5f) < 0.05f, "progress: ~0.5 after 2 of 4 phonemes");
 }
 
+// ── 7b. Per-template progress snapshot (fused-surface telemetry). ────────────
+static void test_progress_snapshot() {
+    auto s = make_spotter();
+
+    auto s0 = s.progress_snapshot();
+    CHECK(s0.count == 0 && s0.frames == 0, "snapshot: empty before enroll");
+    const std::uint32_t gen0 = s0.generation;
+
+    s.enroll_from_classes("abcd", ABCD);
+    s.enroll_from_classes("cec", {3, 5, 3});
+    auto s1 = s.progress_snapshot();
+    CHECK(s1.count == 2, "snapshot: two entries after enroll");
+    CHECK(s1.generation != gen0, "snapshot: generation bumps on enroll");
+    CHECK(std::string(s1.templates[0].name) == "abcd" &&
+          std::string(s1.templates[1].name) == "cec",
+          "snapshot: names in enroll order");
+    CHECK(s1.templates[0].length == 4 && s1.templates[1].length == 3,
+          "snapshot: per-entry template lengths");
+
+    // Half a word: abcd's prefix reads 2/4 with a REAL partial confidence (the
+    // geometric mean of two 0.8-mass frames), while cec only ever rides the
+    // emission floor.
+    PostStream half;
+    half.add_word({1, 2}, 1, 0.8f);   // A, B — one frame per phoneme
+    feed(s, half);
+    auto s2 = s.progress_snapshot();
+    CHECK(s2.frames == 2, "snapshot: frames counts posterior frames");
+    {
+        const auto& e = s2.templates[0];
+        CHECK(e.matched == 2 && std::fabs(e.progress - 0.5f) < 0.05f,
+              "snapshot: abcd matched 2/4 after half a word");
+        CHECK(e.confidence > 0.6f && e.confidence <= 1.0f,
+              "snapshot: partial confidence tracks the real prefix score");
+        CHECK(e.last_advance_frame == 2,
+              "snapshot: last_advance_frame == frame of the latest extension");
+        CHECK(e.completions == 0 && e.last_fire_frame == -1,
+              "snapshot: no completion recorded yet");
+        CHECK(s2.templates[1].confidence < 0.3f,
+              "snapshot: absent template's confidence stays at the floor");
+        std::fprintf(stderr, "    (abcd conf=%.3f, cec conf=%.3f)\n",
+                     e.confidence, s2.templates[1].confidence);
+    }
+
+    // A clean full utterance fires: completions ticks, last_fire_frame lands
+    // inside the fed range, and the re-armed DP drops the prefix.
+    PostStream full;
+    full.add_silence(6);
+    full.add_word(ABCD, 4, 0.9f);
+    full.add_silence(4);
+    auto ev = feed(s, full);
+    CHECK(ev.size() == 1, "snapshot: full word fires once");
+    auto s3 = s.progress_snapshot();
+    CHECK(s3.frames == 2 + 26, "snapshot: frames accumulates across feeds");
+    {
+        const auto& e = s3.templates[0];
+        CHECK(e.completions == 1, "snapshot: completions == 1 after the fire");
+        CHECK(e.last_fire_frame > 2 && e.last_fire_frame <= s3.frames,
+              "snapshot: last_fire_frame inside the fed range");
+        CHECK(e.matched < e.length, "snapshot: DP re-armed after the fire");
+    }
+
+    // reset() clears alignments but the monotonic history survives, so a
+    // poller diffing counters across a reset never sees them go backwards.
+    s.reset();
+    auto s4 = s.progress_snapshot();
+    CHECK(s4.frames == s3.frames, "snapshot: frames survives reset()");
+    CHECK(s4.templates[0].completions == 1,
+          "snapshot: completions survives reset()");
+    CHECK(s4.templates[0].matched == 0, "snapshot: matched cleared by reset()");
+
+    // remove() shrinks the entry set and bumps the generation.
+    const std::uint32_t gen_before = s4.generation;
+    CHECK(s.remove("cec"), "snapshot: remove cec");
+    auto s5 = s.progress_snapshot();
+    CHECK(s5.count == 1 && std::string(s5.templates[0].name) == "abcd",
+          "snapshot: one entry after remove");
+    CHECK(s5.generation != gen_before, "snapshot: generation bumps on remove");
+
+    // Oversized names are truncated, NUL-terminated, into the POD entry.
+    s.enroll_from_classes(std::string(60, 'x'), ABCD);
+    auto s6 = s.progress_snapshot();
+    CHECK(std::string(s6.templates[1].name) == std::string(47, 'x'),
+          "snapshot: long name truncated to the POD field");
+}
+
 // ── 8. enroll collapse + silence-drop. ───────────────────────────────────────
 static void test_enroll_collapse() {
     auto s = make_spotter();
@@ -450,6 +537,7 @@ int main() {
     test_coverage_frac();
     test_refractory();
     test_prefix_progress();
+    test_progress_snapshot();
     test_enroll_collapse();
     test_template_admin();
     test_reset();

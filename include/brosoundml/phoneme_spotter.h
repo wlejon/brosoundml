@@ -5,6 +5,7 @@
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_data.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,6 +137,54 @@ struct SpotEvent {
     int         template_len = 0;
 };
 
+// ─── Per-template progress telemetry ─────────────────────────────────────────
+//
+// The spotter's contribution to the listening stack's FUSED SURFACE: one
+// coherent reading of every enrolled template's streaming alignment state,
+// all taken after the same posterior frame, published lock-free so a fuser
+// can poll it alongside SensorHub's snapshot. Where SpotEvent reports a
+// COMPLETED match after the fact, this reports partial evidence as it
+// accumulates — "'hello there' is 5/7 phonemes deep and scoring 0.6" is
+// actionable (gate a heavier tier, light a UI meter) seconds before any
+// event would fire.
+
+struct TemplateProgress {
+    // Template name, NUL-terminated, truncated to fit. Fixed storage keeps
+    // the snapshot POD so the seqlock write never allocates.
+    char name[48] = {};
+
+    int   matched  = 0;      // furthest prefix depth reached (phonemes)
+    int   length   = 0;      // template length in phoneme classes
+    float progress = 0.0f;   // matched / length, in [0,1]
+
+    // Geometric-mean posterior over the matched prefix span — the SAME
+    // measure the firing threshold tests on completion, so a reader can say
+    // "scoring above threshold, not yet complete". 0 while no prefix exists.
+    float confidence = 0.0f;
+
+    // Poll-safe event history (cf. SensorHub's counter pairing): monotonic
+    // since enroll, NOT cleared by reset(). Frame fields hold the snapshot's
+    // `frames` value at the moment of the event; -1 = never.
+    std::int64_t completions        = 0;   // completed matches (fires)
+    std::int64_t last_advance_frame = -1;  // when `matched` last grew
+    std::int64_t last_fire_frame    = -1;  // when the latest fire happened
+};
+
+struct ProgressSnapshot {
+    // Telemetry covers the first kMaxTemplates enrolled templates (fixed POD
+    // for the seqlock). Enrollment beyond that still matches and fires —
+    // only this snapshot truncates.
+    static constexpr int kMaxTemplates = 32;
+
+    std::int64_t  frames = 0;      // posterior frames processed over the
+                                   // spotter's life — monotonic, survives
+                                   // reset(), so pollers can always diff it
+    std::uint32_t generation = 0;  // bumps on enroll/remove/clear/load: the
+                                   // entry set changed since the last poll
+    int           count = 0;       // valid entries below
+    TemplateProgress templates[kMaxTemplates];
+};
+
 class PhonemeSpotter {
 public:
     PhonemeSpotter();
@@ -225,6 +274,11 @@ public:
     // Best current prefix progress across all templates, in [0,1]
     // (matched_phonemes / template_len of the furthest-advanced template).
     float prefix_progress() const;
+    // Per-template alignment telemetry for the fused surface (see
+    // TemplateProgress above): one coherent seqlock copy of every template's
+    // prefix depth, partial confidence, and completion counters, all taken
+    // after the same posterior frame. Lock-free; any thread.
+    ProgressSnapshot progress_snapshot() const;
 
     void reset();   // drop ALL streaming state (mel ring, model conv cache, every
                     // template's DP state, smoothing, refractory). Keeps weights,

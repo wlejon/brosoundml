@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -77,6 +78,12 @@ struct TemplateMatcher {
 
     int                  refractory_frames = 0;   // counts down once per frame
     int                  furthest = 0;            // largest j with finite S[j]
+
+    // Progress telemetry (see TemplateProgress). History, not matcher state:
+    // reset_dp() leaves these alone so pollers' counter diffs stay monotonic.
+    std::int64_t         completions        = 0;
+    std::int64_t         last_advance_frame = -1;
+    std::int64_t         last_fire_frame    = -1;
 
     int L() const { return static_cast<int>(classes.size()); }
 
@@ -288,6 +295,13 @@ struct PhonemeSpotter::Impl {
     std::atomic<std::uint32_t>  post_seq{0};   // even = stable, odd = writing
     bool                        post_valid = false;
 
+    // Per-template progress seqlock (fixed-size POD, mirrors SensorHub's
+    // publish). Written once per posterior frame and on template-set changes.
+    std::int64_t                frames_total = 0;     // monotonic, survives reset()
+    std::uint32_t               tmpl_generation = 0;  // bumps on set changes
+    ProgressSnapshot            prog_pub;
+    std::atomic<std::uint32_t>  prog_seq{0};   // even = stable, odd = writing
+
     int K() const { return class_map.num_classes; }
 
     int refractory_frames_for(const SpotterConfig& p) const {
@@ -297,6 +311,51 @@ struct PhonemeSpotter::Impl {
         long long f = s / hop;
         if (f < 0) f = 0;
         return static_cast<int>(f);
+    }
+
+    // Rebuild + publish the progress snapshot from the matchers' current
+    // alignment state. Producer thread only (frame loop + template-set
+    // mutations), so reading the matchers here is race-free.
+    void publish_progress(const std::vector<TemplateMatcher>& ms) {
+        const std::uint32_t s0 = prog_seq.load(std::memory_order_relaxed);
+        prog_seq.store(s0 + 1, std::memory_order_release);   // odd: writing
+        prog_pub.frames     = frames_total;
+        prog_pub.generation = tmpl_generation;
+        int n = static_cast<int>(ms.size());
+        if (n > ProgressSnapshot::kMaxTemplates)
+            n = ProgressSnapshot::kMaxTemplates;
+        prog_pub.count = n;
+        for (int i = 0; i < n; ++i) {
+            const TemplateMatcher& m = ms[static_cast<std::size_t>(i)];
+            TemplateProgress& e = prog_pub.templates[i];
+            const std::size_t len =
+                std::min(m.name.size(), sizeof(e.name) - 1);
+            std::memcpy(e.name, m.name.data(), len);
+            e.name[len] = '\0';
+            const int L = m.L();
+            const int f = m.furthest;
+            e.matched  = f;
+            e.length   = L;
+            e.progress = L > 0 ? static_cast<float>(f) / static_cast<float>(L)
+                               : 0.0f;
+            // Partial confidence: geometric-mean posterior over the matched
+            // prefix — exp(S[f]/N[f]), the same statistic the completion
+            // threshold tests at f == L.
+            float conf = 0.0f;
+            if (f > 0 && f < static_cast<int>(m.S.size()) &&
+                m.S[static_cast<std::size_t>(f)] != kNegInf &&
+                m.N[static_cast<std::size_t>(f)] > 0) {
+                conf = static_cast<float>(
+                    std::exp(m.S[static_cast<std::size_t>(f)] /
+                             static_cast<double>(m.N[static_cast<std::size_t>(f)])));
+                if (conf > 1.0f) conf = 1.0f;
+            }
+            e.confidence         = conf;
+            e.completions        = m.completions;
+            e.last_advance_frame = m.last_advance_frame;
+            e.last_fire_frame    = m.last_fire_frame;
+        }
+        prog_seq.store(s0 + 2, std::memory_order_release);   // even: stable
     }
 
     void publish_posterior(const float* p, int K) {
@@ -320,6 +379,9 @@ struct PhonemeSpotter::Impl {
         post_seq.store(s0 + 1, std::memory_order_release);
         post_valid = false;
         post_seq.store(s0 + 2, std::memory_order_release);
+        // Re-publish progress so readers see the cleared alignments. The
+        // monotonic fields (frames, completions, last_*) deliberately survive.
+        publish_progress(matchers);
     }
 };
 
@@ -342,9 +404,10 @@ void PhonemeSpotter::set_class_map(const PhonemeClassMap& cm) {
     impl_->mel.reset();
     impl_->loaded = false;
     impl_->matchers.clear();
+    ++impl_->tmpl_generation;
     impl_->last_post.assign(static_cast<std::size_t>(cm.num_classes), 0.0f);
     impl_->post_valid = false;
-    impl_->reset_stream_state();
+    impl_->reset_stream_state();   // publishes the emptied progress snapshot
 }
 
 void PhonemeSpotter::load(const std::string& weights_path, brotensor::Device device) {
@@ -379,9 +442,10 @@ void PhonemeSpotter::load(const std::string& weights_path, brotensor::Device dev
     impl_->sample_rate   = c.sample_rate;
     impl_->hop_length    = c.hop_length;
     impl_->matchers.clear();
+    ++impl_->tmpl_generation;
     impl_->last_post.assign(static_cast<std::size_t>(cm.num_classes), 0.0f);
     impl_->post_valid = false;
-    impl_->reset_stream_state();
+    impl_->reset_stream_state();   // publishes the emptied progress snapshot
 }
 
 const PhonemeClassMap& PhonemeSpotter::class_map() const { return impl_->class_map; }
@@ -435,6 +499,8 @@ int PhonemeSpotter::enroll_from_classes(const std::string& name,
     m.has_override = (policy_override != nullptr);
     m.reset_dp();
     impl_->matchers.push_back(std::move(m));
+    ++impl_->tmpl_generation;
+    impl_->publish_progress(impl_->matchers);
     return static_cast<int>(tmpl.size());
 }
 
@@ -515,6 +581,8 @@ int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
     m.has_override = (policy_override != nullptr);
     m.reset_dp();
     impl_->matchers.push_back(std::move(m));
+    ++impl_->tmpl_generation;
+    impl_->publish_progress(impl_->matchers);
     return static_cast<int>(classes.size());
 }
 
@@ -608,13 +676,19 @@ bool PhonemeSpotter::remove(const std::string& name) {
     for (std::size_t i = 0; i < v.size(); ++i) {
         if (v[i].name == name) {
             v.erase(v.begin() + static_cast<std::ptrdiff_t>(i));
+            ++impl_->tmpl_generation;
+            impl_->publish_progress(v);
             return true;
         }
     }
     return false;
 }
 
-void PhonemeSpotter::clear() { impl_->matchers.clear(); }
+void PhonemeSpotter::clear() {
+    impl_->matchers.clear();
+    ++impl_->tmpl_generation;
+    impl_->publish_progress(impl_->matchers);
+}
 
 std::vector<std::string> PhonemeSpotter::templates() const {
     std::vector<std::string> out;
@@ -641,6 +715,7 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
 
     for (int t = 0; t < n_frames; ++t) {
         const float* p = posteriors + static_cast<std::size_t>(t) * K;
+        ++impl_->frames_total;
 
         // Per-frame log-posteriors and the silence/argmax for the entry gate.
         int arg = 0; float pmax = p[0];
@@ -661,10 +736,18 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
             const int L = m.L();
             const bool gate = impl_->silence_run >= m.policy.entry_silence_frames;
             SpotEvent ev;
+            const int  prev_furthest = m.furthest;
             const bool fired = (L > 0) && m.step(lp, p, pmax, gate, ev);
             if (fired) {
                 m.refractory_frames = impl_->refractory_frames_for(m.policy);
+                ++m.completions;
+                // A fire IS the prefix reaching L (step() then re-arms the DP,
+                // so furthest reads 0 again) — record both telemetry marks.
+                m.last_fire_frame    = impl_->frames_total;
+                m.last_advance_frame = impl_->frames_total;
                 events.push_back(ev);
+            } else if (m.furthest > prev_furthest) {
+                m.last_advance_frame = impl_->frames_total;
             }
             // Prefix progress contribution (post-step furthest state).
             if (L > 0) {
@@ -681,6 +764,7 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
                 ? static_cast<float>(best_prefix_num) / static_cast<float>(best_prefix_den)
                 : 0.0f,
             std::memory_order_relaxed);
+        impl_->publish_progress(impl_->matchers);
 
         // Update the silence run AFTER this frame is processed (so the gate sees
         // only frames strictly before the current one).
@@ -786,6 +870,17 @@ std::vector<float> PhonemeSpotter::last_posterior() const {
 
 float PhonemeSpotter::prefix_progress() const {
     return impl_->a_prefix_progress.load(std::memory_order_relaxed);
+}
+
+ProgressSnapshot PhonemeSpotter::progress_snapshot() const {
+    ProgressSnapshot out;
+    for (;;) {
+        const std::uint32_t s1 = impl_->prog_seq.load(std::memory_order_acquire);
+        if (s1 & 1u) continue;                       // writer mid-publish
+        out = impl_->prog_pub;
+        const std::uint32_t s2 = impl_->prog_seq.load(std::memory_order_acquire);
+        if (s1 == s2) return out;                    // stable snapshot
+    }
 }
 
 void PhonemeSpotter::reset() { impl_->reset_stream_state(); }
