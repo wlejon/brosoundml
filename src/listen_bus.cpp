@@ -89,7 +89,7 @@ void ListenBus::check_compatible(const WakeWord& wake) const {
 
 ListenFeedResult ListenBus::feed(const float* samples, int n,
                                  SensorHub* hub, PhonemeSpotter* spotter,
-                                 WakeWord* wake) {
+                                 WakeWord* wake, GestureSpotter* gesture) {
     ListenFeedResult out;
     if (!samples || n <= 0) return out;
     const int win = cfg_.win_length;
@@ -118,6 +118,13 @@ ListenFeedResult ListenBus::feed(const float* samples, int n,
                          static_cast<std::size_t>(f)];
             }
             hub->feed_frame(ring_.data() + off, col_.data());
+            // Gesture matching is a pure consumer of THIS frame's tier-0
+            // snapshot — drive it right after the sensors update, so a
+            // completed rhythm/tone surfaces on the same frame.
+            if (gesture) {
+                auto g = gesture->feed(hub->snapshot());
+                for (auto& e : g) out.gestures.push_back(std::move(e));
+            }
         }
         off += static_cast<std::size_t>(hop);
         ++done;

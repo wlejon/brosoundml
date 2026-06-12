@@ -135,6 +135,7 @@ target_sources(brosoundml PRIVATE
     src/bc_resnet2d.cpp
     src/phoneme_model.cpp
     src/phoneme_spotter.cpp
+    src/gesture_spotter.cpp
     src/listen_bus.cpp
     src/sensor_hub.cpp
     src/mel.cpp

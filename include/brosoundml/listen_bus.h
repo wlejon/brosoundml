@@ -1,5 +1,6 @@
 #pragma once
 
+#include "brosoundml/gesture_spotter.h"
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_spotter.h"
 #include "brosoundml/sensor_hub.h"
@@ -29,6 +30,10 @@ namespace brosoundml {
 //                    landed: the model is trained level-invariant (random
 //                    presentation level + PCEN), so it hears the same raw
 //                    no-AGC stream as every other consumer.
+//   GestureSpotter   tier-0 non-speech gesture matcher — consumes the
+//                    SensorHub snapshot computed THIS frame (rhythm / tone),
+//                    so it requires a SensorHub member and adds no DSP of its
+//                    own (GestureSpotter::feed(snapshot)).
 //
 // Consumers are passed PER CALL rather than stored. feed() is single-producer
 // (one audio/inference thread); a caller that owns that thread changes the
@@ -54,6 +59,7 @@ struct ListenFeedResult {
     int frames = 0;                  // mel frames advanced this call
     std::vector<SpotEvent> spots;    // spotter completions fired this call
     bool wake_fired = false;         // wake detector fired this call
+    std::vector<GestureEvent> gestures;  // gesture matches fired this call
 };
 
 class ListenBus {
@@ -71,10 +77,13 @@ public:
     void check_compatible(const WakeWord& wake) const;
 
     // Push `n` mono FP32 samples at sample_rate(); advance the front-end and
-    // every non-null consumer. Single producer.
+    // every non-null consumer. Single producer. `gesture` consumes `hub`'s
+    // per-frame snapshot, so passing a gesture spotter without a hub is a
+    // no-op for it (it has no sensors to read).
     ListenFeedResult feed(const float* samples, int n,
                           SensorHub* hub, PhonemeSpotter* spotter,
-                          WakeWord* wake = nullptr);
+                          WakeWord* wake = nullptr,
+                          GestureSpotter* gesture = nullptr);
 
     // Drop the bus's stream state (mel ring, PCEN smoother, sample ring).
     // Consumers keep their own streaming state — reset them alongside.
