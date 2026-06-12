@@ -1,7 +1,6 @@
 #pragma once
 
-// Special-case rule engine for English G2P. See docs/special_cases.md for
-// the spec.
+// Special-case rule engine for English G2P. See docs/special_cases.md.
 //
 // Runs BEFORE the lexicon: handles function-word allomorphy (`a`/`an`/`the`,
 // `to`, `in`, `by`, `I`, `am`, `used`), symbol words (`%` → "percent" etc.),
@@ -10,7 +9,7 @@
 // proper nouns / acronyms. Direct port of misaki/en.py's `get_special_case`
 // and `get_NNP`. US English only.
 //
-// Sole intended consumer is the planned `Phonemizer` façade. `try_phonemize`
+// Sole consumer is the `Phonemizer` façade. `try_phonemize`
 // returns `""` when no rule applies — the caller falls through to the
 // Lexicon + Morphology chain.
 

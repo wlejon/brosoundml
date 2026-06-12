@@ -1,7 +1,6 @@
 #pragma once
 
-// Sentence → Kokoro-token-ids orchestrator. See docs/phonemizer.md § Slice 5
-// for the spec.
+// Sentence → Kokoro-token-ids orchestrator. See docs/phonemizer.md.
 //
 // Composes the entire in-tree English G2P stack: pre-tokenisation,
 // POS tagging (PosTagger), special-case allomorphy (SpecialCases), the
@@ -10,8 +9,10 @@
 // (future-vowel / future-to) is propagated in a single right-to-left walk so
 // the SpecialCases rules see the same lookahead they would in misaki.
 //
-// US English only. Numbers / currency / years / sentence-stress redistribution
-// are deliberate v1 gaps — see the spec's "Behaviour gaps vs. misaki".
+// US English only. Numbers / currency / years are normalised ahead of the chain
+// by normalize_text(); remaining differences from misaki (no "used to"
+// collocation pass, no sentence-stress redistribution) are listed under
+// docs/phonemizer.md "Known gaps vs. misaki".
 //
 // Move-constructible; non-owning pointers to its five dependencies. Throws
 // std::runtime_error (with the "brosoundml: g2p::Phonemizer::..." prefix) only

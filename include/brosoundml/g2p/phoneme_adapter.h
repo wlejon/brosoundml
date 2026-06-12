@@ -1,7 +1,6 @@
 #pragma once
 
-// IPA-codepoint → Kokoro phoneme-id adapter. See docs/phonemizer.md § Slice 4
-// for the spec.
+// IPA-codepoint → Kokoro phoneme-id adapter. See docs/phonemizer.md.
 //
 // Kokoro's phoneme vocab (read from `weights/kokoro/config.json` into
 // `KokoroConfig::vocab`) maps one IPA codepoint (or, in three combining-mark
@@ -10,8 +9,8 @@
 // Codepoints absent from the vocab are dropped silently, mirroring misaki's
 // behaviour and Kokoro upstream.
 //
-// Sole intended consumer is the planned `Phonemizer` façade; the adapter is
-// stateless besides the borrowed vocab pointer and a cached `max_id_`.
+// Sole consumer is the `Phonemizer` façade; the adapter is stateless besides
+// the borrowed vocab pointer and a cached `max_id_`.
 
 #include <cstdint>
 #include <string>

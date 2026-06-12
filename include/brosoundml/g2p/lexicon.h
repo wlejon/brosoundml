@@ -1,6 +1,6 @@
 #pragma once
 
-// Packed English pronunciation dictionary. See docs/lexicon.md for the spec.
+// Packed English pronunciation dictionary. See docs/lexicon.md.
 //
 // First lookup stage of the in-tree G2P stack: word (+ optional PTB POS tag)
 // → IPA UTF-8 string. Returns an empty string_view when the word is absent

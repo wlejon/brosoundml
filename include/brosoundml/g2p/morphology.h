@@ -1,7 +1,6 @@
 #pragma once
 
-// Affix-stripping rules engine for English G2P. See docs/morphology.md for
-// the spec.
+// Affix-stripping rules engine for English G2P. See docs/morphology.md.
 //
 // Backstops `brosoundml::g2p::Lexicon` for words missing from the dictionary
 // by handling regular inflections (`-s`, `-ed`, `-ing`) and possessive
@@ -9,8 +8,8 @@
 // `stem_s` / `stem_ed` / `stem_ing` plus the two possessive branches inside
 // `get_word`. US English only — British variants are a future slice.
 //
-// Sole intended consumer is the planned `Phonemizer` façade; Morphology
-// itself exposes only the rule chain, never orchestration. `try_phonemize`
+// Sole consumer is the `Phonemizer` façade; Morphology itself exposes only the
+// rule chain, never orchestration. `try_phonemize`
 // does NOT attempt a direct lexicon hit on `word` — the caller probes the
 // lexicon first; morphology is the miss path.
 

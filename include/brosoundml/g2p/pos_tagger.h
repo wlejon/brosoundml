@@ -1,6 +1,6 @@
 #pragma once
 
-// Byte-level Transformer POS tagger. See docs/pos_tagger.md for the spec.
+// Byte-level Transformer POS tagger. See docs/pos_tagger.md.
 
 #include "brosoundml/g2p/tags.h"
 
