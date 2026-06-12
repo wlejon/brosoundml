@@ -3,6 +3,7 @@
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_spotter.h"
 #include "brosoundml/sensor_hub.h"
+#include "brosoundml/wake.h"
 
 #include <vector>
 
@@ -22,6 +23,12 @@ namespace brosoundml {
 //                    template matchers, and its lock-free readers
 //                    (last_posterior / prefix_progress) expose the stream to
 //                    any further pollers.
+//   WakeWord         tier-2 keyword detector — the same new-frame mel block
+//                    drives the streaming BC-ResNet + detector policy
+//                    (WakeWord::feed_mel). Joined once the AGC-free recipe
+//                    landed: the model is trained level-invariant (random
+//                    presentation level + PCEN), so it hears the same raw
+//                    no-AGC stream as every other consumer.
 //
 // Consumers are passed PER CALL rather than stored. feed() is single-producer
 // (one audio/inference thread); a caller that owns that thread changes the
@@ -40,17 +47,13 @@ namespace brosoundml {
 // throws std::runtime_error naming the mismatched field); feed() trusts the
 // caller and does not re-validate per call.
 //
-// WakeWord is NOT a bus consumer yet: its live tap runs AGC (the wake
-// training recipe peak-normalises every clip), so its input stream genuinely
-// differs from the raw stream the spotter/hub listen to. It joins once
-// retrained on the AGC-free recipe.
-//
 // Thread-safety: single producer. feed()/reset() on one thread; the bus has
 // no cross-thread readers of its own (poll the consumers' lock-free surfaces).
 
 struct ListenFeedResult {
     int frames = 0;                  // mel frames advanced this call
     std::vector<SpotEvent> spots;    // spotter completions fired this call
+    bool wake_fired = false;         // wake detector fired this call
 };
 
 class ListenBus {
@@ -61,14 +64,17 @@ public:
     explicit ListenBus(const MelConfig& mel = MelConfig{});
 
     // Throw std::runtime_error (naming the field) if the consumer's framing
-    // differs from the bus front-end. The spotter overload requires load().
+    // differs from the bus front-end. The spotter/wake overloads require
+    // load() (their framing comes from the checkpoint header).
     void check_compatible(const SensorHub& hub) const;
     void check_compatible(const PhonemeSpotter& spotter) const;
+    void check_compatible(const WakeWord& wake) const;
 
     // Push `n` mono FP32 samples at sample_rate(); advance the front-end and
     // every non-null consumer. Single producer.
     ListenFeedResult feed(const float* samples, int n,
-                          SensorHub* hub, PhonemeSpotter* spotter);
+                          SensorHub* hub, PhonemeSpotter* spotter,
+                          WakeWord* wake = nullptr);
 
     // Drop the bus's stream state (mel ring, PCEN smoother, sample ring).
     // Consumers keep their own streaming state — reset them alongside.

@@ -78,8 +78,18 @@ void ListenBus::check_compatible(const PhonemeSpotter& spotter) const {
     check_mel_match("PhonemeSpotter", cfg_, spotter.mel_config());
 }
 
+void ListenBus::check_compatible(const WakeWord& wake) const {
+    if (!wake.loaded()) {
+        fail("ListenBus::check_compatible",
+             "WakeWord has no model loaded (its front-end framing comes "
+             "from the checkpoint)");
+    }
+    check_mel_match("WakeWord", cfg_, wake.mel_config());
+}
+
 ListenFeedResult ListenBus::feed(const float* samples, int n,
-                                 SensorHub* hub, PhonemeSpotter* spotter) {
+                                 SensorHub* hub, PhonemeSpotter* spotter,
+                                 WakeWord* wake) {
     ListenFeedResult out;
     if (!samples || n <= 0) return out;
     const int win = cfg_.win_length;
@@ -115,11 +125,12 @@ ListenFeedResult ListenBus::feed(const float* samples, int n,
     ring_.erase(ring_.begin(), ring_.begin() + static_cast<std::ptrdiff_t>(off));
     out.frames = done;
 
-    // Tier-1/2: ONE forward over the whole new block. feed_mel wants a
-    // contiguous (n_mels, done) block; when the defensive window check above
-    // trimmed the frame count (done < F — cannot happen when ring_ mirrors the
-    // front-end, but cheap to honour), repack the kept columns.
-    if (spotter && done > 0) {
+    // Tier-1/2: ONE forward per model over the whole new block. feed_mel
+    // wants a contiguous (n_mels, done) block; when the defensive window
+    // check above trimmed the frame count (done < F — cannot happen when
+    // ring_ mirrors the front-end, but cheap to honour), repack the kept
+    // columns once and hand the same block to every model consumer.
+    if ((spotter || wake) && done > 0) {
         const float* block = host.data();
         if (done != F) {
             block_.resize(static_cast<std::size_t>(M) * static_cast<std::size_t>(done));
@@ -133,7 +144,8 @@ ListenFeedResult ListenBus::feed(const float* samples, int n,
             }
             block = block_.data();
         }
-        out.spots = spotter->feed_mel(block, done);
+        if (spotter) out.spots = spotter->feed_mel(block, done);
+        if (wake)    out.wake_fired = wake->feed_mel(block, done);
     }
     return out;
 }

@@ -81,6 +81,9 @@ struct WakeWord::Impl {
     std::unique_ptr<MelFrontend> mel;       // built on load()
     std::unique_ptr<BcResnet2d>  model;     // loaded on load()
     bt::Device                   device = bt::Device::CPU;
+    MelConfig                    mcfg;      // the front-end framing, kept for
+                                            // shared-front-end compatibility
+                                            // checks (mel_config())
 
     // Sample-side buffering: feed() appends incoming samples here, then drains
     // them in hop-sized chunks into the mel front-end. The mel front-end has
@@ -117,7 +120,95 @@ struct WakeWord::Impl {
     std::atomic<int>   a_smoothing_hits{2};
     std::atomic<int>   a_smoothing_window{3};
     std::atomic<int>   a_refractory_ms{500};
+
+    // Reused per-frame tensors/buffers (resident on the model device, sized
+    // on load()) — feed paths do no per-frame heap traffic through these.
+    bt::Tensor         frame_tensor;
+    bt::Tensor         logit_tensor;
+    std::vector<float> frame_buf;
+
+    // One PCEN mel column through the streaming model + the detector policy.
+    // `block` is host FP32 (n_mels, T) row-major (MelFrontend's emit layout);
+    // column `t` is sliced into frame_buf. The shared tail of feed() and
+    // feed_mel(). `allow_fire` carries the caller's at-most-one-fire-per-call
+    // rule: when false the decision ring / refractory / warmup still advance,
+    // but the fire test is skipped (exactly the old in-loop behavior).
+    bool step_mel_column(const float* block, int T, int t,
+                         float threshold, int smoothing_hits,
+                         int smoothing_window, int refractory_ms,
+                         bool allow_fire);
 };
+
+bool WakeWord::Impl::step_mel_column(const float* block, int T, int t,
+                                     float threshold, int smoothing_hits,
+                                     int smoothing_window, int refractory_ms,
+                                     bool allow_fire) {
+    const int n_mels = config.n_mels;
+    for (int m = 0; m < n_mels; ++m) {
+        frame_buf[static_cast<std::size_t>(m)] =
+            block[static_cast<std::size_t>(m) * T + t];
+    }
+    frame_tensor = bt::Tensor::from_host_on(device, frame_buf.data(),
+                                            n_mels, 1);
+
+    model->forward_streaming(frame_tensor, logit_tensor);
+
+    // logit_tensor: (1, 1) on `device`.
+    float logit = 0.0f;
+    if (logit_tensor.device == bt::Device::CPU) {
+        logit = logit_tensor.host_f32()[0];
+    } else {
+        bt::Tensor h = logit_tensor.to(bt::Device::CPU);
+        logit = h.host_f32()[0];
+    }
+    const float score = sigmoidf(logit);
+    last_score.store(score, std::memory_order_relaxed);
+
+    // Update the decision ring (drop oldest, append new flag).
+    const bool frame_positive = (score > threshold);
+    if (smoothing_window > 0) {
+        decisions[static_cast<std::size_t>(decision_head)] =
+            frame_positive ? 1u : 0u;
+        decision_head = (decision_head + 1) % smoothing_window;
+        if (decision_len < smoothing_window) {
+            ++decision_len;
+        }
+    }
+
+    // Decrement refractory after every emitted frame.
+    if (refractory_frames > 0) {
+        --refractory_frames;
+    }
+
+    // Count frames since reset for the warmup guard (saturate to avoid
+    // overflow on a long-running stream).
+    if (frames_since_reset < warmup_frames) {
+        ++frames_since_reset;
+    }
+    const bool warmed = frames_since_reset >= warmup_frames;
+
+    // Fire test: warmed up AND refractory clear AND >= hits true in window.
+    if (warmed && refractory_frames == 0 && allow_fire) {
+        int hits = 0;
+        for (int i = 0; i < decision_len; ++i) {
+            if (decisions[static_cast<std::size_t>(i)]) {
+                ++hits;
+            }
+        }
+        if (hits >= smoothing_hits) {
+            // Refractory in frames: refractory_ms * sample_rate / 1000
+            // samples → divide by hop_length to convert to frames.
+            const int refr_samples =
+                refractory_ms * config.sample_rate / 1000;
+            refractory_frames = refr_samples / config.hop_length;
+            if (refractory_frames < 0) {
+                refractory_frames = 0;
+            }
+            return true;
+        }
+    }
+    return false;
+}
 
 WakeWord::WakeWord() : impl_(std::make_unique<Impl>()) {}
 WakeWord::~WakeWord() = default;
@@ -181,9 +272,12 @@ void WakeWord::load(const std::string& weights_path,
     impl_->mel    = std::move(mel);
     impl_->model  = std::move(model);
     impl_->device = device;
+    impl_->mcfg   = mcfg;
     impl_->loaded = true;
     impl_->warmup_frames      = warmup > 0 ? warmup : 0;
     impl_->frames_since_reset = 0;
+    impl_->frame_buf.assign(static_cast<std::size_t>(impl_->config.n_mels),
+                            0.0f);
 
     // Mirror policy into atomics so feed() picks them up.
     impl_->a_threshold       .store(impl_->config.threshold,        std::memory_order_relaxed);
@@ -266,88 +360,63 @@ bool WakeWord::feed(const float* samples, int n) {
     // Pull mel frames to host once so we can slice column-wise without a
     // per-frame device round-trip (the model wants a (n_mels, 1) tensor on
     // the same device each frame).
-    const int n_mels = impl_->config.n_mels;
     std::vector<float> mel_host = new_frames.to_host_vector();   // (n_mels, T_new)
 
-    // Reused per-frame tensors.
-    bt::Tensor frame_tensor = bt::Tensor::empty_on(
-        impl_->device, n_mels, 1, bt::Dtype::FP32);
-    std::vector<float> frame_buf(static_cast<std::size_t>(n_mels), 0.0f);
-    bt::Tensor logit_tensor;
-
     for (int t = 0; t < T_new; ++t) {
-        // Copy column t of mel_host into a (n_mels, 1) host buffer, then
-        // upload to the model device. (For CPU device this is a single
-        // memcpy + from_host_on, which is cheaper than a per-cell loop.)
-        for (int m = 0; m < n_mels; ++m) {
-            frame_buf[static_cast<std::size_t>(m)] =
-                mel_host[static_cast<std::size_t>(m) * T_new + t];
-        }
-        frame_tensor = bt::Tensor::from_host_on(impl_->device,
-                                                frame_buf.data(),
-                                                n_mels, 1);
-
-        impl_->model->forward_streaming(frame_tensor, logit_tensor);
-
-        // logit_tensor: (1, 1) on impl_->device.
-        float logit = 0.0f;
-        if (logit_tensor.device == bt::Device::CPU) {
-            logit = logit_tensor.host_f32()[0];
-        } else {
-            bt::Tensor h = logit_tensor.to(bt::Device::CPU);
-            logit = h.host_f32()[0];
-        }
-        const float score = sigmoidf(logit);
-        impl_->last_score.store(score, std::memory_order_relaxed);
-
-        // Update the decision ring (drop oldest, append new flag).
-        const bool frame_positive = (score > threshold);
-        if (smoothing_window > 0) {
-            impl_->decisions[static_cast<std::size_t>(impl_->decision_head)] =
-                frame_positive ? 1u : 0u;
-            impl_->decision_head =
-                (impl_->decision_head + 1) % smoothing_window;
-            if (impl_->decision_len < smoothing_window) {
-                ++impl_->decision_len;
-            }
-        }
-
-        // Decrement refractory after every emitted frame.
-        if (impl_->refractory_frames > 0) {
-            --impl_->refractory_frames;
-        }
-
-        // Count frames since reset for the warmup guard (saturate to avoid
-        // overflow on a long-running stream).
-        if (impl_->frames_since_reset < impl_->warmup_frames) {
-            ++impl_->frames_since_reset;
-        }
-        const bool warmed = impl_->frames_since_reset >= impl_->warmup_frames;
-
-        // Fire test: warmed up AND refractory clear AND >= hits true in window.
-        if (warmed && impl_->refractory_frames == 0 && !fired_this_call) {
-            int hits = 0;
-            for (int i = 0; i < impl_->decision_len; ++i) {
-                if (impl_->decisions[static_cast<std::size_t>(i)]) {
-                    ++hits;
-                }
-            }
-            if (hits >= smoothing_hits) {
-                fired_this_call = true;
-                // Refractory in frames: refractory_ms * sample_rate / 1000
-                // samples → divide by hop_length to convert to frames.
-                const int refr_samples =
-                    refractory_ms * impl_->config.sample_rate / 1000;
-                impl_->refractory_frames =
-                    refr_samples / impl_->config.hop_length;
-                if (impl_->refractory_frames < 0) {
-                    impl_->refractory_frames = 0;
-                }
-            }
+        if (impl_->step_mel_column(mel_host.data(), T_new, t, threshold,
+                                   smoothing_hits, smoothing_window,
+                                   refractory_ms, !fired_this_call)) {
+            fired_this_call = true;
         }
     }
 
     return fired_this_call;
+}
+
+bool WakeWord::feed_mel(const float* mel, int n_frames) {
+    if (!impl_->loaded) {
+        fail("WakeWord::feed_mel",
+             "no model loaded; call WakeWord::load() first");
+    }
+    if (n_frames < 0) {
+        fail("WakeWord::feed_mel",
+             "negative frame count " + std::to_string(n_frames));
+    }
+    if (n_frames > 0 && mel == nullptr) {
+        fail("WakeWord::feed_mel", "null frames with n_frames > 0");
+    }
+    if (n_frames == 0) return false;
+
+    // Snapshot policy for the duration of this call (same contract as feed()).
+    const float threshold        = impl_->a_threshold       .load(std::memory_order_relaxed);
+    const int   smoothing_hits   = impl_->a_smoothing_hits  .load(std::memory_order_relaxed);
+    const int   smoothing_window = impl_->a_smoothing_window.load(std::memory_order_relaxed);
+    const int   refractory_ms    = impl_->a_refractory_ms   .load(std::memory_order_relaxed);
+
+    if (static_cast<int>(impl_->decisions.size()) != smoothing_window) {
+        impl_->decisions.assign(
+            static_cast<std::size_t>(smoothing_window), 0u);
+        impl_->decision_head = 0;
+        impl_->decision_len  = 0;
+    }
+
+    bool fired_this_call = false;
+    for (int t = 0; t < n_frames; ++t) {
+        if (impl_->step_mel_column(mel, n_frames, t, threshold,
+                                   smoothing_hits, smoothing_window,
+                                   refractory_ms, !fired_this_call)) {
+            fired_this_call = true;
+        }
+    }
+    return fired_this_call;
+}
+
+const MelConfig& WakeWord::mel_config() const {
+    if (!impl_->loaded) {
+        fail("WakeWord::mel_config",
+             "no model loaded; call WakeWord::load() first");
+    }
+    return impl_->mcfg;
 }
 
 void WakeWord::set_threshold(float t) {

@@ -10,6 +10,7 @@
 // Plus the attach-time framing validation and the seam error paths.
 #include "brosoundml/listen_bus.h"
 
+#include "brosoundml/bc_resnet2d.h"
 #include "brosoundml/phoneme_model.h"
 
 #include <brotensor/runtime.h>
@@ -205,7 +206,52 @@ void test_spotter_equivalence() {
                  max_post_diff, spots_a, spots_b);
 }
 
-// ─── 3. attach validation + seam error paths ───────────────────────────────
+// ─── 3. bus-driven WakeWord ≡ standalone feed() ─────────────────────────────
+void test_wake_equivalence() {
+    // Tiny random 2D BC-ResNet, saved + loaded twice so the two detectors are
+    // weight-identical (random weights — the contract under test is that the
+    // bus-driven score stream matches standalone feed(), not that it fires).
+    bsm::BcResnet2dConfig cfg;   // default recipe; n_mels matches the bus
+    auto m = bsm::BcResnet2d::make(cfg, bt::Device::CPU);
+    m.xavier_init_weights(2026);
+    m.fuse_bn();
+    const std::string path = "test_listen_bus_tiny.bw";
+    m.save(path);
+
+    bsm::WakeWord standalone;
+    bsm::WakeWord driven;
+    standalone.load(path, bt::Device::CPU);
+    driven.load(path, bt::Device::CPU);
+    std::filesystem::remove(path);
+
+    bsm::ListenBus bus;
+    bus.check_compatible(driven);
+
+    const std::vector<float> s = scenario();
+    const int chunk = 1601;
+    std::size_t i = 0;
+    int fires_a = 0, fires_b = 0;
+    float max_score_diff = 0.0f;
+    while (i < s.size()) {
+        const int n = static_cast<int>(
+            std::min<std::size_t>(chunk, s.size() - i));
+        if (standalone.feed(s.data() + i, n)) ++fires_a;
+        const bsm::ListenFeedResult r =
+            bus.feed(s.data() + i, n, nullptr, nullptr, &driven);
+        if (r.wake_fired) ++fires_b;
+        max_score_diff = std::max(max_score_diff,
+            std::fabs(standalone.last_score() - driven.last_score()));
+        i += static_cast<std::size_t>(n);
+    }
+
+    CHECK(max_score_diff < 1e-5f,
+          "bus-driven wake score stream matches standalone feed()");
+    CHECK(fires_a == fires_b, "bus-driven fire count matches standalone");
+    std::fprintf(stderr, "  wake: max score diff=%.2e, fires=%d/%d\n",
+                 max_score_diff, fires_a, fires_b);
+}
+
+// ─── 4. attach validation + seam error paths ───────────────────────────────
 void test_validation() {
     bsm::ListenBus bus;
 
@@ -238,6 +284,24 @@ void test_validation() {
     }
     CHECK(threw, "feed_mel without a model throws");
 
+    bsm::WakeWord unloaded_wake;
+    threw = false;
+    try {
+        bus.check_compatible(unloaded_wake);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw, "unloaded wake detector is rejected at attach");
+
+    threw = false;
+    try {
+        float col[40] = {};
+        unloaded_wake.feed_mel(col, 1);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw, "wake feed_mel without a model throws");
+
     // Feeding with no consumers still advances the front-end.
     std::vector<float> quiet(kRate, 0.0f);
     const bsm::ListenFeedResult r =
@@ -252,6 +316,7 @@ int main() {
     try {
         test_hub_equivalence();
         test_spotter_equivalence();
+        test_wake_equivalence();
         test_validation();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());

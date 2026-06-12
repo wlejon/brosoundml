@@ -1,6 +1,7 @@
 #pragma once
 
 #include "brosoundml/audio.h"
+#include "brosoundml/mel.h"
 
 #include <brotensor/tensor.h>
 
@@ -112,6 +113,21 @@ public:
     // crosses its threshold — then suppresses re-fires for `refractory_ms`.
     // Throws std::runtime_error if no model is loaded.
     bool feed(const float* samples, int n);
+
+    // Shared-front-end seam (what ListenBus drives): push PRECOMPUTED PCEN
+    // mel frames — host FP32, (n_mels, n_frames) row-major, MelFrontend's
+    // emit layout — through the streaming model + detector policy, bypassing
+    // the detector's own front-end. The frames must come from a front-end
+    // configured exactly like mel_config() (the bus validates this at
+    // attach). Don't mix feed() and feed_mel() on one stream — the internal
+    // front-end's sample state is not advanced by this path. Same fire
+    // semantics as feed(): true at most once per call, then refractory.
+    // Requires load().
+    bool feed_mel(const float* mel, int n_frames);
+
+    // The loaded model's front-end configuration, for shared-front-end
+    // compatibility checks. Requires load().
+    const MelConfig& mel_config() const;
 
     // Detector-policy setters. Cheap, thread-safe relative to feed(): the
     // values are read (relaxed) at the top of every frame. A change takes
