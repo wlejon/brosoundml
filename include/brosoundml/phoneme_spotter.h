@@ -2,6 +2,7 @@
 
 #include <brotensor/tensor.h>
 
+#include "brosoundml/mel.h"
 #include "brosoundml/phoneme_data.h"
 
 #include <memory>
@@ -205,6 +206,18 @@ public:
     // probability distribution over the K classes. Returns events fired this call.
     std::vector<SpotEvent> feed_posteriors(const float* posteriors, int n_frames);
 
+    // Shared-front-end seam (what ListenBus drives): push PRECOMPUTED PCEN mel
+    // frames — host FP32, (n_mels, n_frames) row-major, MelFrontend's emit
+    // layout — through ONE forward_streaming + softmax + the matchers,
+    // bypassing the spotter's internal front-end. The frames must come from a
+    // front-end configured exactly like mel_config() (the bus validates this
+    // at attach). Requires load(). Returns events fired this call.
+    std::vector<SpotEvent> feed_mel(const float* mel, int n_frames);
+
+    // The loaded model's front-end configuration, for shared-front-end
+    // compatibility checks. Requires load().
+    const MelConfig& mel_config() const;
+
     // ── Cross-thread readers (lock-free) ──
     // Most recent posterior frame (copy of the (K) vector); empty before first
     // frame. Lock-free seqlock snapshot.
@@ -222,6 +235,10 @@ public:
                                                 // enrolled WITHOUT an override.
 
 private:
+    // Shared tail of feed()/feed_mel(): forward_streaming over a (n_mels, T)
+    // device tensor of new frames -> per-frame softmax -> feed_posteriors().
+    std::vector<SpotEvent> run_mel_frames(const brotensor::Tensor& frames, int T);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -128,6 +128,17 @@ public:
     // this call. Single producer.
     int feed(const float* samples, int n);
 
+    // Driven mode — the seam ListenBus calls so the whole stack shares ONE
+    // front-end. Advances every sensor one frame from externally computed
+    // inputs: `window` is the raw analysis window the frame was framed from
+    // (config().mel.win_length samples), `mel_frame` the matching compressed
+    // mel column (config().mel.n_mels values). Publishes the snapshot before
+    // returning. The hub's own front-end and sample ring are NOT touched, so
+    // don't interleave feed() and feed_frame() within one stream (the two
+    // paths' PCEN/ring state would diverge). Single producer, same thread
+    // contract as feed().
+    void feed_frame(const float* window, const float* mel_frame);
+
     // Drop all streaming state (mel ring, sample ring, PCEN smoother, sensor
     // state, counters). Configuration is kept.
     void reset();

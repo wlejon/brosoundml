@@ -56,6 +56,12 @@ int SensorHub::feed(const float* samples, int n) {
     return done;
 }
 
+void SensorHub::feed_frame(const float* window, const float* mel_frame) {
+    if (!window || !mel_frame) return;
+    process_frame(window, mel_frame);
+    publish();
+}
+
 void SensorHub::process_frame(const float* window, const float* mel_frame) {
     const int win = cfg_.mel.win_length;
     const int hop = cfg_.mel.hop_length;

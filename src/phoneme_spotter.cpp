@@ -713,7 +713,24 @@ std::vector<SpotEvent> PhonemeSpotter::feed(const float* samples, int n) {
         impl_->sample_ring.clear();
     }
     if (T_new <= 0) return {};
+    return run_mel_frames(new_frames, T_new);
+}
 
+std::vector<SpotEvent> PhonemeSpotter::feed_mel(const float* mel, int n_frames) {
+    if (!impl_->loaded) {
+        fail("PhonemeSpotter::feed_mel", "no model loaded; call load() first");
+    }
+    if (n_frames < 0 || (n_frames > 0 && mel == nullptr)) {
+        fail("PhonemeSpotter::feed_mel", "invalid mel frames");
+    }
+    if (n_frames == 0) return {};
+    const int M = impl_->mel->config().n_mels;
+    bt::Tensor frames = bt::Tensor::from_host_on(impl_->device, mel, M, n_frames);
+    return run_mel_frames(frames, n_frames);
+}
+
+std::vector<SpotEvent> PhonemeSpotter::run_mel_frames(const bt::Tensor& new_frames,
+                                                      int T_new) {
     // forward_streaming over the whole new mel block -> (T_new, K) logits.
     bt::Tensor logits;
     impl_->model->forward_streaming(new_frames, logits);
@@ -738,6 +755,13 @@ std::vector<SpotEvent> PhonemeSpotter::feed(const float* samples, int n) {
     }
 
     return feed_posteriors(post.data(), T_new);
+}
+
+const MelConfig& PhonemeSpotter::mel_config() const {
+    if (!impl_->mel) {
+        fail("PhonemeSpotter::mel_config", "no model loaded; call load() first");
+    }
+    return impl_->mel->config();
 }
 
 // ─── Telemetry readers ───────────────────────────────────────────────────────
