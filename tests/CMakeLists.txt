@@ -38,6 +38,7 @@ brosoundml_add_test(brosoundml_test_phoneme_spotter_e2e test_phoneme_spotter_e2e
 target_compile_definitions(brosoundml_test_phoneme_spotter_e2e PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 brosoundml_add_test(brosoundml_test_mel      test_mel.cpp)
+brosoundml_add_test(brosoundml_test_sensor_hub test_sensor_hub.cpp)
 brosoundml_add_test(brosoundml_test_whisper  test_whisper.cpp)
 brosoundml_add_test(brosoundml_test_whisper_modules test_whisper_modules.cpp)
 brosoundml_add_test(brosoundml_test_whisper_decoder test_whisper_decoder.cpp)
