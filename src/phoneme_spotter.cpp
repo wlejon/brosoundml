@@ -48,7 +48,12 @@ constexpr float  kLogEps = 1e-8f;
 // All state here is owned by the single producer thread (feed*). No atomics.
 struct TemplateMatcher {
     std::string          name;
-    std::vector<int>     classes;   // c[0..L-1], distinct adjacent phoneme classes
+    std::vector<int>     classes;   // c[0..L-1], distinct adjacent phoneme classes;
+                                    // class 0 = a TIMED GAP state (rhythm templates)
+    // Per-state gap duration window in frames, parallel to `classes`. (0,0) for
+    // sound states. For a gap state, the legal dwell is [gap_lo, gap_hi]:
+    // holding it past gap_hi kills the path, leaving before gap_lo is illegal.
+    std::vector<int>     gap_lo, gap_hi;
     // Per-state alternate classes (soft states): alts[j] holds up to kMaxAlts
     // runner-up class ids from the state's defining enrollment frame, -1 padded.
     // Empty vector = hard template (enroll_from_classes / enroll()), emission
@@ -70,6 +75,17 @@ struct TemplateMatcher {
     // even though the floor keeps its geometric-mean confidence finite.
     std::vector<int>          Cov;
     std::vector<std::uint8_t> Cur;
+    // R[j] = frames spent in state j on the best path reaching it (current
+    // run length) — what the gap duration window is enforced against.
+    std::vector<int>          R;
+    // F[j] = consecutive FLOORED frames the best path has been riding in
+    // state j (rhythm templates only — see kMaxFloorRun).
+    std::vector<int>          F;
+
+    // Rhythm templates: longest run of floored frames a state may ride. Long
+    // enough to absorb intra-sound unit churn and a brief blip inside a gap
+    // (30 ms at the 10 ms hop), far too short to stretch the rhythm's timing.
+    static constexpr int kMaxFloorRun = 3;
 
     // M-of-N smoothing ring of per-frame "confidence > threshold" flags.
     std::vector<std::uint8_t> hits_ring;
@@ -78,6 +94,7 @@ struct TemplateMatcher {
 
     int                  refractory_frames = 0;   // counts down once per frame
     int                  furthest = 0;            // largest j with finite S[j]
+    bool                 has_gap = false;         // any timed gap state present
 
     // Progress telemetry (see TemplateProgress). History, not matcher state:
     // reset_dp() leaves these alone so pollers' counter diffs stay monotonic.
@@ -100,10 +117,21 @@ struct TemplateMatcher {
         N.assign(static_cast<std::size_t>(L) + 1, 0);
         Cov.assign(static_cast<std::size_t>(L) + 1, 0);
         Cur.assign(static_cast<std::size_t>(L) + 1, 0u);
+        R.assign(static_cast<std::size_t>(L) + 1, 0);
+        F.assign(static_cast<std::size_t>(L) + 1, 0);
+        // Templates enrolled without gap data are all-sound: size the bound
+        // vectors so step() can index them unconditionally.
+        if (static_cast<int>(gap_lo.size()) != L) gap_lo.assign(static_cast<std::size_t>(L), 0);
+        if (static_cast<int>(gap_hi.size()) != L) gap_hi.assign(static_cast<std::size_t>(L), 0);
+        has_gap = false;
+        for (int c : classes) has_gap |= (c == 0);
         refractory_frames = 0;
         furthest = 0;
         size_ring();
     }
+
+    // State j (1..L) is a timed gap state. Gap states always carry bounds.
+    bool is_gap(int j) const { return classes[static_cast<std::size_t>(j - 1)] == 0; }
 
     // Advance one frame. `lp` is the length-K per-class log-posterior buffer,
     // `p` the same frame's LINEAR posteriors (for soft-state mass sums), `pmax`
@@ -139,24 +167,14 @@ struct TemplateMatcher {
         N[0]   = 0;
         Cov[0] = 0;
         Cur[0] = 0u;
+        R[0]   = 0;
+        F[0]   = 0;
 
         // Transitions: iterate j = L .. 1 so each candidate reads the PREVIOUS
-        // frame's S[j-1]/N[j-1] (lower indices not yet touched this frame), and
-        // the current-frame launch pad at j == 1.
+        // frame's S[j-1]/N[j-1]/R[j-1] (lower indices not yet touched this
+        // frame), and the current-frame launch pad at j == 1.
         for (int j = L; j >= 1; --j) {
-            const double s_stay = S[j];        // previous frame's S[j]
-            const double s_adv  = S[j - 1];    // previous frame (or launch pad)
-            const double best   = s_stay > s_adv ? s_stay : s_adv;
-            if (best == kNegInf) {
-                S[j]   = kNegInf;
-                N[j]   = 0;
-                Cov[j] = 0;
-                Cur[j] = 0u;
-                continue;
-            }
-            const bool   advance = (s_adv > s_stay);
-            const int    prevN    = advance ? N[j - 1] : N[j];
-            const int    cls      = classes[static_cast<std::size_t>(j - 1)];
+            const int cls = classes[static_cast<std::size_t>(j - 1)];
             // Soft states: the emission is the frame's summed mass over the
             // state's class set (primary + alternates), absorbing identity
             // flips between confusable units. Hard templates (no alts) read
@@ -175,11 +193,61 @@ struct TemplateMatcher {
             // applies only to the DP score; otherwise a losing-but-nonzero
             // class (ratio above the floor) would count as covered and let a
             // template complete on frames where its phonemes never occurred.
-            const bool   above    = raw_lp > log_floor;
+            const bool above = raw_lp > log_floor;
+
+            double s_stay = S[j];              // previous frame's S[j]
+            // A timed GAP state may not be held past its window: rather than
+            // merely scoring badly, an overlong gap is an ILLEGAL path.
+            if (s_stay != kNegInf && is_gap(j) &&
+                gap_hi[static_cast<std::size_t>(j - 1)] > 0 &&
+                R[j] + 1 > gap_hi[static_cast<std::size_t>(j - 1)]) {
+                s_stay = kNegInf;
+            }
+            double s_adv = S[j - 1];           // previous frame (or launch pad)
+            // Leaving a timed GAP state requires its minimum dwell — a
+            // too-short gap can never hand off to the next sound.
+            if (s_adv != kNegInf && j >= 2 && is_gap(j - 1) &&
+                R[j - 1] < gap_lo[static_cast<std::size_t>(j - 2)]) {
+                s_adv = kNegInf;
+            }
+            // Rhythm templates: transitions happen ON evidence, idling is
+            // bounded. The emission floor exists so an unreliable transient
+            // phoneme can't veto a speech template, but in a TIMED template
+            // unlimited floor-riding breaks the timing two ways (measured in
+            // the unit tests): a floor-anchored fresh entry exploits the raw
+            // log-score length bias to displace the genuine path mid-gap,
+            // and a sound state idling on the floor after the gap stretches
+            // the window until a late sound "completes" the rhythm. So for
+            // has_gap templates only: (1) ADVANCING into any state requires
+            // this frame's raw evidence above the floor — a sound state is
+            // entered when its sound is actually heard, a gap when silence
+            // actually starts; (2) STAYING on floored frames is legal only
+            // for kMaxFloorRun in a row — enough to absorb intra-sound unit
+            // churn or a one-frame blip inside a gap, far too short to bend
+            // the rhythm. Sound-only templates keep the legacy behavior
+            // (their tuned recall/FAR numbers are untouched).
+            if (has_gap && !above) {
+                s_adv = kNegInf;
+                if (s_stay != kNegInf && F[j] >= kMaxFloorRun) s_stay = kNegInf;
+            }
+            const double best = s_stay > s_adv ? s_stay : s_adv;
+            if (best == kNegInf) {
+                S[j]   = kNegInf;
+                N[j]   = 0;
+                Cov[j] = 0;
+                Cur[j] = 0u;
+                R[j]   = 0;
+                F[j]   = 0;
+                continue;
+            }
+            const bool   advance = (s_adv > s_stay);
+            const int    prevN    = advance ? N[j - 1] : N[j];
             const double norm_emit = raw_lp - log_comp;
             const double emit     = (norm_emit < log_floor) ? log_floor : norm_emit;
             S[j] = best + emit;
             N[j] = prevN + 1;
+            R[j] = advance ? 1 : R[j] + 1;
+            F[j] = (advance || above) ? 0 : F[j] + 1;
             if (advance) {
                 // Entered phoneme j fresh: bank phoneme j-1's coverage, start j.
                 Cov[j] = Cov[j - 1] + (Cur[j - 1] ? 1 : 0);
@@ -247,6 +315,8 @@ struct TemplateMatcher {
                 N.assign(static_cast<std::size_t>(L) + 1, 0);
                 Cov.assign(static_cast<std::size_t>(L) + 1, 0);
                 Cur.assign(static_cast<std::size_t>(L) + 1, 0u);
+                R.assign(static_cast<std::size_t>(L) + 1, 0);
+                F.assign(static_cast<std::size_t>(L) + 1, 0);
                 furthest = 0;
                 size_ring();            // drop stale positive flags
                 refractory_frames = 0;  // set below from ms→frames by the owner
@@ -524,16 +594,48 @@ int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
     // Collapse runs of equal primary class, dropping silence runs; each kept
     // run's DEFINING frame (its max-posterior frame) contributes the state's
     // alternate classes: runner-ups holding >= enroll_alt_mass, excluding
-    // silence.
+    // silence. With enroll_gaps, internal silence runs >= gap_min_frames
+    // become TIMED gap states instead of dropping (rhythm templates — see
+    // SpotterConfig::enroll_gaps); note the conf gate folds inter-sound unit
+    // churn into the measured gap, which is exactly where it belongs.
     std::vector<int> classes;
+    std::vector<int> tmpl_gap_lo, tmpl_gap_hi;   // parallel to classes
     std::vector<std::array<int, TemplateMatcher::kMaxAlts>> alts;
-    int run_cls = -1, def_frame = -1;
+    const bool  gaps_on = pol.enroll_gaps;
+    const float gtol    = std::max(0.0f, pol.gap_tolerance);
+    int run_cls = -1, run_len = 0, def_frame = -1;
     float def_conf = 0.0f;
+    int pending_gap = 0;   // internal-silence frames awaiting the next sound run
     auto flush_run = [&] {
-        if (run_cls <= 0) return;                  // silence / no run
+        if (run_cls < 0) return;                   // no run yet
+        if (run_cls == 0) {
+            // Silence run. With gaps on, bank INTERNAL silence for the next
+            // sound run (leading silence has no preceding sound; trailing
+            // silence never sees a following sound, so it dies unbanked).
+            if (gaps_on && !classes.empty()) pending_gap += run_len;
+            return;
+        }
+        // Enough banked silence before this sound run -> a timed gap state.
+        const bool real_gap =
+            gaps_on && pending_gap >= std::max(1, pol.gap_min_frames);
+        if (real_gap) {
+            const int lo = std::max(1, static_cast<int>(std::floor(
+                static_cast<double>(pending_gap) * (1.0 - gtol))));
+            const int hi = std::max(lo, static_cast<int>(std::ceil(
+                static_cast<double>(pending_gap) * (1.0 + gtol))));
+            classes.push_back(0);
+            tmpl_gap_lo.push_back(lo);
+            tmpl_gap_hi.push_back(hi);
+            std::array<int, TemplateMatcher::kMaxAlts> ga;
+            ga.fill(-1);
+            alts.push_back(ga);
+        }
+        pending_gap = 0;
         // Match collapse_classes(): silence is dropped BEFORE duplicate
-        // collapse, so a class repeated across a silence gap is one state.
-        if (!classes.empty() && classes.back() == run_cls) return;
+        // collapse, so a class repeated across a (sub-threshold) silence gap
+        // is one state. A materialized gap breaks the adjacency, so the
+        // repeat is a real second state.
+        if (!real_gap && !classes.empty() && classes.back() == run_cls) return;
         std::array<int, TemplateMatcher::kMaxAlts> a;
         a.fill(-1);
         if (n_alts > 0 && def_frame >= 0) {
@@ -555,6 +657,8 @@ int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
             }
         }
         classes.push_back(run_cls);
+        tmpl_gap_lo.push_back(0);
+        tmpl_gap_hi.push_back(0);
         alts.push_back(a);
     };
     for (int t = 0; t < n_frames; ++t) {
@@ -565,9 +669,10 @@ int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
         if (pol.enroll_conf_gate > 0.0f && pa < pol.enroll_conf_gate) arg = 0;
         if (arg != run_cls) {
             flush_run();
-            run_cls = arg; def_frame = t; def_conf = pa;
-        } else if (pa > def_conf) {
-            def_frame = t; def_conf = pa;
+            run_cls = arg; run_len = 1; def_frame = t; def_conf = pa;
+        } else {
+            ++run_len;
+            if (pa > def_conf) { def_frame = t; def_conf = pa; }
         }
     }
     flush_run();
@@ -576,6 +681,8 @@ int PhonemeSpotter::enroll_from_posteriors(const std::string& name,
     TemplateMatcher m;
     m.name         = name;
     m.classes      = classes;
+    m.gap_lo       = std::move(tmpl_gap_lo);
+    m.gap_hi       = std::move(tmpl_gap_hi);
     if (n_alts > 0) m.alts = std::move(alts);
     m.policy       = pol;
     m.has_override = (policy_override != nullptr);

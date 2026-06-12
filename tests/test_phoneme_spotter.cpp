@@ -401,6 +401,93 @@ static void test_progress_snapshot() {
           "snapshot: long name truncated to the POD field");
 }
 
+// ── 7c. Gap-token rhythm templates. ──────────────────────────────────────────
+// click·gap·click: with enroll_gaps the internal silence run survives as a
+// TIMED gap state (duration window [g/2, 3g/2] at the default tolerance), so
+// the rhythm is the template. Without it, enrollment drops the silence and
+// duplicate-collapse merges the two clicks into one short state — the
+// measured failure mode for percussive gestures.
+static void test_gap_templates() {
+    auto s = make_spotter();
+
+    // Enrollment stream: A (4 frames) · 30 frames silence · A (4 frames).
+    PostStream enr;
+    enr.add_silence(6);
+    enr.add_run(1, 4, 0.85f);
+    enr.add_silence(30);
+    enr.add_run(1, 4, 0.85f);
+    enr.add_silence(6);
+
+    // Legacy: silence drops, the repeated class collapses -> a 1-state stub.
+    CHECK(s.enroll_from_posteriors("legacy", enr.data.data(), enr.frames) == 1,
+          "gaps: legacy enroll collapses click-gap-click to len 1");
+    CHECK(s.remove("legacy"), "gaps: drop the legacy stub");
+
+    // Gaps on: A · gap(30; window [15,45]) · A -> len 3.
+    bsm::SpotterConfig pol = s.config();
+    pol.enroll_gaps = true;
+    CHECK(s.enroll_from_posteriors("rhythm", enr.data.data(), enr.frames,
+                                   &pol) == 3,
+          "gaps: gap enroll keeps the timed gap -> len 3");
+
+    // Correct rhythm fires.
+    PostStream good;
+    good.add_silence(6);
+    good.add_run(1, 4, 0.85f);
+    good.add_silence(30);
+    good.add_run(1, 4, 0.85f);
+    good.add_silence(6);
+    auto ev = feed(s, good);
+    CHECK(ev.size() == 1, "gaps: matching rhythm fires once");
+    if (ev.size() == 1) {
+        CHECK(ev[0].confidence > 0.4f, "gaps: rhythm confidence above threshold");
+        std::fprintf(stderr, "    (rhythm confidence=%.3f)\n", ev[0].confidence);
+    }
+
+    // No gap at all (one long contiguous burst): the gap state only ever
+    // rides the emission floor, so it is never covered -> rejected.
+    s.reset();
+    PostStream nogap;
+    nogap.add_silence(6);
+    nogap.add_run(1, 8, 0.85f);
+    nogap.add_silence(10);
+    CHECK(feed(s, nogap).empty(), "gaps: contiguous burst (no gap) rejected");
+
+    // Gap too SHORT (8 < lo 15): the path cannot leave the gap state before
+    // the second sound has passed.
+    s.reset();
+    PostStream shortg;
+    shortg.add_silence(6);
+    shortg.add_run(1, 4, 0.85f);
+    shortg.add_silence(8);
+    shortg.add_run(1, 4, 0.85f);
+    shortg.add_silence(10);
+    CHECK(feed(s, shortg).empty(), "gaps: too-short gap rejected");
+
+    // Gap too LONG (60 > hi 45): holding the gap past its window is an
+    // illegal path, not just a low score.
+    s.reset();
+    PostStream longg;
+    longg.add_silence(6);
+    longg.add_run(1, 4, 0.85f);
+    longg.add_silence(60);
+    longg.add_run(1, 4, 0.85f);
+    longg.add_silence(10);
+    CHECK(feed(s, longg).empty(), "gaps: too-long gap rejected");
+
+    // The fused surface sees rhythm progress: mid-gap the prefix reads 2/3
+    // (first sound + the gap state currently being held).
+    s.reset();
+    PostStream half;
+    half.add_silence(6);
+    half.add_run(1, 4, 0.85f);
+    half.add_silence(20);
+    feed(s, half);
+    auto ps = s.progress_snapshot();
+    CHECK(ps.count == 1 && ps.templates[0].matched == 2,
+          "gaps: progress reads 2/3 while holding the gap");
+}
+
 // ── 8. enroll collapse + silence-drop. ───────────────────────────────────────
 static void test_enroll_collapse() {
     auto s = make_spotter();
@@ -538,6 +625,7 @@ int main() {
     test_refractory();
     test_prefix_progress();
     test_progress_snapshot();
+    test_gap_templates();
     test_enroll_collapse();
     test_template_admin();
     test_reset();

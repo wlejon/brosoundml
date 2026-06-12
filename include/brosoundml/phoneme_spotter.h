@@ -119,6 +119,37 @@ struct SpotterConfig {
                                     // ~0.8+ for the sound itself) that re-takes can
                                     // never reproduce; gating keeps only the sound's
                                     // confident core in the template. 0 disables.
+    bool  enroll_gaps = false;      // keep internal SILENCE runs as timed GAP states
+                                    // when enrolling from audio/posteriors. Off, the
+                                    // enroller drops silence entirely, so a rhythmic
+                                    // gesture collapses to its sounds alone —
+                                    // click·gap·click enrolls as just "click" (the
+                                    // duplicate-collapse merges the two clicks) and
+                                    // single-hit percussion is structurally too short
+                                    // for a sequence matcher (measured on real
+                                    // recordings: the double-click whose inter-click
+                                    // churn happened to survive as units was the
+                                    // STRONGEST of six templates; every one-shot was
+                                    // weak). On, an internal silence run >=
+                                    // gap_min_frames becomes a class-0 state with a
+                                    // duration window, so the rhythm itself — sound,
+                                    // a TIMED gap, sound — is the template: too-short
+                                    // and too-long gaps are illegal paths, not just
+                                    // low scores. Gap frames contribute the silence
+                                    // posterior to the geometric-mean confidence, and
+                                    // a gap counts toward min_phonemes/coverage (its
+                                    // evidence — silence actually held — is real;
+                                    // sound states still need their own above-floor
+                                    // evidence, so pure silence cannot complete).
+    int   gap_min_frames = 5;       // internal silence shorter than this (50 ms at
+                                    // the 10 ms hop) collapses out as before — speech
+                                    // stop closures stay invisible so enroll_gaps is
+                                    // safe to leave on for spoken phrases too.
+    float gap_tolerance = 0.5f;     // gap duration window half-width as a fraction of
+                                    // the enrolled gap length g: legal dwell is
+                                    // [g*(1-tol), g*(1+tol)] frames (min clamped to
+                                    // >= 1). 0.5 absorbs natural re-performance tempo
+                                    // variance; tighten it for stricter rhythm.
     float score_norm_ref = 0.5f;    // denominator floor for score_norm. Pure ratio
                                     // (dividing by p_argmax itself) would inflate MUSHY
                                     // frames — in babble/noise the winner may hold only
@@ -235,7 +266,10 @@ public:
     // each row summing to ~1) — the same representation feed_posteriors()
     // consumes. Applies enroll_conf_gate, drops silence, collapses runs, and
     // records up to enroll_alts runner-up classes per state (the soft-state
-    // mechanism enroll_from_audio uses internally). Requires a class map.
+    // mechanism enroll_from_audio uses internally). With enroll_gaps set,
+    // internal silence runs >= gap_min_frames survive as TIMED gap states
+    // instead (rhythm templates — see SpotterConfig::enroll_gaps). Requires a
+    // class map.
     int enroll_from_posteriors(const std::string& name, const float* posteriors,
                                int n_frames,
                                const SpotterConfig* policy_override = nullptr);
