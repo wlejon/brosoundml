@@ -688,17 +688,57 @@ void clip_posteriors(bsm::PhonemeNet& model, bsm::MelFrontend& mel,
     T_out = Tout;
 }
 
-// Per-frame argmax class sequence — enroll_from_classes applies the same
-// silence-drop + duplicate-collapse that enroll_from_audio would.
-std::vector<int> argmax_classes(const std::vector<float>& post, int T, int K) {
-    std::vector<int> seq(static_cast<std::size_t>(T));
-    for (int t = 0; t < T; ++t) {
-        const float* row = &post[static_cast<std::size_t>(t) * K];
-        int best = 0;
-        for (int j = 1; j < K; ++j) if (row[j] > row[best]) best = j;
-        seq[static_cast<std::size_t>(t)] = best;
+// Print the per-frame argmax unit sequence of each input wav, run-length
+// collapsed as class:frames. Files are processed exactly as given — no lead
+// or tail padding — so PCEN-seeding effects of the file's own head are
+// visible. Diagnostic for "what units does the model hear in this clip".
+void cmd_trace(const std::string& model_path,
+               const std::vector<std::string>& files, bt::Device dev) {
+    bsm::PhonemeNet model = bsm::PhonemeNet::load(model_path, dev);
+    const auto& mc = model.config();
+    bsm::MelConfig mcfg;
+    mcfg.sample_rate = mc.sample_rate;
+    mcfg.n_fft       = mc.n_fft;
+    mcfg.win_length  = mc.win_length;
+    mcfg.hop_length  = mc.hop_length;
+    mcfg.n_mels      = mc.n_mels;
+    mcfg.compression = bsm::MelCompression::PCEN;
+    bsm::MelFrontend mel(mcfg, dev);
+    const int K = model.class_map().num_classes;
+
+    for (const auto& f : files) {
+        const std::vector<float> pcm = load_16k(f);
+        bt::Tensor melt;
+        mel.reset();
+        mel.compute_offline(pcm.data(), static_cast<int>(pcm.size()), melt);
+        const std::vector<float> mh = melt.to_host_vector();
+        const int T = static_cast<int>(mh.size() /
+                                       static_cast<std::size_t>(mc.n_mels));
+        if (T <= 0) { std::printf("%s: no frames\n", f.c_str()); continue; }
+        bt::Tensor feats = bt::Tensor::from_host_on(dev, mh.data(), mc.n_mels, T);
+        bt::Tensor logits;
+        model.forward(feats, logits);
+        std::vector<float> lg = logits.to_host_vector();
+        std::printf("%s  T=%d\n  ", f.c_str(), logits.rows);
+        int prev = -1, run = 0;
+        double conf_sum = 0.0;   // mean softmax prob of the argmax over the run
+        auto flush_run = [&] {
+            if (run > 0) std::printf("%d:%d@%.2f ", prev, run, conf_sum / run);
+        };
+        for (int t = 0; t < logits.rows; ++t) {
+            const float* row = &lg[static_cast<std::size_t>(t) * K];
+            int best = 0;
+            for (int j = 1; j < K; ++j) if (row[j] > row[best]) best = j;
+            double sum = 0.0;
+            for (int j = 0; j < K; ++j) sum += std::exp(row[j] - row[best]);
+            const double conf = 1.0 / sum;
+            if (best != prev) { flush_run(); prev = best; run = 1; conf_sum = 0.0; }
+            else ++run;
+            conf_sum += conf;
+        }
+        flush_run();
+        std::printf("\n");
     }
-    return seq;
 }
 
 std::string family_of(const std::string& name) {
@@ -706,10 +746,17 @@ std::string family_of(const std::string& name) {
     return us == std::string::npos ? name : name.substr(0, us);
 }
 
+// Strip a multi-take alias suffix (name#K -> name).
+std::string base_of(const std::string& name) {
+    const auto h = name.rfind('#');
+    return h == std::string::npos ? name : name.substr(0, h);
+}
+
 void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
                    const std::vector<std::string>& neg_dirs, int neg_cap,
                    float neg_max_dur, float score_norm, float score_norm_ref,
-                   float coverage_frac, int min_phonemes, bt::Device dev) {
+                   float coverage_frac, int min_phonemes, float enroll_conf_gate,
+                   int enroll_alts, int enroll_takes, bt::Device dev) {
     bsm::PhonemeNet model = bsm::PhonemeNet::load(model_path, dev);
     bsm::PhonemeClassMap cm = model.class_map();
     cm.rebuild_inverse();
@@ -736,17 +783,27 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
     }
     if (groups.empty()) fail("no <name>_v<NN>.wav files under " + sounds_dir);
 
-    // Enrollment class sequences from each target's v00.
-    std::map<std::string, std::vector<int>> enroll_seq;
+    // Enrollment posterior streams from each target's v00.
+    std::map<std::string, EvalClip> enroll_post;
     std::vector<EvalClip> clips;
     std::vector<float> post;
     int T = 0;
     for (auto& [name, files] : groups) {
-        std::vector<float> pcm = load_16k(files[0]);
-        clip_posteriors(model, mel, K, n_mels, dev, pcm, post, T);
-        if (T <= 0) { std::fprintf(stderr, "  %s: no frames, skipped\n", name.c_str()); continue; }
-        enroll_seq[name] = argmax_classes(post, T, K);
-        for (std::size_t i = 1; i < files.size(); ++i) {
+        // The first `enroll_takes` files enroll as ALIASES of the target
+        // (name, name#1, ...) — the "perform it N times" UX, where a fire of
+        // ANY alias detects the target. Remaining files are positives.
+        const std::size_t n_en = std::min<std::size_t>(
+            static_cast<std::size_t>(std::max(enroll_takes, 1)),
+            files.size() > 1 ? files.size() - 1 : 1);
+        for (std::size_t k = 0; k < n_en; ++k) {
+            std::vector<float> pcm = load_16k(files[k]);
+            clip_posteriors(model, mel, K, n_mels, dev, pcm, post, T);
+            if (T <= 0) { std::fprintf(stderr, "  %s[%zu]: no frames, skipped\n", name.c_str(), k); continue; }
+            const std::string alias = k ? name + "#" + std::to_string(k) : name;
+            enroll_post[alias].post = post;
+            enroll_post[alias].T    = T;
+        }
+        for (std::size_t i = n_en; i < files.size(); ++i) {
             EvalClip c;
             c.target = name;
             clip_posteriors(model, mel, K, n_mels, dev, load_16k(files[i]),
@@ -783,7 +840,7 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
         }
     }
     std::fprintf(stderr, "spot-eval: %zu targets, %d positives, %d negatives\n",
-                 enroll_seq.size(), n_pos, n_neg);
+                 enroll_post.size(), n_pos, n_neg);
 
     // Offline matcher sweep.
     bsm::PhonemeSpotter spotter;
@@ -804,8 +861,10 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
         pol.score_norm_ref    = score_norm_ref;
         pol.min_coverage_frac = coverage_frac;
         pol.min_phonemes      = min_phonemes;
-        for (const auto& [name, seq] : enroll_seq)
-            spotter.enroll_from_classes(name, seq, &pol);
+        pol.enroll_conf_gate  = enroll_conf_gate;
+        pol.enroll_alts       = enroll_alts;
+        for (const auto& [name, ep] : enroll_post)
+            spotter.enroll_from_posteriors(name, ep.post.data(), ep.T, &pol);
 
         int tp = 0, fp_neg = 0, cross_same = 0, cross_other = 0;
         std::map<std::string, std::pair<int, int>> fam_tp;  // family -> (tp, p)
@@ -815,11 +874,12 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
             bool own = false, same = false, other = false, any = false;
             for (const auto& e : evs) {
                 any = true;
-                if (e.name == c.target) own = true;
-                else if (family_of(e.name) == family_of(c.target)) same = true;
+                const std::string base = base_of(e.name);
+                if (base == c.target) own = true;
+                else if (family_of(base) == family_of(c.target)) same = true;
                 else other = true;
                 if (c.target.empty() && std::fabs(thr - 0.50f) < 1e-6f)
-                    ++target_fp[e.name];
+                    ++target_fp[base];
             }
             if (c.target.empty()) { if (any) ++fp_neg; continue; }
             if (own)   ++tp;
@@ -852,10 +912,13 @@ void cmd_spot_eval(const std::string& model_path, const std::string& sounds_dir,
                 grid[0]);
     {
         bsm::SpotterConfig pol = spotter.config();
-        pol.min_phonemes = 1;
-        for (const auto& [name, seq] : enroll_seq) {
+        pol.min_phonemes     = 1;
+        pol.enroll_conf_gate = enroll_conf_gate;
+        pol.enroll_alts      = enroll_alts;
+        for (const auto& [name, ep] : enroll_post) {
             spotter.remove(name);
-            const int len = spotter.enroll_from_classes(name, seq, &pol);
+            const int len = spotter.enroll_from_posteriors(name, ep.post.data(),
+                                                           ep.T, &pol);
             const auto& t = target_tp[name];
             std::printf("#   %-14s len %-3d  det %d/%d  negfp %d\n",
                         name.c_str(), len, t.first, t.second, target_fp[name]);
@@ -872,10 +935,12 @@ void print_help() {
         "  label  --inputs DIR[,...] --centroids FILE --out shard.bpds\n"
         "         [--max-clips N=0] [--min-dur 0.3] [--max-dur 20] [--smooth 1]\n"
         "         [--chunk-dur S=0  slice over-long files instead of dropping]\n"
+        "  trace  --model units.bpm --inputs FILE.wav[,...]   per-frame argmax units\n"
         "  spot-eval --model units.bpm --inputs VARIANTS_DIR --neg DIR[,...]\n"
         "         [--neg-clips N=1500] [--neg-max-dur 10]\n"
         "         [--score-norm 1.0] [--score-norm-ref 0.5]\n"
         "         [--coverage-frac 0.75] [--min-phonemes 1]\n"
+        "         [--enroll-conf-gate 0] [--enroll-alts 0] [--enroll-takes 1]\n"
         "  kmeans/label/spot-eval take --device cuda|cpu (default: cuda if available)\n");
 }
 
@@ -891,6 +956,9 @@ int main(int argc, char** argv) try {
     float min_dur = 0.3f, max_dur = 20.0f, chunk_dur = 0.0f;
     float neg_max_dur = 10.0f;
     float score_norm = 1.0f, score_norm_ref = 0.5f, coverage_frac = 0.75f;
+    float enroll_conf_gate = 0.0f;
+    int enroll_alts = 0;
+    int enroll_takes = 1;
     unsigned seed = 1234;
     auto need = [&](int& i) -> std::string {
         if (i + 1 >= argc) fail("missing value for " + std::string(argv[i]));
@@ -921,10 +989,14 @@ int main(int argc, char** argv) try {
         else if (k == "--score-norm-ref") score_norm_ref = std::stof(need(i));
         else if (k == "--coverage-frac") coverage_frac = std::stof(need(i));
         else if (k == "--min-phonemes") min_phonemes = std::stoi(need(i));
+        else if (k == "--enroll-conf-gate") enroll_conf_gate = std::stof(need(i));
+        else if (k == "--enroll-alts") enroll_alts = std::stoi(need(i));
+        else if (k == "--enroll-takes") enroll_takes = std::stoi(need(i));
         else if (k == "--seed") seed = static_cast<unsigned>(std::stoul(need(i)));
         else fail("unknown arg: " + k);
     }
-    if (out.empty() && cmd != "spot-eval") fail("--out is required");
+    if (out.empty() && cmd != "spot-eval" && cmd != "trace")
+        fail("--out is required");
 
     bt::init();
     bt::Device dev = bt::Device::CPU;
@@ -952,7 +1024,12 @@ int main(int argc, char** argv) try {
         if (neg.empty())    fail("spot-eval: --neg is required");
         cmd_spot_eval(model, inputs, split_csv(neg), neg_clips, neg_max_dur,
                       score_norm, score_norm_ref, coverage_frac, min_phonemes,
-                      dev);
+                      enroll_conf_gate, enroll_alts, enroll_takes, dev);
+    }
+    else if (cmd == "trace") {
+        if (model.empty())  fail("trace: --model is required");
+        if (inputs.empty()) fail("trace: --inputs is required");
+        cmd_trace(model, split_csv(inputs), dev);
     }
     else fail("unknown subcommand: " + cmd);
     return 0;
