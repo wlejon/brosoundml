@@ -47,6 +47,15 @@ void apply_gain_db(std::vector<float>& x, float gain_db);
 // Scale so peak(x) == target. No-op on a silent buffer.
 void peak_normalize(std::vector<float>& x, float target = 0.99f);
 
+// Scale so the peak sits at a dBFS value drawn uniformly from [lo_db, hi_db].
+// The AGC-free presentation-level draw: a raw (no-AGC) mic tap delivers
+// whatever level the room does, so every training clip gets a random level
+// instead of the fixed peak an AGC would enforce. PCEN cancels static gain
+// while frame energy clears pcen_eps; the wide draw also covers the quiet
+// regime where that normalization fades. No-op on a silent buffer.
+void random_level(std::vector<float>& x, std::mt19937& rng,
+                  float lo_db = -45.0f, float hi_db = -3.0f);
+
 // ─── SNR mixer ─────────────────────────────────────────────────────────────
 //
 // Returns signal + scaled noise, where `noise` is rescaled so that

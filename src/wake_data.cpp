@@ -138,6 +138,12 @@ void peak_normalize(std::vector<float>& x, float target) {
     for (auto& v : x) v *= g;
 }
 
+void random_level(std::vector<float>& x, std::mt19937& rng,
+                  float lo_db, float hi_db) {
+    std::uniform_real_distribution<float> level_db(lo_db, hi_db);
+    peak_normalize(x, std::pow(10.0f, level_db(rng) / 20.0f));
+}
+
 // ─── SNR mixer ─────────────────────────────────────────────────────────────
 
 std::vector<float> mix_at_snr(const std::vector<float>& signal,

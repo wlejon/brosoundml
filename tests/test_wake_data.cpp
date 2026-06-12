@@ -349,6 +349,41 @@ int main() {
         CHECK(zero.size() == x.size(), "pitch_jitter 0: no-op length");
     }
 
+    // ─── random_level: peak inside the dB window, deterministic ─────────
+    {
+        const int N = 4096;
+        std::vector<float> base(static_cast<std::size_t>(N));
+        for (int n = 0; n < N; ++n)
+            base[static_cast<std::size_t>(n)] =
+                0.7f * std::sin(2.f * 3.14159265f * 440.f * n / 16000.f);
+        // Many draws: every peak lands in [-45, -3] dBFS, and the draws span
+        // a good chunk of the window (not all clustered at one level).
+        std::mt19937 rng(31337);
+        float min_db = 0.0f, max_db = -1000.0f;
+        for (int i = 0; i < 64; ++i) {
+            auto x = base;
+            brosoundml::random_level(x, rng);
+            const float p_db = 20.0f * std::log10(brosoundml::peak(x));
+            CHECK(p_db >= -45.0f - 0.01f && p_db <= -3.0f + 0.01f,
+                  "random_level: peak within the default dB window");
+            min_db = std::min(min_db, p_db);
+            max_db = std::max(max_db, p_db);
+        }
+        CHECK(max_db - min_db > 20.0f,
+              "random_level: draws spread across the window");
+        // Deterministic for the same seed.
+        std::mt19937 r1(9), r2(9);
+        auto a = base, b = base;
+        brosoundml::random_level(a, r1);
+        brosoundml::random_level(b, r2);
+        CHECK(a == b, "random_level: deterministic for same rng seed");
+        // Silent buffer is a no-op (no NaNs from a zero peak).
+        std::vector<float> z(256, 0.0f);
+        brosoundml::random_level(z, r1);
+        CHECK(z == std::vector<float>(256, 0.0f),
+              "random_level: silent buffer untouched");
+    }
+
     // ─── apply_acquisition_channel: grid-locked, finite, deterministic ──
     {
         const int N = 16000;

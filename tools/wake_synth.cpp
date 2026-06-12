@@ -4,6 +4,11 @@
 // sentence negatives, layers in synthetic noise + RIR + SNR mixing, resamples
 // every clip to 16 kHz mono 16-bit PCM, and writes a CSV manifest alongside
 // the WAV files. The dataset is byte-deterministic for a fixed --seed.
+//
+// AGC-free recipe: every clip is written at a random presentation level
+// (peak drawn uniformly in dB, see brosoundml::random_level) instead of a
+// fixed peak. The runtime tap is raw — the model must be level-invariant,
+// which lets WakeWord share the listen bus's no-AGC stream.
 
 #include "brosoundml/audio.h"
 #include "brosoundml/kokoro.h"
@@ -346,6 +351,11 @@ int main(int argc, char** argv) {
         // `rng` is the per-variant sub_rng(); the channel draws from it before
         // the noise generator. On return out_nk/out_snr hold the manifest values
         // ("" / 0 for channel-only) and out_tag the filename discriminator.
+        //
+        // The presentation level is drawn LAST (after the channel's
+        // level-sensitive DRC and the SNR mix): the runtime tap is raw — no
+        // AGC — so the level a clip arrives at is a free variable the model
+        // must not depend on, not a contract the dataset gets to assume.
         auto make_acq_variant = [&](const std::vector<float>& clean, int nv,
                                     std::mt19937& rng, std::string& out_nk,
                                     float& out_snr, std::string& out_tag)
@@ -354,7 +364,7 @@ int main(int argc, char** argv) {
                 clean, 16000, target_samples, rng);
             const bool chan_only = (nv == 0 && noise_variants_per_clean >= 2);
             if (chan_only) {
-                brosoundml::peak_normalize(y, 0.99f);
+                brosoundml::random_level(y, rng);
                 out_nk = "";
                 out_snr = 0.0f;
                 out_tag = "chan";
@@ -367,7 +377,7 @@ int main(int argc, char** argv) {
                 nv % static_cast<int>(snrs.size()))];
             auto noise = brosoundml::gen_noise(nk, target_samples, 1.0f, rng);
             auto mixed = brosoundml::mix_at_snr(y, noise, snr);
-            brosoundml::peak_normalize(mixed, 0.99f);
+            brosoundml::random_level(mixed, rng);
             out_nk = brosoundml::noise_kind_name(nk);
             out_snr = snr;
             char tg[32];
@@ -393,7 +403,15 @@ int main(int argc, char** argv) {
                 std::snprintf(buf, sizeof(buf), "pos_%s_sp%03d_clean",
                               voice_names[vi].c_str(),
                               static_cast<int>(speed * 100 + 0.5f));
-                write_clip(clean, "positives", buf, 1, "positive",
+                // Write the anchor at a random presentation level; keep
+                // `clean` at its native level for the channel variants (the
+                // channel's DRC stage is level-sensitive).
+                auto leveled = clean;
+                {
+                    auto lrng = sub_rng();
+                    brosoundml::random_level(leveled, lrng);
+                }
+                write_clip(leveled, "positives", buf, 1, "positive",
                            voice_names[vi], speed, 0.0f, "", clean_seed);
                 ++positives;
 
@@ -433,7 +451,12 @@ int main(int argc, char** argv) {
                                   word.c_str(),
                                   voice_names[vi].c_str(),
                                   static_cast<int>(speed * 100 + 0.5f));
-                    write_clip(clean, "negatives", buf, 0, "confusable",
+                    auto leveled = clean;
+                    {
+                        auto lrng = sub_rng();
+                        brosoundml::random_level(leveled, lrng);
+                    }
+                    write_clip(leveled, "negatives", buf, 0, "confusable",
                                voice_names[vi], speed, 0.0f, "", clean_seed);
                     ++conf_neg;
                     for (int nv = 0; nv < noise_variants_per_clean; ++nv) {
@@ -480,7 +503,12 @@ int main(int argc, char** argv) {
                                   si,
                                   voice_names[vi].c_str(),
                                   static_cast<int>(speed * 100 + 0.5f));
-                    write_clip(clean, "negatives", buf, 0, "sentence",
+                    auto leveled = clean;
+                    {
+                        auto lrng = sub_rng();
+                        brosoundml::random_level(leveled, lrng);
+                    }
+                    write_clip(leveled, "negatives", buf, 0, "sentence",
                                voice_names[vi], speed, 0.0f, "", clean_seed);
                     ++sent_neg;
 
@@ -509,22 +537,20 @@ int main(int argc, char** argv) {
 
         // ─── Pure noise negatives ──────────────────────────────────────
         std::fprintf(stderr, "synthesizing pure-noise negatives...\n");
+        // Level diversity comes from the same random presentation draw as
+        // every other clip. (The old gain sweep here was a no-op: the final
+        // peak_normalize(0.99) undid apply_gain_db on every clip.)
         const int noise_count = small_mode ? 10 : 60;
-        const std::vector<float> gains_db = {-30.0f, -24.0f, -18.0f, -12.0f, -6.0f};
         for (int i = 0; i < noise_count; ++i) {
             auto rng = sub_rng();
             const brosoundml::NoiseKind nk =
                 all_noises[static_cast<std::size_t>(
                     i % static_cast<int>(all_noises.size()))];
-            const float gain = gains_db[static_cast<std::size_t>(
-                i % static_cast<int>(gains_db.size()))];
             auto buf = brosoundml::gen_noise(nk, target_samples, 1.0f, rng);
-            brosoundml::apply_gain_db(buf, gain);
-            brosoundml::peak_normalize(buf, 0.99f);
+            brosoundml::random_level(buf, rng);
             char nm[64];
-            std::snprintf(nm, sizeof(nm), "neg_noise_%s_%03d_g%d",
-                          brosoundml::noise_kind_name(nk), i,
-                          static_cast<int>(gain));
+            std::snprintf(nm, sizeof(nm), "neg_noise_%s_%03d",
+                          brosoundml::noise_kind_name(nk), i);
             const std::uint64_t row_seed = (master_rng)();
             write_clip(buf, "negatives", nm, 0, "noise", "", 1.0f, 0.0f,
                        brosoundml::noise_kind_name(nk), row_seed);
@@ -617,7 +643,7 @@ int main(int argc, char** argv) {
                         auto nz = brosoundml::gen_noise(nk, target_samples,
                                                        1.0f, rng);
                         auto mixed = brosoundml::mix_at_snr(tone, nz, 10.0f);
-                        brosoundml::peak_normalize(mixed, 0.99f);
+                        brosoundml::random_level(mixed, rng);
                         char nm2[96];
                         std::snprintf(nm2, sizeof(nm2),
                                       "neg_tone_%05dhz_amp%03d_%s_snr10",
