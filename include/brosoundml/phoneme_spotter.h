@@ -216,6 +216,31 @@ struct ProgressSnapshot {
     TemplateProgress templates[kMaxTemplates];
 };
 
+// ─── Template inspection ─────────────────────────────────────────────────────
+//
+// What an enrolled template actually IS: the decoded sequence of phoneme-class
+// states it will align against. This is the human-legible view of a template —
+// surfacing it lets a tool show "you enrolled 'what is the first' as
+// [W AH T · IH Z · DH AH · F ER S T]" so the user can SEE why a suffix matches,
+// edit the sequence, and re-enroll the trimmed class ids (enroll_from_classes).
+// For rhythm templates (enroll_gaps) it also reveals the timed gap states and
+// their duration windows, the structure that makes the rhythm the template.
+
+struct TemplateState {
+    int  cls    = 0;        // phoneme class id in [0,K); 0 == a timed GAP state
+    bool gap    = false;    // true for a timed silence/gap state (cls == 0)
+    int  gap_lo = 0;        // legal gap dwell window in frames (gap states only;
+    int  gap_hi = 0;        // 0,0 for sound states)
+};
+
+struct TemplateView {
+    std::string                name;
+    std::vector<TemplateState> states;        // the template, in order
+    bool                       has_gaps = false;  // any timed gap state present
+    float                      threshold = 0.0f;  // this template's fire threshold
+    float                      frame_ms  = 10.0f; // ms per frame (gap window unit)
+};
+
 class PhonemeSpotter {
 public:
     PhonemeSpotter();
@@ -277,6 +302,14 @@ public:
     bool remove(const std::string& name);
     void clear();                 // drop all templates
     std::vector<std::string> templates() const;
+
+    // Decode an enrolled template into its human-legible state sequence (see
+    // TemplateView): the phoneme classes (and timed gap states, for rhythm
+    // templates) it aligns against, plus its fire threshold. Returns false if
+    // no template by that name exists. A const read of immutable per-template
+    // structure (classes/gap windows are fixed at enroll, only the DP state
+    // mutates), so it is safe to call while listening.
+    bool inspect(const std::string& name, TemplateView& out) const;
 
     // ── Streaming ──
     // REAL use: push mono FP32 PCM @ model sample_rate. Internally: MelFrontend

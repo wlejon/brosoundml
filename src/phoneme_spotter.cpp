@@ -816,6 +816,33 @@ std::vector<std::string> PhonemeSpotter::templates() const {
     return out;
 }
 
+bool PhonemeSpotter::inspect(const std::string& name, TemplateView& out) const {
+    for (const auto& m : impl_->matchers) {
+        if (m.name != name) continue;
+        out.name      = m.name;
+        out.threshold = m.policy.threshold;
+        const int hop = impl_->hop_length > 0 ? impl_->hop_length : 160;
+        const int sr  = impl_->sample_rate > 0 ? impl_->sample_rate : 16000;
+        out.frame_ms  = 1000.0f * static_cast<float>(hop) / static_cast<float>(sr);
+        out.has_gaps  = false;
+        out.states.clear();
+        out.states.reserve(m.classes.size());
+        for (std::size_t j = 0; j < m.classes.size(); ++j) {
+            TemplateState st;
+            st.cls = m.classes[j];
+            st.gap = (st.cls == 0);
+            if (st.gap) {
+                out.has_gaps = true;
+                if (j < m.gap_lo.size()) st.gap_lo = m.gap_lo[j];
+                if (j < m.gap_hi.size()) st.gap_hi = m.gap_hi[j];
+            }
+            out.states.push_back(st);
+        }
+        return true;
+    }
+    return false;
+}
+
 // ─── Streaming core ──────────────────────────────────────────────────────────
 
 std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
