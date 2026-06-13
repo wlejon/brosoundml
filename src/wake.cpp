@@ -77,10 +77,13 @@ struct WakeWord::Impl {
     bool               loaded = false;
     std::atomic<float> last_score{0.0f};
 
-    // Streaming state.
-    std::unique_ptr<MelFrontend> mel;       // built on load()
-    std::unique_ptr<BcResnet2d>  model;     // loaded on load()
-    bt::Device                   device = bt::Device::CPU;
+    // Streaming state. The net is SHARED and read-only — weights live once
+    // behind the shared_ptr and may back N detectors; this detector owns only
+    // `stream`, its private streaming session over that net.
+    std::unique_ptr<MelFrontend>      mel;     // built on load()
+    std::shared_ptr<const BcResnet2d> model;   // shared, loaded on load()
+    BcResnet2dStreamState             stream;  // this detector's own session
+    bt::Device                        device = bt::Device::CPU;
     MelConfig                    mcfg;      // the front-end framing, kept for
                                             // shared-front-end compatibility
                                             // checks (mel_config())
@@ -137,6 +140,58 @@ struct WakeWord::Impl {
                          float threshold, int smoothing_hits,
                          int smoothing_window, int refractory_ms,
                          bool allow_fire);
+
+    // Install a shared, loaded net: adopt its framing, build the matching PCEN
+    // front-end, allocate this detector's private streaming session, and reset
+    // the per-frame bookkeeping. Shared by load() and the shared-net ctor.
+    void install_net(std::shared_ptr<const BcResnet2d> net) {
+        const int model_n_mels = net->config().n_mels;
+        if (model_n_mels <= 0)
+            fail("WakeWord::install",
+                 "model header reports non-positive n_mels=" +
+                 std::to_string(model_n_mels));
+        // Trust the model header; overwrite ours if it disagrees.
+        if (config.n_mels != model_n_mels) config.n_mels = model_n_mels;
+
+        // PCEN front-end matching the model's framing (the 2D recipe is trained
+        // on PCEN — the runtime front-end must match).
+        MelConfig m;
+        m.sample_rate = config.sample_rate;
+        m.n_fft       = config.n_fft;
+        m.win_length  = config.win_length;
+        m.hop_length  = config.hop_length;
+        m.n_mels      = config.n_mels;
+        m.fmin        = config.mel_fmin;
+        m.fmax        = config.mel_fmax;
+        m.compression = MelCompression::PCEN;
+        const bt::Device dev = net->device();
+        auto melfe = std::make_unique<MelFrontend>(m, dev);
+
+        const int warmup = net->gap_window_frames();   // read before the move
+
+        // Commit.
+        mel    = std::move(melfe);
+        model  = std::move(net);
+        stream = model->make_stream_state();
+        device = dev;
+        mcfg   = m;
+        loaded = true;
+        warmup_frames      = warmup > 0 ? warmup : 0;
+        frames_since_reset = 0;
+        frame_buf.assign(static_cast<std::size_t>(config.n_mels), 0.0f);
+
+        a_threshold       .store(config.threshold,        std::memory_order_relaxed);
+        a_smoothing_hits  .store(config.smoothing_hits,   std::memory_order_relaxed);
+        a_smoothing_window.store(config.smoothing_window, std::memory_order_relaxed);
+        a_refractory_ms   .store(config.refractory_ms,    std::memory_order_relaxed);
+
+        decisions.assign(static_cast<std::size_t>(config.smoothing_window), 0u);
+        decision_head = 0;
+        decision_len  = 0;
+        refractory_frames = 0;
+        sample_ring.clear();
+        last_score.store(0.0f, std::memory_order_relaxed);
+    }
 };
 
 bool WakeWord::Impl::step_mel_column(const float* block, int T, int t,
@@ -151,7 +206,7 @@ bool WakeWord::Impl::step_mel_column(const float* block, int T, int t,
     frame_tensor = bt::Tensor::from_host_on(device, frame_buf.data(),
                                             n_mels, 1);
 
-    model->forward_streaming(frame_tensor, logit_tensor);
+    model->forward_streaming(stream, frame_tensor, logit_tensor);
 
     // logit_tensor: (1, 1) on `device`.
     float logit = 0.0f;
@@ -211,6 +266,14 @@ bool WakeWord::Impl::step_mel_column(const float* block, int T, int t,
 }
 
 WakeWord::WakeWord() : impl_(std::make_unique<Impl>()) {}
+
+WakeWord::WakeWord(std::shared_ptr<const BcResnet2d> net)
+    : impl_(std::make_unique<Impl>()) {
+    if (!net) fail("WakeWord", "null net");
+    brotensor::init();
+    impl_->install_net(std::move(net));
+}
+
 WakeWord::~WakeWord() = default;
 WakeWord::WakeWord(WakeWord&&) noexcept = default;
 WakeWord& WakeWord::operator=(WakeWord&&) noexcept = default;
@@ -235,65 +298,12 @@ void WakeWord::load(const std::string& weights_path,
              "(expected 'BWK2')");
     }
 
-    // Load the 2D BC-ResNet. Throws on bad-version / shape mismatch.
-    auto model = std::make_unique<BcResnet2d>(
+    // Load the 2D BC-ResNet (throws on bad-version / shape mismatch) and adopt
+    // it as a shared, read-only net. install_net builds the matching front-end,
+    // allocates this detector's session, and mirrors policy into the atomics.
+    auto net = std::make_shared<const BcResnet2d>(
         BcResnet2d::load(weights_path, device));
-
-    const int model_n_mels = model->config().n_mels;
-    if (model_n_mels <= 0) {
-        fail("WakeWord::load",
-             "model header reports non-positive n_mels=" +
-             std::to_string(model_n_mels));
-    }
-    // Trust the model. The .bw header is authoritative; if the caller's
-    // WakeConfig.n_mels disagrees, overwrite ours and run with the model's.
-    if (impl_->config.n_mels != model_n_mels) {
-        impl_->config.n_mels = model_n_mels;
-    }
-
-    // Build the mel front-end with config matching the model. The 2D recipe is
-    // trained on PCEN features (per-channel energy normalization that cancels
-    // mic/channel spectral tilt), so the runtime front-end must match.
-    MelConfig mcfg;
-    mcfg.sample_rate = impl_->config.sample_rate;
-    mcfg.n_fft       = impl_->config.n_fft;
-    mcfg.win_length  = impl_->config.win_length;
-    mcfg.hop_length  = impl_->config.hop_length;
-    mcfg.n_mels      = impl_->config.n_mels;
-    mcfg.fmin        = impl_->config.mel_fmin;
-    mcfg.fmax        = impl_->config.mel_fmax;
-    mcfg.compression = MelCompression::PCEN;
-    auto mel = std::make_unique<MelFrontend>(mcfg, device);
-
-    // Warmup span = the model's GAP-ring capacity (read before the move).
-    const int warmup = model->gap_window_frames();
-
-    // Commit on success.
-    impl_->mel    = std::move(mel);
-    impl_->model  = std::move(model);
-    impl_->device = device;
-    impl_->mcfg   = mcfg;
-    impl_->loaded = true;
-    impl_->warmup_frames      = warmup > 0 ? warmup : 0;
-    impl_->frames_since_reset = 0;
-    impl_->frame_buf.assign(static_cast<std::size_t>(impl_->config.n_mels),
-                            0.0f);
-
-    // Mirror policy into atomics so feed() picks them up.
-    impl_->a_threshold       .store(impl_->config.threshold,        std::memory_order_relaxed);
-    impl_->a_smoothing_hits  .store(impl_->config.smoothing_hits,   std::memory_order_relaxed);
-    impl_->a_smoothing_window.store(impl_->config.smoothing_window, std::memory_order_relaxed);
-    impl_->a_refractory_ms   .store(impl_->config.refractory_ms,    std::memory_order_relaxed);
-
-    // Size the decision ring for the current window. set_smoothing() can
-    // grow/shrink this later — the ring is rebuilt on resize.
-    impl_->decisions.assign(
-        static_cast<std::size_t>(impl_->config.smoothing_window), 0u);
-    impl_->decision_head = 0;
-    impl_->decision_len  = 0;
-    impl_->refractory_frames = 0;
-    impl_->sample_ring.clear();
-    impl_->last_score.store(0.0f, std::memory_order_relaxed);
+    impl_->install_net(std::move(net));
 }
 
 bool WakeWord::feed(const float* samples, int n) {
@@ -453,7 +463,7 @@ float WakeWord::last_score() const {
 void WakeWord::reset() {
     impl_->sample_ring.clear();
     if (impl_->mel)   impl_->mel->reset();
-    if (impl_->model) impl_->model->reset_streaming_state();
+    if (impl_->model) impl_->model->reset(impl_->stream);
     std::fill(impl_->decisions.begin(), impl_->decisions.end(),
               static_cast<std::uint8_t>(0));
     impl_->decision_head = 0;

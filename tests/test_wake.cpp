@@ -15,10 +15,12 @@
 #include <brotensor/tensor.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -363,6 +365,52 @@ static int run() {
         w.reset();
         CHECK(w.last_score() == 0.0f, "reset on unloaded leaves last_score at 0");
         CHECK(!w.loaded(),            "reset does not toggle loaded()");
+    }
+
+    // ─── Shared net: one load-once weight set drives N independent detectors ─
+    //
+    // Build a net, wrap it shared+const, and construct two detectors over it.
+    // The weights are held once (use_count), and each detector owns its own
+    // mel front-end + streaming session — so interleaving feed() on the two
+    // must not cross-talk: detector A's last_score matches a standalone
+    // detector fed only A's audio, regardless of B's interleaved feeds.
+    {
+        brosoundml::BcResnet2dConfig cfg;   // defaults — n_mels=40
+        auto model = brosoundml::BcResnet2d::make(cfg, brotensor::Device::CPU);
+        model.xavier_init_weights(7);
+        model.fuse_bn();                    // runtime checkpoints are fused
+        auto net = std::make_shared<const brosoundml::BcResnet2d>(std::move(model));
+
+        WakeWord wa(net), wb(net);
+        CHECK(wa.loaded() && wb.loaded(),
+              "shared: both detectors loaded from one net");
+        CHECK(net.use_count() == 3,
+              "shared: weights held once (net + 2 detectors share the shared_ptr)");
+
+        std::mt19937 rng(0x5151);
+        std::uniform_real_distribution<float> uni(-0.3f, 0.3f);
+        std::vector<float> A(16000), B(16000);
+        for (auto& s : A) s = uni(rng);
+        for (auto& s : B) s = uni(rng);
+
+        // Standalone reference: a fresh detector fed only A, in one shot.
+        WakeWord wc(net);
+        wc.feed(A.data(), 16000);
+        const float refA = wc.last_score();
+
+        // Interleave A into wa and B into wb in halves: A0,B0,A1,B1.
+        wa.feed(A.data(),         8000);
+        wb.feed(B.data(),         8000);
+        wa.feed(A.data() + 8000,  8000);
+        wb.feed(B.data() + 8000,  8000);
+        const float outA = wa.last_score();
+
+        const float d = std::fabs(outA - refA);
+        CHECK(d < 1e-3f,
+              "shared: detector A last_score matches standalone (no crosstalk)");
+        std::fprintf(stderr,
+                     "    (shared-net wake crosstalk diff=%g, use_count=%ld)\n",
+                     d, static_cast<long>(net.use_count()));
     }
 
     // ─── Move construction / assignment preserves config and state ─────────

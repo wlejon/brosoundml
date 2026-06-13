@@ -1,6 +1,7 @@
 #pragma once
 
 #include "brosoundml/audio.h"
+#include "brosoundml/bc_resnet2d.h"
 #include "brosoundml/mel.h"
 
 #include <brotensor/tensor.h>
@@ -96,6 +97,15 @@ public:
     WakeWord& operator=(WakeWord&&) noexcept;
     WakeWord(const WakeWord&) = delete;
     WakeWord& operator=(const WakeWord&) = delete;
+
+    // Construct over a SHARED, already-loaded 2D BC-ResNet (the multi-stream
+    // entry). The weights live once behind the shared_ptr; this detector owns
+    // only its own streaming session (a BcResnet2dStreamState) plus its
+    // front-end and detector bookkeeping. Build N detectors over one net to run
+    // the same wake word on N asynchronous streams (e.g. mic + system-audio
+    // loopback) without copying weights. Front-end framing comes from the net.
+    // Throws if net is null. Detector-policy fields keep their current values.
+    explicit WakeWord(std::shared_ptr<const BcResnet2d> net);
 
     // Load a trained wake-word checkpoint. The file carries the front-end and
     // model hyperparameters in its header; the loader overwrites the matching
