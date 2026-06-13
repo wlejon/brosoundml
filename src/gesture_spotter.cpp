@@ -204,6 +204,9 @@ std::vector<GestureEvent> GestureSpotter::feed(const SensorSnapshot& s) {
             ev.kind = GestureKind::Rhythm;
             ev.confidence = static_cast<float>(std::max(
                 0.0, 1.0 - err_sum / static_cast<double>(t.intervals.size())));
+            // Matched span: first..last onset of the winning sequence.
+            ev.start_frame = t.onset_hist.front();
+            ev.end_frame   = t.onset_hist.back();   // == s.frames
             events.push_back(ev);
             t.refractory = t.policy.refractory_frames;
             t.onset_hist.clear();   // re-arm from the next fresh sequence
@@ -232,6 +235,8 @@ std::vector<GestureEvent> GestureSpotter::feed(const SensorSnapshot& s) {
                 ev.kind = GestureKind::Tone;
                 ev.confidence = static_cast<float>(std::max(
                     0.0, 1.0 - rel / static_cast<double>(t.policy.pitch_tol)));
+                ev.start_frame = t.run_start;
+                ev.end_frame   = s.frames;
                 events.push_back(ev);
                 t.run_fired = true;
                 t.refractory = t.policy.refractory_frames;

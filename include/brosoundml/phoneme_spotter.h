@@ -166,6 +166,14 @@ struct SpotEvent {
     float       confidence = 0.0f;   // geometric-mean posterior over the matched span, [0,1]
     int         matched_phonemes = 0;  // == template length on a full match
     int         template_len = 0;
+    // Matched span in the posterior-frame stream. matched_frames is the length
+    // of the winning alignment (N[L]); start/end are absolute frame indices on
+    // the spotter's monotonic frames counter (same axis as ProgressSnapshot and
+    // the SensorHub frames). end_frame is the completion (fire) frame; start =
+    // end - matched_frames + 1. -1 before any fire / on offline-only events.
+    int          matched_frames = 0;
+    std::int64_t start_frame = -1;
+    std::int64_t end_frame   = -1;
 };
 
 // ─── Per-template progress telemetry ─────────────────────────────────────────

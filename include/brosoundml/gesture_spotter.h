@@ -63,6 +63,11 @@ struct GestureEvent {
     std::string name;
     float       confidence = 0.0f;   // [0,1], 1 == exact reproduction
     GestureKind kind = GestureKind::Rhythm;
+    // Matched span on the SensorHub frames axis (same axis bro.sense reports).
+    // Rhythm: first..last matched onset frame. Tone: run start..fire frame.
+    // -1 until a match fires.
+    std::int64_t start_frame = -1;
+    std::int64_t end_frame   = -1;
 };
 
 // Human-legible view of an enrolled gesture (cf. PhonemeSpotter::TemplateView):

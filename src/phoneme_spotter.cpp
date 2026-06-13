@@ -321,6 +321,7 @@ struct TemplateMatcher {
                 out_ev.confidence       = conf;
                 out_ev.matched_phonemes = L;   // full match
                 out_ev.template_len     = L;
+                out_ev.matched_frames   = N[L];  // span length (captured pre-reset)
                 // Re-enter from silence for the next utterance: clear the DP,
                 // the smoothing ring, and arm the refractory window.
                 S.assign(static_cast<std::size_t>(L) + 1, kNegInf);
@@ -891,6 +892,12 @@ std::vector<SpotEvent> PhonemeSpotter::feed_posteriors(const float* posteriors,
                 // so furthest reads 0 again) — record both telemetry marks.
                 m.last_fire_frame    = impl_->frames_total;
                 m.last_advance_frame = impl_->frames_total;
+                // Absolute matched span on the frames axis: the fire is this
+                // frame; the span ran matched_frames frames up to and including
+                // it.
+                ev.end_frame   = impl_->frames_total;
+                ev.start_frame = impl_->frames_total -
+                                 (ev.matched_frames > 0 ? ev.matched_frames - 1 : 0);
                 events.push_back(ev);
             } else if (m.furthest > prev_furthest) {
                 m.last_advance_frame = impl_->frames_total;
