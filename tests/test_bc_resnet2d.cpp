@@ -105,9 +105,54 @@ static void run_device(bt::Device dev, const char* dn) {
           (tag("streaming(chunked) == one-shot (diff=", dn) +
            std::to_string(d_chunk) + ")").c_str());
 
-    std::fprintf(stderr, "[%s] params=%d rf=%d io=%g fuse=%g stream=%g chunk=%g\n",
+    // 6. Two sessions, one shared net, interleaved — zero crosstalk (caches AND
+    //    the head GAP ring are per-stream). Each stream's interleaved result
+    //    must match its own standalone single-stream result.
+    const bsm::BcResnet2d& net = ms;   // drive through the const session API
+    const auto fa = random_feats(cfg.n_mels, T, 101);
+    const auto fb = random_feats(cfg.n_mels, T, 202);
+    auto ref = [&](const std::vector<float>& f) {
+        auto st = net.make_stream_state();
+        bt::Tensor t = bt::Tensor::from_host_on(dev, f.data(), cfg.n_mels, T);
+        bt::Tensor o; net.forward_streaming(st, t, o);
+        return o.to_host_vector();
+    };
+    const std::vector<float> refA = ref(fa);
+    const std::vector<float> refB = ref(fb);
+    auto stA = net.make_stream_state();
+    auto stB = net.make_stream_state();
+    std::vector<float> outA, outB;
+    auto feed_chunk = [&](bsm::BcResnet2dStreamState& st, const std::vector<float>& f,
+                          int start, int w, std::vector<float>& acc) {
+        std::vector<float> sub(static_cast<std::size_t>(cfg.n_mels) * w);
+        for (int r = 0; r < cfg.n_mels; ++r)
+            for (int t = 0; t < w; ++t)
+                sub[static_cast<std::size_t>(r) * w + t] =
+                    f[static_cast<std::size_t>(r) * T + (start + t)];
+        bt::Tensor cf = bt::Tensor::from_host_on(dev, sub.data(), cfg.n_mels, w);
+        bt::Tensor co; net.forward_streaming(st, cf, co);
+        const auto coh = co.to_host_vector();
+        acc.insert(acc.end(), coh.begin(), coh.end());
+    };
+    for (int start = 0; start < T; start += chunk) {
+        const int w = std::min(chunk, T - start);
+        feed_chunk(stA, fa, start, w, outA);
+        feed_chunk(stB, fb, start, w, outB);
+    }
+    const float dA = max_abs_diff(refA, outA);
+    const float dB = max_abs_diff(refB, outB);
+    CHECK(dA <= 1e-3f && refA.size() == outA.size(),
+          (tag("interleaved stream A == standalone (diff=", dn) +
+           std::to_string(dA) + ")").c_str());
+    CHECK(dB <= 1e-3f && refB.size() == outB.size(),
+          (tag("interleaved stream B == standalone (diff=", dn) +
+           std::to_string(dB) + ")").c_str());
+    CHECK(max_abs_diff(refA, refB) > 1e-3f,
+          tag("streams A and B are distinct", dn).c_str());
+
+    std::fprintf(stderr, "[%s] params=%d rf=%d io=%g fuse=%g stream=%g chunk=%g mstreamA=%g mstreamB=%g\n",
                  dn, m.param_count(), m.receptive_field_frames(),
-                 d_io, d_fuse, d_stream, d_chunk);
+                 d_io, d_fuse, d_stream, d_chunk, dA, dB);
     std::remove(path.c_str());
 }
 

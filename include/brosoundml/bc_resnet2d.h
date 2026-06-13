@@ -87,6 +87,21 @@ struct BcResnet2dConfig {
     float bn_eps = 1e-5f;
 };
 
+// Per-stream streaming scratch for ONE independent wake stream. Unlike
+// PhonemeNet the wake head pools over time, so a stream carries BOTH the
+// per-conv causal time-ring caches AND the head's temporal global-average-pool
+// ring (gap_window + its head/len). Weights stay in the (shared, read-only)
+// net; a StreamState holds only this scratch, so one load-once net can drive N
+// asynchronous streams without copying weights. Allocate with
+// make_stream_state(), advance with forward_streaming(state, ...), zero with
+// reset(state). Move-only.
+struct BcResnet2dStreamState {
+    std::vector<brotensor::Tensor> conv_caches;   // one per cache-bearing conv
+    std::vector<float>             gap_window;     // (gap_cap * c_last) ring
+    int                            gap_len  = 0;
+    int                            gap_head = 0;
+};
+
 class BcResnet2d {
 public:
     BcResnet2d();
@@ -120,9 +135,27 @@ public:
     void forward(const brotensor::Tensor& feats,
                  brotensor::Tensor& out_logit_per_frame) const;
 
-    // Frame-by-frame streaming. new_feats: (n_mels, N). Maintains per-conv
-    // causal time-ring caches + the GAP window so a sequence of calls matches
-    // forward() over the concatenation (within FP rounding). out: (N, 1).
+    // ── Multi-stream session API (load-once weights, N independent streams) ──
+    //
+    // Allocate a fresh per-stream state (conv caches + GAP ring) on the model's
+    // device. N streams = one shared net + N of these. Const, so callable
+    // through a shared_ptr<const BcResnet2d>.
+    BcResnet2dStreamState make_stream_state() const;
+
+    // Streaming forward into a caller-owned state. new_feats: (n_mels, N).
+    // out: (N, 1). Reads weights, writes ONLY into `state` (conv caches + GAP
+    // ring) — so interleaved sessions on one const net never cross-talk. A
+    // sequence of calls on one state matches forward() over the concatenation
+    // (within FP rounding).
+    void forward_streaming(BcResnet2dStreamState& state,
+                           const brotensor::Tensor& new_feats,
+                           brotensor::Tensor& out_logit_per_frame) const;
+
+    // Zero a stream's caches + GAP ring (clean restart). Const.
+    void reset(BcResnet2dStreamState& state) const;
+
+    // Legacy single-stream streaming over an internally-owned state. Non-const;
+    // prefer the session API for multi-stream use.
     void forward_streaming(const brotensor::Tensor& new_feats,
                            brotensor::Tensor& out_logit_per_frame);
 
