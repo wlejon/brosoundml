@@ -135,6 +135,17 @@ the application resolves them:
   must place weights on the chosen backend and the whole forward pass must
   dispatch through brotensor device ops. Qwen3-TTS is the reference: its FP32
   CPU/CUDA paths produce a bit-identical discrete-code stream.
+- **Multi-stream = load-once weights + a per-stream `Session`.** A model that
+  serves N streams holds weights behind a `shared_ptr<const Model>` (read-only,
+  `const` forward) and pushes all per-stream scratch into a `<Model>Session`
+  (`make_session()` → session; `forward_streaming`/`synthesize`/`reset` take the
+  session as their first arg and are `const`). The forward writes only into the
+  session it is handed, so streams never cross-talk. Each model declares a
+  concurrency tier — *concurrent* (conv streamers: `BcResnet2d`, `PhonemeNet`)
+  or *serialized* (`Kokoro`: shared CUDA-graph step buffers + one GPU stream).
+  Consumers (`WakeWord`, `PhonemeSpotter`, `KokoroSession`) are constructed over
+  the shared model and own one session each. Full convention:
+  `docs/multi-stream-sessions.md`.
 
 ## Model notes
 
