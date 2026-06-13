@@ -86,7 +86,7 @@ struct Conv2dLayer {
     bt::Tensor b;               // (Cout, 1)
     // Streaming state no longer lives here — the per-stream causal time-ring
     // (the last padLeftW columns per (Cin,H) row, laid out (1, Cin*Hcache*
-    // padLeftW)) is a tensor in BcResnet2dStreamState, addressed by this index
+    // padLeftW)) is a tensor in BcResnet2dSession, addressed by this index
     // (>=0 for a cache-bearing conv, -1 for a kW==1 conv). Hcache is the
     // layer's input H, used to size that cache.
     int cache_index = -1;
@@ -136,7 +136,7 @@ void init_conv(Conv2dLayer& c, int cin, int cout, int kH, int kW,
     const int win = (cin / groups) * kH * kW;
     c.W = bt::Tensor::zeros_on(dev, cout, win, bt::Dtype::FP32);
     c.b = bt::Tensor::zeros_on(dev, cout, 1, bt::Dtype::FP32);
-    // No cache allocated here — per-stream caches live in BcResnet2dStreamState,
+    // No cache allocated here — per-stream caches live in BcResnet2dSession,
     // sized from cache_cols() and indexed by cache_index (assigned in build()).
 }
 
@@ -161,7 +161,7 @@ void make_const_kernel(bt::Tensor& k, int C, int H, float val, bt::Device dev) {
 // only input columns <= t. The cache tensor lives in
 // state->conv_caches[c.cache_index].
 void conv_forward(const Conv2dLayer& c, const bt::Tensor& X, int H, int W,
-                  BcResnet2dStreamState* state, bt::Tensor& Y) {
+                  BcResnet2dSession* state, bt::Tensor& Y) {
     const bt::Device dev = X.device;
     const int rows = c.Cin * H;                 // number of (channel,freq) rows
     if (X.cols != rows * W) {
@@ -316,15 +316,15 @@ struct BcResnet2d::Impl {
     bt::Tensor   head_avg_kernel;      // (c_last, head_H) for head freq-avg
 
     // GAP-ring capacity (a net property; the ring itself is per-stream and
-    // lives in BcResnet2dStreamState).
+    // lives in BcResnet2dSession).
     int gap_cap = 0;
 
     // Cache-bearing convs in a stable enumeration order; each is assigned its
-    // cache_index = position here in build(). make_stream_state() allocates one
+    // cache_index = position here in build(). make_session() allocates one
     // cache slot per entry, so slot i always belongs to *cache_convs[i].
     std::vector<Conv2dLayer*> cache_convs;
     // Internally-owned session backing the legacy single-stream API.
-    BcResnet2dStreamState owned_state;
+    BcResnet2dSession owned_state;
 
     std::unique_ptr<BcResnet2dTrainState> train_state;
 
@@ -347,8 +347,8 @@ struct BcResnet2d::Impl {
         }
     }
 
-    BcResnet2dStreamState alloc_state() const {
-        BcResnet2dStreamState st;
+    BcResnet2dSession alloc_state() const {
+        BcResnet2dSession st;
         st.conv_caches.reserve(cache_convs.size());
         for (const Conv2dLayer* c : cache_convs) {
             const int cols = c->cache_cols();
@@ -361,14 +361,14 @@ struct BcResnet2d::Impl {
         return st;
     }
 
-    void check_state(const BcResnet2dStreamState& st) const {
+    void check_state(const BcResnet2dSession& st) const {
         if (st.conv_caches.size() != cache_convs.size() ||
             st.gap_window.size() != static_cast<std::size_t>(gap_cap) * c_last)
             fail("BcResnet2d::forward_streaming",
                  "stream state was not made by this model");
     }
 
-    static void zero_state(BcResnet2dStreamState& st) {
+    static void zero_state(BcResnet2dSession& st) {
         for (auto& c : st.conv_caches) if (c.size() > 0) c.zero();
         std::fill(st.gap_window.begin(), st.gap_window.end(), 0.0f);
         st.gap_len = 0; st.gap_head = 0;
@@ -456,7 +456,7 @@ struct BcResnet2d::Impl {
     // Y: (cout, Hz, W). Reads weights only; `state` (null for one-shot) carries
     // the per-stream time caches.
     void run_block(const BCBlock& blk, const bt::Tensor& X, int Hin, int W,
-                   BcResnet2dStreamState* state, bt::Tensor& Y) const {
+                   BcResnet2dSession* state, bt::Tensor& Y) const {
         const int cout = blk.cout;
         // Channel/stride entry.
         bt::Tensor u;     // (cout, Hin, W)
@@ -505,7 +505,7 @@ struct BcResnet2d::Impl {
     // Shared forward producing per-frame logits (T,1). state==null is the
     // one-shot path (fresh GAP window); non-null streams (persistent caches+GAP
     // in `state`).
-    void forward_core(const bt::Tensor& feats, BcResnet2dStreamState* state,
+    void forward_core(const bt::Tensor& feats, BcResnet2dSession* state,
                       bt::Tensor& out_logits) const {
         if (feats.rows != cfg.n_mels)
             fail("BcResnet2d::forward", "input rows != n_mels");
@@ -619,18 +619,18 @@ void BcResnet2d::forward(const bt::Tensor& feats, bt::Tensor& out_logit_per_fram
 }
 
 // ── Multi-stream session API ──
-BcResnet2dStreamState BcResnet2d::make_stream_state() const {
+BcResnet2dSession BcResnet2d::make_session() const {
     return impl_->alloc_state();
 }
 
-void BcResnet2d::forward_streaming(BcResnet2dStreamState& state,
+void BcResnet2d::forward_streaming(BcResnet2dSession& state,
                                    const bt::Tensor& new_feats,
                                    bt::Tensor& out_logit_per_frame) const {
     impl_->check_state(state);
     impl_->forward_core(new_feats, &state, out_logit_per_frame);
 }
 
-void BcResnet2d::reset(BcResnet2dStreamState& state) const {
+void BcResnet2d::reset(BcResnet2dSession& state) const {
     Impl::zero_state(state);
 }
 

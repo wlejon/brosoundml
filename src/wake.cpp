@@ -82,7 +82,7 @@ struct WakeWord::Impl {
     // `stream`, its private streaming session over that net.
     std::unique_ptr<MelFrontend>      mel;     // built on load()
     std::shared_ptr<const BcResnet2d> model;   // shared, loaded on load()
-    BcResnet2dStreamState             stream;  // this detector's own session
+    BcResnet2dSession             stream;  // this detector's own session
     bt::Device                        device = bt::Device::CPU;
     MelConfig                    mcfg;      // the front-end framing, kept for
                                             // shared-front-end compatibility
@@ -172,7 +172,7 @@ struct WakeWord::Impl {
         // Commit.
         mel    = std::move(melfe);
         model  = std::move(net);
-        stream = model->make_stream_state();
+        stream = model->make_session();
         device = dev;
         mcfg   = m;
         loaded = true;

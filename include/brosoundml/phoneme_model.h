@@ -90,13 +90,13 @@ struct PhonemeNetConfig {
 
 // Per-stream streaming scratch — the per-conv causal time-ring caches for ONE
 // independent stream. The weights stay in the (shared, read-only) net; a
-// StreamState holds caches only, so one load-once net can drive N asynchronous
-// streams without copying weights. Allocate with make_stream_state(), advance
+// Session holds caches only, so one load-once net can drive N asynchronous
+// streams without copying weights. Allocate with make_session(), advance
 // with forward_streaming(state, ...), zero with reset(state). Cheap to build;
 // move-only (the caches are device tensors). Sessions advance independently —
 // two interleaved streams over one net never cross-talk because each writes
-// only its own StreamState.
-struct PhonemeStreamState {
+// only its own Session.
+struct PhonemeSession {
     std::vector<brotensor::Tensor> conv_caches;   // one per cache-bearing conv
 };
 
@@ -140,22 +140,22 @@ public:
     // state is independent of every other; N streams = one shared net + N of
     // these. Const (reads only layer shapes), so callable through a
     // shared_ptr<const PhonemeNet>.
-    PhonemeStreamState make_stream_state() const;
+    PhonemeSession make_session() const;
 
     // Streaming forward into a caller-owned state. new_feats: (n_mels, N).
     // out: (N, K). Reads weights, writes ONLY into `state` — so concurrent
     // sessions on one const net are isolated. A sequence of calls on one state
     // matches forward() over the concatenation (within FP rounding); the head
     // is pointwise in time, so no ring/warm-up beyond the trunk caches.
-    void forward_streaming(PhonemeStreamState& state,
+    void forward_streaming(PhonemeSession& state,
                            const brotensor::Tensor& new_feats,
                            brotensor::Tensor& out_logits) const;
 
     // Zero a stream's caches (clean restart on a silence boundary). Const.
-    void reset(PhonemeStreamState& state) const;
+    void reset(PhonemeSession& state) const;
 
     // Legacy single-stream streaming over an internally-owned state — equivalent
-    // to make_stream_state() once + forward_streaming(that, ...). Non-const (it
+    // to make_session() once + forward_streaming(that, ...). Non-const (it
     // mutates the owned state); prefer the session API for multi-stream use.
     void forward_streaming(const brotensor::Tensor& new_feats,
                            brotensor::Tensor& out_logits);

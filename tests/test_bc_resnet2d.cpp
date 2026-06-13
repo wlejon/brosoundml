@@ -112,17 +112,17 @@ static void run_device(bt::Device dev, const char* dn) {
     const auto fa = random_feats(cfg.n_mels, T, 101);
     const auto fb = random_feats(cfg.n_mels, T, 202);
     auto ref = [&](const std::vector<float>& f) {
-        auto st = net.make_stream_state();
+        auto st = net.make_session();
         bt::Tensor t = bt::Tensor::from_host_on(dev, f.data(), cfg.n_mels, T);
         bt::Tensor o; net.forward_streaming(st, t, o);
         return o.to_host_vector();
     };
     const std::vector<float> refA = ref(fa);
     const std::vector<float> refB = ref(fb);
-    auto stA = net.make_stream_state();
-    auto stB = net.make_stream_state();
+    auto stA = net.make_session();
+    auto stB = net.make_session();
     std::vector<float> outA, outB;
-    auto feed_chunk = [&](bsm::BcResnet2dStreamState& st, const std::vector<float>& f,
+    auto feed_chunk = [&](bsm::BcResnet2dSession& st, const std::vector<float>& f,
                           int start, int w, std::vector<float>& acc) {
         std::vector<float> sub(static_cast<std::size_t>(cfg.n_mels) * w);
         for (int r = 0; r < cfg.n_mels; ++r)

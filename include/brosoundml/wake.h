@@ -100,7 +100,7 @@ public:
 
     // Construct over a SHARED, already-loaded 2D BC-ResNet (the multi-stream
     // entry). The weights live once behind the shared_ptr; this detector owns
-    // only its own streaming session (a BcResnet2dStreamState) plus its
+    // only its own streaming session (a BcResnet2dSession) plus its
     // front-end and detector bookkeeping. Build N detectors over one net to run
     // the same wake word on N asynchronous streams (e.g. mic + system-audio
     // loopback) without copying weights. Front-end framing comes from the net.

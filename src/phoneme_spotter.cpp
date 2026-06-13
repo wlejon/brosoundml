@@ -352,7 +352,7 @@ struct PhonemeSpotter::Impl {
     // weights live once behind the shared_ptr and may back N spotters; this
     // spotter owns only `stream`, its private streaming session over that net.
     std::shared_ptr<const PhonemeNet> model;
-    PhonemeStreamState                stream;
+    PhonemeSession                stream;
     std::unique_ptr<MelFrontend>      mel;
     bt::Device                        device = bt::Device::CPU;
     bool                              loaded = false;
@@ -494,7 +494,7 @@ struct PhonemeSpotter::Impl {
 
         // Commit.
         model         = std::move(net);
-        stream        = model->make_stream_state();
+        stream        = model->make_session();
         mel           = std::move(melfe);
         device        = dev;
         loaded        = true;
@@ -778,7 +778,7 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
     // disturbs the live stream's caches; only this spotter's own mel front-end
     // needs the reset/restore dance below.
     impl_->mel->reset();
-    PhonemeStreamState enroll_stream = impl_->model->make_stream_state();
+    PhonemeSession enroll_stream = impl_->model->make_session();
 
     bt::Tensor frames;   // (n_mels, T)
     const int T = impl_->mel->consume(padded.data(),

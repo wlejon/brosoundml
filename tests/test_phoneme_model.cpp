@@ -257,7 +257,7 @@ static void test_loss_decreases(bt::Device dev, const char* dn) {
 }
 
 // ── C. two sessions, one shared net, interleaved — zero cache crosstalk ──────
-// Proves the StreamState extraction: a single load-once net drives two
+// Proves the Session extraction: a single load-once net drives two
 // independent streams. Each stream's interleaved result must match its own
 // standalone single-stream result bit-for-bit (within FP rounding), which can
 // only hold if neither session touches the other's caches.
@@ -274,7 +274,7 @@ static void test_multistream(bt::Device dev, const char* dn) {
 
     // Standalone reference per stream: its own fresh session, single forward.
     auto ref = [&](const std::vector<float>& f) {
-        auto st = net.make_stream_state();
+        auto st = net.make_session();
         bt::Tensor feats = bt::Tensor::from_host_on(dev, f.data(), nm, T);
         bt::Tensor out; net.forward_streaming(st, feats, out);
         return out.to_host_vector();
@@ -283,10 +283,10 @@ static void test_multistream(bt::Device dev, const char* dn) {
     const std::vector<float> refB = ref(fb);
 
     // Interleaved: two sessions on ONE net, fed alternating chunks A,B,A,B,...
-    auto stA = net.make_stream_state();
-    auto stB = net.make_stream_state();
+    auto stA = net.make_session();
+    auto stB = net.make_session();
     std::vector<float> outA, outB;
-    auto feed_chunk = [&](bsm::PhonemeStreamState& st, const std::vector<float>& f,
+    auto feed_chunk = [&](bsm::PhonemeSession& st, const std::vector<float>& f,
                           int start, int w, std::vector<float>& acc) {
         std::vector<float> sub(static_cast<std::size_t>(nm) * w);
         for (int r = 0; r < nm; ++r)

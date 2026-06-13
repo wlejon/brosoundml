@@ -261,7 +261,7 @@ public:
 
     // Construct over a SHARED, already-loaded net (the multi-stream entry). The
     // weights live once behind the shared_ptr; this spotter owns only its own
-    // streaming session (a PhonemeStreamState) plus its templates/matcher and
+    // streaming session (a PhonemeSession) plus its templates/matcher and
     // front-end. Build N spotters over one net to spot the same vocabulary on N
     // asynchronous audio streams without copying weights. The class map and
     // front-end framing come from the net. Throws if net is null.
