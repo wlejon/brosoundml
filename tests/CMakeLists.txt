@@ -46,6 +46,8 @@ brosoundml_add_test(brosoundml_test_whisper_modules test_whisper_modules.cpp)
 brosoundml_add_test(brosoundml_test_whisper_decoder test_whisper_decoder.cpp)
 brosoundml_add_test(brosoundml_test_whisper_e2e test_whisper_e2e.cpp)
 brosoundml_add_test(brosoundml_test_parakeet test_parakeet.cpp)
+target_compile_definitions(brosoundml_test_parakeet PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 brosoundml_add_test(brosoundml_test_pos_tagger test_pos_tagger.cpp)
 target_compile_definitions(brosoundml_test_pos_tagger PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")

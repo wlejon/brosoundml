@@ -254,6 +254,15 @@ struct Parakeet::Impl {
         token    = static_cast<int32_t>(best_t);
         duration = config.durations[static_cast<std::size_t>(best_d)];
     }
+
+    // The shared transcribe body: validate, encode, then run the greedy TDT
+    // decode into the caller-supplied prediction state `st` (re-initialised to
+    // the zero state on entry, so every call is a self-contained one-shot
+    // decode). Both the legacy and the session transcribe() overloads funnel
+    // through here. Defined out-of-line below.
+    Parakeet::Transcription run_transcribe(ParakeetPrediction::State& st,
+                                           const AudioBuffer& audio,
+                                           const Parakeet::TranscribeOptions& opts) const;
 };
 
 Parakeet::Parakeet() : impl_(std::make_unique<Impl>()) {}
@@ -290,39 +299,39 @@ void Parakeet::load(const std::string& model_dir, bt::Device device) {
     impl_->loaded = true;
 }
 
-Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio) const {
-    return transcribe(audio, TranscribeOptions{});
-}
-
-Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
-                                             const TranscribeOptions& opts) const {
-    if (!impl_->loaded)
+Parakeet::Transcription Parakeet::Impl::run_transcribe(
+    ParakeetPrediction::State& st,
+    const AudioBuffer& audio,
+    const Parakeet::TranscribeOptions& opts) const {
+    if (!loaded)
         fail("Parakeet::transcribe", "no model loaded; call Parakeet::load() first");
     if (audio.samples.empty())
         fail("Parakeet::transcribe", "audio buffer is empty");
-    if (audio.sample_rate != impl_->config.sample_rate)
+    if (audio.sample_rate != config.sample_rate)
         fail("Parakeet::transcribe",
              "audio.sample_rate must be 16000 Hz; resampling is the caller's "
              "responsibility");
 
-    const ParakeetConfig& cfg = impl_->config;
-    const bt::Device dev = impl_->device;
+    const ParakeetConfig& cfg = config;
+    const bt::Device dev = device;
     bt::DeviceScope scope(dev);
     const int H = cfg.decoder_hidden_size;
 
     // ── Encoder + projector: audio -> (T, 640) ──
     bt::Tensor enc;
-    impl_->encoder.forward(audio, enc);                    // (T, 1024)
+    encoder.forward(audio, enc);                           // (T, 1024)
     const int T = enc.rows;
     bt::Tensor enc_proj;
-    bt::linear_forward_batched(impl_->enc_proj_w, impl_->enc_proj_b,
+    bt::linear_forward_batched(enc_proj_w, enc_proj_b,
                                enc, enc_proj);              // (T, 640)
 
     // ── Greedy TDT decode ──
-    ParakeetPrediction::State st = impl_->prediction.init_state();
+    // One-shot: re-init the prediction state to the zero state so a reused
+    // session decodes this utterance independently of any prior one.
+    st = prediction.init_state();
     bt::Tensor dec_proj;
     // Initial decoder output from the SOS = blank token.
-    impl_->prediction.step(cfg.blank_token_id, st, dec_proj);
+    prediction.step(cfg.blank_token_id, st, dec_proj);
 
     Transcription out;
     const int max_new = opts.max_new_tokens;
@@ -343,7 +352,7 @@ Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
         bool advanced = false;
         while (symbols < max_sym) {
             int32_t token; int duration;
-            impl_->joint_argmax(enc_row, dec_proj, token, duration);
+            joint_argmax(enc_row, dec_proj, token, duration);
 
             if (token == cfg.blank_token_id) {
                 if (duration == 0) duration = 1;   // never stall on a blank
@@ -355,7 +364,7 @@ Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
             out.token_ids.push_back(token);
             out.token_frames.push_back(time);
             if (opts.on_token) opts.on_token(token);
-            impl_->prediction.step(token, st, dec_proj);   // advance predictor
+            prediction.step(token, st, dec_proj);          // advance predictor
             ++symbols;
             time += duration;
 
@@ -372,6 +381,59 @@ Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
     }
 
     return out;
+}
+
+// ── Legacy single-call transcribe: decode with a throwaway local state. ──
+Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio) const {
+    return transcribe(audio, TranscribeOptions{});
+}
+
+Parakeet::Transcription Parakeet::transcribe(const AudioBuffer& audio,
+                                             const TranscribeOptions& opts) const {
+    ParakeetPrediction::State st;
+    return impl_->run_transcribe(st, audio, opts);
+}
+
+// ─── ParakeetSession (per-decode prediction-net state) ─────────────────────
+//
+// The opaque session state is just the TDT prediction LSTM (h, c); the encoder,
+// joint, and weights stay in the shared Parakeet. make_session() seeds the zero
+// state; transcribe(session, ...) funnels through the same run_transcribe() the
+// legacy path uses, against the session's own state.
+
+struct ParakeetSessionState {
+    ParakeetPrediction::State st;
+};
+
+ParakeetSession::ParakeetSession()
+    : state_(std::make_unique<ParakeetSessionState>()) {}
+ParakeetSession::~ParakeetSession() = default;
+ParakeetSession::ParakeetSession(ParakeetSession&&) noexcept = default;
+ParakeetSession& ParakeetSession::operator=(ParakeetSession&&) noexcept = default;
+
+ParakeetSession Parakeet::make_session() const {
+    if (!impl_->loaded)
+        fail("Parakeet::make_session", "no model loaded; call Parakeet::load() first");
+    ParakeetSession s;
+    s.state_->st = impl_->prediction.init_state();
+    return s;
+}
+
+void Parakeet::reset(ParakeetSession& session) const {
+    if (!impl_->loaded)
+        fail("Parakeet::reset", "no model loaded");
+    session.state_->st = impl_->prediction.init_state();
+}
+
+Parakeet::Transcription Parakeet::transcribe(ParakeetSession& session,
+                                             const AudioBuffer& audio,
+                                             const TranscribeOptions& opts) const {
+    return impl_->run_transcribe(session.state_->st, audio, opts);
+}
+
+Parakeet::Transcription Parakeet::transcribe(ParakeetSession& session,
+                                             const AudioBuffer& audio) const {
+    return transcribe(session, audio, TranscribeOptions{});
 }
 
 const ParakeetConfig& Parakeet::config() const { return impl_->config; }

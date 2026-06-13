@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -295,17 +296,104 @@ static int run_for_device(brotensor::Device dev, const char* dn) {
               full.token_frames.back() < /*some bound*/ 100000,
           tag("uncapped decode terminates", dn).c_str());
 
+    // ── Session API (synthetic): make_session + transcribe(session, ...) ─────
+    // Exercises the new session surface on CPU/CUDA in CI regardless of weights.
+    // Two sessions interleaved over one model stay well-formed and in-range, and
+    // reset() works. (Bit-exact cross-talk isolation is the real-weights smoke
+    // in main(); with these near-tie synthetic logits the argmax tips on FP
+    // noise, so we assert structure here, not exact ids.)
+    {
+        using brosoundml::ParakeetSession;
+        auto well_formed = [&](const Parakeet::Transcription& r) {
+            if (r.token_ids.size() != r.token_frames.size()) return false;
+            for (auto id : r.token_ids)
+                if (id < 0 || id >= t.vocab) return false;
+            return r.token_ids.size() <= 8;   // max_new_tokens
+        };
+        ParakeetSession s1 = p.make_session();
+        ParakeetSession s2 = p.make_session();
+        auto rs1  = p.transcribe(s1, audio, opts);
+        auto rs2  = p.transcribe(s2, audio, opts);   // interleave a 2nd session
+        auto rs1b = p.transcribe(s1, audio, opts);   // s1 again
+        CHECK(well_formed(rs1) && well_formed(rs2) && well_formed(rs1b),
+              tag("session transcribe returns well-formed, in-range output",
+                  dn).c_str());
+        p.reset(s1);   // must not throw
+        CHECK(well_formed(p.transcribe(s1, audio, opts)),
+              tag("session transcribe after reset stays well-formed", dn).c_str());
+    }
+
     fs::remove_all(root);
     return failures;
+}
+
+// Real-weights session isolation: with a real checkpoint the joint logits are
+// not near-ties, so greedy decode is deterministic run-to-run and a session's
+// transcript is bit-identical to the legacy transcribe() — the strong proof
+// that N sessions over one shared, load-once model never cross-talk. Gated on
+// <repo>/weights/parakeet/0.6b-v3 + a 16 kHz wav being present; a no-op
+// otherwise. Reuses the Whisper test clip (both models are 16 kHz mono).
+static int run_real_session_smoke(brotensor::Device dev, const char* dn) {
+    using brosoundml::AudioBuffer;
+    using brosoundml::Parakeet;
+    using brosoundml::ParakeetSession;
+
+    const fs::path root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "parakeet" / "0.6b-v3";
+    const fs::path model = root / "model.safetensors";
+    const fs::path cfg   = root / "config.json";
+    const fs::path wav   = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "whisper" / "test_audio_en.wav";
+    if (!(fs::exists(model) && fs::exists(cfg) && fs::exists(wav))) return 0;
+
+    auto sp = std::make_shared<Parakeet>();
+    sp->load(root.string(), dev);
+    if (!sp->loaded()) {
+        std::fprintf(stderr, "FAIL: [%s] real Parakeet: loaded()\n", dn);
+        return 1;
+    }
+    AudioBuffer audio = brosoundml::read_wav(wav.string());
+    if (audio.sample_rate != 16000) return 0;
+
+    std::shared_ptr<const Parakeet> shared = sp;
+    auto legacy = shared->transcribe(audio);
+
+    ParakeetSession sA = shared->make_session();
+    ParakeetSession sB = shared->make_session();
+    auto rA1 = shared->transcribe(sA, audio);
+    auto rB  = shared->transcribe(sB, audio);   // interleave B
+    auto rA2 = shared->transcribe(sA, audio);   // sA again
+
+    int fails = 0;
+    auto expect = [&](bool ok, const char* msg) {
+        if (!ok) { std::fprintf(stderr, "FAIL: [%s] %s\n", dn, msg); ++fails; }
+    };
+    expect(legacy.token_ids.size() > 0,
+           "real Parakeet: legacy transcribe produced tokens");
+    expect(rA1.token_ids == legacy.token_ids,
+           "ParakeetSession: session A transcript == legacy transcribe");
+    expect(rB.token_ids == legacy.token_ids,
+           "ParakeetSession: session B transcript == legacy transcribe");
+    expect(rA2.token_ids == rA1.token_ids,
+           "ParakeetSession: session A unchanged across interleaved B (no cross-talk)");
+    shared->reset(sA);
+    auto rA3 = shared->transcribe(sA, audio);
+    expect(rA3.token_ids == legacy.token_ids,
+           "ParakeetSession: transcribe after reset() matches legacy");
+    if (fails == 0)
+        std::printf("    [%s] ParakeetSession: 2 sessions over 1 model, "
+                    "interleaved, bit-exact, no cross-talk (%zu tokens)\n",
+                    dn, legacy.token_ids.size());
+    return fails;
 }
 
 int main() {
     brotensor::init();
     try {
         int f = run_for_device(brotensor::Device::CPU, "CPU");
-        if (brotensor::is_available(brotensor::Device::CUDA))
+        f += run_real_session_smoke(brotensor::Device::CPU, "CPU");
+        if (brotensor::is_available(brotensor::Device::CUDA)) {
             f += run_for_device(brotensor::Device::CUDA, "CUDA");
-        else
+            f += run_real_session_smoke(brotensor::Device::CUDA, "CUDA");
+        } else
             std::printf("test_parakeet: CUDA not available — CUDA path skipped\n");
         if (f) {
             std::fprintf(stderr, "test_parakeet: %d failure(s)\n", f);

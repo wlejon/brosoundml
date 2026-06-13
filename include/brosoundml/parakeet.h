@@ -99,6 +99,12 @@ struct ParakeetConfig {
     }
 };
 
+// Opaque per-session decode state (the TDT prediction-network LSTM state),
+// defined in parakeet.cpp so the public header stays free of the decoder's
+// brotensor module internals.
+struct ParakeetSessionState;
+class ParakeetSession;
+
 // The Parakeet STT pipeline. Construct, load() a model directory, then
 // transcribe(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -149,12 +155,67 @@ public:
     // nested struct that has default member initializers — CWG2335.)
     Transcription transcribe(const AudioBuffer& audio) const;
 
+    // ── Multi-stream session API (load-once weights, N decode sessions) ──────
+    //
+    // Allocate a fresh per-stream decode session — its own TDT prediction-net
+    // LSTM state, on the model's device. N streams = one shared net + N
+    // sessions; hold the model through a std::shared_ptr<const Parakeet> and
+    // call these `const` methods on it. Mirrors Whisper::make_session(): the
+    // session is bare per-decode scratch, the weights stay read-only in the
+    // shared model. Throws if no model is loaded.
+    //
+    // Concurrency tier: CONCURRENT (the strongest — same as the conv streamers).
+    // Parakeet's forward touches NO shared mutable model state: the prediction
+    // LSTM (h, c) lives in the session, and the encoder / joint are pure `const`
+    // forwards over caller-supplied buffers. So sessions are fully independent —
+    // transcribe(session, ...) over two sessions never cross-talks, on CPU or
+    // CUDA (the GPU's single stream serializes execution, never correctness).
+    // The legacy transcribe(audio, ...) overloads already run a self-contained
+    // decode with a local state, so this API is about parity, explicit
+    // weight-sharing, and giving the per-decode state a home for future
+    // cross-chunk streaming.
+    ParakeetSession make_session() const;
+
+    Transcription transcribe(ParakeetSession& session,
+                             const AudioBuffer& audio,
+                             const TranscribeOptions& opts) const;
+
+    Transcription transcribe(ParakeetSession& session,
+                             const AudioBuffer& audio) const;
+
+    // Reset a session's prediction state to the start-of-utterance zero state.
+    // Each transcribe() already re-inits per call, so this is only needed to
+    // drop state a caller is holding between calls. Const.
+    void reset(ParakeetSession& session) const;
+
     const ParakeetConfig& config() const;
     bool loaded() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// A Parakeet decode session: the per-stream TDT prediction-network state, owned
+// by the caller, that turns one load-once Parakeet into N independent
+// transcription streams (see Parakeet::make_session and
+// docs/multi-stream-sessions.md). Bare scratch — it does not own the model; hold
+// the weights through a std::shared_ptr<const Parakeet> and pass both to
+// transcribe(). Move-only (the state is device tensors). Build with
+// Parakeet::make_session(); the LSTM-state internals stay behind the opaque
+// ParakeetSessionState pImpl.
+class ParakeetSession {
+public:
+    ParakeetSession();
+    ~ParakeetSession();
+    ParakeetSession(ParakeetSession&&) noexcept;
+    ParakeetSession& operator=(ParakeetSession&&) noexcept;
+    ParakeetSession(const ParakeetSession&) = delete;
+    ParakeetSession& operator=(const ParakeetSession&) = delete;
+
+private:
+    friend class Parakeet;
+    std::unique_ptr<ParakeetSessionState> state_;
 };
 
 }  // namespace brosoundml
