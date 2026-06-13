@@ -269,6 +269,26 @@ QwenTts::~QwenTts() = default;
 QwenTts::QwenTts(QwenTts&&) noexcept = default;
 QwenTts& QwenTts::operator=(QwenTts&&) noexcept = default;
 
+// Opaque per-voice scratch behind QwenTtsSession (one AR gen-state per stream).
+struct QwenTtsSessionState {
+    QwenTtsGenState gen;
+};
+
+QwenTtsSession::QwenTtsSession()
+    : state_(std::make_unique<QwenTtsSessionState>()) {}
+QwenTtsSession::~QwenTtsSession() = default;
+QwenTtsSession::QwenTtsSession(QwenTtsSession&&) noexcept = default;
+QwenTtsSession& QwenTtsSession::operator=(QwenTtsSession&&) noexcept = default;
+
+QwenTtsSession QwenTts::make_session() const {
+    if (!impl_->loaded) fail("QwenTts::make_session", "no model loaded; call load() first");
+    return QwenTtsSession{};
+}
+
+void QwenTts::reset(QwenTtsSession& session) const {
+    session.state_->gen = QwenTtsGenState{};
+}
+
 void QwenTts::load(const std::string& model_dir, brotensor::Device device,
                    QwenTtsWeightPrecision precision) {
     brotensor::init();
@@ -429,13 +449,13 @@ void QwenTts::resolve_inputs(const char* who, const std::string& text,
     }
 }
 
-AudioBuffer QwenTts::synthesize(const std::string& text,
-                                const std::string& speaker,
-                                const std::string& language,
-                                const std::string& instruct,
-                                const CancelCheck& cancel,
-                                const QwenTtsSampling& sampling,
-                                QwenTtsTrace* trace) const {
+AudioBuffer QwenTts::synthesize_into(QwenTtsGenState& gen, const std::string& text,
+                                     const std::string& speaker,
+                                     const std::string& language,
+                                     const std::string& instruct,
+                                     const CancelCheck& cancel,
+                                     const QwenTtsSampling& sampling,
+                                     QwenTtsTrace* trace) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize", "no model loaded; call QwenTts::load() first");
     }
@@ -443,9 +463,25 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     int spk_id = -1, language_id = -1;
     resolve_inputs("QwenTts::synthesize", text, speaker, language, instruct,
                    input_ids, instruct_ids, spk_id, language_id);
-    return synth_core(impl_->gen, input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
+    return synth_core(gen, input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
                       language_id, cancel, sampling, /*chunk_frames=*/0,
                       /*on_chunk=*/{}, trace);
+}
+
+AudioBuffer QwenTts::synthesize(const std::string& text, const std::string& speaker,
+                                const std::string& language, const std::string& instruct,
+                                const CancelCheck& cancel, const QwenTtsSampling& sampling,
+                                QwenTtsTrace* trace) const {
+    return synthesize_into(impl_->gen, text, speaker, language, instruct, cancel,
+                           sampling, trace);
+}
+
+AudioBuffer QwenTts::synthesize(QwenTtsSession& session, const std::string& text,
+                                const std::string& speaker, const std::string& language,
+                                const std::string& instruct, const CancelCheck& cancel,
+                                const QwenTtsSampling& sampling, QwenTtsTrace* trace) const {
+    return synthesize_into(session.state_->gen, text, speaker, language, instruct,
+                           cancel, sampling, trace);
 }
 
 AudioBuffer QwenTts::synthesize_stream(const std::string& text,
@@ -468,11 +504,12 @@ AudioBuffer QwenTts::synthesize_stream(const std::string& text,
                       language_id, cancel, sampling, cf, on_chunk);
 }
 
-AudioBuffer QwenTts::synthesize_clone(const std::string& text,
-                                      const AudioBuffer& ref,
-                                      const std::string& language,
-                                      const CancelCheck& cancel,
-                                      const QwenTtsSampling& sampling) const {
+AudioBuffer QwenTts::synthesize_clone_into(QwenTtsGenState& gen,
+                                           const std::string& text,
+                                           const AudioBuffer& ref,
+                                           const std::string& language,
+                                           const CancelCheck& cancel,
+                                           const QwenTtsSampling& sampling) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize_clone", "no model loaded; call QwenTts::load() first");
     }
@@ -507,16 +544,32 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
         fail("QwenTts::synthesize_clone", "prompt tokenized to too few tokens");
     }
 
-    return synth_core(impl_->gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+    return synth_core(gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
                       spk_embed.data(), language_id, cancel, sampling);
 }
 
-AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
-                                             const std::vector<float>& xvector,
-                                             const std::string& language,
-                                             const CancelCheck& cancel,
-                                             const QwenTtsSampling& sampling,
-                                             QwenTtsTrace* trace) const {
+AudioBuffer QwenTts::synthesize_clone(const std::string& text, const AudioBuffer& ref,
+                                      const std::string& language,
+                                      const CancelCheck& cancel,
+                                      const QwenTtsSampling& sampling) const {
+    return synthesize_clone_into(impl_->gen, text, ref, language, cancel, sampling);
+}
+
+AudioBuffer QwenTts::synthesize_clone(QwenTtsSession& session, const std::string& text,
+                                      const AudioBuffer& ref, const std::string& language,
+                                      const CancelCheck& cancel,
+                                      const QwenTtsSampling& sampling) const {
+    return synthesize_clone_into(session.state_->gen, text, ref, language, cancel,
+                                 sampling);
+}
+
+AudioBuffer QwenTts::synthesize_with_xvector_into(QwenTtsGenState& gen,
+                                                  const std::string& text,
+                                                  const std::vector<float>& xvector,
+                                                  const std::string& language,
+                                                  const CancelCheck& cancel,
+                                                  const QwenTtsSampling& sampling,
+                                                  QwenTtsTrace* trace) const {
     if (!impl_->loaded) {
         fail("QwenTts::synthesize_with_xvector", "no model loaded; call QwenTts::load() first");
     }
@@ -551,9 +604,30 @@ AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
         fail("QwenTts::synthesize_with_xvector", "prompt tokenized to too few tokens");
     }
 
-    return synth_core(impl_->gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+    return synth_core(gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
                       xvector.data(), language_id, cancel, sampling,
                       /*chunk_frames=*/0, /*on_chunk=*/{}, trace);
+}
+
+AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
+                                             const std::vector<float>& xvector,
+                                             const std::string& language,
+                                             const CancelCheck& cancel,
+                                             const QwenTtsSampling& sampling,
+                                             QwenTtsTrace* trace) const {
+    return synthesize_with_xvector_into(impl_->gen, text, xvector, language, cancel,
+                                        sampling, trace);
+}
+
+AudioBuffer QwenTts::synthesize_with_xvector(QwenTtsSession& session,
+                                             const std::string& text,
+                                             const std::vector<float>& xvector,
+                                             const std::string& language,
+                                             const CancelCheck& cancel,
+                                             const QwenTtsSampling& sampling,
+                                             QwenTtsTrace* trace) const {
+    return synthesize_with_xvector_into(session.state_->gen, text, xvector, language,
+                                        cancel, sampling, trace);
 }
 
 AudioBuffer QwenTts::synthesize_stream_with_xvector(

@@ -117,7 +117,7 @@ in parallel; on a single CUDA stream it buys nothing.
 | `Parakeet`       | `ParakeetSession`     | Concurrent  | TDT prediction-net LSTM (h, c)             |
 | `QwenAsr`        | `QwenAsrSession`      | Concurrent  | Qwen3 decoder KV-cache (per clip)          |
 | `Rave`           | — (none needed)       | Concurrent  | none — stateless, see below                |
-| `QwenTts`        | —                     | (single)    | Talker + CodePredictor captured-graph step state still on `Impl` — not yet sessioned |
+| `QwenTts`        | `QwenTtsSession`      | Serialized  | Talker decode session + CodePredictor frame graph (per voice) |
 
 `Whisper` sits at the serialized tier for the same reason as `Kokoro`: its
 decoder replays a single lazily-captured CUDA step graph whose buffers are shared
@@ -142,11 +142,27 @@ already call `decode()` on one shared `Rave` with zero cross-talk. Manufacturing
 an empty `RaveSession` would only add ceremony, so the convention is satisfied by
 declaring the tier and skipping the struct.
 
-The one remaining autoregressive holdout, `QwenTts`, keeps its Talker and
-CodePredictor per-step scratch — each a lazily-captured CUDA graph with baked
-device pointers, reached through the `const` `synthesize()` — on the pImpl today,
-so it is single-session and lands at the **serialized** tier once sessioned.
-Sessioning it is the Whisper move at larger scale: hoist both captured-graph step
-states (and the decode KV-cache) off `Impl` into a `QwenTtsSession` threaded
-through `synth_core` and its five entry points. That is the natural next step when
-multi-voice Qwen synthesis is needed.
+`QwenTts` is sessioned at the **serialized** tier — the Whisper move at larger
+scale. Its two per-stream captured graphs (the Talker decode session: fixed-cap
+KV + captured step; and the CodePredictor's whole-frame greedy graph), each with
+device pointers baked at capture, were `mutable` members on the shared model
+structs. They now live in a `QwenTtsGenState` (a pair of custom-deleter
+unique_ptrs, so the bundle is destructible across translation units without the
+opaque state types being complete there), threaded through `generate_codes` and
+`Talker::decode_{begin,prefill,step}` / `CodePredictor::predict_dev`. The public
+`QwenTtsSession` is a pImpl over one `QwenTtsGenState`; `make_session()` plus the
+`synthesize(session, …)` / `synthesize_clone(session, …)` /
+`synthesize_with_xvector(session, …)` overloads drive it. Two gen-states over one
+shared model produce bit-identical code streams interleaved (CPU + CUDA), and the
+bench holds the pre-session `synthesize()` RT — the compute graph is unchanged.
+
+It is serialized because the captured graphs and the single GPU stream are shared
+the moment two sessions run *concurrently*; *serial* reuse across voices is exact
+(same-shape graph replays per voice), which is the NPC-turn-taking / bulk-offline
+shape Qwen is used in. The streaming twins (`synthesize_stream*`) are realtime
+single-consumer wrappers and stay on the model's built-in session; they are not
+sessioned because Qwen is not the realtime speaker (Kokoro is) — multi-voice Qwen
+is the non-streaming bulk path.
+
+That clears the last holdout: every model now declares a tier, and a sessioned
+one names its `Session` type.

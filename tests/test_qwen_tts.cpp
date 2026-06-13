@@ -587,6 +587,34 @@ static int run() {
                 CHECK(gotF == F, tag("synth AR loop frame count matches"));
                 CHECK(sm == 0, tag("synth code stream matches upstream exactly"));
 
+                // Multi-stream (SERIALIZED tier): two independent gen-states over
+                // the one shared Talker + Code Predictor, driven interleaved, must
+                // each reproduce the single-stream code stream bit-for-bit — the
+                // captured graphs and KV caches now live per-stream, so nothing
+                // cross-talks. (Serialized = no *concurrent* overlap; serial reuse
+                // across streams is exact, which is what this checks.)
+                {
+                    brosoundml::QwenTtsGenState genA, genB;
+                    std::vector<int32_t> fA1, fB, fA2;
+                    const int fa1 = brosoundml::generate_codes(
+                        talker, cp, genA, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), gp, fA1);
+                    const int fb = brosoundml::generate_codes(   // B between A's runs
+                        talker, cp, genB, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), gp, fB);
+                    const int fa2 = brosoundml::generate_codes(  // A reused
+                        talker, cp, genA, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), gp, fA2);
+                    CHECK(fa1 == gotF && fA1 == got_frames,
+                          tag("session A code stream matches the single-stream run"));
+                    CHECK(fb == gotF && fB == got_frames,
+                          tag("session B (interleaved) matches — no cross-talk"));
+                    CHECK(fa2 == gotF && fA2 == got_frames,
+                          tag("session A reused matches (graph replay is stable)"));
+                    std::printf("    [synth sessions] 2 gen-states over 1 model, "
+                                "interleaved, bit-exact (F=%d)\n", gotF);
+                }
+
                 // (4) the public synthesize() path runs end to end (codes ->
                 // 24 kHz). Gated behind the heavy-decode env like the codec
                 // fixture, since it runs the full x1920 decode.
@@ -598,6 +626,30 @@ static int run() {
                     CHECK(!wav.samples.empty(), tag("synthesize() returns audio"));
                     std::printf("    [%s synthesize] %zu samples (%.2fs)\n",
                                 dev_name, wav.samples.size(), wav.samples.size() / 24000.0);
+
+                    // Public multi-voice session API: two sessions over the one
+                    // loaded model, interleaved, each reproduce the single-call
+                    // waveform bit-for-bit (codec is deterministic over the codes).
+                    // GPU-only — the x1920 codec on CPU is far too slow to run
+                    // four times here (CPU is not a Qwen synthesis target).
+                    if (dev != brotensor::Device::CPU) {
+                    brosoundml::QwenTtsSession sA = q2.make_session();
+                    brosoundml::QwenTtsSession sB = q2.make_session();
+                    auto wA1 = q2.synthesize(sA, text, "serena", "english");
+                    auto wB  = q2.synthesize(sB, text, "serena", "english");
+                    auto wA2 = q2.synthesize(sA, text, "serena", "english");
+                    CHECK(wA1.samples == wav.samples,
+                          tag("session synthesize matches the single-call waveform"));
+                    CHECK(wB.samples == wav.samples,
+                          tag("interleaved session waveform matches — no cross-talk"));
+                    CHECK(wA2.samples == wA1.samples,
+                          tag("reused session waveform is stable"));
+                    q2.reset(sA);
+                    auto wA3 = q2.synthesize(sA, text, "serena", "english");
+                    CHECK(wA3.samples == wav.samples, tag("session after reset matches"));
+                    std::printf("    [%s sessions] 2 QwenTtsSession over 1 model, "
+                                "bit-exact, no cross-talk\n", dev_name);
+                    }
                 }
             }
         }

@@ -311,6 +311,11 @@ enum class QwenTtsWeightPrecision { FP32, BF16 };
 // by reference and a multi-voice session can own one.
 struct QwenTtsGenState;
 
+// Per-stream synthesis session for multi-voice serving (below). Opaque (a pImpl
+// over QwenTtsGenState), defined in qwen_tts.cpp.
+struct QwenTtsSessionState;
+class QwenTtsSession;
+
 // The Qwen3-TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -425,6 +430,50 @@ public:
                                                const CancelCheck& cancel = {},
                                                const QwenTtsSampling& sampling = {}) const;
 
+    // ── Multi-voice session API (docs/multi-stream-sessions.md) ──
+    //
+    // One loaded QwenTts behind a std::shared_ptr<const QwenTts> serves N voices:
+    // each stream owns a QwenTtsSession (its Talker + Code Predictor AR scratch)
+    // and the synthesize overloads below read the shared weights, writing only
+    // into the session they are handed. SERIALIZED tier — the per-session
+    // captured graphs and the single GPU stream mean calls over one model must
+    // not overlap; drive them from one worker / queue (ideal for NPC turn-taking
+    // and bulk offline generation). The non-streaming synthesis paths are
+    // sessioned; the streaming twins (synthesize_stream*) run on the model's
+    // built-in single session and are for one realtime consumer.
+    //
+    // Allocate a fresh per-stream session on the model device. const — callable
+    // through shared_ptr<const QwenTts>.
+    QwenTtsSession make_session() const;
+
+    // Session forms of the non-streaming synthesis entry points. Identical to
+    // the same-named methods but driving `session`'s AR scratch instead of the
+    // model's built-in one, so two sessions over one model never cross-talk.
+    AudioBuffer synthesize(QwenTtsSession& session, const std::string& text,
+                           const std::string& speaker,
+                           const std::string& language = "english",
+                           const std::string& instruct = "",
+                           const CancelCheck& cancel = {},
+                           const QwenTtsSampling& sampling = {},
+                           QwenTtsTrace* trace = nullptr) const;
+    AudioBuffer synthesize_clone(QwenTtsSession& session, const std::string& text,
+                                 const AudioBuffer& ref,
+                                 const std::string& language = "english",
+                                 const CancelCheck& cancel = {},
+                                 const QwenTtsSampling& sampling = {}) const;
+    AudioBuffer synthesize_with_xvector(QwenTtsSession& session,
+                                        const std::string& text,
+                                        const std::vector<float>& xvector,
+                                        const std::string& language = "english",
+                                        const CancelCheck& cancel = {},
+                                        const QwenTtsSampling& sampling = {},
+                                        QwenTtsTrace* trace = nullptr) const;
+
+    // Reset a session's AR scratch (drops its captured decode graphs). Each
+    // synthesize is already self-contained, so this is rarely needed; part of the
+    // convention. const.
+    void reset(QwenTtsSession& session) const;
+
     // Decode a precomputed code stream straight through the bundled 12 Hz codec
     // decoder to a 24 kHz waveform — the deterministic tail of synthesis, usable
     // on its own once the Talker / Code Predictor have produced (or a caller
@@ -484,6 +533,30 @@ private:
                            const QwenTtsStreamChunkFn& on_chunk = {},
                            QwenTtsTrace* trace = nullptr) const;
 
+    // Bodies of the non-streaming synthesis entries, parameterized on the AR
+    // scratch. The public single-stream methods pass the Impl-owned gen-state;
+    // the session overloads pass the session's. Keeps the prep (validation /
+    // tokenize / enroll) in one place.
+    AudioBuffer synthesize_into(QwenTtsGenState& gen, const std::string& text,
+                                const std::string& speaker,
+                                const std::string& language,
+                                const std::string& instruct,
+                                const CancelCheck& cancel,
+                                const QwenTtsSampling& sampling,
+                                QwenTtsTrace* trace) const;
+    AudioBuffer synthesize_clone_into(QwenTtsGenState& gen, const std::string& text,
+                                      const AudioBuffer& ref,
+                                      const std::string& language,
+                                      const CancelCheck& cancel,
+                                      const QwenTtsSampling& sampling) const;
+    AudioBuffer synthesize_with_xvector_into(QwenTtsGenState& gen,
+                                             const std::string& text,
+                                             const std::vector<float>& xvector,
+                                             const std::string& language,
+                                             const CancelCheck& cancel,
+                                             const QwenTtsSampling& sampling,
+                                             QwenTtsTrace* trace) const;
+
     // Resolve a CustomVoice/VoiceDesign request to the synth_core inputs shared by
     // synthesize() and synthesize_stream(): tokenized body + instruct turns, the
     // preset speaker token (or -1), and the language token (incl. dialect override).
@@ -497,6 +570,25 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// One voice stream's AR scratch over a shared QwenTts (SERIALIZED tier). Build
+// with QwenTts::make_session() and pass it to the QwenTts::synthesize(session,…)
+// overloads. Move-only — it owns device tensors (the captured decode graphs +
+// KV caches). The scratch is opaque (a pImpl over QwenTtsGenState) so this
+// header stays free of module internals.
+class QwenTtsSession {
+public:
+    QwenTtsSession();
+    ~QwenTtsSession();
+    QwenTtsSession(QwenTtsSession&&) noexcept;
+    QwenTtsSession& operator=(QwenTtsSession&&) noexcept;
+    QwenTtsSession(const QwenTtsSession&) = delete;
+    QwenTtsSession& operator=(const QwenTtsSession&) = delete;
+
+private:
+    friend class QwenTts;
+    std::unique_ptr<QwenTtsSessionState> state_;
 };
 
 }  // namespace brosoundml
