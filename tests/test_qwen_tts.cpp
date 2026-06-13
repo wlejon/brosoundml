@@ -455,8 +455,9 @@ static int run() {
                 params.max_frames = F;
                 params.rope_delta = rope_delta;
                 std::vector<int32_t> got_frames;
+                brosoundml::QwenTtsGenState gen;   // per-stream AR scratch
                 const int got_F = generate_codes(
-                    talker, cp, prefill.data(), T, pos3.data(),
+                    talker, cp, gen, prefill.data(), T, pos3.data(),
                     trailing.data(), L, tts_pad.data(), params, got_frames);
                 CHECK(got_F == F, tag("AR loop emits the expected frame count"));
                 int fr_mismatch = 0;
@@ -573,8 +574,9 @@ static int run() {
                 gp.min_frames  = 2;
                 gp.repetition_penalty = 1.05f;
                 std::vector<int32_t> got_frames;
+                brosoundml::QwenTtsGenState gen;   // per-stream AR scratch
                 const int gotF = brosoundml::generate_codes(
-                    talker, cp, prefill.data(), gotT, pos3.data(),
+                    talker, cp, gen, prefill.data(), gotT, pos3.data(),
                     trailing.data(), gotL, tts_pad.data(), gp, got_frames);
                 CHECK(gotF == F, tag("synth AR loop emits the expected frame count"));
                 int sm = 0;
@@ -780,8 +782,9 @@ static int run() {
                 gp.min_frames = 2;
                 gp.repetition_penalty = 1.05f;
                 std::vector<int32_t> got_frames;
+                brosoundml::QwenTtsGenState gen;   // per-stream AR scratch
                 const int gotF = brosoundml::generate_codes(
-                    talker, cp, prefill.data(), gotT, pos3.data(),
+                    talker, cp, gen, prefill.data(), gotT, pos3.data(),
                     trailing.data(), gotL, tts_pad.data(), gp, got_frames);
                 int sm = 0;
                 if (gotF == F)

@@ -256,6 +256,12 @@ struct QwenTts::Impl {
     QwenTtsTalker         talker;      // 28-layer Qwen3 decoder backbone
     QwenTtsCodePredictor  code_pred;   // 5-layer depth transformer
     std::unique_ptr<brolm::qwen::Tokenizer> tokenizer;  // text -> Qwen BPE ids
+
+    // The single-stream AR scratch the bare synthesize()/clone entry points use
+    // (one loaded model, one caller). Multi-voice callers own their own via a
+    // QwenTtsSession instead. Serialized tier — the captured graphs here must
+    // not be driven by two overlapping calls.
+    QwenTtsGenState       gen;
 };
 
 QwenTts::QwenTts() : impl_(std::make_unique<Impl>()) {}
@@ -437,7 +443,7 @@ AudioBuffer QwenTts::synthesize(const std::string& text,
     int spk_id = -1, language_id = -1;
     resolve_inputs("QwenTts::synthesize", text, speaker, language, instruct,
                    input_ids, instruct_ids, spk_id, language_id);
-    return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
+    return synth_core(impl_->gen, input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
                       language_id, cancel, sampling, /*chunk_frames=*/0,
                       /*on_chunk=*/{}, trace);
 }
@@ -458,7 +464,7 @@ AudioBuffer QwenTts::synthesize_stream(const std::string& text,
     resolve_inputs("QwenTts::synthesize_stream", text, speaker, language, instruct,
                    input_ids, instruct_ids, spk_id, language_id);
     const int cf = chunk_frames > 0 ? chunk_frames : 25;
-    return synth_core(input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
+    return synth_core(impl_->gen, input_ids, instruct_ids, spk_id, /*spk_embed=*/nullptr,
                       language_id, cancel, sampling, cf, on_chunk);
 }
 
@@ -501,7 +507,7 @@ AudioBuffer QwenTts::synthesize_clone(const std::string& text,
         fail("QwenTts::synthesize_clone", "prompt tokenized to too few tokens");
     }
 
-    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+    return synth_core(impl_->gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
                       spk_embed.data(), language_id, cancel, sampling);
 }
 
@@ -545,7 +551,7 @@ AudioBuffer QwenTts::synthesize_with_xvector(const std::string& text,
         fail("QwenTts::synthesize_with_xvector", "prompt tokenized to too few tokens");
     }
 
-    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+    return synth_core(impl_->gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
                       xvector.data(), language_id, cancel, sampling,
                       /*chunk_frames=*/0, /*on_chunk=*/{}, trace);
 }
@@ -587,7 +593,7 @@ AudioBuffer QwenTts::synthesize_stream_with_xvector(
     }
 
     const int cf = chunk_frames > 0 ? chunk_frames : 25;
-    return synth_core(input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
+    return synth_core(impl_->gen, input_ids, /*instruct_ids=*/{}, /*spk_id=*/-1,
                       xvector.data(), language_id, cancel, sampling, cf, on_chunk);
 }
 
@@ -622,7 +628,8 @@ std::vector<float> QwenTts::embed_speaker(const AudioBuffer& ref) const {
     return impl_->spk_enc.embed(wav, n);
 }
 
-AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
+AudioBuffer QwenTts::synth_core(QwenTtsGenState& gen,
+                                const std::vector<int32_t>& input_ids,
                                 const std::vector<int32_t>& instruct_ids,
                                 int spk_id, const float* spk_embed,
                                 int language_id, const CancelCheck& cancel,
@@ -734,7 +741,7 @@ AudioBuffer QwenTts::synth_core(const std::vector<int32_t>& input_ids,
     }
 
     std::vector<int32_t> frames;
-    const int F = generate_codes(impl_->talker, impl_->code_pred, prefill.data(),
+    const int F = generate_codes(impl_->talker, impl_->code_pred, gen, prefill.data(),
                                  T, pos3.data(), trailing.data(), L, tts_pad.data(),
                                  gp, frames, cancel, trace);
     // Cancelled mid-loop: discard the partial code stream and return silence

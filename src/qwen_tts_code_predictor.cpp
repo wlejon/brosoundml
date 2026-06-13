@@ -251,19 +251,16 @@ void run_frame_body(const QwenTtsCodePredictor& cp, CpFrameState& st,
 
 }  // namespace
 
-// Out-of-line so frame_state (unique_ptr<CpFrameState>) can be an incomplete
-// type in the header — CpFrameState is only fully defined here.
-QwenTtsCodePredictor::QwenTtsCodePredictor() = default;
-QwenTtsCodePredictor::~QwenTtsCodePredictor() = default;
-QwenTtsCodePredictor::QwenTtsCodePredictor(QwenTtsCodePredictor&&) noexcept = default;
-QwenTtsCodePredictor&
-QwenTtsCodePredictor::operator=(QwenTtsCodePredictor&&) noexcept = default;
+// Out-of-line so a CpFramePtr (custom-deleter unique_ptr<CpFrameState>) is
+// destructible in any TU — CpFrameState is only fully defined here.
+void CpFrameStateDeleter::operator()(CpFrameState* p) const noexcept {
+    delete p;
+}
 
 void QwenTtsCodePredictor::load(const sf::File& f,
                                 const QwenTtsCodePredictorConfig& cfg,
                                 int talker_hidden_, bt::Device dev,
                                 bool bf16_weights) {
-    frame_state.reset();   // drop any stale per-instance decode state on reload
     num_layers      = cfg.transformer.num_hidden_layers;
     hidden          = cfg.transformer.hidden_size;
     talker_hidden   = talker_hidden_;
@@ -353,10 +350,12 @@ void QwenTtsCodePredictor::predict(const float* past_hidden,
     bt::DeviceScope scope(dev);
     bt::Tensor ph = bt::Tensor::from_host_on(dev, past_hidden, 1, talker_hidden);
     bt::Tensor ce = bt::Tensor::from_host_on(dev, c0_embed,    1, talker_hidden);
-    predict_dev(ph, ce, out_codes);
+    CpFramePtr fs;   // convenience wrapper owns its own one-shot frame state
+    predict_dev(fs, ph, ce, out_codes);
 }
 
-void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
+void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
+                                       const bt::Tensor& past_hidden,
                                        const bt::Tensor& c0_embed,
                                        std::vector<int>& out_codes,
                                        float temperature, int top_k, float top_p,
@@ -377,14 +376,14 @@ void QwenTtsCodePredictor::predict_dev(const bt::Tensor& past_hidden,
     // Lazily build the per-instance persistent state: the depth KV cache, the
     // conditioning-input staging buffer, and the (15,1) INT32 code buffer. The
     // pass scratch sizes itself on the first run_frame_body call.
-    if (!frame_state) {
-        frame_state = std::make_unique<CpFrameState>();
+    if (!fs) {
+        fs.reset(new CpFrameState());
         const int kd = n_kv_heads * head_dim;
-        frame_state->cache.alloc(num_layers, num_code_groups, dev, kd);
-        frame_state->cond_in  = bt::Tensor::empty_on(dev, 2, talker_hidden, bt::Dtype::FP32);
-        frame_state->code_dev = bt::Tensor::empty_on(dev, n_out, 1, bt::Dtype::INT32);
+        fs->cache.alloc(num_layers, num_code_groups, dev, kd);
+        fs->cond_in  = bt::Tensor::empty_on(dev, 2, talker_hidden, bt::Dtype::FP32);
+        fs->code_dev = bt::Tensor::empty_on(dev, n_out, 1, bt::Dtype::INT32);
     }
-    CpFrameState& st = *frame_state;
+    CpFrameState& st = *fs;
 
     // Stage the two conditioning rows into the persistent input buffer in place —
     // the only per-frame input a captured graph reads (everything downstream is

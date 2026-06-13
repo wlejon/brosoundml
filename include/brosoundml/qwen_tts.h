@@ -305,6 +305,12 @@ struct QwenTtsConfig {
 //          contract; FP32 remains the fixture-gated reference mode.
 enum class QwenTtsWeightPrecision { FP32, BF16 };
 
+// Per-stream autoregressive scratch (Talker + Code Predictor captured-graph
+// state). Opaque here — defined in src/qwen_tts_generate.h — so the public
+// header stays free of module internals; named only so synth_core can take it
+// by reference and a multi-voice session can own one.
+struct QwenTtsGenState;
+
 // The Qwen3-TTS pipeline. Construct, load() a model directory, then
 // synthesize(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -461,11 +467,15 @@ public:
 
 private:
     // Shared synthesis tail: tokenize-resolved inputs -> prefill -> AR loop ->
-    // codec decode. `spk_embed` (hidden floats, or null) is the Base clone's
-    // x-vector spliced into the prefill speaker slot; `spk_id` the CustomVoice
-    // preset token (or -1). Both callers (synthesize / synthesize_clone) resolve
-    // language + speaker then delegate here.
-    AudioBuffer synth_core(const std::vector<int32_t>& input_ids,
+    // codec decode. `gen` is the caller-chosen per-stream AR scratch (the
+    // Talker/CodePredictor captured-graph state); the single-stream entry points
+    // pass the Impl-owned one, a multi-voice session passes its own. `spk_embed`
+    // (hidden floats, or null) is the Base clone's x-vector spliced into the
+    // prefill speaker slot; `spk_id` the CustomVoice preset token (or -1). Both
+    // callers (synthesize / synthesize_clone) resolve language + speaker then
+    // delegate here.
+    AudioBuffer synth_core(QwenTtsGenState& gen,
+                           const std::vector<int32_t>& input_ids,
                            const std::vector<int32_t>& instruct_ids,
                            int spk_id, const float* spk_embed, int language_id,
                            const CancelCheck& cancel,

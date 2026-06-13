@@ -27,6 +27,19 @@
 
 namespace brosoundml {
 
+// All per-stream mutable scratch the AR loop touches: the Talker's captured
+// decode session and the Code Predictor's captured per-frame state. One per
+// audio stream (docs/multi-stream-sessions.md) — the Talker and Code Predictor
+// weights stay read-only, so N gen-states over one loaded model never
+// cross-talk. The custom-deleter pointers make this destructible in any TU
+// (qwen_tts.cpp's Impl and the public QwenTtsSession both own one) without the
+// opaque state types being complete there. Serialized tier: the captured graphs
+// + the single GPU stream mean calls over one model must not overlap.
+struct QwenTtsGenState {
+    QwenTtsTalkerStepPtr talker_step;   // captured Talker decode session (CUDA)
+    CpFramePtr           cp_frame;      // captured Code Predictor frame graph
+};
+
 struct QwenTtsGenParams {
     int eos_id     = 0;   // codec EOS in the Talker vocab; stops the loop
     int max_frames = 0;   // hard cap on emitted frames
@@ -76,6 +89,7 @@ struct QwenTtsGenParams {
 // and returns the frames emitted so far (the caller discards them). Empty (the
 // default) never cancels, so existing callers are unaffected.
 int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
+                   QwenTtsGenState& gen,
                    const float* prefill_embeds, int T, const int32_t* pos3T,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,

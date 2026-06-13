@@ -28,8 +28,16 @@ namespace brosoundml {
 // Persistent decode-session state for the captured single-token step: the
 // fixed-capacity KV cache, valid-length mask, per-layer scratch, generation
 // RoPE table, and (on CUDA) the captured step graph. Defined in
-// qwen_tts_talker.cpp.
+// qwen_tts_talker.cpp. This is the Talker's per-stream scratch — one per audio
+// stream (see docs/multi-stream-sessions.md), owned by the caller, never by the
+// shared read-only Talker. The deleter is defined out-of-line so a
+// QwenTtsTalkerStepPtr is destructible in any TU without the complete type.
 struct QwenTtsTalkerStepState;
+struct QwenTtsTalkerStepDeleter {
+    void operator()(QwenTtsTalkerStepState*) const noexcept;
+};
+using QwenTtsTalkerStepPtr =
+    std::unique_ptr<QwenTtsTalkerStepState, QwenTtsTalkerStepDeleter>;
 
 // One Qwen3 decoder layer: RMSNorm, GQA self-attention with per-head QK-norm and
 // interleaved M-RoPE, then a SwiGLU MLP. All projections are bias-free; the two
@@ -83,9 +91,6 @@ struct QwenTtsTalker {
     brotensor::Tensor final_norm;       // (hidden,1) RMSNorm
     std::vector<QwenTtsTalkerLayer> layers;
 
-    // Lazily-built captured-decode session (CUDA AR loop); see decode_begin().
-    mutable std::unique_ptr<QwenTtsTalkerStepState> step_state;
-
     QwenTtsTalker();
     ~QwenTtsTalker();
     QwenTtsTalker(QwenTtsTalker&&) noexcept;
@@ -138,22 +143,25 @@ struct QwenTtsTalker {
     // scatter_rows with a device-resident row index, so the same captured
     // kernels append to a new row every replay.
     //
-    // decode_begin(min_cap) — (re)allocate the session to hold >= min_cap rows
+    // The session state is caller-owned (one per stream) and passed in, so the
+    // Talker weights stay read-only and N streams never share a captured graph:
+    //
+    // decode_begin(st, min_cap) — (re)allocate `st` to hold >= min_cap rows
     //   (bucketed so repeat utterances reuse the captured graph) and reset
-    //   len. Returns false when the Talker is not CUDA-resident — the caller
-    //   keeps the run_dev path.
-    // decode_prefill(...) — run() the prefill eagerly into the session cache
+    //   len; lazily constructs `st` on first use. Returns false when the Talker
+    //   is not CUDA-resident — the caller keeps the run_dev path.
+    // decode_prefill(st, ...) — run() the prefill eagerly into st's cache
     //   (rows [0, T)) and set the mask; hidden_out as run().
-    // decode_step(embed, pos, hidden_view) — one generation step: stage the
+    // decode_step(st, embed, pos, hidden_view) — one generation step: stage the
     //   (1, hidden) embedding + scalar position, replay (or first capture)
-    //   the step graph, advance len. hidden_view aliases the session's
-    //   persistent post-final-norm hidden row — valid until the next step.
-    //   Grows + re-captures transparently if len reaches capacity.
-    bool decode_begin(int min_cap) const;
-    void decode_prefill(const float* embeds, int T, const int32_t* pos3T,
-                        brotensor::Tensor& hidden_out) const;
-    void decode_step(const brotensor::Tensor& embed, int pos,
-                     brotensor::Tensor& hidden_view) const;
+    //   st's step graph, advance len. hidden_view aliases st's persistent
+    //   post-final-norm hidden row — valid until the next step. Grows +
+    //   re-captures transparently if len reaches capacity.
+    bool decode_begin(QwenTtsTalkerStepPtr& st, int min_cap) const;
+    void decode_prefill(QwenTtsTalkerStepState& st, const float* embeds, int T,
+                        const int32_t* pos3T, brotensor::Tensor& hidden_out) const;
+    void decode_step(QwenTtsTalkerStepState& st, const brotensor::Tensor& embed,
+                     int pos, brotensor::Tensor& hidden_view) const;
 
     // codec_head over `n` hidden rows (n*hidden row-major) -> (n,vocab) logits.
     void codec_logits(const float* hidden_rows, int n,

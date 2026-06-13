@@ -68,6 +68,7 @@ struct ArProfiler {
 }  // namespace
 
 int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
+                   QwenTtsGenState& gen,
                    const float* prefill_embeds, int T, const int32_t* pos3T,
                    const float* trailing_text_hidden, int L,
                    const float* tts_pad_embed, const QwenTtsGenParams& params,
@@ -93,12 +94,13 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     // (rope_delta < 0 would index the session's [0, cap) RoPE table negatively
     // — no current caller does that, but the eager path handles it, so gate.)
     const bool captured = !no_graph && params.rope_delta >= 0 &&
-        talker.decode_begin(T + std::min(params.max_frames, 1024) + 8);   // false off-CUDA
+        talker.decode_begin(gen.talker_step,
+                            T + std::min(params.max_frames, 1024) + 8);   // false off-CUDA
     QwenTtsTalkerCache cache;
     bt::Tensor hidden;
     auto tp = prof.tick();
     if (captured) {
-        talker.decode_prefill(prefill_embeds, T, pos3T, hidden);   // (T, H) device
+        talker.decode_prefill(*gen.talker_step, prefill_embeds, T, pos3T, hidden);
     } else {
         cache.reset(talker.num_layers);
         talker.run(prefill_embeds, T, pos3T, &cache, hidden);      // (T, H) device
@@ -197,8 +199,9 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         auto tpr = prof.tick();
         bt::Tensor c0row = qtd::gather_rows(
             talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H) device
-        cp.predict_dev(hcur, c0row, rest, params.temperature, params.top_k,
-                       params.top_p, params.seed, sampling ? &rng_counter : nullptr);
+        cp.predict_dev(gen.cp_frame, hcur, c0row, rest, params.temperature,
+                       params.top_k, params.top_p, params.seed,
+                       sampling ? &rng_counter : nullptr);
         prof.add(prof.predict, tpr);
 
         // emit the frame [c0, c1..c15].
@@ -233,8 +236,8 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
         auto tt = prof.tick();
         if (captured) {
             bt::Tensor hview;
-            talker.decode_step(e, pos, hview);   // graph replay; hview aliases
-            hcur = std::move(hview);             // the session's hidden buffer
+            talker.decode_step(*gen.talker_step, e, pos, hview);  // graph replay
+            hcur = std::move(hview);             // hview aliases the session hidden
         } else {
             const int32_t pos3[3] = {pos, pos, pos};
             bt::Tensor hstep;

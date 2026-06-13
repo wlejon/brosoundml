@@ -87,6 +87,10 @@ struct QwenTtsTalkerStepState {
     bool captured = false;
 };
 
+void QwenTtsTalkerStepDeleter::operator()(QwenTtsTalkerStepState* p) const noexcept {
+    delete p;
+}
+
 QwenTtsTalker::QwenTtsTalker() = default;
 QwenTtsTalker::~QwenTtsTalker() = default;
 QwenTtsTalker::QwenTtsTalker(QwenTtsTalker&&) noexcept = default;
@@ -94,7 +98,6 @@ QwenTtsTalker& QwenTtsTalker::operator=(QwenTtsTalker&&) noexcept = default;
 
 void QwenTtsTalker::load(const sf::File& f, const QwenTtsTalkerConfig& cfg,
                          bt::Device dev, bool bf16_weights) {
-    step_state.reset();   // drop any stale decode session on reload
     num_layers   = cfg.transformer.num_hidden_layers;
     hidden       = cfg.transformer.hidden_size;
     intermediate = cfg.transformer.intermediate_size;
@@ -380,11 +383,11 @@ void talker_state_alloc(const QwenTtsTalker& t, QwenTtsTalkerStepState& st,
 
 }  // namespace
 
-bool QwenTtsTalker::decode_begin(int min_cap) const {
+bool QwenTtsTalker::decode_begin(QwenTtsTalkerStepPtr& st_ptr, int min_cap) const {
     if (final_norm.device != bt::Device::CUDA) return false;
     bt::DeviceScope scope(final_norm.device);
-    if (!step_state) step_state = std::make_unique<QwenTtsTalkerStepState>();
-    QwenTtsTalkerStepState& st = *step_state;
+    if (!st_ptr) st_ptr.reset(new QwenTtsTalkerStepState());
+    QwenTtsTalkerStepState& st = *st_ptr;
     // Bucket the capacity so back-to-back utterances of similar length reuse
     // the captured graph; only grow (a bigger session serves smaller calls).
     const int bucket = ((std::max(min_cap, 256) + 511) / 512) * 512;
@@ -393,10 +396,9 @@ bool QwenTtsTalker::decode_begin(int min_cap) const {
     return true;
 }
 
-void QwenTtsTalker::decode_prefill(const float* embeds, int T,
-                                   const int32_t* pos3T,
+void QwenTtsTalker::decode_prefill(QwenTtsTalkerStepState& st, const float* embeds,
+                                   int T, const int32_t* pos3T,
                                    bt::Tensor& hidden_out) const {
-    QwenTtsTalkerStepState& st = *step_state;
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int kd = n_kv_heads * head_dim;
@@ -424,9 +426,8 @@ void QwenTtsTalker::decode_prefill(const float* embeds, int T,
         st.mask.data, hmask.data(), static_cast<std::size_t>(st.cap) * sizeof(float));
 }
 
-void QwenTtsTalker::decode_step(const bt::Tensor& embed, int pos,
-                                bt::Tensor& hidden_view) const {
-    QwenTtsTalkerStepState& st = *step_state;
+void QwenTtsTalker::decode_step(QwenTtsTalkerStepState& st, const bt::Tensor& embed,
+                                int pos, bt::Tensor& hidden_view) const {
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int half = head_dim / 2;

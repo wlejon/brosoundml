@@ -39,19 +39,25 @@ struct QwenTtsCodePredictorLayer {
     brotensor::Tensor gate, up, down;
 };
 
-// Per-instance persistent decode state for predict_dev: the reused scratch
+// Per-stream persistent decode state for predict_dev: the reused scratch
 // buffers (so a frame allocates nothing on the steady-state path) and, on CUDA
 // greedy, the captured CUDA graph that replays the whole frame as one launch.
-// Defined in qwen_tts_code_predictor.cpp; opaque here.
+// Defined in qwen_tts_code_predictor.cpp; opaque here. Caller-owned, one per
+// audio stream (see docs/multi-stream-sessions.md) — never shared by the
+// read-only predictor. The deleter is out-of-line so a CpFramePtr is
+// destructible in any TU without the complete type.
 struct CpFrameState;
+struct CpFrameStateDeleter {
+    void operator()(CpFrameState*) const noexcept;
+};
+using CpFramePtr = std::unique_ptr<CpFrameState, CpFrameStateDeleter>;
 
 struct QwenTtsCodePredictor {
     // Out-of-line so the unique_ptr<CpFrameState> member can hold an incomplete
     // type in this header (state lives entirely in the .cpp).
-    QwenTtsCodePredictor();
-    ~QwenTtsCodePredictor();
-    QwenTtsCodePredictor(QwenTtsCodePredictor&&) noexcept;
-    QwenTtsCodePredictor& operator=(QwenTtsCodePredictor&&) noexcept;
+    QwenTtsCodePredictor() = default;
+    QwenTtsCodePredictor(QwenTtsCodePredictor&&) noexcept = default;
+    QwenTtsCodePredictor& operator=(QwenTtsCodePredictor&&) noexcept = default;
 
     // ── dims ──
     int num_layers = 0;
@@ -110,12 +116,17 @@ struct QwenTtsCodePredictor {
     // no host round-trip (argmax runs on-device, only the chosen code id — 4
     // bytes per head — comes back). Same greedy result as predict().
     //
+    // `fs` is the caller-owned per-stream frame state (the reused scratch +
+    // captured graph); lazily constructed on first use. One per audio stream so
+    // the predictor weights stay read-only and concurrent streams never share a
+    // captured graph.
+    //
     // Sampling: with temperature == 0 (or counter == nullptr) every codebook is
     // the greedy argmax — the default, bit-exact with predict(). With
     // temperature > 0 each codebook 1..15 is drawn through
     // brotensor::sample_logits seeded by (key, *counter); *counter is advanced
     // one step per code so the draws compose with the Talker's codebook-0 stream.
-    void predict_dev(const brotensor::Tensor& past_hidden,
+    void predict_dev(CpFramePtr& fs, const brotensor::Tensor& past_hidden,
                      const brotensor::Tensor& c0_embed,
                      std::vector<int>& out_codes,
                      float temperature = 0.0f, int top_k = 0, float top_p = 1.0f,
@@ -124,10 +135,6 @@ struct QwenTtsCodePredictor {
 
     // Raw pointer to codec_embedding table `table` row `id` (hidden floats).
     const float* codec_embedding_row(int table, int id) const;
-
-    // Reused scratch + captured CUDA graph for predict_dev. Mutable: predict_dev
-    // is logically const (weights unchanged) but lazily builds this on first use.
-    mutable std::unique_ptr<CpFrameState> frame_state;
 };
 
 }  // namespace brosoundml
