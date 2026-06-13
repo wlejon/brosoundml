@@ -71,6 +71,22 @@ void place_click(std::vector<float>& s, double at_seconds, float amp) {
         s[i0 + i] = amp * (2.0f * u - 1.0f);
     }
 }
+// A short VOICED burst — a pitched "syllable" (like a beat of a laugh): an
+// abrupt attack trips an onset, and the sustained body reads as voiced (high
+// autocorrelation periodicity) at a clear pitch. The opposite timbre of a
+// broadband click landing on the same beat.
+void place_voiced(std::vector<float>& s, double at_seconds, double dur,
+                  double hz, float amp) {
+    std::size_t i0   = static_cast<std::size_t>(at_seconds * kRate);
+    std::size_t n    = static_cast<std::size_t>(dur * kRate);
+    std::size_t fade = static_cast<std::size_t>(0.01 * kRate);
+    for (std::size_t i = 0; i < n && i0 + i < s.size(); ++i) {
+        const double g = (i >= n - fade)
+            ? static_cast<double>(n - i) / static_cast<double>(fade) : 1.0;
+        s[i0 + i] = amp * static_cast<float>(
+            g * std::sin(2.0 * kPi * hz * static_cast<double>(i) / kRate));
+    }
+}
 
 // Drive a clip through the matcher exactly as the live host would: one private
 // SensorHub, frame by frame (prime one window, then one hop per frame),
@@ -107,6 +123,15 @@ std::vector<float> rhythm_clip(double gap) {
     place_click(s, 0.3 + 2 * gap, 0.8f);
     return s;
 }
+// 3 voiced bursts at the given inter-beat spacing — a "laugh" performed at a
+// click-rhythm's tempo (same timing, very different sound).
+std::vector<float> voiced_rhythm_clip(double gap, double hz) {
+    std::vector<float> s = silence(0.3 + 3 * gap + 0.3);
+    place_voiced(s, 0.3, 0.12, hz, 0.5f);
+    place_voiced(s, 0.3 + gap, 0.12, hz, 0.5f);
+    place_voiced(s, 0.3 + 2 * gap, 0.12, hz, 0.5f);
+    return s;
+}
 std::vector<float> tone_clip(double hz) {
     std::vector<float> s = silence(0.3);
     append_tone(s, 0.6, hz, 0.12f);
@@ -141,6 +166,62 @@ void test_rhythm() {
     g.reset();
     auto other = run_clip(g, cfg.sensor, rhythm_clip(0.5));   // 2x slower
     CHECK(other.empty(), "rhythm: does NOT fire on a different tempo");
+}
+
+// ─── 1b. a rhythm rejects the same tempo with a different SOUND SHAPE ────────
+// The reported failure: a double tongue-click enrolls as "rhythm" and then a
+// laugh at the same pace fires it, because timing was the only thing checked.
+// Each beat now carries an acoustic signature (voicedness / pitch / brightness),
+// so voiced bursts at the click tempo must NOT fire while a re-click still does.
+void test_rhythm_rejects_shape() {
+    GestureConfig cfg;
+    GestureSpotter g(cfg);
+    auto clip = rhythm_clip(0.25);
+    g.enroll_from_audio("clicks", clip.data(), (int)clip.size());
+    GestureView v;
+    CHECK(g.inspect("clicks", v) && v.onsets.size() == 3,
+          "shape: rhythm captured a per-beat signature");
+    bool unvoiced = !v.onsets.empty();
+    for (auto& o : v.onsets) if (o.voiced >= 0.5f) unvoiced = false;
+    CHECK(unvoiced, "shape: broadband click beats enrolled as unvoiced");
+    if (!v.onsets.empty())
+        std::fprintf(stderr, "  [shape] click beat0 voiced=%.2f pitch=%.0f bright=%.2f\n",
+                     v.onsets[0].voiced, v.onsets[0].pitch, v.onsets[0].bright);
+
+    g.reset();
+    auto self = run_clip(g, cfg.sensor, rhythm_clip(0.25));
+    CHECK(!self.empty() && self[0].name == "clicks",
+          "shape: still self-fires on the same clicks");
+
+    // Sanity: the voiced version is the SAME 3-beat rhythm at the SAME tempo —
+    // so the rejection below is from sound shape, not a timing miss. (Voiced
+    // bursts would otherwise classify as a TONE — a sustained tonal run — so we
+    // force rhythm classification here purely to read back the per-beat sigs.)
+    {
+        GestureConfig rcfg = cfg;
+        rcfg.min_tone_frames = 100000;   // never classify as tone
+        GestureSpotter g2(rcfg);
+        auto vr = voiced_rhythm_clip(0.25, 220.0);
+        g2.enroll_from_audio("laugh", vr.data(), (int)vr.size());
+        GestureView lv;
+        CHECK(g2.inspect("laugh", lv) && lv.kind == GestureKind::Rhythm &&
+              lv.onsets.size() == 3,
+              "shape: voiced bursts are a 3-beat rhythm too (same tempo)");
+        bool voiced = lv.onsets.size() == 3;
+        for (auto& o : lv.onsets) if (o.voiced < 0.5f) voiced = false;
+        CHECK(voiced, "shape: voiced beats enrolled as voiced (pitch present)");
+        if (!lv.onsets.empty())
+            std::fprintf(stderr, "  [shape] laugh beat0 voiced=%.2f pitch=%.0f\n",
+                         lv.onsets[0].voiced, lv.onsets[0].pitch);
+    }
+
+    g.reset();
+    auto laugh = run_clip(g, cfg.sensor, voiced_rhythm_clip(0.25, 220.0));
+    if (!laugh.empty())
+        std::fprintf(stderr, "  [shape] UNEXPECTED fire on voiced bursts conf=%.2f\n",
+                     laugh[0].confidence);
+    CHECK(laugh.empty(),
+          "shape: a laugh at the click tempo does NOT fire the click rhythm");
 }
 
 // ─── 2. a tone gesture self-fires and rejects a different pitch ─────────────
@@ -232,6 +313,7 @@ void test_refractory() {
 int main() {
     brotensor::init();
     test_rhythm();
+    test_rhythm_rejects_shape();
     test_tone();
     test_tone_rejects_wander();
     test_too_sparse();

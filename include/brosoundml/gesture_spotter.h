@@ -50,11 +50,22 @@ struct GestureConfig {
                                // whistle holds a steady pitch; a cough/throat
                                // noise wanders through the band — same mean,
                                // far higher spread — and is rejected here.
+    float shape_tol = 0.30f;   // rhythm: each beat must SOUND like the enrolled
+                               // beat, not just land on time. Max allowed
+                               // per-beat deviation in voicedness (autocorrelation
+                               // periodicity) and brightness (mel centroid), both
+                               // normalized [0,1]. A tongue click and a laugh at
+                               // the same tempo differ sharply in voicedness, so
+                               // the laugh is rejected. Looser = more forgiving of
+                               // timbre drift; tighter = stricter sound match.
     int   refractory_frames = 40;  // suppress re-fires of the SAME gesture this
                                    // many frames (~400 ms at the 10 ms hop).
     int   min_onsets    = 2;   // a rhythm gesture needs at least this many onsets.
     int   min_tone_frames = 8; // a tone gesture's run must last at least this
                                // long to enroll AND to fire (~80 ms).
+    int   onset_sig_frames = 5;  // frames after each onset averaged into its
+                               // acoustic signature (~50 ms — the beat's body,
+                               // where a voiced sound reveals its pitch).
 
     // Front-end + sensors for the offline enroll pass and (informationally) the
     // framing the live snapshots are expected to come from. Defaults to the KWS
@@ -63,6 +74,20 @@ struct GestureConfig {
 };
 
 enum class GestureKind { Rhythm, Tone };
+
+// Per-beat acoustic signature for a rhythm gesture — what a single onset SOUNDS
+// like, averaged over a short window just after the transient. Lets the matcher
+// require a re-performed beat to match the enrolled beat's timbre, not only its
+// timing.
+struct OnsetSig {
+    float voiced = 0.0f;   // mean autocorrelation periodicity over the window
+                           // [0,1] — high for a voiced/pitched sound (a laugh),
+                           // low for a broadband click/tap.
+    float pitch  = 0.0f;   // mean dominant pitch (Hz) over the voiced frames of
+                           // the window; 0 when the beat wasn't pitched.
+    float bright = 0.0f;   // mean spectral centroid [0,1] — the beat's brightness
+                           // (a thump reads low, a snap high).
+};
 
 struct GestureEvent {
     std::string name;
@@ -84,6 +109,9 @@ struct GestureView {
     float       frame_ms = 10.0f;
     // Rhythm: inter-onset intervals in frames (n_onsets == intervals+1).
     std::vector<int> intervals;
+    // Rhythm: per-beat acoustic signature (one per onset, intervals.size()+1) —
+    // the sound shape each beat must reproduce, not just its timing.
+    std::vector<OnsetSig> onsets;
     // Tone:
     float tone_hz = 0.0f;
     int   tone_frames = 0;
@@ -139,6 +167,7 @@ private:
         bool         has_override = false;
         // Rhythm:
         std::vector<int> intervals;     // enrolled inter-onset intervals (frames)
+        std::vector<OnsetSig> onset_sigs;       // enrolled per-beat signatures
         // Tone:
         float tone_hz = 0.0f;
         int   tone_frames = 0;
@@ -146,6 +175,17 @@ private:
 
         // ── streaming match state ──
         std::vector<std::int64_t> onset_hist;   // recent onset frame indices
+        std::vector<OnsetSig>     sig_hist;     // their captured signatures (parallel)
+        // In-flight post-onset signature capture (the live analogue of the
+        // enroll window): accumulates the frames just after an onset before the
+        // beat is finalized into onset_hist/sig_hist and the rhythm is matched.
+        bool         cap_active   = false;
+        int          cap_len      = 0;
+        double       cap_per_sum  = 0.0;        // Σ periodicity
+        double       cap_bright_sum = 0.0;      // Σ centroid
+        double       cap_pitch_sum  = 0.0;      // Σ dominant_hz over voiced frames
+        int          cap_pitch_n  = 0;
+        std::int64_t cap_frame    = 0;          // the onset frame being captured
         int          refractory = 0;
         bool         in_run = false;            // tone: currently in a tonal run
         std::int64_t run_start = 0;

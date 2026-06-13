@@ -116,6 +116,16 @@ struct SensorSnapshot {
     std::int64_t tonal_frames = 0;        // consecutive frames tonal has been true
     std::int64_t tonal_events = 0;        // nontonal→tonal transitions since reset
     std::int64_t last_tonal_frame = -1;
+
+    // spectral shape (PCEN mel centroid — "brightness")
+    float        centroid = 0.0f;         // energy-weighted mel-bin center,
+                                          // normalized to [0,1] (0 = low/dark,
+                                          // 1 = high/bright). A cheap, gain-robust
+                                          // timbre axis: a tap reads low, a finger
+                                          // snap high. The gesture matcher uses it
+                                          // to tell beats of different sound shape
+                                          // apart even when they land on the same
+                                          // beat (along with periodicity/pitch).
 };
 
 class SensorHub {

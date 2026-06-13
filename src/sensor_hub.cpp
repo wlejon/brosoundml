@@ -138,6 +138,21 @@ void SensorHub::process_frame(const float* window, const float* mel_frame) {
     cur_.onset = onset;
     flux_ema_ = (1.0f - cfg_.onset_ema) * flux_ema_ + cfg_.onset_ema * flux;
 
+    // ── spectral shape (mel centroid / "brightness") ──
+    // Energy-weighted center of the PCEN mel frame, normalized to [0,1]. PCEN
+    // flattens dynamics but keeps WHICH bins are active, so the centroid is a
+    // stable, gain-robust timbre axis (low for a thump, high for a snap). The
+    // gesture matcher reads it per onset; it's a cheap by-product of the frame.
+    double cen_w = 0.0, cen_s = 0.0;
+    for (int m = 0; m < M; ++m) {
+        const double e = static_cast<double>(std::max(0.0f, mel_frame[m]));
+        cen_w += e * static_cast<double>(m);
+        cen_s += e;
+    }
+    cur_.centroid = (cen_s > 1e-9 && M > 1)
+        ? static_cast<float>(cen_w / cen_s / static_cast<double>(M - 1))
+        : 0.0f;
+
     // ── tonality (normalized autocorrelation on the raw window) ──
     // Periodicity, not spectral peakiness: PCEN flattens static spectral
     // shape by design, and a raw-window autocorrelation peak catches harmonic
