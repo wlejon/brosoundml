@@ -256,8 +256,70 @@ static void test_loss_decreases(bt::Device dev, const char* dn) {
     CHECK(l < l0, (std::string("[") + dn + "] framewise CE loss decreases").c_str());
 }
 
+// ── C. two sessions, one shared net, interleaved — zero cache crosstalk ──────
+// Proves the StreamState extraction: a single load-once net drives two
+// independent streams. Each stream's interleaved result must match its own
+// standalone single-stream result bit-for-bit (within FP rounding), which can
+// only hold if neither session touches the other's caches.
+static void test_multistream(bt::Device dev, const char* dn) {
+    auto cfg = stream_cfg();
+    auto cm  = small_classmap();
+    auto m = bsm::PhonemeNet::make(cfg, cm, dev);
+    m.xavier_init_weights(4242);
+    const bsm::PhonemeNet& net = m;   // drive the whole test through the const API
+    const int nm = cfg.n_mels, T = 96;
+
+    const auto fa = random_feats(nm, T, 101);
+    const auto fb = random_feats(nm, T, 202);
+
+    // Standalone reference per stream: its own fresh session, single forward.
+    auto ref = [&](const std::vector<float>& f) {
+        auto st = net.make_stream_state();
+        bt::Tensor feats = bt::Tensor::from_host_on(dev, f.data(), nm, T);
+        bt::Tensor out; net.forward_streaming(st, feats, out);
+        return out.to_host_vector();
+    };
+    const std::vector<float> refA = ref(fa);
+    const std::vector<float> refB = ref(fb);
+
+    // Interleaved: two sessions on ONE net, fed alternating chunks A,B,A,B,...
+    auto stA = net.make_stream_state();
+    auto stB = net.make_stream_state();
+    std::vector<float> outA, outB;
+    auto feed_chunk = [&](bsm::PhonemeStreamState& st, const std::vector<float>& f,
+                          int start, int w, std::vector<float>& acc) {
+        std::vector<float> sub(static_cast<std::size_t>(nm) * w);
+        for (int r = 0; r < nm; ++r)
+            for (int t = 0; t < w; ++t)
+                sub[static_cast<std::size_t>(r) * w + t] =
+                    f[static_cast<std::size_t>(r) * T + (start + t)];
+        bt::Tensor cf = bt::Tensor::from_host_on(dev, sub.data(), nm, w);
+        bt::Tensor co; net.forward_streaming(st, cf, co);
+        const auto coh = co.to_host_vector();
+        acc.insert(acc.end(), coh.begin(), coh.end());
+    };
+    const int chunk = 11;
+    for (int start = 0; start < T; start += chunk) {
+        const int w = std::min(chunk, T - start);
+        feed_chunk(stA, fa, start, w, outA);
+        feed_chunk(stB, fb, start, w, outB);
+    }
+
+    const float dA = max_abs_diff(refA, outA);
+    const float dB = max_abs_diff(refB, outB);
+    CHECK(dA <= 1e-3f, (tag("interleaved stream A == standalone (diff=", dn) +
+                        std::to_string(dA) + ")").c_str());
+    CHECK(dB <= 1e-3f, (tag("interleaved stream B == standalone (diff=", dn) +
+                        std::to_string(dB) + ")").c_str());
+    // Guard against a vacuous pass: the two streams must genuinely differ.
+    CHECK(max_abs_diff(refA, refB) > 1e-3f,
+          tag("streams A and B are distinct", dn).c_str());
+    std::fprintf(stderr, "[%s] multistream: dA=%g dB=%g\n", dn, dA, dB);
+}
+
 static void run_device(bt::Device dev, const char* dn) {
     test_forward_stream_io(dev, dn);
+    test_multistream(dev, dn);
     test_gradient_check(dev, dn);
     test_loss_decreases(dev, dn);
 }

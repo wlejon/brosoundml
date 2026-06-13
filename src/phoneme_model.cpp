@@ -80,8 +80,15 @@ struct Conv2dLayer {
     int padLeftW = 0;           // = dilW*(kW-1)
     bt::Tensor W;               // (Cout, (Cin/groups)*kH*kW)
     bt::Tensor b;               // (Cout, 1)
-    bt::Tensor cache;           // streaming time-history (1, Cin*Hcache*padLeftW)
+    // Streaming state no longer lives here — the per-stream causal time-ring is
+    // a tensor in PhonemeStreamState, addressed by this index (>=0 for a
+    // cache-bearing conv, -1 for a kW==1 conv that needs no history). Hcache is
+    // the layer's input frequency height, used to size that cache.
+    int cache_index = -1;
     int Hcache = 0;
+
+    // Cols of this layer's per-stream cache (0 if it needs none).
+    int cache_cols() const { return padLeftW > 0 ? Cin * Hcache * padLeftW : 0; }
 };
 
 struct BatchNorm2d {
@@ -107,16 +114,6 @@ struct BCBlock {
     int Hz = 0;
 };
 
-void ensure_cache(bt::Tensor& t, bt::Device dev, int cols) {
-    if (cols <= 0) { t = bt::Tensor{}; return; }
-    if (t.device != dev || t.rows != 1 || t.cols != cols ||
-        t.dtype != bt::Dtype::FP32) {
-        t = bt::Tensor::zeros_on(dev, 1, cols, bt::Dtype::FP32);
-    } else {
-        t.zero();
-    }
-}
-
 void init_conv(Conv2dLayer& c, int cin, int cout, int kH, int kW,
                int sH, int padH, int dilW, int groups, int Hin,
                bt::Device dev) {
@@ -127,7 +124,8 @@ void init_conv(Conv2dLayer& c, int cin, int cout, int kH, int kW,
     const int win = (cin / groups) * kH * kW;
     c.W = bt::Tensor::zeros_on(dev, cout, win, bt::Dtype::FP32);
     c.b = bt::Tensor::zeros_on(dev, cout, 1, bt::Dtype::FP32);
-    ensure_cache(c.cache, dev, c.padLeftW > 0 ? cin * Hin * c.padLeftW : 0);
+    // No cache allocated here — per-stream caches live in PhonemeStreamState,
+    // sized from cache_cols() and indexed by cache_index (assigned in build()).
 }
 
 void init_bn(BatchNorm2d& bn, int C, bt::Device dev, float eps) {
@@ -144,9 +142,13 @@ void make_const_kernel(bt::Tensor& k, int C, int H, float val, bt::Device dev) {
     k = bt::Tensor::from_host_on(dev, h.data(), C, H);
 }
 
-// Causal-time conv forward on an NCHW (1, Cin*H*W) input (streaming-capable).
-void conv_forward(Conv2dLayer& c, const bt::Tensor& X, int H, int W,
-                  bool use_cache, bt::Tensor& Y) {
+// Causal-time conv forward on an NCHW (1, Cin*H*W) input. Reads weights only
+// (const layer). `state` carries the per-stream caches: non-null streams (reads
+// this conv's cache as left history, then refreshes it); null is the one-shot /
+// pointwise path (zero left-pad, no cache). The cache tensor itself lives in
+// state->conv_caches[c.cache_index].
+void conv_forward(const Conv2dLayer& c, const bt::Tensor& X, int H, int W,
+                  PhonemeStreamState* state, bt::Tensor& Y) {
     const bt::Device dev = X.device;
     const int rows = c.Cin * H;
     if (X.cols != rows * W) {
@@ -162,22 +164,28 @@ void conv_forward(Conv2dLayer& c, const bt::Tensor& X, int H, int W,
         return;
     }
 
+    bt::Tensor* cache =
+        (state && c.cache_index >= 0 &&
+         state->conv_caches[static_cast<std::size_t>(c.cache_index)].size() > 0)
+            ? &state->conv_caches[static_cast<std::size_t>(c.cache_index)]
+            : nullptr;
+
     const int Wp = W + c.padLeftW;
     bt::Tensor padded = bt::Tensor::zeros_on(dev, 1, rows * Wp, bt::Dtype::FP32);
-    if (use_cache && c.cache.size() > 0)
-        bt::copy_d2d_strided(c.cache, 0, c.padLeftW, padded, 0, Wp,
+    if (cache)
+        bt::copy_d2d_strided(*cache, 0, c.padLeftW, padded, 0, Wp,
                              c.padLeftW, rows);
     bt::copy_d2d_strided(X, 0, W, padded, c.padLeftW, Wp, W, rows);
     conv2d_forward(padded, c.W, &c.b, /*N=*/1, c.Cin, H, Wp, c.Cout,
                    c.kH, c.kW, c.sH, /*sw=*/1, c.padH, /*pad_w=*/0,
                    /*dil_h=*/1, c.dilW, c.groups, Y);
 
-    if (use_cache && c.cache.size() > 0)
+    if (cache)
         bt::copy_d2d_strided(padded, Wp - c.padLeftW, Wp,
-                             c.cache, 0, c.padLeftW, c.padLeftW, rows);
+                             *cache, 0, c.padLeftW, c.padLeftW, rows);
 }
 
-void bn_inplace(BatchNorm2d& bn, bt::Tensor& X, int C, int H, int W) {
+void bn_inplace(const BatchNorm2d& bn, bt::Tensor& X, int C, int H, int W) {
     if (!bn.present) return;
     bt::Tensor Y;
     bt::batch_norm_inference(X, bn.gamma, bn.beta, bn.mean, bn.var,
@@ -289,8 +297,56 @@ struct PhonemeNet::Impl {
 
     std::unique_ptr<PhonemeNetTrainState> train_state;
 
+    // Cache-bearing convs in a stable enumeration order; each is assigned its
+    // cache_index = position here in build(). make_stream_state() allocates one
+    // cache slot per entry, so slot i always belongs to *cache_convs[i].
+    std::vector<Conv2dLayer*> cache_convs;
+    // Internally-owned session backing the legacy single-stream API.
+    PhonemeStreamState owned_state;
+
     int K() const { return cfg.num_classes; }
     int freq_pad(int k) const { return (k - 1) / 2; }
+
+    // Walk the trunk convs once and bind each to a cache slot (stem, then per
+    // block: pw_in, f2, f1, pw_f1, res). The head is pointwise in time — no
+    // cache. Order is arbitrary but must be self-consistent; cache_index lives
+    // on the layer, so the forward addresses its own slot regardless of call
+    // order.
+    void collect_cache_convs() {
+        cache_convs.clear();
+        auto add = [&](Conv2dLayer& c) {
+            c.cache_index = static_cast<int>(cache_convs.size());
+            cache_convs.push_back(&c);
+        };
+        add(stem);
+        for (auto& blk : blocks) {
+            if (blk.is_transition) add(blk.pw_in);
+            add(blk.f2); add(blk.f1); add(blk.pw_f1);
+            if (blk.is_transition) add(blk.res);
+        }
+    }
+
+    PhonemeStreamState alloc_state() const {
+        PhonemeStreamState st;
+        st.conv_caches.reserve(cache_convs.size());
+        for (const Conv2dLayer* c : cache_convs) {
+            const int cols = c->cache_cols();
+            st.conv_caches.push_back(
+                cols > 0 ? bt::Tensor::zeros_on(device, 1, cols, bt::Dtype::FP32)
+                         : bt::Tensor{});
+        }
+        return st;
+    }
+
+    void check_state(const PhonemeStreamState& st) const {
+        if (st.conv_caches.size() != cache_convs.size())
+            fail("PhonemeNet::forward_streaming",
+                 "stream state was not made by this model");
+    }
+
+    static void zero_state(PhonemeStreamState& st) {
+        for (auto& c : st.conv_caches) if (c.size() > 0) c.zero();
+    }
 
     void build() {
         const int H0 = cfg.n_mels;
@@ -358,6 +414,10 @@ struct PhonemeNet::Impl {
         auto* op = static_cast<int32_t*>(offh.host_raw_mut());
         op[0] = off[0]; op[1] = off[1];
         head_offsets = offh.to(device);
+
+        // Bind cache slots and allocate the legacy single-stream session.
+        collect_cache_convs();
+        owned_state = alloc_state();
     }
 
     int rf_frames() const {
@@ -368,14 +428,15 @@ struct PhonemeNet::Impl {
         return rf + 1;
     }
 
-    // Run one BC block (mirrors bc_resnet2d's run_block; inference path).
-    void run_block(BCBlock& blk, const bt::Tensor& X, int Hin, int W,
-                   bool use_cache, bt::Tensor& Y) {
+    // Run one BC block (mirrors bc_resnet2d's run_block; inference path). Reads
+    // weights only; `state` (null for one-shot) carries the per-stream caches.
+    void run_block(const BCBlock& blk, const bt::Tensor& X, int Hin, int W,
+                   PhonemeStreamState* state, bt::Tensor& Y) const {
         const int cout = blk.cout;
         bt::Tensor u;
         if (blk.is_transition) {
             bt::Tensor t;
-            conv_forward(blk.pw_in, X, Hin, W, use_cache, t);
+            conv_forward(blk.pw_in, X, Hin, W, state, t);
             bn_inplace(blk.bn_in, t, cout, Hin, W);
             relu_into(t, u);
         } else {
@@ -383,17 +444,17 @@ struct PhonemeNet::Impl {
         }
 
         bt::Tensor z;
-        conv_forward(blk.f2, u, Hin, W, use_cache, z);
+        conv_forward(blk.f2, u, Hin, W, state, z);
         bn_inplace(blk.bn_f2, z, cout, blk.Hz, W);
 
         bt::Tensor a;
         freq_avg(z, blk.avg_kernel, cout, blk.Hz, W, a);
         bt::Tensor tt;
-        conv_forward(blk.f1, a, /*H=*/1, W, use_cache, tt);
+        conv_forward(blk.f1, a, /*H=*/1, W, state, tt);
         bn_inplace(blk.bn_f1, tt, cout, 1, W);
         bt::Tensor tt_relu; relu_into(tt, tt_relu);
         bt::Tensor tt_pw;
-        conv_forward(blk.pw_f1, tt_relu, /*H=*/1, W, use_cache, tt_pw);
+        conv_forward(blk.pw_f1, tt_relu, /*H=*/1, W, state, tt_pw);
 
         bt::Tensor bc;
         freq_broadcast(tt_pw, blk.ones_kernel, cout, blk.Hz, W, bc);
@@ -402,7 +463,7 @@ struct PhonemeNet::Impl {
 
         bt::Tensor res;
         if (blk.is_transition) {
-            conv_forward(blk.res, X, Hin, W, use_cache, res);
+            conv_forward(blk.res, X, Hin, W, state, res);
             bn_inplace(blk.bn_res, res, cout, blk.Hz, W);
         } else {
             res = X;
@@ -411,11 +472,11 @@ struct PhonemeNet::Impl {
         Y = std::move(y);
     }
 
-    // Inference forward producing per-frame logits (T, K). use_cache=false is the
-    // one-shot path; true streams (persistent causal caches). The head is
-    // pointwise in time, so the two paths agree once the trunk caches do.
-    void forward_core(const bt::Tensor& feats, bool use_cache,
-                      bt::Tensor& out_logits) {
+    // Inference forward producing per-frame logits (T, K). state==null is the
+    // one-shot path; non-null streams (persistent causal caches in `state`). The
+    // head is pointwise in time, so the two paths agree once the trunk caches do.
+    void forward_core(const bt::Tensor& feats, PhonemeStreamState* state,
+                      bt::Tensor& out_logits) const {
         if (feats.rows != cfg.n_mels)
             fail("PhonemeNet::forward", "input rows != n_mels");
         if (feats.dtype != bt::Dtype::FP32)
@@ -430,23 +491,24 @@ struct PhonemeNet::Impl {
         bt::copy_d2d(feats, 0, x, 0, cfg.n_mels * T);
 
         bt::Tensor y_stem;
-        conv_forward(stem, x, cfg.n_mels, T, use_cache, y_stem);
+        conv_forward(stem, x, cfg.n_mels, T, state, y_stem);
         bn_inplace(bn_stem, y_stem, cfg.c_stem, stem_Hout, T);
         bt::Tensor h; relu_into(y_stem, h);
 
         int Hin = stem_Hout;
         for (auto& blk : blocks) {
             bt::Tensor y;
-            run_block(blk, h, Hin, T, use_cache, y);
+            run_block(blk, h, Hin, T, state, y);
             h = std::move(y);
             Hin = blk.Hz;
         }
 
-        // Head: freq-avg → (1, c_last*T) → 1x1 conv → (1, K*T) → (T, K).
+        // Head: freq-avg → (1, c_last*T) → 1x1 conv → (1, K*T) → (T, K). The head
+        // is pointwise in time (no history), so it never touches the stream cache.
         bt::Tensor favg;
         freq_avg(h, head_avg_kernel, c_last, head_H, T, favg);   // (1, c_last*T)
         bt::Tensor hc;
-        conv_forward(head, favg, /*H=*/1, T, /*use_cache=*/false, hc);  // (1, K*T)
+        conv_forward(head, favg, /*H=*/1, T, /*state=*/nullptr, hc);  // (1, K*T)
         bt::nchw_to_sequence(hc, /*N=*/1, /*C=*/Kc, /*H=*/1, /*W=*/T, out_logits);
     }
 };
@@ -493,22 +555,31 @@ int PhonemeNet::param_count() const {
     return n;
 }
 
-void PhonemeNet::reset_streaming_state() {
-    auto rc = [](Conv2dLayer& c) { if (c.cache.size() > 0) c.cache.zero(); };
-    rc(impl_->stem);
-    for (auto& blk : impl_->blocks) {
-        if (blk.is_transition) { rc(blk.pw_in); rc(blk.res); }
-        rc(blk.f2); rc(blk.f1); rc(blk.pw_f1);
-    }
+void PhonemeNet::forward(const bt::Tensor& feats, bt::Tensor& out_logits) const {
+    impl_->forward_core(feats, /*state=*/nullptr, out_logits);
 }
 
-void PhonemeNet::forward(const bt::Tensor& feats, bt::Tensor& out_logits) const {
-    auto& mut = const_cast<Impl&>(*impl_);
-    mut.forward_core(feats, /*use_cache=*/false, out_logits);
+// ── Multi-stream session API ──
+PhonemeStreamState PhonemeNet::make_stream_state() const {
+    return impl_->alloc_state();
 }
+
+void PhonemeNet::forward_streaming(PhonemeStreamState& state,
+                                   const bt::Tensor& new_feats,
+                                   bt::Tensor& out_logits) const {
+    impl_->check_state(state);
+    impl_->forward_core(new_feats, &state, out_logits);
+}
+
+void PhonemeNet::reset(PhonemeStreamState& state) const {
+    Impl::zero_state(state);
+}
+
+// ── Legacy single-stream API over the internally-owned session ──
+void PhonemeNet::reset_streaming_state() { Impl::zero_state(impl_->owned_state); }
 
 void PhonemeNet::forward_streaming(const bt::Tensor& new_feats, bt::Tensor& out) {
-    impl_->forward_core(new_feats, /*use_cache=*/true, out);
+    impl_->forward_core(new_feats, &impl_->owned_state, out);
 }
 
 // ─── BN fold ──────────────────────────────────────────────────────────────────
