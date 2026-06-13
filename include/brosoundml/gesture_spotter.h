@@ -45,6 +45,11 @@ struct GestureConfig {
                                // also the tone min-duration slack.
     float pitch_tol = 0.12f;   // tone: dominant pitch must be within this
                                // fraction of the enrolled pitch.
+    float pitch_stability_tol = 0.06f;  // tone: the run's per-frame pitch spread
+                               // (std/mean) must stay below this to fire. A
+                               // whistle holds a steady pitch; a cough/throat
+                               // noise wanders through the band — same mean,
+                               // far higher spread — and is rejected here.
     int   refractory_frames = 40;  // suppress re-fires of the SAME gesture this
                                    // many frames (~400 ms at the 10 ms hop).
     int   min_onsets    = 2;   // a rhythm gesture needs at least this many onsets.
@@ -82,6 +87,9 @@ struct GestureView {
     // Tone:
     float tone_hz = 0.0f;
     int   tone_frames = 0;
+    float tone_spread = 0.0f;   // enrolled run's relative pitch spread (std/mean)
+                                // — how steady the captured tone was. A clean
+                                // whistle is ~0; a clip that drifted is higher.
 };
 
 class GestureSpotter {
@@ -134,6 +142,7 @@ private:
         // Tone:
         float tone_hz = 0.0f;
         int   tone_frames = 0;
+        float tone_spread = 0.0f;               // enrolled relative pitch spread
 
         // ── streaming match state ──
         std::vector<std::int64_t> onset_hist;   // recent onset frame indices
@@ -141,6 +150,7 @@ private:
         bool         in_run = false;            // tone: currently in a tonal run
         std::int64_t run_start = 0;
         double       run_hz_sum = 0.0;
+        double       run_hz_sumsq = 0.0;        // for the run's pitch spread
         int          run_len = 0;
         bool         run_fired = false;         // fired once for the current run
     };

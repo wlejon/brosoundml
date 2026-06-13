@@ -47,6 +47,21 @@ void append_tone(std::vector<float>& s, double seconds, double hz, float amp) {
         s.push_back(amp * static_cast<float>(std::sin(2.0 * kPi * hz * t)));
     }
 }
+// A frequency sweep with continuous phase: every frame is locally sinusoidal
+// (reads as tonal) but the pitch wanders f0 -> f1 across the clip — the shape of
+// a cough / throat-clear that an only-checks-the-mean tone matcher fires on.
+void append_chirp(std::vector<float>& s, double seconds, double f0, double f1,
+                  float amp) {
+    const std::size_t n = static_cast<std::size_t>(seconds * kRate);
+    double phase = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double frac = n > 1 ? static_cast<double>(i) /
+                                        static_cast<double>(n - 1) : 0.0;
+        const double f = f0 + (f1 - f0) * frac;
+        phase += 2.0 * kPi * f / kRate;
+        s.push_back(amp * static_cast<float>(std::sin(phase)));
+    }
+}
 void place_click(std::vector<float>& s, double at_seconds, float amp) {
     std::size_t i0 = static_cast<std::size_t>(at_seconds * kRate);
     std::uint32_t x = static_cast<std::uint32_t>(i0) | 1u;
@@ -155,6 +170,35 @@ void test_tone() {
     CHECK(other.empty(), "tone: does NOT fire at a different pitch");
 }
 
+// ─── 2b. a tone gesture rejects a wandering pitch (cough / throat-clear) ─────
+// The reported failure: a held whistle fires on a cough. A cough is a sustained
+// tonal-ish run whose MEAN pitch can land in the enrolled band, but whose pitch
+// sweeps the whole way through instead of holding. The stability gate must
+// reject it while a clean re-whistle (test_tone above) still fires.
+void test_tone_rejects_wander() {
+    GestureConfig cfg;
+    GestureSpotter g(cfg);
+    auto clip = tone_clip(1200.0);
+    g.enroll_from_audio("whistle", clip.data(), (int)clip.size());
+    GestureView v;
+    CHECK(g.inspect("whistle", v), "wander: whistle enrolled");
+    std::fprintf(stderr, "  [wander] enrolled tone spread = %.3f\n", v.tone_spread);
+    CHECK(v.tone_spread < 0.05f,
+          "wander: a clean whistle enrolls as a steady (low-spread) pitch");
+
+    g.reset();
+    std::vector<float> sweep = silence(0.3);
+    append_chirp(sweep, 0.5, 1000.0, 1500.0, 0.12f);  // mean ~1250: inside the
+    auto tail = silence(0.3);                          // 12% band, but wide spread
+    sweep.insert(sweep.end(), tail.begin(), tail.end());
+    auto fired = run_clip(g, cfg.sensor, sweep);
+    if (!fired.empty())
+        std::fprintf(stderr, "  [wander] UNEXPECTED fire conf=%.2f\n",
+                     fired[0].confidence);
+    CHECK(fired.empty(),
+          "wander: does NOT fire on a sweeping pitch (the cough failure mode)");
+}
+
 // ─── 3. a lone click is too sparse to enroll ────────────────────────────────
 void test_too_sparse() {
     GestureConfig cfg;
@@ -189,6 +233,7 @@ int main() {
     brotensor::init();
     test_rhythm();
     test_tone();
+    test_tone_rejects_wander();
     test_too_sparse();
     test_refractory();
     if (failures == 0) std::printf("test_gesture_spotter: all tests passed\n");

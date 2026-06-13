@@ -192,8 +192,24 @@ void SensorHub::process_frame(const float* window, const float* mel_frame) {
         }
         periodicity = best;
         if (best_lag > 0) {
-            dominant_hz = static_cast<float>(rate) /
-                          static_cast<float>(best_lag);
+            // Integer-lag pitch is coarse: at a 16 kHz rate adjacent lags are
+            // ~18% apart near 3 kHz, so a perfectly steady high whistle would
+            // jump between two quantized frequencies frame to frame. Refine the
+            // peak with a parabola through (lag-1, lag, lag+1) of the
+            // normalized autocorrelation — the vertex is the true period to
+            // sub-sample precision. This sharpens the HUD pitch readout and,
+            // crucially, lets a pitch-stability measure tell a held whistle
+            // from a wandering cough instead of from quantization noise.
+            const double y0 = nac_[static_cast<std::size_t>(best_lag - 1)];
+            const double y1 = nac_[static_cast<std::size_t>(best_lag)];
+            const double y2 = nac_[static_cast<std::size_t>(best_lag + 1)];
+            const double denom = y0 - 2.0 * y1 + y2;
+            double refined = best_lag;
+            if (std::abs(denom) > 1e-12) {
+                const double delta = 0.5 * (y0 - y2) / denom;   // in (-1, 1)
+                if (delta > -1.0 && delta < 1.0) refined = best_lag + delta;
+            }
+            dominant_hz = static_cast<float>(rate) / static_cast<float>(refined);
         }
     }
     cur_.periodicity = periodicity;

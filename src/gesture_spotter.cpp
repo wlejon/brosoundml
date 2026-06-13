@@ -37,23 +37,31 @@ GestureSpotter::Template GestureSpotter::build_template(
     std::vector<std::int64_t> onset_frames;
     int   best_run_len = 0;
     float best_run_hz  = 0.0f;
+    float best_run_spread = 0.0f;
     bool  in_run = false;
     double run_hz_sum = 0.0;
+    double run_hz_sumsq = 0.0;
     int    run_len = 0;
     auto close_run = [&] {
         if (in_run && run_len > best_run_len) {
-            best_run_len = run_len;
-            best_run_hz  = static_cast<float>(run_hz_sum /
-                                              static_cast<double>(run_len));
+            const double mean = run_hz_sum / static_cast<double>(run_len);
+            const double var  = std::max(
+                0.0, run_hz_sumsq / static_cast<double>(run_len) - mean * mean);
+            best_run_len    = run_len;
+            best_run_hz     = static_cast<float>(mean);
+            best_run_spread = mean > 0.0
+                ? static_cast<float>(std::sqrt(var) / mean) : 0.0f;
         }
-        in_run = false; run_hz_sum = 0.0; run_len = 0;
+        in_run = false; run_hz_sum = 0.0; run_hz_sumsq = 0.0; run_len = 0;
     };
     for (int i = 0; i < n; ++i) {
         const SensorSnapshot& s = snaps[i];
         if (s.onset) onset_frames.push_back(s.frames);
         if (s.tonal) {
-            if (!in_run) { in_run = true; run_hz_sum = 0.0; run_len = 0; }
-            run_hz_sum += static_cast<double>(s.dominant_hz);
+            if (!in_run) { in_run = true; run_hz_sum = 0.0; run_hz_sumsq = 0.0; run_len = 0; }
+            run_hz_sum   += static_cast<double>(s.dominant_hz);
+            run_hz_sumsq += static_cast<double>(s.dominant_hz) *
+                            static_cast<double>(s.dominant_hz);
             ++run_len;
         } else {
             close_run();
@@ -75,6 +83,7 @@ GestureSpotter::Template GestureSpotter::build_template(
         t.kind = GestureKind::Tone;
         t.tone_hz     = best_run_hz;
         t.tone_frames = best_run_len;
+        t.tone_spread = best_run_spread;
     } else if (static_cast<int>(onset_frames.size()) >= pol.min_onsets) {
         t.kind = GestureKind::Rhythm;
         for (std::size_t i = 1; i < onset_frames.size(); ++i)
@@ -164,6 +173,7 @@ bool GestureSpotter::inspect(const std::string& name, GestureView& out) const {
         out.intervals = t.intervals;
         out.tone_hz   = t.tone_hz;
         out.tone_frames = t.tone_frames;
+        out.tone_spread = t.tone_spread;
         return true;
     }
     return false;
@@ -214,9 +224,12 @@ std::vector<GestureEvent> GestureSpotter::feed(const SensorSnapshot& s) {
             if (s.tonal) {
                 if (!t.in_run) {
                     t.in_run = true; t.run_start = s.frames;
-                    t.run_hz_sum = 0.0; t.run_len = 0; t.run_fired = false;
+                    t.run_hz_sum = 0.0; t.run_hz_sumsq = 0.0;
+                    t.run_len = 0; t.run_fired = false;
                 }
-                t.run_hz_sum += static_cast<double>(s.dominant_hz);
+                t.run_hz_sum   += static_cast<double>(s.dominant_hz);
+                t.run_hz_sumsq += static_cast<double>(s.dominant_hz) *
+                                  static_cast<double>(s.dominant_hz);
                 ++t.run_len;
                 if (t.run_fired || t.refractory > 0) continue;
                 const float tol  = t.policy.tempo_tol;
@@ -230,6 +243,17 @@ std::vector<GestureEvent> GestureSpotter::feed(const SensorSnapshot& s) {
                 const double rel = t.tone_hz > 0.0f
                     ? std::abs(mean_hz - t.tone_hz) / t.tone_hz : 1.0;
                 if (rel > t.policy.pitch_tol) continue;
+                // Right note, but is it HELD? A cough or throat-clear can pass
+                // a sustained tonal run whose mean lands in the band while its
+                // pitch sweeps the whole way through. A real whistle holds the
+                // pitch nearly constant. Reject runs whose per-frame pitch
+                // spread is too wide to be one steady note.
+                const double var = std::max(
+                    0.0, t.run_hz_sumsq / static_cast<double>(t.run_len) -
+                             mean_hz * mean_hz);
+                const double spread = mean_hz > 0.0
+                    ? std::sqrt(var) / mean_hz : 1.0;
+                if (spread > t.policy.pitch_stability_tol) continue;
                 GestureEvent ev;
                 ev.name = t.name;
                 ev.kind = GestureKind::Tone;
@@ -241,7 +265,7 @@ std::vector<GestureEvent> GestureSpotter::feed(const SensorSnapshot& s) {
                 t.run_fired = true;
                 t.refractory = t.policy.refractory_frames;
             } else {
-                t.in_run = false; t.run_hz_sum = 0.0;
+                t.in_run = false; t.run_hz_sum = 0.0; t.run_hz_sumsq = 0.0;
                 t.run_len = 0; t.run_fired = false;
             }
         }
@@ -254,7 +278,8 @@ void GestureSpotter::reset() {
         t.onset_hist.clear();
         t.refractory = 0;
         t.in_run = false; t.run_start = 0;
-        t.run_hz_sum = 0.0; t.run_len = 0; t.run_fired = false;
+        t.run_hz_sum = 0.0; t.run_hz_sumsq = 0.0;
+        t.run_len = 0; t.run_fired = false;
     }
 }
 
