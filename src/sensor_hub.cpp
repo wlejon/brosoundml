@@ -151,7 +151,6 @@ void SensorHub::process_frame(const float* window, const float* mel_frame) {
     float dominant_hz = 0.0f;
     if (lag_max > lag_min && energy > 1e-9) {
         nac_.assign(static_cast<std::size_t>(lag_max + 1), 0.0f);
-        float best = 0.0f;
         for (int lag = lag_min; lag <= lag_max; ++lag) {
             const int n = win - lag;
             double num = 0.0, e0 = 0.0, e1 = 0.0;
@@ -163,18 +162,30 @@ void SensorHub::process_frame(const float* window, const float* mel_frame) {
                 e1  += b * b;
             }
             const double den = std::sqrt(e0 * e1);
-            const float  v   = den > 1e-12
+            nac_[static_cast<std::size_t>(lag)] = den > 1e-12
                 ? static_cast<float>(num / den)
                 : 0.0f;
-            nac_[static_cast<std::size_t>(lag)] = v;
-            if (v > best) best = v;
         }
-        // Smallest lag within 5% of the peak — a pure tone correlates equally
-        // at every multiple of its period, and the shortest period is the one
-        // to report.
+        // The normalized autocorrelation always starts high near lag 0 — adjacent
+        // samples of any band-limited signal are correlated — and decays. That
+        // main-lobe shoulder is NOT periodicity: scanning from lag_min would snap
+        // any low-pitched/smooth sound (a hum, a vowel) to lag_min and report the
+        // ceiling frequency (fmax). A real period instead appears as a local
+        // maximum after the shoulder, so search peaks only — take the strongest
+        // local-max correlation as the periodicity, and report the shortest-period
+        // peak within 5% of it (prefer the fundamental over its octaves).
+        const auto is_peak = [&](int lag) {
+            const float v = nac_[static_cast<std::size_t>(lag)];
+            return v > nac_[static_cast<std::size_t>(lag - 1)] &&
+                   v >= nac_[static_cast<std::size_t>(lag + 1)];
+        };
+        float best = 0.0f;
+        for (int lag = lag_min + 1; lag < lag_max; ++lag)
+            if (is_peak(lag) && nac_[static_cast<std::size_t>(lag)] > best)
+                best = nac_[static_cast<std::size_t>(lag)];
         int best_lag = 0;
-        for (int lag = lag_min; lag <= lag_max; ++lag) {
-            if (nac_[static_cast<std::size_t>(lag)] >= 0.95f * best) {
+        for (int lag = lag_min + 1; lag < lag_max; ++lag) {
+            if (is_peak(lag) && nac_[static_cast<std::size_t>(lag)] >= 0.95f * best) {
                 best_lag = lag;
                 break;
             }

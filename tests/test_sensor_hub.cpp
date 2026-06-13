@@ -120,6 +120,26 @@ void test_tone() {
           "tone: level near -20 dBFS (amp 0.1 sine ~ -23 dB rms)");
 }
 
+// ─── 2b. low-pitch tone: reports the fundamental, not the fmax ceiling ─────
+// Regression: a low/smooth pitch (a hum, a vowel like "ummm" ~130 Hz) has a
+// high autocorrelation at the shortest lag (the main-lobe shoulder). The old
+// "smallest lag within 5% of the peak" rule snapped to lag_min and reported the
+// 4 kHz ceiling for any such sound. The fundamental must win.
+void test_low_tone() {
+    SensorHubConfig cfg;
+    SensorHub hub(cfg);
+    std::vector<float> s = silence(0.5);
+    append_tone(s, 1.5, 130.0, 0.1f);
+    hub.feed(s.data(), static_cast<int>(s.size()));
+    const SensorSnapshot sn = hub.snapshot();
+    std::fprintf(stderr, "  [low-tone] periodicity=%.3f dominant=%.0f Hz\n",
+        sn.periodicity, sn.dominant_hz);
+    CHECK(sn.tonal, "low-tone: a sustained 130 Hz tone is tonal");
+    CHECK(sn.periodicity > 0.9f, "low-tone: near-perfect periodicity");
+    CHECK(sn.dominant_hz > 120.0f && sn.dominant_hz < 140.0f,
+          "low-tone: dominant_hz tracks the 130 Hz fundamental, not the fmax ceiling");
+}
+
 // ─── 3. white noise: voiced but NOT tonal ──────────────────────────────────
 void test_noise() {
     SensorHubConfig cfg;
@@ -209,6 +229,7 @@ int main() {
     brotensor::init();
     test_silence();
     test_tone();
+    test_low_tone();
     test_noise();
     test_clicks();
     test_chunk_invariance();
