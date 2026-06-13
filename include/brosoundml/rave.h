@@ -114,6 +114,12 @@ struct RaveMultiBuffer {
 // The RAVE autoencoder. Construct, load() a converted model directory, then
 // encode() / decode(). Heavy state (weights, config, module graph) lives behind
 // a pImpl so this header stays free of brotensor module internals.
+//
+// Multi-stream (docs/multi-stream-sessions.md): encode()/decode() are `const`
+// and fully stateless — no KV-cache, no captured graph, no RNG on the model (the
+// stochastic noise / latent-pad branches draw randomness from the caller's
+// RaveDecodeOptions). One loaded Rave behind a std::shared_ptr<const Rave> serves
+// N streams concurrently with zero cross-talk; the model needs no session type.
 class Rave {
 public:
     Rave();

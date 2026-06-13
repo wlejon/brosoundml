@@ -404,6 +404,32 @@ static int run() {
                 }
             }
         }
+
+        // 6. Multi-stream sessions (CONCURRENT tier): two sessions over one
+        // shared model, interleaved, must each reproduce the single-call result
+        // bit-exactly and never cross-talk. Also pins the convention surface
+        // (make_session / transcribe(session,…) / reset).
+        {
+            QwenAsr::TranscribeOptions opts;
+            opts.max_new_tokens = static_cast<int>(fx.gen_ids.size()) + 8;
+            const auto legacy = asr.transcribe(audio, opts).token_ids;
+
+            brosoundml::QwenAsrSession sA = asr.make_session();
+            brosoundml::QwenAsrSession sB = asr.make_session();
+            const auto rA1 = asr.transcribe(sA, audio, opts).token_ids;  // A
+            const auto rB  = asr.transcribe(sB, audio, opts).token_ids;  // B between A's calls
+            const auto rA2 = asr.transcribe(sA, audio, opts).token_ids;  // A reused
+            CHECK(rA1 == legacy, "session A matches the single-call stream");
+            CHECK(rB  == legacy, "session B (interleaved) matches — no cross-talk");
+            CHECK(rA2 == rA1, "session A reused is one-shot stable");
+
+            asr.reset(sA);
+            const auto rA3 = asr.transcribe(sA, audio, opts).token_ids;
+            CHECK(rA3 == legacy, "session A after reset matches");
+            std::printf("    [%s] QwenAsrSession: 2 sessions over 1 model, "
+                        "interleaved, bit-exact, no cross-talk (%zu tokens)\n",
+                        dev_name, legacy.size());
+        }
     };
 
     std::printf("  [cpu]\n");

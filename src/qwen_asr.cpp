@@ -139,6 +139,20 @@ struct QwenAsr::Impl {
     QwenAsrDecoder decoder;
     bt::Device     device = bt::Device::CPU;
     bool           loaded = false;
+
+    // Shared transcribe body over a caller-supplied decode cache: the legacy
+    // single-call path hands it a stack-local cache, the session path hands it
+    // the session's cache. The cache is reset on entry (one-shot semantics), so
+    // the only thing a session buys is reuse of the API/vocabulary and a pinned
+    // concurrency guarantee — the forward touches no mutable model state.
+    QwenAsr::Transcription run_transcribe(QwenAsrDecoderCache& cache,
+                                          const AudioBuffer& audio,
+                                          const QwenAsr::TranscribeOptions& opts) const;
+};
+
+// Opaque per-stream decode scratch behind QwenAsrSession.
+struct QwenAsrSessionState {
+    QwenAsrDecoderCache cache;
 };
 
 QwenAsr::QwenAsr() : impl_(std::make_unique<Impl>()) {}
@@ -194,16 +208,23 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio) const {
 
 QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
                                            const TranscribeOptions& opts) const {
-    const std::string where = "QwenAsr::transcribe";
-    if (!impl_->loaded) fail(where, "load() not called");
-    const Impl& im = *impl_;
+    if (!impl_->loaded) fail("QwenAsr::transcribe", "load() not called");
+    QwenAsrDecoderCache cache;
+    return impl_->run_transcribe(cache, audio, opts);
+}
+
+QwenAsr::Transcription QwenAsr::Impl::run_transcribe(
+    QwenAsrDecoderCache& cache, const AudioBuffer& audio,
+    const TranscribeOptions& opts) const {
+    const Impl& im = *this;
     const QwenAsrConfig& cfg = im.config;
     const bt::Device dev = im.device;
     bt::DeviceScope scope(dev);
 
     // ── 1. audio -> encoder hidden states ──
-    // Exactly the latent tap encode() exposes — one encoder path, not two.
-    bt::Tensor audio_embeds = encode(audio);   // (n_audio, latent_dim)
+    // The same latent tap QwenAsr::encode() exposes — one encoder path, not two.
+    bt::Tensor audio_embeds;
+    im.encoder.forward(audio, audio_embeds);   // (n_audio, latent_dim)
     const int n_audio = audio_embeds.rows;
 
     // ── 2. chat-template prompt around the audio block ──
@@ -236,7 +257,7 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
     }
 
     // ── 3. prefill + greedy decode ──
-    QwenAsrDecoderCache cache;
+    // One-shot: clear the caller's cache so a reused session starts clean.
     cache.reset(im.decoder.num_layers);
 
     auto is_eos = [&cfg](std::int32_t id) {
@@ -276,6 +297,37 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
         token = greedy_step(hidden, idx_dev);
     }
     return out;
+}
+
+// ─── QwenAsrSession (multi-stream, CONCURRENT tier) ─────────────────────────
+
+QwenAsrSession::QwenAsrSession()
+    : state_(std::make_unique<QwenAsrSessionState>()) {}
+QwenAsrSession::~QwenAsrSession() = default;
+QwenAsrSession::QwenAsrSession(QwenAsrSession&&) noexcept = default;
+QwenAsrSession& QwenAsrSession::operator=(QwenAsrSession&&) noexcept = default;
+
+QwenAsrSession QwenAsr::make_session() const {
+    if (!impl_->loaded) fail("QwenAsr::make_session", "load() not called");
+    QwenAsrSession s;
+    s.state_->cache.reset(impl_->decoder.num_layers);
+    return s;
+}
+
+void QwenAsr::reset(QwenAsrSession& session) const {
+    session.state_->cache.reset(impl_->decoder.num_layers);
+}
+
+QwenAsr::Transcription QwenAsr::transcribe(QwenAsrSession& session,
+                                           const AudioBuffer& audio) const {
+    return transcribe(session, audio, TranscribeOptions{});
+}
+
+QwenAsr::Transcription QwenAsr::transcribe(QwenAsrSession& session,
+                                           const AudioBuffer& audio,
+                                           const TranscribeOptions& opts) const {
+    if (!impl_->loaded) fail("QwenAsr::transcribe", "load() not called");
+    return impl_->run_transcribe(session.state_->cache, audio, opts);
 }
 
 // ─── QwenAsrStream ──────────────────────────────────────────────────────────

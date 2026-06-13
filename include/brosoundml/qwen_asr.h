@@ -105,9 +105,21 @@ struct QwenAsrConfig {
     float latent_hz  = 0.0f;            // 12.5 (latents per second)
 };
 
+// Per-stream decode scratch for the session API (below). Opaque here — it wraps
+// the internal Qwen3 decoder KV-cache — and is defined in qwen_asr.cpp.
+struct QwenAsrSessionState;
+class QwenAsrSession;
+
 // The Qwen3-ASR pipeline. Construct, load() a model directory, then
 // transcribe(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of module internals.
+//
+// Multi-stream (see docs/multi-stream-sessions.md): the weights are read-only
+// and the forward pass is `const`, so one loaded QwenAsr serves N streams behind
+// a std::shared_ptr<const QwenAsr>. Each stream owns a QwenAsrSession (its decode
+// KV-cache); transcribe(session, ...) reads weights and writes only into that
+// session. CONCURRENT tier — the encoder is stateless and the decoder holds no
+// captured graph, so sessions run truly in parallel with zero cross-talk.
 class QwenAsr {
 public:
     QwenAsr();
@@ -171,6 +183,24 @@ public:
     // nested struct that has default member initializers — CWG2335.)
     Transcription transcribe(const AudioBuffer& audio) const;
 
+    // ── Multi-stream session API (docs/multi-stream-sessions.md) ──
+    // Allocate a fresh per-stream decode session on the model device. const —
+    // callable through shared_ptr<const QwenAsr>.
+    QwenAsrSession make_session() const;
+
+    // Transcribe over a caller-owned session. Reads weights; writes ONLY into
+    // `session`'s KV-cache — two sessions over one model never cross-talk. Each
+    // call is one-shot (the cache is reset on entry), so a session is reusable
+    // across clips. const.
+    Transcription transcribe(QwenAsrSession& session, const AudioBuffer& audio,
+                             const TranscribeOptions& opts) const;
+    Transcription transcribe(QwenAsrSession& session,
+                             const AudioBuffer& audio) const;
+
+    // Zero a session's decode cache (a no-op between one-shot transcribes, but
+    // part of the convention). const.
+    void reset(QwenAsrSession& session) const;
+
     // Latent tap: run the AuT encoder + projector ONLY (no decoder) and return
     // the post-projector latents as a (T, config().latent_dim) FP32 tensor on
     // the model device, at config().latent_hz frames/second. These are exactly
@@ -193,6 +223,25 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// One stream's decode scratch over a shared QwenAsr (CONCURRENT tier). Build one
+// with QwenAsr::make_session() and pass it to QwenAsr::transcribe(session, ...).
+// Move-only — it owns device tensors (the KV-cache). The scratch is opaque (a
+// pImpl over the internal decoder cache) so this header stays free of module
+// internals.
+class QwenAsrSession {
+public:
+    QwenAsrSession();
+    ~QwenAsrSession();
+    QwenAsrSession(QwenAsrSession&&) noexcept;
+    QwenAsrSession& operator=(QwenAsrSession&&) noexcept;
+    QwenAsrSession(const QwenAsrSession&) = delete;
+    QwenAsrSession& operator=(const QwenAsrSession&) = delete;
+
+private:
+    friend class QwenAsr;
+    std::unique_ptr<QwenAsrSessionState> state_;
 };
 
 // ─── QwenAsrStream ──────────────────────────────────────────────────────────

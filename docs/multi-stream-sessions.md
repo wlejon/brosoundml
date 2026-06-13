@@ -115,7 +115,9 @@ in parallel; on a single CUDA stream it buys nothing.
 | `Kokoro`         | `KokoroSession`       | Serialized  | bound voice (one-shot forward; no caches)  |
 | `Whisper`        | `WhisperSession`      | Serialized  | decode KV-cache (per 30 s window)          |
 | `Parakeet`       | `ParakeetSession`     | Concurrent  | TDT prediction-net LSTM (h, c)             |
-| Qwen3-ASR / Qwen3-TTS | —            | (single)    | decode KV-cache still on `Impl` — not yet sessioned |
+| `QwenAsr`        | `QwenAsrSession`      | Concurrent  | Qwen3 decoder KV-cache (per clip)          |
+| `Rave`           | — (none needed)       | Concurrent  | none — stateless, see below                |
+| `QwenTts`        | —                     | (single)    | Talker + CodePredictor captured-graph step state still on `Impl` — not yet sessioned |
 
 `Whisper` sits at the serialized tier for the same reason as `Kokoro`: its
 decoder replays a single lazily-captured CUDA step graph whose buffers are shared
@@ -124,7 +126,27 @@ overlap on one model. `Parakeet` reaches the concurrent tier — it has no captu
 step graph and no `Impl`-resident cache, so once the prediction state lives in the
 session nothing mutable is shared and sessions are fully independent.
 
-The remaining autoregressive models (Qwen3-ASR, Qwen3-TTS) keep their decode
-KV-cache on the pImpl today, so they are single-session. Sessioning them is the
-same move — hoist the cache (and any per-decode scratch) off `Impl` into a
-`<Model>Session` — and is the natural next step when multi-stream Qwen is needed.
+`QwenAsr` is concurrent too: its `transcribe()` already allocates the Qwen3
+decoder KV-cache per call (it never lived on `Impl`), the AuT encoder is a
+stateless one-shot forward, and the decoder holds no captured graph. The session
+just moves that per-call cache into caller-owned scratch so the convention and the
+concurrency guarantee are explicit — `make_session()` / `transcribe(session, …)`
+mirror the other models, and the test pins two interleaved sessions to the
+single-call token stream.
+
+`Rave` needs **no session type at all**: `encode()`/`decode()` are `const` and
+fully stateless — there is no KV-cache, no captured graph, and no RNG on `Impl`
+(the stochastic noise/latent-pad branches take their randomness from the caller's
+`RaveDecodeOptions`, so they are deterministic given the options). N threads can
+already call `decode()` on one shared `Rave` with zero cross-talk. Manufacturing
+an empty `RaveSession` would only add ceremony, so the convention is satisfied by
+declaring the tier and skipping the struct.
+
+The one remaining autoregressive holdout, `QwenTts`, keeps its Talker and
+CodePredictor per-step scratch — each a lazily-captured CUDA graph with baked
+device pointers, reached through the `const` `synthesize()` — on the pImpl today,
+so it is single-session and lands at the **serialized** tier once sessioned.
+Sessioning it is the Whisper move at larger scale: hoist both captured-graph step
+states (and the decode KV-cache) off `Impl` into a `QwenTtsSession` threaded
+through `synth_core` and its five entry points. That is the natural next step when
+multi-voice Qwen synthesis is needed.
