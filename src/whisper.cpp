@@ -85,7 +85,11 @@ struct Whisper::Impl {
     // transcriptions reuse the same per-layer slabs (allocation-free decode
     // loop, once the loop lands in stage 5).
     WhisperDecoder    decoder;
-    mutable WhisperKVCache cache;
+    // The legacy single-session cache, backing the transcribe(audio, ...)
+    // overloads. The multi-stream transcribe(session, ...) overloads thread the
+    // session's own cache instead; every decode helper below takes the cache as
+    // a parameter so the two paths share one implementation.
+    mutable WhisperKVCache owned_cache;
 
     // Encode an audio buffer to (max_source_positions, d_model) hidden states.
     // Called from the future transcribe() path; exposed here so the test layer
@@ -111,7 +115,8 @@ struct Whisper::Impl {
     // the (T, vocab_size) logits to `logits`. After the call
     // `cache.size() == T`. The caller's greedy loop reads logits.row(T-1) to
     // pick the first generated token. NOTE: caller must `cache.reset()` first.
-    void decode_prefill(const std::int32_t* prompt_ids, int T,
+    void decode_prefill(WhisperKVCache& cache,
+                        const std::int32_t* prompt_ids, int T,
                         const brotensor::Tensor& encoder_hidden,
                         brotensor::Tensor& logits) const {
         decoder.prime_cross(encoder_hidden, cache);
@@ -122,7 +127,7 @@ struct Whisper::Impl {
     // cache length, writing (1, vocab_size) logits. The cache grows by one
     // row. The caller is responsible for `decode_prefill` having been called
     // first (cross-attn cache must already be primed).
-    void decode_step(std::int32_t token_id,
+    void decode_step(WhisperKVCache& cache, std::int32_t token_id,
                      brotensor::Tensor& logits) const {
         const int pos_offset = cache.size();
         decoder.forward(&token_id, /*T=*/1, pos_offset, cache, logits);
@@ -136,8 +141,9 @@ struct Whisper::Impl {
     // generated.size() on entry) of the last timestamp token whose id >=
     // `timestamp_begin_id`, or -1 if seek is disabled / none was emitted — the
     // long-form caller uses it to advance the window. Defined out-of-line below
-    // (after argmax_last_row).
-    int decode_window(const AudioBuffer& window,
+    // (after argmax_last_row). Decodes into the caller-supplied `cache`.
+    int decode_window(WhisperKVCache& cache,
+                      const AudioBuffer& window,
                       const std::vector<int32_t>& prompt_ids,
                       int budget,
                       const CancelCheck& cancel,
@@ -145,6 +151,14 @@ struct Whisper::Impl {
                       int timestamp_begin_id,
                       std::vector<int32_t>& generated,
                       bool* cancelled) const;
+
+    // The shared transcribe body — short-form one-shot or long-form windowed —
+    // decoding into the caller-supplied `cache`. Both the legacy and the
+    // session transcribe() overloads funnel through here. Defined out-of-line.
+    Transcription run_transcribe(WhisperKVCache& cache,
+                                 const AudioBuffer& audio,
+                                 const std::vector<int32_t>& prompt_ids,
+                                 const TranscribeOptions& opts) const;
 };
 
 Whisper::Whisper() : impl_(std::make_unique<Impl>()) {}
@@ -201,11 +215,11 @@ void Whisper::load(const std::string& model_dir, brotensor::Device device) {
                              impl_->config.max_target_positions,
                              impl_->config.max_source_positions,
                              device);
-    impl_->cache.allocate(impl_->config.decoder_layers,
-                          impl_->config.d_model,
-                          impl_->config.max_target_positions,
-                          impl_->config.max_source_positions,
-                          device);
+    impl_->owned_cache.allocate(impl_->config.decoder_layers,
+                                impl_->config.d_model,
+                                impl_->config.max_target_positions,
+                                impl_->config.max_source_positions,
+                                device);
 
     impl_->loaded = true;
 }
@@ -250,7 +264,8 @@ int32_t argmax_last_row(const brotensor::Tensor& logits) {
 
 // Defined out-of-line (declared in struct Impl) so it can reach the
 // file-local argmax_last_row above.
-int Whisper::Impl::decode_window(const AudioBuffer& window,
+int Whisper::Impl::decode_window(WhisperKVCache& cache,
+                                 const AudioBuffer& window,
                                  const std::vector<int32_t>& prompt_ids,
                                  int budget,
                                  const CancelCheck& cancel,
@@ -271,7 +286,7 @@ int Whisper::Impl::decode_window(const AudioBuffer& window,
     cache.reset();
     brotensor::Tensor logits = brotensor::Tensor::empty_on(
         device, 0, 0, brotensor::Dtype::FP32);
-    decode_prefill(prompt_ids.data(), prompt_len, hidden, logits);
+    decode_prefill(cache, prompt_ids.data(), prompt_len, hidden, logits);
 
     // Captured decode session (CUDA): replay the whole single-token step as
     // one cudaGraphLaunch instead of ~300 individual kernel launches. The
@@ -307,7 +322,7 @@ int Whisper::Impl::decode_window(const AudioBuffer& window,
         if (use_step_graph) {
             decoder.step_decode(next_id, cache.size(), cache, logits);
         } else {
-            decode_step(next_id, logits);
+            decode_step(cache, next_id, logits);
         }
     }
     return last_ts_rel;
@@ -323,16 +338,18 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     return transcribe(audio, prompt_ids, opts);
 }
 
-Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
-                                           const std::vector<int32_t>& prompt_ids,
-                                           const TranscribeOptions& opts) const {
-    if (!impl_->loaded) {
+Whisper::Transcription Whisper::Impl::run_transcribe(
+    WhisperKVCache& cache,
+    const AudioBuffer& audio,
+    const std::vector<int32_t>& prompt_ids,
+    const TranscribeOptions& opts) const {
+    if (!loaded) {
         fail("Whisper::transcribe", "no model loaded; call Whisper::load() first");
     }
     if (audio.samples.empty()) {
         fail("Whisper::transcribe", "audio buffer is empty");
     }
-    if (audio.sample_rate != impl_->config.sample_rate) {
+    if (audio.sample_rate != config.sample_rate) {
         fail("Whisper::transcribe",
              "audio.sample_rate must be 16000 Hz (Whisper-fixed); "
              "resampling is the caller's responsibility");
@@ -344,16 +361,16 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     }
 
     const int prompt_len = static_cast<int>(prompt_ids.size());
-    if (prompt_len >= impl_->config.max_target_positions) {
+    if (prompt_len >= config.max_target_positions) {
         fail("Whisper::transcribe",
              "prompt_ids length >= max_target_positions; nothing to generate");
     }
     // Per-window token budget (long-form caps each 30 s segment independently).
     int budget = opts.max_new_tokens;
-    const int hard_cap = impl_->config.max_target_positions - prompt_len;
+    const int hard_cap = config.max_target_positions - prompt_len;
     if (budget <= 0 || budget > hard_cap) budget = hard_cap;
 
-    const int   window_samples = impl_->config.sample_rate * 30;  // 30 s
+    const int   window_samples = config.sample_rate * 30;  // 30 s
     const std::size_t total     = audio.samples.size();
     const bool long_form = opts.timestamp_begin_id >= 0 &&
                            total > static_cast<std::size_t>(window_samples);
@@ -366,9 +383,9 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
         std::vector<int32_t> generated;
         generated.reserve(static_cast<std::size_t>(budget));
         bool cancelled = false;
-        impl_->decode_window(audio, prompt_ids, budget, opts.cancel,
-                             opts.on_token, opts.timestamp_begin_id, generated,
-                             &cancelled);
+        decode_window(cache, audio, prompt_ids, budget, opts.cancel,
+                      opts.on_token, opts.timestamp_begin_id, generated,
+                      &cancelled);
         out.token_ids.insert(out.token_ids.end(),
                              generated.begin(), generated.end());
         return out;
@@ -393,9 +410,9 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
         const std::size_t gen_before = generated.size();
         bool cancelled = false;
         const int last_ts_rel =
-            impl_->decode_window(window, prompt_ids, budget, opts.cancel,
-                                 opts.on_token, opts.timestamp_begin_id,
-                                 generated, &cancelled);
+            decode_window(cache, window, prompt_ids, budget, opts.cancel,
+                          opts.on_token, opts.timestamp_begin_id,
+                          generated, &cancelled);
         if (cancelled) break;
 
         // Advance the window. A timestamp token id maps to seconds via
@@ -418,6 +435,65 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
     out.token_ids.insert(out.token_ids.end(),
                          generated.begin(), generated.end());
     return out;
+}
+
+// ── Legacy single-session transcribe: decode into the model-owned cache. ──
+Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           const TranscribeOptions& opts) const {
+    return impl_->run_transcribe(impl_->owned_cache, audio, prompt_ids, opts);
+}
+
+// ─── WhisperSession (per-decode KV-cache) ──────────────────────────────────
+//
+// The opaque session state is just the KV-cache; all the heavy decoder
+// internals stay in the shared Whisper. make_session() sizes a fresh cache to
+// the model; transcribe(session, ...) funnels through the same run_transcribe()
+// the legacy path uses, but against the session's own cache.
+
+struct WhisperSessionState {
+    WhisperKVCache cache;
+};
+
+WhisperSession::WhisperSession()
+    : state_(std::make_unique<WhisperSessionState>()) {}
+WhisperSession::~WhisperSession() = default;
+WhisperSession::WhisperSession(WhisperSession&&) noexcept = default;
+WhisperSession& WhisperSession::operator=(WhisperSession&&) noexcept = default;
+
+WhisperSession Whisper::make_session() const {
+    if (!impl_->loaded) {
+        fail("Whisper::make_session", "no model loaded; call Whisper::load() first");
+    }
+    WhisperSession s;
+    s.state_->cache.allocate(impl_->config.decoder_layers,
+                             impl_->config.d_model,
+                             impl_->config.max_target_positions,
+                             impl_->config.max_source_positions,
+                             impl_->device);
+    return s;
+}
+
+void Whisper::reset(WhisperSession& session) const {
+    session.state_->cache.reset();
+}
+
+Whisper::Transcription Whisper::transcribe(WhisperSession& session,
+                                           const AudioBuffer& audio,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           int max_new_tokens,
+                                           const CancelCheck& cancel) const {
+    TranscribeOptions opts;
+    opts.max_new_tokens = max_new_tokens;
+    opts.cancel         = cancel;
+    return transcribe(session, audio, prompt_ids, opts);
+}
+
+Whisper::Transcription Whisper::transcribe(WhisperSession& session,
+                                           const AudioBuffer& audio,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           const TranscribeOptions& opts) const {
+    return impl_->run_transcribe(session.state_->cache, audio, prompt_ids, opts);
 }
 
 const WhisperConfig& Whisper::config() const { return impl_->config; }

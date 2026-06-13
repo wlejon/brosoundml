@@ -84,6 +84,11 @@ struct WhisperConfig {
     int decoder_start_token_id   = 0;      // <|startoftranscript|>
 };
 
+// Opaque per-session decode state (the KV-cache), defined in whisper.cpp so the
+// public header stays free of the decoder's brotensor module internals.
+struct WhisperSessionState;
+class WhisperSession;
+
 // The Whisper STT pipeline. Construct, load() a model directory, then
 // transcribe(). Heavy state (weights, config, module graph) lives behind a
 // pImpl so the public header stays free of brotensor module internals.
@@ -179,12 +184,71 @@ public:
                              const std::vector<int32_t>& prompt_ids,
                              const TranscribeOptions& opts) const;
 
+    // ── Multi-stream session API (load-once weights, N decode sessions) ──────
+    //
+    // Allocate a fresh per-stream decode session — its own KV-cache, sized to
+    // this model's dims on the model's device. N streams = one shared net + N
+    // sessions; hold the model through a std::shared_ptr<const Whisper> and call
+    // these `const` methods on it. The TTS/STT analog of PhonemeNet's
+    // make_session(): the session is bare per-decode scratch, the weights stay
+    // read-only in the shared model. Throws if no model is loaded.
+    //
+    // Concurrency tier: SHARED WEIGHTS, SERIALIZED TRANSCRIBE on the GPU. Each
+    // transcribe(session, ...) runs a full encode▶prefill▶greedy-loop to
+    // completion against the session's own cache, so serial calls — including
+    // interleaving two sessions — never cross-talk: a session's transcript is
+    // bit-identical to the same call on a fresh model. On CUDA the decoder's
+    // captured single-token step graph is warmed once and shared across
+    // sessions (re-keyed to each session's cache pointers on switch), and the
+    // GPU runs one stream regardless, so overlapping (concurrent) transcribe
+    // calls on sessions that share a model are NOT supported — drive them from
+    // one worker / queue. On CPU there is no shared step graph, so sessions are
+    // fully independent.
+    WhisperSession make_session() const;
+
+    Transcription transcribe(WhisperSession& session,
+                             const AudioBuffer& audio,
+                             const std::vector<int32_t>& prompt_ids,
+                             int max_new_tokens = 0,
+                             const CancelCheck& cancel = {}) const;
+
+    Transcription transcribe(WhisperSession& session,
+                             const AudioBuffer& audio,
+                             const std::vector<int32_t>& prompt_ids,
+                             const TranscribeOptions& opts) const;
+
+    // Clear a session's KV-cache for a fresh, unrelated utterance. Each
+    // transcribe() already resets the cache per 30 s window, so this is only
+    // needed to drop state a caller is holding between calls. Const.
+    void reset(WhisperSession& session) const;
+
     const WhisperConfig& config() const;
     bool loaded() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// A Whisper decode session: the per-stream KV-cache, owned by the caller, that
+// turns one load-once Whisper into N independent transcription streams (see
+// Whisper::make_session and docs/multi-stream-sessions.md). Bare scratch — it
+// does not own the model; hold the weights through a std::shared_ptr<const
+// Whisper> and pass both to transcribe(). Move-only (the cache is device
+// tensors). Build with Whisper::make_session(); the heavy decoder internals
+// stay behind the opaque WhisperSessionState pImpl.
+class WhisperSession {
+public:
+    WhisperSession();
+    ~WhisperSession();
+    WhisperSession(WhisperSession&&) noexcept;
+    WhisperSession& operator=(WhisperSession&&) noexcept;
+    WhisperSession(const WhisperSession&) = delete;
+    WhisperSession& operator=(const WhisperSession&) = delete;
+
+private:
+    friend class Whisper;
+    std::unique_ptr<WhisperSessionState> state_;
 };
 
 }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -461,7 +462,10 @@ static int run() {
               fs::exists(merges_path))) {
             return;
         }
-        Whisper real;
+        // Heap-allocated so the multi-stream session sub-test below can share
+        // the one loaded model through a shared_ptr<const Whisper>.
+        auto    real_sp = std::make_shared<Whisper>();
+        Whisper& real   = *real_sp;
         real.load(real_root.string(), dev);
         if (!real.loaded()) {
             std::fprintf(stderr, "FAIL: [%s] real Whisper: loaded()\n", dev_name);
@@ -537,6 +541,51 @@ static int run() {
                     dev_name, secs, generated.size(),
                     secs > 0.0 ? static_cast<double>(generated.size()) / secs
                                : 0.0);
+        // ── Multi-stream sessions: one shared model, N decode sessions ───────
+        // Two WhisperSessions over ONE load-once model (held via
+        // shared_ptr<const Whisper>). Each owns its KV-cache;
+        // transcribe(session, ...) is bit-identical to the legacy transcribe(),
+        // and interleaving the two sessions changes neither transcript — the
+        // serialized-tier captured decode graph is reused / re-keyed across
+        // sessions with no cross-talk. Calls are serial, per the tier.
+        {
+            using brosoundml::WhisperSession;
+            std::shared_ptr<const Whisper> shared = real_sp;
+            WhisperSession sA = shared->make_session();
+            WhisperSession sB = shared->make_session();
+
+            auto rA1 = shared->transcribe(sA, audio, prompt);
+            auto rB  = shared->transcribe(sB, audio, prompt);   // interleave B
+            auto rA2 = shared->transcribe(sA, audio, prompt);   // sA again
+
+            if (rA1.token_ids != result.token_ids) {
+                std::fprintf(stderr, "FAIL: [%s] WhisperSession: session "
+                             "transcript matches legacy transcribe\n", dev_name);
+                ++failures;
+            }
+            if (rB.token_ids != result.token_ids) {
+                std::fprintf(stderr, "FAIL: [%s] WhisperSession: 2nd session "
+                             "matches legacy transcribe\n", dev_name);
+                ++failures;
+            }
+            if (rA2.token_ids != rA1.token_ids) {
+                std::fprintf(stderr, "FAIL: [%s] WhisperSession: session A "
+                             "unchanged across interleaved B (no cross-talk)\n",
+                             dev_name);
+                ++failures;
+            }
+            // reset() drops the cache; a post-reset transcribe still matches.
+            shared->reset(sA);
+            auto rA3 = shared->transcribe(sA, audio, prompt);
+            if (rA3.token_ids != result.token_ids) {
+                std::fprintf(stderr, "FAIL: [%s] WhisperSession: transcribe "
+                             "after reset() matches legacy\n", dev_name);
+                ++failures;
+            }
+            std::printf("    [%s] WhisperSession: 2 sessions over 1 model, "
+                        "interleaved, no cross-talk\n", dev_name);
+        }
+
         // Warm repeat (GPU only): the first transcribe pays one-time costs —
         // on CUDA the captured decode session's warm-up + graph instantiate —
         // so a second identical run shows the steady-state rate the long-form
