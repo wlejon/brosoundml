@@ -177,7 +177,10 @@ static int run() {
     const fs::path real_root  = fs::path(BROSOUNDML_REPO_DIR) / "weights" / "kokoro";
     const fs::path real_model = real_root / "model.safetensors";
     if (fs::exists(real_model)) {
-        Kokoro real;
+        // Heap-allocated so the multi-voice session sub-test below can share the
+        // one loaded model through a shared_ptr<const Kokoro>.
+        auto   real_sp = std::make_shared<Kokoro>();
+        Kokoro& real   = *real_sp;
         real.load(real_root.string(), dev);
         const auto& rcfg = real.config();
         auto tag = [&](const char* s) {
@@ -304,6 +307,59 @@ static int run() {
                       tag("synthesize_stream: cancel stops after the current chunk"));
                 CHECK(partial.samples.size() == s0.samples.size(),
                       tag("synthesize_stream: cancelled run returns delivered chunks only"));
+            }
+
+            // ── Multi-voice sessions: one shared model, N bound voices ───────
+            // Two KokoroSessions over ONE load-once model. The 82M weights are
+            // held once (use_count), each session binds its own voice, and a
+            // session's output is bit-identical to the direct synthesize() it
+            // wraps. Interleaving the two sessions changes nothing — the
+            // serialized tier reuses the shared warmed LSTM graph across voices
+            // with no cross-talk.
+            {
+                using brosoundml::KokoroSession;
+                std::shared_ptr<const Kokoro> shared = real_sp;
+
+                // A second, distinct voice authored from the first's style row,
+                // perturbed so the two NPCs genuinely differ.
+                std::vector<float> style2 =
+                    v.pick_for(static_cast<int>(phonemes.size()) + 2)
+                        .to_host_vector();
+                for (float& x : style2) x = x * 0.9f + 0.05f;
+                Voice v2 = real.make_voice(style2, "npc2");
+
+                KokoroSession npcA(shared, v);
+                KokoroSession npcB(shared, v2);
+
+                // real_sp + shared + npcA + npcB all own the one model.
+                CHECK(shared.use_count() >= 4,
+                      tag("KokoroSession: weights shared (one load, N sessions)"));
+
+                AudioBuffer directA = real.synthesize(phonemes, v,  1.0f);
+                AudioBuffer directB = real.synthesize(phonemes, v2, 1.0f);
+
+                AudioBuffer sessA = npcA.synthesize(phonemes, 1.0f);
+                AudioBuffer sessB = npcB.synthesize(phonemes, 1.0f);
+                CHECK(sessA.samples == directA.samples,
+                      tag("KokoroSession: session A bit-exact vs direct synthesize"));
+                CHECK(sessB.samples == directB.samples,
+                      tag("KokoroSession: session B bit-exact vs direct synthesize"));
+                CHECK(!directA.samples.empty() && directA.samples != directB.samples,
+                      tag("KokoroSession: distinct voices produce distinct audio"));
+
+                // Interleave A/B again — each still matches its standalone run.
+                AudioBuffer iA = npcA.synthesize(phonemes, 1.0f);
+                AudioBuffer iB = npcB.synthesize(phonemes, 1.0f);
+                CHECK(iA.samples == directA.samples,
+                      tag("KokoroSession: interleaved A unchanged (no cross-talk)"));
+                CHECK(iB.samples == directB.samples,
+                      tag("KokoroSession: interleaved B unchanged (no cross-talk)"));
+
+                // set_voice re-skins in place: A speaking B's voice == directB.
+                npcA.set_voice(v2);
+                AudioBuffer reskin = npcA.synthesize(phonemes, 1.0f);
+                CHECK(reskin.samples == directB.samples,
+                      tag("KokoroSession: set_voice re-skins to the new voice"));
             }
         }
     }

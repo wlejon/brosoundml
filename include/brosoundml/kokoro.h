@@ -355,4 +355,60 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ─── KokoroSession ─────────────────────────────────────────────────────────
+//
+// The multi-voice entry: a bound (shared Kokoro + Voice) speaking handle. The
+// 82M weights live once behind a std::shared_ptr<const Kokoro>; each session
+// adds only its bound Voice. Build N sessions over one loaded model to give N
+// NPCs distinct voices over a single weight set — the TTS analog of N WakeWord
+// detectors over one shared BcResnet2d (see docs/multi-stream-sessions.md).
+//
+// Concurrency tier: SHARED WEIGHTS, SERIALIZED SYNTHESIS. Unlike the streaming
+// conv sessions (PhonemeSession / BcResnet2dSession), whose forward writes only
+// into their own scratch and so run truly concurrently, Kokoro synthesis over
+// one model is serialized: on CUDA the LSTM cells replay a single lazily
+// captured CUDA graph whose step buffers are shared, and the GPU runs one stream
+// regardless of how many sessions exist. Sessions therefore isolate the VOICE,
+// not parallel execution — synthesize() calls on sessions that share a model
+// must not overlap; drive them from one synth worker / queue (the NPC
+// turn-taking pattern). The captured graph is voice- and length-independent, so
+// serial reuse across voices is exact: a session's output is bit-identical to
+// model().synthesize(ids, voice(), ...). Kokoro is move-only and lives behind a
+// pImpl, so a session holds the model by shared_ptr rather than constructing one
+// from a member of Kokoro.
+class KokoroSession {
+public:
+    // Bind a shared, already-loaded model to a voice. Throws std::runtime_error
+    // if `model` is null or not loaded.
+    KokoroSession(std::shared_ptr<const Kokoro> model, Voice voice);
+
+    // Speak phoneme token ids in this session's bound voice. Exactly
+    // model().synthesize(phoneme_ids, voice(), speed, pred_dur_out, cancel,
+    // trace_out) — the voice is supplied for you. See Kokoro::synthesize for the
+    // pred_dur_out / cancel / trace_out contract.
+    AudioBuffer synthesize(const std::vector<int32_t>& phoneme_ids,
+                           float speed = 1.0f,
+                           std::vector<int32_t>* pred_dur_out = nullptr,
+                           const CancelCheck& cancel = {},
+                           KokoroTrace* trace_out = nullptr) const;
+
+    // Streaming variant — see Kokoro::synthesize_stream. The bound voice applies
+    // to every chunk.
+    AudioBuffer synthesize_stream(
+        const std::vector<std::vector<int32_t>>& phoneme_chunks,
+        const KokoroStreamChunkFn& on_chunk,
+        float speed = 1.0f,
+        const CancelCheck& cancel = {}) const;
+
+    // Re-skin this NPC: swap the bound voice without touching the shared weights.
+    void set_voice(Voice voice);
+
+    const Voice&  voice() const { return voice_; }
+    const Kokoro& model() const { return *model_; }
+
+private:
+    std::shared_ptr<const Kokoro> model_;
+    Voice                         voice_;
+};
+
 }

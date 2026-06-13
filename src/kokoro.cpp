@@ -772,4 +772,44 @@ brotensor::Tensor Voice::pick_for(int n_phonemes) const {
     return row;
 }
 
+// ─── KokoroSession ─────────────────────────────────────────────────────────
+//
+// A thin (shared model + bound voice) handle — all the heavy state stays in the
+// shared Kokoro behind the shared_ptr. synthesize()/synthesize_stream() simply
+// forward to the model with the bound voice supplied. Serialized tier: the
+// caller must not overlap synthesize() calls on sessions sharing a model (see
+// the class comment in kokoro.h); when used serially, a session's output is
+// bit-identical to calling model().synthesize(ids, voice(), ...) directly.
+
+KokoroSession::KokoroSession(std::shared_ptr<const Kokoro> model, Voice voice)
+    : model_(std::move(model)), voice_(std::move(voice)) {
+    if (!model_) {
+        fail("KokoroSession::KokoroSession", "model is null");
+    }
+    if (!model_->loaded()) {
+        fail("KokoroSession::KokoroSession",
+             "model is not loaded; call Kokoro::load() before building a session");
+    }
+}
+
+AudioBuffer KokoroSession::synthesize(const std::vector<int32_t>& phoneme_ids,
+                                      float speed,
+                                      std::vector<int32_t>* pred_dur_out,
+                                      const CancelCheck& cancel,
+                                      KokoroTrace* trace_out) const {
+    return model_->synthesize(phoneme_ids, voice_, speed, pred_dur_out,
+                              cancel, trace_out);
+}
+
+AudioBuffer KokoroSession::synthesize_stream(
+    const std::vector<std::vector<int32_t>>& phoneme_chunks,
+    const KokoroStreamChunkFn& on_chunk,
+    float speed,
+    const CancelCheck& cancel) const {
+    return model_->synthesize_stream(phoneme_chunks, voice_, on_chunk, speed,
+                                     cancel);
+}
+
+void KokoroSession::set_voice(Voice voice) { voice_ = std::move(voice); }
+
 }  // namespace brosoundml
