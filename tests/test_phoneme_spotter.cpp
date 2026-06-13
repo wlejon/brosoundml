@@ -15,9 +15,12 @@
 
 #include <brotensor/runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -646,9 +649,71 @@ static void test_soft_states() {
     }
 }
 
+// ── 14. Shared net: one load-once weight set drives N independent spotters. ──
+// Build a tiny net, wrap it shared+const, and construct two spotters over it.
+// The weights are held once (shared_ptr, use_count proves it); each spotter
+// owns its own streaming session, so interleaving feed_mel on the two must not
+// cross-talk — spotter A's posterior stream matches a standalone spotter fed
+// only A's frames, regardless of B's interleaved feeds.
+static void test_shared_net() {
+    const auto dev = brotensor::Device::CPU;
+    bsm::PhonemeNetConfig cfg;            // 40 mels; shrink the trunk for speed
+    cfg.c_stem = 8; cfg.c[0] = 8; cfg.c[1] = 12; cfg.c[2] = 16; cfg.c[3] = 24;
+    auto net = std::make_shared<const bsm::PhonemeNet>(
+        bsm::PhonemeNet::make(cfg, toy_classmap(), dev));
+
+    bsm::PhonemeSpotter sa(net), sb(net);
+    CHECK(sa.loaded() && sb.loaded(), "shared: both spotters report loaded");
+    CHECK(net.use_count() == 3,
+          "shared: weights held once (net + 2 spotters share the shared_ptr)");
+    CHECK(sa.class_map().num_classes == 6, "shared: class map adopted from net");
+
+    const int M = sa.mel_config().n_mels;
+    const int T = 40;
+    std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+    auto gen = [&](std::uint32_t seed) {
+        std::mt19937 r(seed);
+        std::vector<float> v(static_cast<std::size_t>(M) * T);
+        for (auto& x : v) x = u(r);
+        return v;
+    };
+    const std::vector<float> A = gen(1), B = gen(2);
+
+    // Standalone reference for stream A: its own fresh spotter, fed all at once.
+    bsm::PhonemeSpotter sc(net);
+    sc.feed_mel(A.data(), T);
+    const std::vector<float> refA = sc.last_posterior();
+
+    // Interleave A into sa and B into sb, in halves: A0,B0,A1,B1.
+    auto feed_half = [&](bsm::PhonemeSpotter& s, const std::vector<float>& f,
+                         int start, int w) {
+        std::vector<float> sub(static_cast<std::size_t>(M) * w);
+        for (int r = 0; r < M; ++r)
+            for (int t = 0; t < w; ++t)
+                sub[static_cast<std::size_t>(r) * w + t] =
+                    f[static_cast<std::size_t>(r) * T + (start + t)];
+        s.feed_mel(sub.data(), w);
+    };
+    const int half = T / 2;
+    feed_half(sa, A, 0, half);
+    feed_half(sb, B, 0, half);
+    feed_half(sa, A, half, T - half);
+    feed_half(sb, B, half, T - half);
+
+    const std::vector<float> outA = sa.last_posterior();
+    float d = (outA.size() == refA.size()) ? 0.0f : 1e9f;
+    const std::size_t n = std::min(outA.size(), refA.size());
+    for (std::size_t i = 0; i < n; ++i) d = std::max(d, std::fabs(outA[i] - refA[i]));
+    CHECK(d <= 1e-4f,
+          "shared: spotter A interleaved posteriors match standalone (no crosstalk)");
+    std::fprintf(stderr, "    (shared-net crosstalk diff=%g, use_count=%ld)\n",
+                 d, static_cast<long>(net.use_count()));
+}
+
 int main() {
     brotensor::init();
     test_positive();
+    test_shared_net();
     test_entry_gate();
     test_min_phonemes();
     test_negative();

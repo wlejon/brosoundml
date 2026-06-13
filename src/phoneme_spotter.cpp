@@ -348,11 +348,14 @@ struct PhonemeSpotter::Impl {
     PhonemeClassMap class_map;
     bool            has_class_map = false;
 
-    // Model + front-end (REAL path only).
-    std::unique_ptr<PhonemeNet>  model;
-    std::unique_ptr<MelFrontend> mel;
-    bt::Device                   device = bt::Device::CPU;
-    bool                         loaded = false;
+    // Model + front-end (REAL path only). The net is SHARED and read-only —
+    // weights live once behind the shared_ptr and may back N spotters; this
+    // spotter owns only `stream`, its private streaming session over that net.
+    std::shared_ptr<const PhonemeNet> model;
+    PhonemeStreamState                stream;
+    std::unique_ptr<MelFrontend>      mel;
+    bt::Device                        device = bt::Device::CPU;
+    bool                              loaded = false;
 
     // Framing params used to convert refractory_ms -> frames. Defaults match the
     // PhonemeNet front-end (16 kHz, 10 ms hop); load() overwrites from the model.
@@ -452,7 +455,7 @@ struct PhonemeSpotter::Impl {
 
     void reset_stream_state() {
         if (mel)   mel->reset();
-        if (model) model->reset_streaming_state();
+        if (model) model->reset(stream);
         sample_ring.clear();
         silence_run = 1 << 20;   // post-reset counts as silence seen
         for (auto& m : matchers) m.reset_dp();
@@ -466,9 +469,56 @@ struct PhonemeSpotter::Impl {
         // monotonic fields (frames, completions, last_*) deliberately survive.
         publish_progress(matchers);
     }
+
+    // Install a shared, loaded net: build the matching PCEN front-end, allocate
+    // this spotter's private streaming session, and adopt the net's class map +
+    // framing. Shared by load() and the shared-net constructor.
+    void install_net(std::shared_ptr<const PhonemeNet> net) {
+        const PhonemeClassMap   cm = net->class_map();
+        const PhonemeNetConfig& c  = net->config();
+        if (cm.num_classes <= 0)
+            fail("PhonemeSpotter::install",
+                 "model class map has non-positive num_classes");
+        cm.rebuild_inverse();
+        const bt::Device dev = net->device();
+
+        // PCEN mel front-end matching the model's framing (mirror WakeWord).
+        MelConfig mcfg;
+        mcfg.sample_rate = c.sample_rate;
+        mcfg.n_fft       = c.n_fft;
+        mcfg.win_length  = c.win_length;
+        mcfg.hop_length  = c.hop_length;
+        mcfg.n_mels      = c.n_mels;
+        mcfg.compression = MelCompression::PCEN;
+        auto melfe = std::make_unique<MelFrontend>(mcfg, dev);
+
+        // Commit.
+        model         = std::move(net);
+        stream        = model->make_stream_state();
+        mel           = std::move(melfe);
+        device        = dev;
+        loaded        = true;
+        class_map     = cm;
+        has_class_map = true;
+        sample_rate   = c.sample_rate;
+        hop_length    = c.hop_length;
+        matchers.clear();
+        ++tmpl_generation;
+        last_post.assign(static_cast<std::size_t>(cm.num_classes), 0.0f);
+        post_valid = false;
+        reset_stream_state();   // publishes the emptied progress snapshot
+    }
 };
 
 PhonemeSpotter::PhonemeSpotter() : impl_(std::make_unique<Impl>()) {}
+
+PhonemeSpotter::PhonemeSpotter(std::shared_ptr<const PhonemeNet> net)
+    : impl_(std::make_unique<Impl>()) {
+    if (!net) fail("PhonemeSpotter", "null net");
+    bt::init();
+    impl_->install_net(std::move(net));
+}
+
 PhonemeSpotter::~PhonemeSpotter() = default;
 PhonemeSpotter::PhonemeSpotter(PhonemeSpotter&&) noexcept = default;
 PhonemeSpotter& PhonemeSpotter::operator=(PhonemeSpotter&&) noexcept = default;
@@ -495,40 +545,9 @@ void PhonemeSpotter::set_class_map(const PhonemeClassMap& cm) {
 
 void PhonemeSpotter::load(const std::string& weights_path, brotensor::Device device) {
     bt::init();
-
-    auto model = std::make_unique<PhonemeNet>(PhonemeNet::load(weights_path, device));
-    const PhonemeClassMap cm  = model->class_map();
-    const PhonemeNetConfig& c = model->config();
-    if (cm.num_classes <= 0) {
-        fail("PhonemeSpotter::load", "model class map has non-positive num_classes");
-    }
-    cm.rebuild_inverse();
-
-    // Build the PCEN mel front-end matching the model's framing (the recipe is
-    // trained on PCEN — mirror WakeWord::load).
-    MelConfig mcfg;
-    mcfg.sample_rate = c.sample_rate;
-    mcfg.n_fft       = c.n_fft;
-    mcfg.win_length  = c.win_length;
-    mcfg.hop_length  = c.hop_length;
-    mcfg.n_mels      = c.n_mels;
-    mcfg.compression = MelCompression::PCEN;
-    auto mel = std::make_unique<MelFrontend>(mcfg, device);
-
-    // Commit.
-    impl_->model         = std::move(model);
-    impl_->mel           = std::move(mel);
-    impl_->device        = device;
-    impl_->loaded        = true;
-    impl_->class_map     = cm;
-    impl_->has_class_map = true;
-    impl_->sample_rate   = c.sample_rate;
-    impl_->hop_length    = c.hop_length;
-    impl_->matchers.clear();
-    ++impl_->tmpl_generation;
-    impl_->last_post.assign(static_cast<std::size_t>(cm.num_classes), 0.0f);
-    impl_->post_valid = false;
-    impl_->reset_stream_state();   // publishes the emptied progress snapshot
+    auto net = std::make_shared<const PhonemeNet>(
+        PhonemeNet::load(weights_path, device));
+    impl_->install_net(std::move(net));
 }
 
 const PhonemeClassMap& PhonemeSpotter::class_map() const { return impl_->class_map; }
@@ -755,8 +774,11 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
                               0.0f);
     if (n > 0) std::copy(samples, samples + n, padded.begin() + pad);
 
+    // Enrollment runs the model over a SEPARATE throwaway session so it never
+    // disturbs the live stream's caches; only this spotter's own mel front-end
+    // needs the reset/restore dance below.
     impl_->mel->reset();
-    impl_->model->reset_streaming_state();
+    PhonemeStreamState enroll_stream = impl_->model->make_stream_state();
 
     bt::Tensor frames;   // (n_mels, T)
     const int T = impl_->mel->consume(padded.data(),
@@ -765,7 +787,7 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
     int T_post = 0;
     if (T > 0) {
         bt::Tensor logits;   // (T, K)
-        impl_->model->forward_streaming(frames, logits);
+        impl_->model->forward_streaming(enroll_stream, frames, logits);
         std::vector<float> lh = logits.to_host_vector();   // (T, K) row-major
         const int K = impl_->K();
         T_post = logits.rows;
@@ -784,9 +806,10 @@ int PhonemeSpotter::enroll_from_audio(const std::string& name,
             for (int k = 0; k < K; ++k) o[k] *= inv;
         }
     }
-    // Restore the live stream's clean state (the probe disturbed the caches).
+    // Restore the live front-end's clean state (the probe disturbed the mel
+    // ring). The model's live session was never touched — enrollment ran on a
+    // separate throwaway session.
     impl_->mel->reset();
-    impl_->model->reset_streaming_state();
 
     return enroll_from_posteriors(name, post.data(), T_post, policy_override);
 }
@@ -968,9 +991,10 @@ std::vector<SpotEvent> PhonemeSpotter::feed_mel(const float* mel, int n_frames) 
 
 std::vector<SpotEvent> PhonemeSpotter::run_mel_frames(const bt::Tensor& new_frames,
                                                       int T_new) {
-    // forward_streaming over the whole new mel block -> (T_new, K) logits.
+    // forward_streaming over the whole new mel block -> (T_new, K) logits,
+    // advancing this spotter's private session over the shared net.
     bt::Tensor logits;
-    impl_->model->forward_streaming(new_frames, logits);
+    impl_->model->forward_streaming(impl_->stream, new_frames, logits);
     std::vector<float> lh = logits.to_host_vector();   // (T_new, K) row-major
     const int K = impl_->K();
 

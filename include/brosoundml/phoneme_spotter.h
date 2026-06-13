@@ -4,6 +4,7 @@
 
 #include "brosoundml/mel.h"
 #include "brosoundml/phoneme_data.h"
+#include "brosoundml/phoneme_model.h"
 
 #include <cstdint>
 #include <memory>
@@ -258,7 +259,16 @@ public:
     PhonemeSpotter(const PhonemeSpotter&) = delete;
     PhonemeSpotter& operator=(const PhonemeSpotter&) = delete;
 
+    // Construct over a SHARED, already-loaded net (the multi-stream entry). The
+    // weights live once behind the shared_ptr; this spotter owns only its own
+    // streaming session (a PhonemeStreamState) plus its templates/matcher and
+    // front-end. Build N spotters over one net to spot the same vocabulary on N
+    // asynchronous audio streams without copying weights. The class map and
+    // front-end framing come from the net. Throws if net is null.
+    explicit PhonemeSpotter(std::shared_ptr<const PhonemeNet> net);
+
     // REAL use: load the phoneme model + its embedded class map onto device.
+    // Equivalent to constructing from a freshly loaded, shared net.
     void load(const std::string& weights_path,
               brotensor::Device device = brotensor::Device::CPU);
 
