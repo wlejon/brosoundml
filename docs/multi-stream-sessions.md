@@ -113,10 +113,18 @@ in parallel; on a single CUDA stream it buys nothing.
 | `BcResnet2d`     | `BcResnet2dSession`   | Concurrent  | conv causal ring-caches + head GAP ring    |
 | `PhonemeNet`     | `PhonemeSession`      | Concurrent  | conv causal ring-caches                     |
 | `Kokoro`         | `KokoroSession`       | Serialized  | bound voice (one-shot forward; no caches)  |
-| Whisper / Qwen / Parakeet | —            | (single)    | KV-cache still on `Impl` — not yet sessioned |
+| `Whisper`        | `WhisperSession`      | Serialized  | decode KV-cache (per 30 s window)          |
+| `Parakeet`       | `ParakeetSession`     | Concurrent  | TDT prediction-net LSTM (h, c)             |
+| Qwen3-ASR / Qwen3-TTS | —            | (single)    | decode KV-cache still on `Impl` — not yet sessioned |
 
-The autoregressive speech models (Whisper, Qwen3-ASR/TTS, Parakeet) keep their
-decode KV-cache on the pImpl today, so they are single-session. Sessioning them
-means hoisting that cache (and any per-decode scratch) off `Impl` into a
-`<Model>Session` — the same move, larger surface — and is the natural next step
-when multi-stream STT/ASR is needed.
+`Whisper` sits at the serialized tier for the same reason as `Kokoro`: its
+decoder replays a single lazily-captured CUDA step graph whose buffers are shared
+across sessions (re-keyed to each session's cache on switch), so calls must not
+overlap on one model. `Parakeet` reaches the concurrent tier — it has no captured
+step graph and no `Impl`-resident cache, so once the prediction state lives in the
+session nothing mutable is shared and sessions are fully independent.
+
+The remaining autoregressive models (Qwen3-ASR, Qwen3-TTS) keep their decode
+KV-cache on the pImpl today, so they are single-session. Sessioning them is the
+same move — hoist the cache (and any per-decode scratch) off `Impl` into a
+`<Model>Session` — and is the natural next step when multi-stream Qwen is needed.
