@@ -137,5 +137,39 @@ int main() {
         return 1;
     }
     std::printf("PASS: text_encoder matches ONNX reference within %.1e\n", te_tol);
+
+    // ── duration predictor (text_ids + style_dp -> scalar total duration) ──
+    if (!fs::exists(fs::path(dir) / "duration_predictor.safetensors")) {
+        std::printf("SKIP: duration_predictor weights absent\n");
+        return 0;
+    }
+    const std::vector<float> dp_tid = read_bin(pdir + "/duration_predictor.in.text_ids.bin");
+    const std::vector<float> dp_sty = read_bin(pdir + "/duration_predictor.in.style_dp.bin");
+    const std::vector<float> dp_ref = read_bin(pdir + "/duration_predictor.out.duration.bin");
+    if (dp_tid.empty() || dp_sty.empty() || dp_ref.empty()) {
+        std::printf("SKIP: duration_predictor parity bins missing\n");
+        return 0;
+    }
+    std::vector<int> dp_ids(dp_tid.size());
+    for (std::size_t i = 0; i < dp_tid.size(); ++i)
+        dp_ids[i] = static_cast<int>(dp_tid[i] + 0.5f);
+
+    float dur = 0.0f;
+    try {
+        dur = model.predict_duration(dp_ids, dp_sty);
+    } catch (const std::exception& e) {
+        std::printf("FAIL: predict_duration threw: %s\n", e.what());
+        return 1;
+    }
+    const float dp_err = std::fabs(dur - dp_ref[0]);
+    std::printf("duration_predictor: T=%zu -> %.6f (ref %.6f), abs-err %.3e\n",
+                dp_ids.size(), dur, dp_ref[0], dp_err);
+    const float dp_tol = 1.0e-3f;
+    if (dp_err >= dp_tol) {
+        std::printf("FAIL: duration_predictor parity error %.3e >= tol %.3e\n",
+                    dp_err, dp_tol);
+        return 1;
+    }
+    std::printf("PASS: duration_predictor matches ONNX reference within %.1e\n", dp_tol);
     return 0;
 }

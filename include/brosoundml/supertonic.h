@@ -28,10 +28,11 @@ namespace brosoundml {
 // frontend tables + voice_styles/ presets), as hosted under
 // brosoundml-data/supertonic.
 //
-// THIS BUILD implements the vocoder stage (latent -> waveform) and the text
-// encoder (text_ids + TTL style -> text_emb). The duration predictor and the
-// flow-matching estimator land next; until then synthesize() is unavailable and
-// the public entry points are encode_text() and decode().
+// THIS BUILD implements the vocoder stage (latent -> waveform), the text
+// encoder (text_ids + TTL style -> text_emb), and the duration predictor
+// (text_ids + DP style -> scalar total duration). The flow-matching estimator
+// lands next; until then synthesize() is unavailable and the public entry
+// points are encode_text(), predict_duration(), and decode().
 
 // Model hyperparameters, read from the converted tts.json by Supertonic::load.
 struct SupertonicConfig {
@@ -88,6 +89,21 @@ public:
     // are absent or the style matrix is mis-sized.
     std::vector<float> encode_text(const std::vector<int>& text_ids,
                                    const std::vector<float>& style_ttl) const;
+
+    // Duration predictor: token ids + a DP style matrix -> a single scalar total
+    // duration for the utterance. The flow-matching estimator does its own
+    // (RoPE cross-attention) text↔audio alignment, so this predicts only the
+    // overall length, not a per-token duration.
+    //
+    // `text_ids` are the same codepoint-level vocabulary ids as encode_text;
+    // `style_dp` is the voice preset's DP style, 8*16 = 128 floats row-major
+    // (style_dp[i*16 + j]). The encoder prepends a learned sentence token,
+    // pools it after a 6-block ConvNeXt + 2-layer relative-attention stack, and
+    // an MLP head (Gemm/PReLU/Gemm/Exp) maps the pooled vector + style to the
+    // positive scalar. Throws if the duration-predictor weights are absent or
+    // the style matrix is mis-sized.
+    float predict_duration(const std::vector<int>& text_ids,
+                           const std::vector<float>& style_dp) const;
 
     const SupertonicConfig& config() const;
     bool loaded() const;
