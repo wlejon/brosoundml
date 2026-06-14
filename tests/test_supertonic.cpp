@@ -40,6 +40,7 @@ static float max_abs_err(const std::vector<float>& a, const std::vector<float>& 
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash
     std::string dir;
     if (const char* e = std::getenv("BROSOUNDML_SUPERTONIC_DIR"); e && *e) {
         dir = e;
@@ -94,5 +95,47 @@ int main() {
         return 1;
     }
     std::printf("PASS: vocoder matches ONNX reference within %.1e\n", tol);
+
+    // ── text encoder parity (text_ids + style_ttl -> text_emb [256 x T]) ──
+    if (!fs::exists(fs::path(dir) / "text_encoder.safetensors")) {
+        std::printf("SKIP: text_encoder weights absent\n");
+        return 0;
+    }
+    const std::vector<float> tid_f = read_bin(pdir + "/text_encoder.in.text_ids.bin");
+    const std::vector<float> styl  = read_bin(pdir + "/text_encoder.in.style_ttl.bin");
+    const std::vector<float> te_ref = read_bin(pdir + "/text_encoder.out.text_emb.bin");
+    if (tid_f.empty() || styl.empty() || te_ref.empty()) {
+        std::printf("SKIP: text_encoder parity bins missing\n");
+        return 0;
+    }
+    std::vector<int> tids(tid_f.size());
+    for (std::size_t i = 0; i < tid_f.size(); ++i)
+        tids[i] = static_cast<int>(tid_f[i] + 0.5f);
+
+    std::vector<float> te_emb;
+    try {
+        te_emb = model.encode_text(tids, styl);
+    } catch (const std::exception& e) {
+        std::printf("FAIL: encode_text threw: %s\n", e.what());
+        return 1;
+    }
+    std::printf("text_encoder: T=%zu -> %zu floats (ref %zu)\n",
+                tids.size(), te_emb.size(), te_ref.size());
+    if (te_emb.size() != te_ref.size()) {
+        std::printf("FAIL: text_emb size %zu != reference %zu\n",
+                    te_emb.size(), te_ref.size());
+        return 1;
+    }
+    const float te_err = max_abs_err(te_emb, te_ref);
+    std::printf("text_encoder max-abs-err vs ONNX reference: %.3e\n", te_err);
+    // Deeper graph (4 attn layers + 2 cross-attn) accumulates more FP32 reorder
+    // drift than the vocoder; 2e-3 is still tight enough to catch real bugs.
+    const float te_tol = 2.0e-3f;
+    if (te_err >= te_tol) {
+        std::printf("FAIL: text_encoder parity error %.3e >= tol %.3e\n",
+                    te_err, te_tol);
+        return 1;
+    }
+    std::printf("PASS: text_encoder matches ONNX reference within %.1e\n", te_tol);
     return 0;
 }

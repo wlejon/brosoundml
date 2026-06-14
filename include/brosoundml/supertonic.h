@@ -28,9 +28,10 @@ namespace brosoundml {
 // frontend tables + voice_styles/ presets), as hosted under
 // brosoundml-data/supertonic.
 //
-// THIS BUILD implements the vocoder stage (latent -> waveform). The text
-// encoder, duration predictor, and flow-matching estimator land next; until
-// then synthesize() is unavailable and the public entry point is decode().
+// THIS BUILD implements the vocoder stage (latent -> waveform) and the text
+// encoder (text_ids + TTL style -> text_emb). The duration predictor and the
+// flow-matching estimator land next; until then synthesize() is unavailable and
+// the public entry points are encode_text() and decode().
 
 // Model hyperparameters, read from the converted tts.json by Supertonic::load.
 struct SupertonicConfig {
@@ -75,6 +76,18 @@ public:
     AudioBuffer decode(const float* latent, int channels, int frames) const;
     AudioBuffer decode(const std::vector<float>& latent, int channels,
                        int frames) const;
+
+    // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
+    //
+    // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor
+    // output); `style_ttl` is the voice preset's TTL style, 50*256 row-major
+    // (token-major: style_ttl[s*256 + c], 50 style tokens x 256). Returns the
+    // text embedding as a (256 x T) channel-major grid (emb[c*T + t]), with
+    // T == text_ids.size(). Processes a single unpadded sequence (the upstream
+    // length mask is implicitly all-ones). Throws if the text-encoder weights
+    // are absent or the style matrix is mis-sized.
+    std::vector<float> encode_text(const std::vector<int>& text_ids,
+                                   const std::vector<float>& style_ttl) const;
 
     const SupertonicConfig& config() const;
     bool loaded() const;
