@@ -270,8 +270,20 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # The token embedding is tied four ways in the checkpoint (model.shared,
+    # encoder/decoder embed_tokens, lm_head) — all aliasing one storage. brolm
+    # reads only model.shared.weight, so drop the redundant aliases: keeping
+    # them would both trip safetensors' shared-memory guard and waste ~1 GB of
+    # disk per duplicated copy of the (vocab, d_model) matrix.
+    redundant = {a for a in tie_aliases if a != "model.shared.weight"}
     tensors = {n: t.detach().to(dtype=torch.float32, device="cpu").contiguous()
-               for n, t in sd.items()}
+               for n, t in sd.items() if n not in redundant}
+    dropped_aliases = sorted(n for n in sd if n in redundant)
+    if dropped_aliases:
+        print(f"  dropped {len(dropped_aliases)} tied embedding alias(es) "
+              "(brolm reads model.shared.weight):")
+        for n in dropped_aliases:
+            print(f"    - {n}")
     save_file(tensors, str(out_path))
     print(f"\nwrote {len(tensors)} tensors -> {out_path} "
           f"({out_path.stat().st_size:,} bytes)")
