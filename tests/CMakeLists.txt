@@ -16,6 +16,9 @@ brosoundml_add_test(brosoundml_test_kokoro   test_kokoro.cpp)
 brosoundml_add_test(brosoundml_test_qwen_tts test_qwen_tts.cpp)
 brosoundml_add_test(brosoundml_test_qwen_asr test_qwen_asr.cpp)
 brosoundml_add_test(brosoundml_test_rave     test_rave.cpp)
+brosoundml_add_test(brosoundml_test_supertonic test_supertonic.cpp)
+target_compile_definitions(brosoundml_test_supertonic PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 brosoundml_add_test(brosoundml_test_speaker_encoder test_speaker_encoder.cpp)
 target_compile_definitions(brosoundml_test_speaker_encoder PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
