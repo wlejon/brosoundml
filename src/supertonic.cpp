@@ -148,6 +148,32 @@ struct Gemm {
     int in = 0, out = 0;
 };
 
+// ─── flow-field (vector estimator) block types ───────────────────────────────
+
+struct VeFilm {        // time FiLM (main_blocks %6==1): h += time_emb @ W + b
+    bt::Tensor w;      // [64, 512] (in,out) for the row matmul
+    bt::Tensor b;      // [1, 512]
+};
+
+struct VeRope {        // text cross-attention with RoPE (main_blocks %6==3)
+    ConvW conv_q, conv_k, conv_v, conv_o;  // q:512->512, k/v:256->512, o:512->512
+    std::vector<float> theta;              // [32] RoPE base frequencies (host)
+    bt::Tensor norm_g, norm_b;             // post-attention LayerNorm
+};
+
+struct VeStyle {       // tanh-gated style cross-attention (main_blocks %6==5)
+    StyleAttn  attn;   // q:512->256, k/v:256->256, o:256->512
+    bt::Tensor norm_g, norm_b;             // post-attention LayerNorm
+};
+
+struct VeBlock {
+    int type = 0;                          // 0 convnext(x2), 1 film, 2 rope, 3 style
+    std::vector<ConvNeXtBlock> conv;       // type 0: two ConvNeXt sub-blocks
+    VeFilm  film;
+    VeRope  rope;
+    VeStyle style;
+};
+
 // Load a folded ONNX MatMul weight [in, out] (a Linear, x @ W) + bias as a 1x1
 // conv: conv weight is [out, in], so transpose host-side. Bias is [out].
 ConvW load_linear_as_conv(const sf::File& f, const std::string& wname,
@@ -304,6 +330,25 @@ bt::Tensor layernorm_chan(const bt::Tensor& x, const bt::Tensor& g,
     return out;
 }
 
+// One ConvNeXt-1D block over [C,L] channel-major: depthwise conv (symmetric
+// edge pad = 2*dilation each side) -> channel-wise LayerNorm -> 1x1 pwconv1 ->
+// GELU -> 1x1 pwconv2 (LayerScale gamma folded into its weight/bias) -> residual.
+// Shared by the text encoder, the duration predictor, and the flow field.
+bt::Tensor convnext_block(const bt::Tensor& h, const ConvNeXtBlock& blk,
+                          int C, int L, int dil, bt::Tensor& scratch) {
+    const int pad = 2 * dil;
+    bt::Tensor dwy = pconv(h, blk.dw, C, L, dil, C, pad, pad, /*edge=*/2, scratch);
+    bt::Tensor seq, seqn, normed;
+    bt::nchw_to_sequence(dwy, 1, C, 1, L, seq);
+    bt::layernorm_forward_inference_batched(seq, blk.ln_g, blk.ln_b, seqn, 1.0e-6f);
+    bt::sequence_to_nchw(seqn, 1, C, 1, L, normed);
+    bt::Tensor a = pconv(normed, blk.pw1, C, L, 1, 1, 0, 0, 0, scratch);
+    bt::Tensor ga; bt::gelu_exact_forward(a, ga);
+    bt::Tensor y = pconv(ga, blk.pw2, blk.pw1.cout, L, 1, 1, 0, 0, 0, scratch);
+    bt::add_inplace(y, h);
+    return y;
+}
+
 // Text-encoder architecture constants (fixed for supertonic-3, from tts.json).
 constexpr int kTeC      = 256;  // hidden channels
 constexpr int kTeHeads  = 4;    // attn heads
@@ -366,38 +411,124 @@ bt::Tensor rel_attention(const bt::Tensor& x, const AttnLayer& L, int T,
     return pconv(flat(y), L.conv_o, C, T, 1, 1, 0, 0, 0, scr2);  // [C,T]
 }
 
-// One speech-prompted style cross-attention: query [C,T], key source [C,S],
-// value source [C,S] -> out_fc(MHA) [C,T] (tanh on keys, scale 1/16, softmax
-// over S style tokens). S == kNStyle.
+// One tanh-gated style cross-attention: query [Cq,Lq], key source [Ck,S], value
+// source [Ck,S] -> out_fc(MHA) [Cout,Lq] (tanh on keys, scale 1/16, softmax over
+// S style tokens). All channel dims are read off the loaded 1x1-conv
+// projections, so this serves both the text encoder (256->256->256) and the
+// flow field's style blocks (512->256->512). kSpteHeads heads.
 bt::Tensor style_attention(const bt::Tensor& query, const bt::Tensor& key_src,
-                           const bt::Tensor& val_src, const StyleAttn& A, int T) {
-    const int C = kTeC, nh = kSpteHeads, hd = kSpteHd, S = kNStyle;
+                           const bt::Tensor& val_src, const StyleAttn& A,
+                           int Lq, int S) {
+    const int nh    = kSpteHeads;     // 2
+    const int Cq    = A.wq.cin_pg;    // query input channels
+    const int inner = A.wq.cout;      // q/k/v projection width
+    const int hd    = inner / nh;     // per-head channels
+    const int Ck    = A.wk.cin_pg;    // key/value input channels
     bt::Tensor scr;
-    bt::Tensor q = pconv(query,   A.wq, C, T, 1, 1, 0, 0, 0, scr);  // [C,T]
-    bt::Tensor k = pconv(key_src, A.wk, C, S, 1, 1, 0, 0, 0, scr);  // [C,S]
-    bt::Tensor v = pconv(val_src, A.wv, C, S, 1, 1, 0, 0, 0, scr);  // [C,S]
+    bt::Tensor q = pconv(query,   A.wq, Cq, Lq, 1, 1, 0, 0, 0, scr);  // [inner,Lq]
+    bt::Tensor k = pconv(key_src, A.wk, Ck, S,  1, 1, 0, 0, 0, scr);  // [inner,S]
+    bt::Tensor v = pconv(val_src, A.wv, Ck, S,  1, 1, 0, 0, 0, scr);  // [inner,S]
     const float inv = 1.0f / kSpteScale;
 
     std::vector<bt::Tensor> heads(nh);
     std::vector<const bt::Tensor*> hp(nh);
     for (int h = 0; h < nh; ++h) {
-        const bt::Tensor qh = sub_view(q, h * hd * T, hd, T);  // [hd,T]
-        const bt::Tensor kh = sub_view(k, h * hd * S, hd, S);  // [hd,S]
-        const bt::Tensor vh = sub_view(v, h * hd * S, hd, S);  // [hd,S]
-        bt::Tensor qhT = transpose2d(qh, hd, T);               // [T,hd]
-        bt::Tensor ktanh; bt::tanh_forward(kh, ktanh);         // [hd,S]
-        bt::Tensor scores; bt::matmul(qhT, ktanh, scores);     // [T,S]
+        const bt::Tensor qh = sub_view(q, h * hd * Lq, hd, Lq);  // [hd,Lq]
+        const bt::Tensor kh = sub_view(k, h * hd * S,  hd, S);   // [hd,S]
+        const bt::Tensor vh = sub_view(v, h * hd * S,  hd, S);   // [hd,S]
+        bt::Tensor qhT = transpose2d(qh, hd, Lq);                // [Lq,hd]
+        bt::Tensor ktanh; bt::tanh_forward(kh, ktanh);           // [hd,S]
+        bt::Tensor scores; bt::matmul(qhT, ktanh, scores);       // [Lq,S]
         bt::scale_inplace(scores, inv);
-        softmax_rows(scores, T, S);
+        softmax_rows(scores, Lq, S);
 
-        bt::Tensor vhT = transpose2d(vh, hd, S);               // [S,hd]
-        bt::Tensor outh; bt::matmul(scores, vhT, outh);        // [T,hd]
-        heads[h] = transpose2d(outh, T, hd);                   // [hd,T]
+        bt::Tensor vhT = transpose2d(vh, hd, S);                 // [S,hd]
+        bt::Tensor outh; bt::matmul(scores, vhT, outh);          // [Lq,hd]
+        heads[h] = transpose2d(outh, Lq, hd);                    // [hd,Lq]
         hp[h] = &heads[h];
     }
-    bt::Tensor cat; bt::concat_rows(hp, cat);                  // [C,T] channel-major
+    bt::Tensor cat; bt::concat_rows(hp, cat);                    // [inner,Lq]
     bt::Tensor scr2;
-    return pconv(flat(cat), A.wo, C, T, 1, 1, 0, 0, 0, scr2);  // [C,T]
+    return pconv(flat(cat), A.wo, inner, Lq, 1, 1, 0, 0, 0, scr2);  // [Cout,Lq]
+}
+
+// ─── flow-field RoPE text cross-attention ────────────────────────────────────
+
+constexpr int kVeC      = 512;   // field hidden channels
+constexpr int kVeHeads  = 8;     // text-attn heads
+constexpr int kVeHd     = 64;    // per-head channels
+constexpr int kVeHalf   = 32;    // RoPE rotates the 32+32 split halves
+constexpr float kVeAttnScale = 16.0f;  // QK divisor (both field attn types)
+
+// Per-position RoPE cos/sin tables [half x len] from theta[half]; the angle for
+// position p is (p/len)*theta[f] — positions are normalised by sequence length,
+// so query (len L) and key (len T) align on a shared [0,1) scale.
+void rope_tables(const std::vector<float>& theta, int len, bt::Device dev,
+                 bt::Tensor& cosm, bt::Tensor& sinm) {
+    const int n = static_cast<int>(theta.size());
+    std::vector<float> c(static_cast<std::size_t>(n) * len), s(c.size());
+    for (int f = 0; f < n; ++f)
+        for (int p = 0; p < len; ++p) {
+            const float a = (len > 0 ? static_cast<float>(p) / len : 0.0f) * theta[f];
+            c[static_cast<std::size_t>(f) * len + p] = std::cos(a);
+            s[static_cast<std::size_t>(f) * len + p] = std::sin(a);
+        }
+    cosm = bt::Tensor::from_host_on(dev, c.data(), n, len);
+    sinm = bt::Tensor::from_host_on(dev, s.data(), n, len);
+}
+
+// RoPE on one head [2*half x len] channel-major: rotate the split halves —
+// out[0:half] = x1*cos - x2*sin, out[half:] = x1*sin + x2*cos.
+bt::Tensor rope_apply(const bt::Tensor& xh, int half, int len,
+                      const bt::Tensor& cosm, const bt::Tensor& sinm) {
+    const bt::Tensor x1 = reshape_owned(sub_view(xh, 0, half, len), half, len);
+    const bt::Tensor x2 = reshape_owned(sub_view(xh, half * len, half, len), half, len);
+    bt::Tensor a = x1.clone(); bt::mul_inplace(a, cosm);   // x1*cos
+    bt::Tensor b = x2.clone(); bt::mul_inplace(b, sinm);   // x2*sin
+    bt::axpby_inplace(a, b, 1.0f, -1.0f);                  // x1*cos - x2*sin
+    bt::Tensor c = x1.clone(); bt::mul_inplace(c, sinm);   // x1*sin
+    bt::Tensor d = x2.clone(); bt::mul_inplace(d, cosm);   // x2*cos
+    bt::add_inplace(c, d);                                 // x1*sin + x2*cos
+    std::vector<const bt::Tensor*> parts = {&a, &c};
+    bt::Tensor out; bt::concat_rows(parts, out);           // flat (2*half*len, 1)
+    // concat_rows yields a flat buffer; its layout is the channel-major
+    // [2*half, len] we want, so re-tag the shape for the downstream matmul.
+    return reshape_owned(out, 2 * half, len);
+}
+
+// Text cross-attention with RoPE: query=hidden [512,L], key/value=text [256,T].
+// 8 heads x 64; query positions normalised by L, key positions by T; scale 1/16.
+bt::Tensor rope_attention(const bt::Tensor& h, const bt::Tensor& text_src,
+                          const VeRope& A, int L, int T) {
+    const int nh = kVeHeads, hd = kVeHd, half = kVeHalf, Ck = A.conv_k.cin_pg;
+    bt::Tensor scr;
+    bt::Tensor q = pconv(h,        A.conv_q, kVeC, L, 1, 1, 0, 0, 0, scr);  // [512,L]
+    bt::Tensor k = pconv(text_src, A.conv_k, Ck,   T, 1, 1, 0, 0, 0, scr);  // [512,T]
+    bt::Tensor v = pconv(text_src, A.conv_v, Ck,   T, 1, 1, 0, 0, 0, scr);  // [512,T]
+    bt::Tensor cosL, sinL, cosT, sinT;
+    rope_tables(A.theta, L, h.device, cosL, sinL);
+    rope_tables(A.theta, T, h.device, cosT, sinT);
+    const float inv = 1.0f / kVeAttnScale;
+    std::vector<bt::Tensor> heads(nh);
+    std::vector<const bt::Tensor*> hp(nh);
+    for (int hh = 0; hh < nh; ++hh) {
+        const bt::Tensor qh = sub_view(q, hh * hd * L, hd, L);  // [64,L]
+        const bt::Tensor kh = sub_view(k, hh * hd * T, hd, T);  // [64,T]
+        const bt::Tensor vh = sub_view(v, hh * hd * T, hd, T);  // [64,T]
+        bt::Tensor qr = rope_apply(qh, half, L, cosL, sinL);    // [64,L]
+        bt::Tensor kr = rope_apply(kh, half, T, cosT, sinT);    // [64,T]
+        bt::Tensor qrT = transpose2d(qr, hd, L);                // [L,64]
+        bt::Tensor scores; bt::matmul(qrT, kr, scores);         // [L,T]
+        bt::scale_inplace(scores, inv);
+        softmax_rows(scores, L, T);
+        bt::Tensor vhT = transpose2d(vh, hd, T);                // [T,64]
+        bt::Tensor outh; bt::matmul(scores, vhT, outh);         // [L,64]
+        heads[hh] = transpose2d(outh, L, hd);                   // [64,L]
+        hp[hh] = &heads[hh];
+    }
+    bt::Tensor cat; bt::concat_rows(hp, cat);                   // [512,L]
+    bt::Tensor scr2;
+    return pconv(flat(cat), A.conv_o, kVeC, L, 1, 1, 0, 0, 0, scr2);  // [512,L]
 }
 
 }  // namespace
@@ -442,14 +573,35 @@ struct Supertonic::Impl {
     Gemm                       dp_pred0, dp_pred1; // predictor MLP (Gemm/PReLU/Gemm)
     float                      dp_prelu = 0.0f;    // predictor PReLU slope
 
+    // Flow-matching vector estimator (the DiT field). Optional until present.
+    bool                       ve_ready = false;
+    ConvW                      ve_proj_in, ve_proj_out;  // 144<->512 convs (no bias)
+    std::vector<float>         ve_t0w, ve_t0b, ve_t1w, ve_t1b;  // time mlp (host)
+    std::vector<float>         ve_sin_freqs;       // [32] sinusoidal frequencies
+    std::vector<VeBlock>       ve_blocks;          // 24 main blocks
+    std::vector<ConvNeXtBlock> ve_last;            // 4 last_convnext blocks
+    bt::Tensor                 ve_style_key_proto; // [256,50] learned style key
+    std::vector<float>         ve_text_uncond;     // [256] text_special_token
+    bt::Tensor                 ve_style_key_unc;   // [256,50] uncond style key
+    bt::Tensor                 ve_style_val_unc;   // [256,50] uncond style value
+    float                      ve_guid_cond = 4.0f, ve_guid_uncond = 3.0f;  // CFG
+
     void load(const std::string& dir, bt::Device device);
     void load_text_encoder(const fs::path& path);
     void load_duration_predictor(const fs::path& path);
+    void load_vector_estimator(const fs::path& path);
     AudioBuffer decode(const float* latent, int channels, int frames) const;
     std::vector<float> encode_text(const std::vector<int>& ids,
                                    const std::vector<float>& style) const;
     float predict_duration(const std::vector<int>& ids,
                            const std::vector<float>& style_dp) const;
+    bt::Tensor run_field(const bt::Tensor& h0, const bt::Tensor& time_emb,
+                         const bt::Tensor& text_src, const bt::Tensor& style_key,
+                         const bt::Tensor& style_val, int L, int T) const;
+    std::vector<float> denoise(const std::vector<float>& noisy, int channels,
+                               int frames, const std::vector<float>& text_emb,
+                               int text_len, const std::vector<float>& style_ttl,
+                               int current_step, int total_step) const;
 };
 
 void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
@@ -522,6 +674,9 @@ void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
     // Duration predictor is likewise optional until synthesize() lands.
     const fs::path dp = root / "duration_predictor.safetensors";
     if (fs::exists(dp)) load_duration_predictor(dp);
+
+    const fs::path ve = root / "vector_estimator.safetensors";
+    if (fs::exists(ve)) load_vector_estimator(ve);
 }
 
 void Supertonic::Impl::load_text_encoder(const fs::path& path) {
@@ -572,21 +727,20 @@ void Supertonic::Impl::load_text_encoder(const fs::path& path) {
     }
 
     // Speech-prompted style cross-attention (two layers) + final LayerNorm.
+    // Linears load by canonical name (the converter renames the ONNX-export
+    // `onnx::MatMul_*` weights to `<scope>.linear.weight`).
     const std::string SP = "tts.ttl.speech_prompted_text_encoder.";
-    auto load_spte = [&](const std::string& at, const std::string& wq,
-                         const std::string& wk, const std::string& wv,
-                         const std::string& wo) {
+    auto load_spte = [&](const std::string& at) {
+        const std::string b = SP + at + ".";
         StyleAttn A;
-        A.wq = load_linear_as_conv(f, wq, SP + at + ".W_query.linear.bias", dev);
-        A.wk = load_linear_as_conv(f, wk, SP + at + ".W_key.linear.bias",   dev);
-        A.wv = load_linear_as_conv(f, wv, SP + at + ".W_value.linear.bias", dev);
-        A.wo = load_linear_as_conv(f, wo, SP + at + ".out_fc.linear.bias",  dev);
+        A.wq = load_linear_as_conv(f, b + "W_query.linear.weight", b + "W_query.linear.bias", dev);
+        A.wk = load_linear_as_conv(f, b + "W_key.linear.weight",   b + "W_key.linear.bias",   dev);
+        A.wv = load_linear_as_conv(f, b + "W_value.linear.weight", b + "W_value.linear.bias", dev);
+        A.wo = load_linear_as_conv(f, b + "out_fc.linear.weight",  b + "out_fc.linear.bias",  dev);
         return A;
     };
-    spte1 = load_spte("attention1", "onnx::MatMul_3680", "onnx::MatMul_3681",
-                      "onnx::MatMul_3682", "onnx::MatMul_3683");
-    spte2 = load_spte("attention2", "onnx::MatMul_3684", "onnx::MatMul_3685",
-                      "onnx::MatMul_3686", "onnx::MatMul_3687");
+    spte1 = load_spte("attention1");
+    spte2 = load_spte("attention2");
     spte_norm_g = up_vec(f, SP + "norm.norm.weight", kTeC, dev);
     spte_norm_b = up_vec(f, SP + "norm.norm.bias",   kTeC, dev);
 
@@ -620,20 +774,8 @@ std::vector<float> Supertonic::Impl::encode_text(
 
     // ── 6 ConvNeXt blocks (ksz 5, symmetric edge pad = 2*dilation each side) ──
     static const int kDil[6] = {1, 1, 2, 2, 4, 4};
-    for (int i = 0; i < 6; ++i) {
-        const ConvNeXtBlock& blk = te_blocks[i];
-        const int pad = 2 * kDil[i];
-        bt::Tensor dwy = pconv(h, blk.dw, C, T, kDil[i], C, pad, pad, /*edge=*/2, scratch);
-        bt::Tensor seq, seqn, normed;
-        bt::nchw_to_sequence(dwy, 1, C, 1, T, seq);
-        bt::layernorm_forward_inference_batched(seq, blk.ln_g, blk.ln_b, seqn, 1.0e-6f);
-        bt::sequence_to_nchw(seqn, 1, C, 1, T, normed);
-        bt::Tensor a = pconv(normed, blk.pw1, C, T, 1, 1, 0, 0, 0, scratch);
-        bt::Tensor ga; bt::gelu_exact_forward(a, ga);
-        bt::Tensor y = pconv(ga, blk.pw2, blk.pw1.cout, T, 1, 1, 0, 0, 0, scratch);
-        bt::add_inplace(y, h);
-        h = std::move(y);
-    }
+    for (int i = 0; i < 6; ++i)
+        h = convnext_block(h, te_blocks[i], C, T, kDil[i], scratch);
     const bt::Tensor x0 = h.clone();  // global residual skip (proj_out)
 
     // ── 4 relative-position attention layers ──
@@ -657,9 +799,9 @@ std::vector<float> Supertonic::Impl::encode_text(
     const bt::Tensor styleV = bt::Tensor::from_host_on(dev, sv.data(), 1, C * kNStyle);
 
     const bt::Tensor t0 = h;  // proj_out text [C,T]
-    bt::Tensor x1 = style_attention(t0, te_style_key, styleV, spte1, T);
+    bt::Tensor x1 = style_attention(t0, te_style_key, styleV, spte1, T, kNStyle);
     bt::add_inplace(x1, t0);                            // residual to text
-    bt::Tensor x2 = style_attention(x1, te_style_key, styleV, spte2, T);
+    bt::Tensor x2 = style_attention(x1, te_style_key, styleV, spte2, T, kNStyle);
     bt::add_inplace(x2, t0);                            // residual to text
     bt::Tensor out = layernorm_chan(x2, spte_norm_g, spte_norm_b, C, T);  // [C,T]
     return out.to_host_vector();
@@ -756,19 +898,8 @@ float Supertonic::Impl::predict_duration(
     bt::Tensor scratch;
 
     // ── 6 ConvNeXt blocks (ksz 5, dilation 1, symmetric edge pad = 2) ──
-    for (int i = 0; i < 6; ++i) {
-        const ConvNeXtBlock& blk = dp_blocks[i];
-        bt::Tensor dwy = pconv(h, blk.dw, C, T, 1, C, 2, 2, /*edge=*/2, scratch);
-        bt::Tensor seq, seqn, normed;
-        bt::nchw_to_sequence(dwy, 1, C, 1, T, seq);
-        bt::layernorm_forward_inference_batched(seq, blk.ln_g, blk.ln_b, seqn, 1.0e-6f);
-        bt::sequence_to_nchw(seqn, 1, C, 1, T, normed);
-        bt::Tensor a = pconv(normed, blk.pw1, C, T, 1, 1, 0, 0, 0, scratch);
-        bt::Tensor ga; bt::gelu_exact_forward(a, ga);
-        bt::Tensor y = pconv(ga, blk.pw2, blk.pw1.cout, T, 1, 1, 0, 0, 0, scratch);
-        bt::add_inplace(y, h);
-        h = std::move(y);
-    }
+    for (int i = 0; i < 6; ++i)
+        h = convnext_block(h, dp_blocks[i], C, T, 1, scratch);
     const bt::Tensor x0 = h.clone();  // global residual skip (attn_encoder out)
 
     // ── 2 relative-position attention layers ──
@@ -805,6 +936,200 @@ float Supertonic::Impl::predict_duration(
     bt::Tensor dur; bt::exp_forward(y1, dur);
     const std::vector<float> hv = dur.to_host_vector();
     return hv.empty() ? 0.0f : hv[0];
+}
+
+void Supertonic::Impl::load_vector_estimator(const fs::path& path) {
+    const sf::File f = sf::File::open(path.string());
+    const std::string V = "vector_estimator.tts.ttl.vector_field.";
+
+    ve_proj_in  = load_conv(f, V + "proj_in.net.weight",  "", dev);   // 144->512
+    ve_proj_out = load_conv(f, V + "proj_out.net.weight", "", dev);   // 512->144
+
+    // Time encoder MLP (kept host-resident; a tiny per-step scalar forward):
+    // sinusoidal(t) [64] -> Gemm 64->256 -> Mish -> Gemm 256->64. Gemm weights
+    // are [out,in].
+    ve_t0w = read_host(f, V + "time_encoder.mlp.0.linear.weight");  // [256,64]
+    ve_t0b = read_host(f, V + "time_encoder.mlp.0.linear.bias");    // [256]
+    ve_t1w = read_host(f, V + "time_encoder.mlp.2.linear.weight");  // [64,256]
+    ve_t1b = read_host(f, V + "time_encoder.mlp.2.linear.bias");    // [64]
+    ve_sin_freqs = read_host(
+        f, "/vector_estimator/vector_field/time_encoder/sinusoidal/Constant_3_output_0");
+
+    auto load_convnext = [&](const std::string& p) {
+        ConvNeXtBlock c;
+        c.dw   = load_conv(f, p + ".dwconv.weight", p + ".dwconv.bias", dev);
+        c.ln_g = up_vec(f, p + ".norm.norm.weight", c.dw.cout, dev);
+        c.ln_b = up_vec(f, p + ".norm.norm.bias",   c.dw.cout, dev);
+        c.pw1  = load_conv(f, p + ".pwconv1.weight", p + ".pwconv1.bias", dev);
+        c.pw2  = load_pwconv2_scaled(f, p, dev);
+        return c;
+    };
+
+    // RoPE theta/increments are a single shared parameter (exported once, on the
+    // first text-attn block); every text-attn block reuses it. increments are the
+    // implicit 0,1,2,... positions, so only theta is needed.
+    const std::vector<float> rope_theta = read_host(f, V + "main_blocks.3.attn.theta");
+
+    // 24 main blocks: a period-6 pattern (convnext, film, convnext, text-attn,
+    // convnext, style-attn) repeated four times.
+    ve_blocks.assign(24, VeBlock{});
+    for (int i = 0; i < 24; ++i) {
+        const std::string mb = V + "main_blocks." + std::to_string(i) + ".";
+        VeBlock blk;
+        const int r = i % 6;
+        if (r == 0 || r == 2 || r == 4) {
+            blk.type = 0;
+            // ConvNeXt main-blocks hold a varying number of sub-blocks (4/1/1
+            // per period) — load until the next sub-block's weight is absent.
+            for (int s = 0;; ++s) {
+                const std::string p = mb + "convnext." + std::to_string(s);
+                if (!f.find(p + ".dwconv.weight")) break;
+                blk.conv.push_back(load_convnext(p));
+            }
+        } else if (r == 1) {
+            blk.type = 1;
+            blk.film.w = up(f, mb + "linear.linear.weight", kVeHd, kVeC, dev);  // [64,512]
+            blk.film.b = up(f, mb + "linear.linear.bias", 1, kVeC, dev);        // [1,512]
+        } else if (r == 3) {
+            blk.type = 2;
+            const std::string a = mb + "attn.";
+            blk.rope.conv_q = load_linear_as_conv(f, a + "W_query.linear.weight", a + "W_query.linear.bias", dev);
+            blk.rope.conv_k = load_linear_as_conv(f, a + "W_key.linear.weight",   a + "W_key.linear.bias",   dev);
+            blk.rope.conv_v = load_linear_as_conv(f, a + "W_value.linear.weight", a + "W_value.linear.bias", dev);
+            blk.rope.conv_o = load_linear_as_conv(f, a + "out_fc.linear.weight",  a + "out_fc.linear.bias",  dev);
+            blk.rope.theta  = rope_theta;                                       // shared [32]
+            blk.rope.norm_g = up_vec(f, mb + "norm.norm.weight", kVeC, dev);
+            blk.rope.norm_b = up_vec(f, mb + "norm.norm.bias",   kVeC, dev);
+        } else {  // r == 5
+            blk.type = 3;
+            const std::string a = mb + "attention.";
+            blk.style.attn.wq = load_linear_as_conv(f, a + "W_query.linear.weight", a + "W_query.linear.bias", dev);
+            blk.style.attn.wk = load_linear_as_conv(f, a + "W_key.linear.weight",   a + "W_key.linear.bias",   dev);
+            blk.style.attn.wv = load_linear_as_conv(f, a + "W_value.linear.weight", a + "W_value.linear.bias", dev);
+            blk.style.attn.wo = load_linear_as_conv(f, a + "out_fc.linear.weight",  a + "out_fc.linear.bias",  dev);
+            blk.style.norm_g  = up_vec(f, mb + "norm.norm.weight", kVeC, dev);
+            blk.style.norm_b  = up_vec(f, mb + "norm.norm.bias",   kVeC, dev);
+        }
+        ve_blocks[i] = std::move(blk);
+    }
+
+    ve_last.clear();
+    for (int i = 0; i < 4; ++i)
+        ve_last.push_back(load_convnext(V + "last_convnext.convnext." + std::to_string(i)));
+
+    // Learned style-key prototype + the unconditional special tokens, all stored
+    // token-major [50,256] -> transposed to channel-major [256,50].
+    const bt::Tensor proto = up(f, "/vector_estimator/Expand_output_0", kNStyle, kTeC, dev);
+    ve_style_key_proto = transpose2d(proto, kNStyle, kTeC);
+    const std::string UM = "vector_estimator.tts.ttl.uncond_masker.";
+    ve_text_uncond = read_host(f, UM + "text_special_token");  // [256]
+    const bt::Tensor sk = up(f, UM + "style_key_special_token",   kNStyle, kTeC, dev);
+    ve_style_key_unc = transpose2d(sk, kNStyle, kTeC);
+    const bt::Tensor sv = up(f, UM + "style_value_special_token", kNStyle, kTeC, dev);
+    ve_style_val_unc = transpose2d(sv, kNStyle, kTeC);
+
+    ve_ready = true;
+}
+
+// One pass of the flow field: hidden h0 [512,L] + time/text/style conditioning
+// -> velocity field [144,L]. text_src is [256,T]; style_key/style_val [256,50].
+bt::Tensor Supertonic::Impl::run_field(
+        const bt::Tensor& h0, const bt::Tensor& time_emb,
+        const bt::Tensor& text_src, const bt::Tensor& style_key,
+        const bt::Tensor& style_val, int L, int T) const {
+    bt::Tensor h = h0.clone();
+    bt::Tensor scratch;
+    for (int i = 0; i < 24; ++i) {
+        const VeBlock& blk = ve_blocks[i];
+        if (blk.type == 0) {
+            // Within a ConvNeXt main-block the sub-blocks are dilated 1,2,4,8...
+            for (std::size_t s = 0; s < blk.conv.size(); ++s)
+                h = convnext_block(h, blk.conv[s], kVeC, L, 1 << s, scratch);
+        } else if (blk.type == 1) {
+            // FiLM: h += (time_emb @ W + b), broadcast across all L positions.
+            bt::Tensor proj; bt::matmul(time_emb, blk.film.w, proj);  // [1,512]
+            bt::add_inplace(proj, blk.film.b);
+            bt::Tensor pcol = transpose2d(proj, 1, kVeC);             // [512,1]
+            std::vector<float> ones(static_cast<std::size_t>(L), 1.0f);
+            bt::Tensor onesT = bt::Tensor::from_host_on(dev, ones.data(), 1, L);
+            bt::Tensor tiled; bt::matmul(pcol, onesT, tiled);         // [512,L]
+            bt::add_inplace(h, tiled);
+        } else if (blk.type == 2) {
+            bt::Tensor a = rope_attention(h, text_src, blk.rope, L, T);
+            bt::add_inplace(a, h);                                    // residual
+            h = layernorm_chan(a, blk.rope.norm_g, blk.rope.norm_b, kVeC, L);
+        } else {  // type 3: style cross-attention
+            bt::Tensor a = style_attention(h, style_key, style_val, blk.style.attn, L, kNStyle);
+            bt::add_inplace(a, h);                                    // residual
+            h = layernorm_chan(a, blk.style.norm_g, blk.style.norm_b, kVeC, L);
+        }
+    }
+    for (const ConvNeXtBlock& c : ve_last)
+        h = convnext_block(h, c, kVeC, L, 1, scratch);
+    return pconv(flat(h), ve_proj_out, kVeC, L, 1, 1, 0, 0, 0, scratch);  // [144,L]
+}
+
+std::vector<float> Supertonic::Impl::denoise(
+        const std::vector<float>& noisy, int channels, int frames,
+        const std::vector<float>& text_emb, int text_len,
+        const std::vector<float>& style_ttl, int current_step, int total_step) const {
+    if (!ve_ready) fail("denoise() before vector-estimator load");
+    if (channels != 144) fail("noisy_latent must have 144 channels");
+    const int L = frames, T = text_len;
+    if (static_cast<int>(text_emb.size()) != kTeC * T) fail("text_emb size != 256*T");
+    if (static_cast<int>(style_ttl.size()) != kNStyle * kTeC) fail("style_ttl size != 50*256");
+
+    // ── time embedding (host): sinusoidal -> Gemm -> Mish -> Gemm -> [1,64] ──
+    const float t = (total_step != 0) ? static_cast<float>(current_step) / total_step : 0.0f;
+    std::vector<float> sino(2 * kVeHalf);
+    for (int fr = 0; fr < kVeHalf; ++fr) {
+        const float a = t * 1000.0f * ve_sin_freqs[fr];
+        sino[fr]           = std::sin(a);
+        sino[kVeHalf + fr] = std::cos(a);
+    }
+    std::vector<float> m0(256);
+    for (int o = 0; o < 256; ++o) {
+        float s = ve_t0b[o];
+        for (int i = 0; i < 64; ++i) s += ve_t0w[static_cast<std::size_t>(o) * 64 + i] * sino[i];
+        const float sp = std::log1p(std::exp(s));     // softplus
+        m0[o] = s * std::tanh(sp);                    // Mish: x*tanh(softplus(x))
+    }
+    std::vector<float> tev(64);
+    for (int o = 0; o < 64; ++o) {
+        float s = ve_t1b[o];
+        for (int i = 0; i < 256; ++i) s += ve_t1w[static_cast<std::size_t>(o) * 256 + i] * m0[i];
+        tev[o] = s;
+    }
+    bt::Tensor time_emb = bt::Tensor::from_host_on(dev, tev.data(), 1, 64);
+
+    // proj_in is shared by the conditional and unconditional passes (same noisy).
+    bt::Tensor scratch;
+    bt::Tensor noisyT = bt::Tensor::from_host_on(dev, noisy.data(), 1, channels * L);
+    bt::Tensor h0 = pconv(noisyT, ve_proj_in, channels, L, 1, 1, 0, 0, 0, scratch);  // [512,L]
+
+    // conditional sources: text_emb [256,T]; style key=prototype, value=style_ttl.
+    bt::Tensor text_cond = bt::Tensor::from_host_on(dev, text_emb.data(), 1, kTeC * T);
+    std::vector<float> sv(static_cast<std::size_t>(kTeC) * kNStyle);  // [256,50] chan-major
+    for (int s = 0; s < kNStyle; ++s)
+        for (int c = 0; c < kTeC; ++c)
+            sv[static_cast<std::size_t>(c) * kNStyle + s] = style_ttl[static_cast<std::size_t>(s) * kTeC + c];
+    bt::Tensor style_val_cond = bt::Tensor::from_host_on(dev, sv.data(), 1, kTeC * kNStyle);
+
+    // unconditional text: the special token broadcast over T positions.
+    std::vector<float> tu(static_cast<std::size_t>(kTeC) * T);
+    for (int c = 0; c < kTeC; ++c)
+        for (int p = 0; p < T; ++p) tu[static_cast<std::size_t>(c) * T + p] = ve_text_uncond[c];
+    bt::Tensor text_unc = bt::Tensor::from_host_on(dev, tu.data(), 1, kTeC * T);
+
+    bt::Tensor field_cond = run_field(h0, time_emb, text_cond, ve_style_key_proto, style_val_cond, L, T);
+    bt::Tensor field_unc  = run_field(h0, time_emb, text_unc,  ve_style_key_unc,    ve_style_val_unc,  L, T);
+
+    // CFG guidance + one Euler step: denoised = noisy + (1/total_step)*(4*cond - 3*uncond).
+    bt::axpby_inplace(field_cond, field_unc, ve_guid_cond, -ve_guid_uncond);
+    const float dt = (total_step != 0) ? 1.0f / total_step : 0.0f;
+    bt::scale_inplace(field_cond, dt);
+    bt::add_inplace(field_cond, noisyT);
+    return field_cond.to_host_vector();
 }
 
 AudioBuffer Supertonic::Impl::decode(const float* latent, int channels,
@@ -904,6 +1229,16 @@ std::vector<float> Supertonic::encode_text(const std::vector<int>& text_ids,
 float Supertonic::predict_duration(const std::vector<int>& text_ids,
                                    const std::vector<float>& style_dp) const {
     return impl_->predict_duration(text_ids, style_dp);
+}
+
+std::vector<float> Supertonic::denoise(const std::vector<float>& noisy_latent,
+                                       int channels, int frames,
+                                       const std::vector<float>& text_emb,
+                                       int text_len,
+                                       const std::vector<float>& style_ttl,
+                                       int current_step, int total_step) const {
+    return impl_->denoise(noisy_latent, channels, frames, text_emb, text_len,
+                          style_ttl, current_step, total_step);
 }
 
 const SupertonicConfig& Supertonic::config() const { return impl_->cfg; }

@@ -72,7 +72,12 @@ int main() {
     }
 
     brosoundml::Supertonic model;
-    model.load(dir, brotensor::Device::CPU);
+    try {
+        model.load(dir, brotensor::Device::CPU);
+    } catch (const std::exception& e) {
+        std::printf("FAIL: load threw: %s\n", e.what());
+        return 1;
+    }
     const brosoundml::AudioBuffer wav = model.decode(latent, channels, frames);
 
     std::printf("vocoder: in[%d x %d] -> %zu samples (ref %zu), sr=%d\n",
@@ -171,5 +176,51 @@ int main() {
         return 1;
     }
     std::printf("PASS: duration_predictor matches ONNX reference within %.1e\n", dp_tol);
+
+    // ── vector estimator (one guided flow-matching denoising step) ──
+    if (!fs::exists(fs::path(dir) / "vector_estimator.safetensors")) {
+        std::printf("SKIP: vector_estimator weights absent\n");
+        return 0;
+    }
+    const std::vector<float> ve_noisy = read_bin(pdir + "/vector_estimator.in.noisy_latent.bin");
+    const std::vector<float> ve_text  = read_bin(pdir + "/vector_estimator.in.text_emb.bin");
+    const std::vector<float> ve_style = read_bin(pdir + "/vector_estimator.in.style_ttl.bin");
+    const std::vector<float> ve_cur   = read_bin(pdir + "/vector_estimator.in.current_step.bin");
+    const std::vector<float> ve_tot   = read_bin(pdir + "/vector_estimator.in.total_step.bin");
+    const std::vector<float> ve_ref   = read_bin(pdir + "/vector_estimator.out.denoised_latent.bin");
+    if (ve_noisy.empty() || ve_text.empty() || ve_style.empty() || ve_ref.empty()) {
+        std::printf("SKIP: vector_estimator parity bins missing\n");
+        return 0;
+    }
+    const int ve_ch = 144;
+    const int ve_L  = static_cast<int>(ve_noisy.size()) / ve_ch;           // 32
+    const int ve_T  = static_cast<int>(ve_text.size()) / 256;              // 24
+    const int ve_cs = ve_cur.empty() ? 0 : static_cast<int>(ve_cur[0] + 0.5f);
+    const int ve_ts = ve_tot.empty() ? 8 : static_cast<int>(ve_tot[0] + 0.5f);
+
+    std::vector<float> ve_out;
+    try {
+        ve_out = model.denoise(ve_noisy, ve_ch, ve_L, ve_text, ve_T, ve_style, ve_cs, ve_ts);
+    } catch (const std::exception& e) {
+        std::printf("FAIL: denoise threw: %s\n", e.what());
+        return 1;
+    }
+    std::printf("vector_estimator: 144x%d, T=%d, step %d/%d -> %zu floats (ref %zu)\n",
+                ve_L, ve_T, ve_cs, ve_ts, ve_out.size(), ve_ref.size());
+    if (ve_out.size() != ve_ref.size()) {
+        std::printf("FAIL: denoised size %zu != reference %zu\n", ve_out.size(), ve_ref.size());
+        return 1;
+    }
+    const float ve_err = max_abs_err(ve_out, ve_ref);
+    std::printf("vector_estimator max-abs-err vs ONNX reference: %.3e\n", ve_err);
+    // 64M-param DiT with 8 attention blocks + CFG; deepest graph here, so it
+    // accumulates the most FP32 reorder drift. 5e-3 stays tight on a unit-scale
+    // latent while tolerating the reorder.
+    const float ve_tol = 5.0e-3f;
+    if (ve_err >= ve_tol) {
+        std::printf("FAIL: vector_estimator parity error %.3e >= tol %.3e\n", ve_err, ve_tol);
+        return 1;
+    }
+    std::printf("PASS: vector_estimator matches ONNX reference within %.1e\n", ve_tol);
     return 0;
 }

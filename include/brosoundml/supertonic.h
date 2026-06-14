@@ -28,11 +28,13 @@ namespace brosoundml {
 // frontend tables + voice_styles/ presets), as hosted under
 // brosoundml-data/supertonic.
 //
-// THIS BUILD implements the vocoder stage (latent -> waveform), the text
-// encoder (text_ids + TTL style -> text_emb), and the duration predictor
-// (text_ids + DP style -> scalar total duration). The flow-matching estimator
-// lands next; until then synthesize() is unavailable and the public entry
-// points are encode_text(), predict_duration(), and decode().
+// THIS BUILD implements all four graphs as standalone stages: the text encoder
+// (text_ids + TTL style -> text_emb), the duration predictor (text_ids + DP
+// style -> scalar total duration), the flow-matching vector estimator (one
+// guided denoising step), and the vocoder (latent -> waveform). The top-level
+// synthesize() that chains them (with the UnicodeProcessor frontend and the
+// flow-matching loop) lands next; until then the public entry points are
+// encode_text(), predict_duration(), denoise(), and decode().
 
 // Model hyperparameters, read from the converted tts.json by Supertonic::load.
 struct SupertonicConfig {
@@ -104,6 +106,25 @@ public:
     // the style matrix is mis-sized.
     float predict_duration(const std::vector<int>& text_ids,
                            const std::vector<float>& style_dp) const;
+
+    // Flow-matching vector estimator: one classifier-free-guided denoising step.
+    //
+    // Given the current `noisy_latent` (channels==144 working channels x frames,
+    // channel-major: noisy[c*frames + t]), the text conditioning `text_emb`
+    // (256 x text_len channel-major, from encode_text) and the voice preset's
+    // TTL style (50*256 token-major, as for encode_text), runs the DiT vector
+    // field for both the conditional and unconditional prompt and returns the
+    // updated latent after one Euler step with guidance baked in:
+    //   denoised = noisy + (1/total_step) * (4*field_cond - 3*field_uncond).
+    // `current_step`/`total_step` set the flow time t = current_step/total_step.
+    // synthesize() calls this total_step times, feeding the result back as the
+    // next noisy_latent. Returns the (144 x frames) channel-major latent. Throws
+    // if the vector-estimator weights are absent or an argument is mis-sized.
+    std::vector<float> denoise(const std::vector<float>& noisy_latent,
+                               int channels, int frames,
+                               const std::vector<float>& text_emb, int text_len,
+                               const std::vector<float>& style_ttl,
+                               int current_step, int total_step) const;
 
     const SupertonicConfig& config() const;
     bool loaded() const;
