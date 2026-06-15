@@ -250,6 +250,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_build_speaker_encoder tools/build_speaker_encoder.cpp)
     target_link_libraries(brosoundml_build_speaker_encoder PRIVATE brosoundml)
+
+    add_executable(brosoundml_supertonic_synth tools/supertonic_synth.cpp)
+    target_link_libraries(brosoundml_supertonic_synth PRIVATE brosoundml)
 endif()
 
 # --- Tests ---
