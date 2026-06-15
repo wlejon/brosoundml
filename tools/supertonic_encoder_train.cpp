@@ -25,6 +25,7 @@
 #include <brotensor/tensor.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -51,6 +52,7 @@ struct Args {
     int    save_every = 1;
     std::uint64_t seed = 1234;
     bool   cpu = false;
+    bool   profile = false;   // time each phase (sync-bracketed) over the run
 };
 
 [[noreturn]] void usage(const char* msg) {
@@ -75,6 +77,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--save-every") a.save_every = std::stoi(need(i));
         else if (k == "--seed")       a.seed = std::stoull(need(i));
         else if (k == "--cpu")        a.cpu = true;
+        else if (k == "--profile")    a.profile = true;
         else usage(("unknown arg: " + k).c_str());
     }
     if (a.data.empty()) usage("--data <wavdir> required");
@@ -180,12 +183,20 @@ int main(int argc, char** argv) {
     std::sort(clips.begin(), clips.end());
     std::mt19937 rng(static_cast<std::uint32_t>(a.seed));
     std::shuffle(clips.begin(), clips.end(), rng);
-    if (a.overfit > 0 && static_cast<int>(clips.size()) > a.overfit)
-        clips.resize(a.overfit);
-    else if (a.max_clips > 0 && static_cast<int>(clips.size()) > a.max_clips)
-        clips.resize(a.max_clips);
     if (clips.empty()) { std::fprintf(stderr, "no .wav under %s\n", a.data.c_str()); return 1; }
-    std::printf("clips: %zu\n", clips.size());
+    // Hold out a few clips for the reconstruction gate (skipped in overfit mode).
+    std::vector<std::string> val;
+    if (a.overfit > 0) {
+        if (static_cast<int>(clips.size()) > a.overfit) clips.resize(a.overfit);
+    } else {
+        const int val_n = std::min<int>(4, std::max<int>(1,
+            static_cast<int>(a.val_frac * clips.size())));
+        val.assign(clips.begin(), clips.begin() + val_n);
+        clips.erase(clips.begin(), clips.begin() + val_n);
+        if (a.max_clips > 0 && static_cast<int>(clips.size()) > a.max_clips)
+            clips.resize(a.max_clips);
+    }
+    std::printf("clips: %zu train, %zu val\n", clips.size(), val.size());
 
     // Adam state (m, v) + per-step grads, all matching the encoder weight layout.
     bsm::SupertonicEncoderGrads grads, mst, vst;
@@ -195,6 +206,14 @@ int main(int argc, char** argv) {
     std::vector<bt::Tensor*> M = gather_g(mst);
     std::vector<bt::Tensor*> V = gather_g(vst);
     const int max_samp = static_cast<int>(a.max_secs * SR);
+
+    using Clock = std::chrono::steady_clock;
+    auto secs = [](Clock::time_point x, Clock::time_point y) {
+        return std::chrono::duration<double>(y - x).count();
+    };
+    auto tp = [&]() { if (a.profile) bt::sync(dev); return Clock::now(); };
+    double pt[5] = {0, 0, 0, 0, 0};  // spec / fwd / recon / bwd / adam
+    long pn = 0;
 
     int step = 0;
     const int epochs = (a.overfit > 0) ? std::max(a.epochs, 40) : a.epochs;
@@ -211,27 +230,34 @@ int main(int argc, char** argv) {
             const int T = aligned_T(L, hop, CC, L_used);
             if (T == 0) continue;
 
+            const auto t0 = tp();
             bt::Tensor feat = spec.compute(wav.samples.data(), L_used);   // [1253, T]
             bt::Tensor latent;
             bsm::SupertonicEncoderCache cache;
-            enc.forward_train(feat, T, latent, cache);                   // [24, T]
-            const std::vector<float> z_real = latent.to_host_vector();
+            const auto t1 = tp();
+            enc.forward_train(feat, T, latent, cache);                   // [24, T] device
 
+            // Fully on-device recon: z_real / dLatent never leave the GPU.
             const int nwave = model.config().base_chunk * T;  // base_chunk * LF, LF = T
             const int target_len = std::min(static_cast<int>(wav.samples.size()), nwave);
-            std::vector<float> dZReal;
-            const float loss = model.recon_loss_and_grad(
-                z_real.data(), enc.latent_dim, /*LF=*/T,
-                wav.samples.data(), target_len, dZReal);
+            bt::Tensor target = bt::Tensor::from_host_on(dev, wav.samples.data(), 1, target_len);
+            const auto t2 = tp();
+            bt::Tensor dLatent;
+            const float loss = model.recon_loss_and_grad(latent, /*LF=*/T, target, dLatent);
 
-            bt::Tensor dLatent = bt::Tensor::from_host_on(dev, dZReal.data(),
-                                                          enc.latent_dim, T);
+            const auto t3 = tp();
             grads.zero(enc);
             enc.backward(cache, dLatent, grads);
+            const auto t4 = tp();
 
             ++step;
             for (std::size_t i = 0; i < W.size(); ++i)
                 bt::adam_step(*W[i], *G[i], *M[i], *V[i], a.lr, 0.9f, 0.999f, 1.0e-8f, step);
+            const auto t5 = tp();
+            if (a.profile) {
+                pt[0] += secs(t0, t1); pt[1] += secs(t1, t2); pt[2] += secs(t2, t3);
+                pt[3] += secs(t3, t4); pt[4] += secs(t4, t5); ++pn;
+            }
 
             loss_sum += loss; ++seen;
             if (seen % 200 == 0)
@@ -248,5 +274,47 @@ int main(int argc, char** argv) {
 
     save_encoder(a.out, enc);
     std::printf("done. saved %s\n", a.out.c_str());
+
+    if (a.profile && pn > 0) {
+        const double tot = pt[0] + pt[1] + pt[2] + pt[3] + pt[4];
+        std::printf("profile over %ld clips (ms/clip): spec %.1f  fwd %.1f  recon %.1f"
+                    "  bwd %.1f  adam %.1f  | total %.1f (%.1f clips/s)\n", pn,
+                    1e3 * pt[0] / pn, 1e3 * pt[1] / pn, 1e3 * pt[2] / pn,
+                    1e3 * pt[3] / pn, 1e3 * pt[4] / pn, 1e3 * tot / pn, pn / tot);
+    }
+
+    // Reconstruction gate: encode + frozen-decode each held-out clip, report the
+    // recon loss, and write input/recon wavs beside the checkpoint for listening.
+    const fs::path outdir = fs::path(a.out).parent_path();
+    for (std::size_t vi = 0; vi < val.size(); ++vi) {
+        bsm::AudioBuffer wav;
+        try { wav = bsm::read_wav(val[vi]); } catch (...) { continue; }
+        if (wav.sample_rate != SR || wav.empty()) continue;
+        int L = static_cast<int>(wav.samples.size());
+        if (max_samp > 0 && L > max_samp) L = max_samp;
+        int L_used = 0;
+        const int T = aligned_T(L, hop, CC, L_used);
+        if (T == 0) continue;
+
+        bt::Tensor feat = spec.compute(wav.samples.data(), L_used);
+        bt::Tensor latent = enc.forward(feat, T);
+        const std::vector<float> z_real = latent.to_host_vector();
+        const int nwave = model.config().base_chunk * T;
+        std::vector<float> dZ;
+        const float loss = model.recon_loss_and_grad(
+            z_real.data(), enc.latent_dim, T, wav.samples.data(),
+            std::min(static_cast<int>(wav.samples.size()), nwave), dZ);
+
+        bsm::AudioBuffer recon = model.decode_real(z_real.data(), enc.latent_dim, T);
+        bsm::AudioBuffer in_clip; in_clip.sample_rate = SR;
+        in_clip.samples.assign(wav.samples.begin(),
+                               wav.samples.begin() + std::min<int>(L_used, nwave));
+        const std::string tag = "val" + std::to_string(vi);
+        in_clip.write_wav((outdir / (tag + "_input.wav")).string());
+        recon.write_wav((outdir / (tag + "_recon.wav")).string());
+        std::printf("  recon %s: loss %.5f  (%s_input.wav / %s_recon.wav)\n",
+                    fs::path(val[vi]).filename().string().c_str(), loss,
+                    tag.c_str(), tag.c_str());
+    }
     return 0;
 }

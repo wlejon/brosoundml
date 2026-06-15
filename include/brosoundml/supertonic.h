@@ -107,6 +107,15 @@ public:
                               const float* target, int target_len,
                               std::vector<float>& dZReal) const;
 
+    // Fully on-device reconstruction objective: `z_real` [latent_dim, LF] and
+    // `target` [1, target_len] (or [latent_dim*LF] / [target_len]) stay on the
+    // GPU, and `dZReal` [latent_dim, LF] is returned on-device — no per-step host
+    // round-trips. Same objective as the host overload but an L2 STFT magnitude
+    // loss (linear gradient). This is the training hot-path.
+    float recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
+                              const brotensor::Tensor& target,
+                              brotensor::Tensor& dZReal) const;
+
     // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
     //
     // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor
