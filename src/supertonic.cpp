@@ -585,10 +585,66 @@ void replace_all(std::u32string& s, const std::u32string& from,
     }
 }
 
-// NFKD compatibility decomposition. ASCII (and any codepoint with no
-// decomposition) is identity, which is exact for English / Latin-ASCII text.
-// TODO(next): vendored BMP decomposition + canonical reorder for accented / CJK.
-std::u32string nfkd(std::u32string s) { return s; }
+// NFKD compatibility decomposition over the BMP. The decomposition table is
+// generated offline from the Unicode database (supertonic-convert/gen_nfkd.py);
+// Hangul syllables decompose algorithmically; a canonical-combining-class pass
+// reorders marks. ASCII passes through unchanged.
+#include "supertonic_nfkd.inc"  // kNfkdN/kCccN + kNfkd*/kCcc* tables (BMP)
+
+// Canonical combining class of `c` (0 for starters / unlisted).
+int nfkd_ccc(char32_t c) {
+    if (c > 0xFFFF) return 0;
+    int lo = 0, hi = kCccN;
+    while (lo < hi) { const int m = (lo + hi) / 2;
+                      if (kCccKey[m] < c) lo = m + 1; else hi = m; }
+    return (lo < kCccN && kCccKey[lo] == c) ? kCccVal[lo] : 0;
+}
+
+// Append the (already-recursed) NFKD decomposition of one codepoint.
+void nfkd_decompose_one(char32_t c, std::u32string& out) {
+    constexpr char32_t kSBase = 0xAC00;
+    constexpr int kSCount = 11172, kLBase = 0x1100, kVBase = 0x1161,
+                  kTBase = 0x11A7, kTCount = 28, kNCount = 21 * 28;
+    if (c >= kSBase && c < kSBase + static_cast<char32_t>(kSCount)) {  // Hangul
+        const int si = static_cast<int>(c - kSBase);
+        out.push_back(static_cast<char32_t>(kLBase + si / kNCount));
+        out.push_back(static_cast<char32_t>(kVBase + (si % kNCount) / kTCount));
+        if (const int ti = si % kTCount) out.push_back(static_cast<char32_t>(kTBase + ti));
+        return;
+    }
+    if (c <= 0xFFFF) {
+        int lo = 0, hi = kNfkdN;
+        while (lo < hi) { const int m = (lo + hi) / 2;
+                          if (kNfkdKey[m] < c) lo = m + 1; else hi = m; }
+        if (lo < kNfkdN && kNfkdKey[lo] == c) {
+            for (int i = kNfkdOff[lo]; i < kNfkdOff[lo + 1]; ++i)
+                out.push_back(static_cast<char32_t>(kNfkdPool[i]));
+            return;
+        }
+    }
+    out.push_back(c);
+}
+
+std::u32string nfkd(const std::u32string& in) {
+    std::u32string d; d.reserve(in.size());
+    for (char32_t c : in) nfkd_decompose_one(c, d);
+
+    // Canonical ordering: stable-sort each maximal run of combining marks by ccc.
+    const std::size_t n = d.size();
+    for (std::size_t i = 0; i < n;) {
+        if (nfkd_ccc(d[i]) == 0) { ++i; continue; }
+        std::size_t j = i;
+        while (j < n && nfkd_ccc(d[j]) != 0) ++j;
+        for (std::size_t a = i + 1; a < j; ++a) {        // stable insertion sort
+            const char32_t v = d[a]; const int cv = nfkd_ccc(v);
+            std::size_t b = a;
+            while (b > i && nfkd_ccc(d[b - 1]) > cv) { d[b] = d[b - 1]; --b; }
+            d[b] = v;
+        }
+        i = j;
+    }
+    return d;
+}
 
 // The full _preprocess_text pipeline, codepoint-exact with the upstream.
 std::u32string preprocess_text(const std::string& utf8, const std::string& lang) {

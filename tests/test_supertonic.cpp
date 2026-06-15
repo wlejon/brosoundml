@@ -264,6 +264,33 @@ int main() {
     for (int id : ids)
         if (id < 0) { std::printf("FAIL: negative id %d leaked\n", id); return 1; }
 
+    // Frontend parity: exact ids vs the upstream UnicodeProcessor (py/helper.py).
+    // Covers the <lang>…</lang> wrap, the auto-period, NFKD of precomposed Latin
+    // (é -> e + combining acute -> id 146) and Hangul (syllable -> L/V/T jamo).
+    struct FrontCase { const char* text; const char* lang; std::vector<int> ids; };
+    const std::vector<FrontCase> fcases = {
+        {"Hello, world.", "en",
+         {29,64,73,31, 40,64,71,71,74,13,2,82,74,77,71,63,15, 29,16,64,73,31}},
+        {"caf\xc3\xa9", "en",                       // "café"
+         {29,64,73,31, 62,60,65,64,146,15, 29,16,64,73,31}},
+        {"r\xc3\xa9sum\xc3\xa9", "en",              // "résumé"
+         {29,64,73,31, 77,64,146,78,80,72,64,146,15, 29,16,64,73,31}},
+        {"no period here", "en",                    // auto-period appended
+         {29,64,73,31, 73,74,2,75,64,77,68,74,63,2,67,64,77,64,15, 29,16,64,73,31}},
+        {"\xed\x95\x9c\xea\xb5\xad", "ko",          // "한국" -> jamo
+         {29,70,74,31, 578,580,605,560,593,602,15, 29,16,70,74,31}},
+    };
+    for (const FrontCase& fc : fcases) {
+        const std::vector<int> got = model.text_to_ids(fc.text, fc.lang);
+        if (got != fc.ids) {
+            std::printf("FAIL: text_to_ids(\"%s\", %s) mismatch (%zu vs %zu ids)\n",
+                        fc.text, fc.lang, got.size(), fc.ids.size());
+            return 1;
+        }
+    }
+    std::printf("PASS: frontend matches upstream UnicodeProcessor "
+                "(%zu cases, incl NFKD Latin + Hangul)\n", fcases.size());
+
     const int total_step = 8;
     brosoundml::AudioBuffer syn, syn2;
     try {
