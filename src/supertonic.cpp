@@ -1,6 +1,7 @@
 #include "brosoundml/supertonic.h"
 
 #include "supertonic_internal.h"
+#include "supertonic_backward.h"   // vocoder_decode_forward_train/backward (encoder training)
 
 #include "brosoundml/detail/json.h"
 
@@ -888,6 +889,9 @@ struct Supertonic::Impl {
     // encoder's reconstruction path feeds its real latent straight in.
     AudioBuffer decode_dn(const std::vector<float>& dn, int LF) const;
     AudioBuffer decode_real(const float* latent_real, int latent_dim, int LF) const;
+    float recon_loss_and_grad(const float* z_real, int latent_dim, int LF,
+                              const float* target, int target_len,
+                              std::vector<float>& dZReal) const;
     std::vector<float> encode_text(const std::vector<int>& ids,
                                    const std::vector<float>& style) const;
     float predict_duration(const std::vector<int>& ids,
@@ -1692,6 +1696,125 @@ AudioBuffer Supertonic::Impl::decode_real(const float* latent_real, int latent_d
                      latent_real + static_cast<std::size_t>(latent_dim) * LF), LF);
 }
 
+namespace {
+// Periodic Hann window (matches torch.hann_window / SupertonicSpec).
+std::vector<float> hann_periodic(int win) {
+    std::vector<float> w(static_cast<std::size_t>(win));
+    for (int n = 0; n < win; ++n)
+        w[static_cast<std::size_t>(n)] = static_cast<float>(
+            0.5 * (1.0 - std::cos(2.0 * 3.14159265358979323846 * n / win)));
+    return w;
+}
+
+// Multi-resolution STFT magnitude-L1 loss between wave and target, both (1, n)
+// on `dev`. Returns the mean loss across resolutions; writes the accumulated
+// gradient w.r.t. the waveform into dWave (1, n). The per-resolution magnitude
+// diff / sign is done host-side (small), the STFT + its adjoint on-device.
+float mrstft_loss(bt::Device dev, const bt::Tensor& wave, const bt::Tensor& target,
+                  int n, bt::Tensor& dWave) {
+    static const int cfgs[3][2] = {{512, 128}, {1024, 256}, {2048, 512}};
+    std::vector<float> dacc(static_cast<std::size_t>(n), 0.0f);
+    double loss = 0.0;
+    int used = 0;
+    for (const auto& cf : cfgs) {
+        const int n_fft = cf[0], hop = cf[1], win = n_fft;
+        if (n < n_fft) continue;
+        ++used;
+        const std::vector<float> wh = hann_periodic(win);
+        bt::Tensor window = bt::Tensor::from_host_on(dev, wh.data(), 1, win);
+        bt::Tensor sw, stg, magw, magt;
+        bt::stft(wave, window, 1, n_fft, hop, win, /*center=*/true, false, sw);
+        bt::stft(target, window, 1, n_fft, hop, win, /*center=*/true, false, stg);
+        bt::complex_abs(sw, magw);
+        bt::complex_abs(stg, magt);
+        const std::vector<float> mw = magw.to_host_vector();
+        const std::vector<float> mt = magt.to_host_vector();
+        const std::size_t M = mw.size();
+        const float invM = (M > 0) ? 1.0f / static_cast<float>(M) : 0.0f;
+        std::vector<float> dmag(M, 0.0f);
+        double lc = 0.0;
+        for (std::size_t i = 0; i < M; ++i) {
+            const float d = mw[i] - mt[i];
+            lc += std::fabs(static_cast<double>(d));
+            dmag[i] = (d > 0.0f) ? invM : (d < 0.0f ? -invM : 0.0f);
+        }
+        loss += lc * invM;
+        bt::Tensor dMag = bt::Tensor::from_host_on(dev, dmag.data(), magw.rows, magw.cols);
+        bt::Tensor dSpec, dWcfg;
+        bt::complex_abs_backward(sw, dMag, dSpec);
+        bt::stft_backward(dSpec, window, 1, n, n_fft, hop, win, true, false, dWcfg);
+        const std::vector<float> dwc = dWcfg.to_host_vector();
+        const int m = std::min<int>(n, static_cast<int>(dwc.size()));
+        for (int i = 0; i < m; ++i) dacc[static_cast<std::size_t>(i)] += dwc[static_cast<std::size_t>(i)];
+    }
+    if (used > 0) {
+        loss /= used;
+        const float inv = 1.0f / static_cast<float>(used);
+        for (float& x : dacc) x *= inv;
+    }
+    dWave = bt::Tensor::from_host_on(dev, dacc.data(), 1, n);
+    return static_cast<float>(loss);
+}
+}  // namespace
+
+float Supertonic::Impl::recon_loss_and_grad(const float* z_real, int latent_dim,
+                                            int LF, const float* target,
+                                            int target_len,
+                                            std::vector<float>& dZReal) const {
+    if (!ready) fail("recon_loss_and_grad() before load()");
+    const int D = cfg.latent_dim, CC = cfg.chunk;
+    if (latent_dim != D) fail("recon_loss_and_grad latent_dim mismatch");
+    if (LF <= 0 || LF % CC != 0) fail("LF must be a positive multiple of chunk");
+    const int F = LF / CC;
+
+    // Pack + normalise the real latent [D, LF] into the flow-domain latent
+    // [D*CC, F] the vocoder expects (the exact inverse of decode's de-chunk +
+    // de-normalise, so the decoder reconstructs z_real internally).
+    std::vector<float> zf(static_cast<std::size_t>(D * CC) * F);
+    for (int d = 0; d < D; ++d) {
+        const float denom = inv_scale * latent_std[d], mn = latent_mean[d];
+        for (int t = 0; t < F; ++t)
+            for (int jx = 0; jx < CC; ++jx)
+                zf[static_cast<std::size_t>(d * CC + jx) * F + t] =
+                    (z_real[static_cast<std::size_t>(d) * LF + (t * CC + jx)] - mn) / denom;
+    }
+    bt::Tensor latent_in = bt::Tensor::from_host_on(dev, zf.data(), 1, D * CC * F);
+
+    bt::Tensor wave;
+    VocoderCache vc;
+    vocoder_decode_forward_train(latent_in, D, CC, F, inv_scale, latent_mean, latent_std,
+                                 conv_in, blocks, bn_g, bn_b, bn_mean, bn_var, 1.0e-5f,
+                                 head1, prelu_slope, head2, wave, vc);
+    const int BC = head2.cout, nwave = BC * LF;
+    const int n = std::min(nwave, target_len);
+
+    bt::Tensor wave_n = bt::Tensor::view(dev, wave.data, 1, n, wave.dtype);
+    bt::Tensor tgt = bt::Tensor::from_host_on(dev, target, 1, n);
+    bt::Tensor dWaveN;
+    const float loss = mrstft_loss(dev, wave_n, tgt, n, dWaveN);
+
+    std::vector<float> dwfull(static_cast<std::size_t>(nwave), 0.0f);
+    const std::vector<float> dwn = dWaveN.to_host_vector();
+    for (int i = 0; i < n; ++i) dwfull[static_cast<std::size_t>(i)] = dwn[static_cast<std::size_t>(i)];
+    bt::Tensor dWave = bt::Tensor::from_host_on(dev, dwfull.data(), 1, nwave);
+
+    bt::Tensor dLatentFlow;
+    vocoder_decode_backward(conv_in, blocks, head1, prelu_slope, head2, inv_scale,
+                            latent_std, vc, dWave, dLatentFlow);
+
+    // Adjoint of pack + normalise: d(z_real)[d, t*CC+jx] = d(flow)[(d*CC+jx),t]/denom.
+    const std::vector<float> dflow = dLatentFlow.to_host_vector();
+    dZReal.assign(static_cast<std::size_t>(D) * LF, 0.0f);
+    for (int d = 0; d < D; ++d) {
+        const float denom = inv_scale * latent_std[d];
+        for (int t = 0; t < F; ++t)
+            for (int jx = 0; jx < CC; ++jx)
+                dZReal[static_cast<std::size_t>(d) * LF + (t * CC + jx)] =
+                    dflow[static_cast<std::size_t>(d * CC + jx) * F + t] / denom;
+    }
+    return loss;
+}
+
 AudioBuffer Supertonic::Impl::decode_dn(const std::vector<float>& dn, int LF) const {
     const int D = cfg.latent_dim;           // 24
     bt::Tensor scratch;
@@ -1772,6 +1895,12 @@ AudioBuffer Supertonic::decode(const std::vector<float>& latent, int channels,
 AudioBuffer Supertonic::decode_real(const float* latent_real, int latent_dim,
                                     int frames_dechunked) const {
     return impl_->decode_real(latent_real, latent_dim, frames_dechunked);
+}
+
+float Supertonic::recon_loss_and_grad(const float* z_real, int latent_dim, int LF,
+                                      const float* target, int target_len,
+                                      std::vector<float>& dZReal) const {
+    return impl_->recon_loss_and_grad(z_real, latent_dim, LF, target, target_len, dZReal);
 }
 
 std::vector<float> Supertonic::encode_text(const std::vector<int>& text_ids,

@@ -96,6 +96,17 @@ public:
     AudioBuffer decode_real(const float* latent_real, int latent_dim,
                             int frames_dechunked) const;
 
+    // Reconstruction objective for training the AE encoder against the FROZEN
+    // decoder. Given the encoder's real latent `z_real` [latent_dim, LF]
+    // (channel-major; LF a multiple of chunk), packs + normalises it to the flow
+    // domain, runs the frozen vocoder, and computes a multi-resolution
+    // STFT-magnitude loss against `target` (time-domain, target_len samples).
+    // Returns the loss and fills `dZReal` (latent_dim*LF) with d(loss)/d(z_real)
+    // — feed straight into SupertonicEncoder::backward. Decoder weights frozen.
+    float recon_loss_and_grad(const float* z_real, int latent_dim, int LF,
+                              const float* target, int target_len,
+                              std::vector<float>& dZReal) const;
+
     // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
     //
     // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor

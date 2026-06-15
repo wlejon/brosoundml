@@ -220,6 +220,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_phoneme_train tools/phoneme_train.cpp)
     target_link_libraries(brosoundml_phoneme_train PRIVATE brosoundml)
 
+    # AE audio->latent encoder trainer (reconstruction through the frozen decoder).
+    add_executable(brosoundml_supertonic_encoder_train tools/supertonic_encoder_train.cpp)
+    target_link_libraries(brosoundml_supertonic_encoder_train PRIVATE brosoundml)
+    target_include_directories(brosoundml_supertonic_encoder_train PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
     add_executable(brosoundml_phoneme_test tools/phoneme_test.cpp)
     target_link_libraries(brosoundml_phoneme_test PRIVATE brosoundml)
 
