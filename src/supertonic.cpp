@@ -7,6 +7,10 @@
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
+#ifdef BROSOUNDML_HAS_CUDA
+#include <brotensor/cuda_graph.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -512,18 +516,30 @@ bt::Tensor rope_apply(const bt::Tensor& xh, int half, int len,
     return reshape_owned(out, 2 * half, len);
 }
 
+// Prebuilt RoPE cos/sin tables for one (L, T) pair, shared by every text-attn
+// block (they all use the same theta) and by every flow step (L, T fixed for an
+// utterance). Hoisted out of rope_attention so the per-step field body carries
+// no host->device upload — a hard requirement for CUDA-graph capture, and a win
+// regardless (the tables were rebuilt 16x per utterance before).
+struct RopeTables { bt::Tensor cosL, sinL, cosT, sinT; };
+
+RopeTables build_rope_tables(const std::vector<float>& theta, int L, int T,
+                             bt::Device dev) {
+    RopeTables rt;
+    rope_tables(theta, L, dev, rt.cosL, rt.sinL);
+    rope_tables(theta, T, dev, rt.cosT, rt.sinT);
+    return rt;
+}
+
 // Text cross-attention with RoPE: query=hidden [512,L], key/value=text [256,T].
 // 8 heads x 64; query positions normalised by L, key positions by T; scale 1/16.
 bt::Tensor rope_attention(const bt::Tensor& h, const bt::Tensor& text_src,
-                          const VeRope& A, int L, int T) {
+                          const VeRope& A, int L, int T, const RopeTables& rt) {
     const int nh = kVeHeads, hd = kVeHd, half = kVeHalf, Ck = A.conv_k.cin_pg;
     bt::Tensor scr;
     bt::Tensor q = pconv(h,        A.conv_q, kVeC, L, 1, 1, 0, 0, 0, scr);  // [512,L]
     bt::Tensor k = pconv(text_src, A.conv_k, Ck,   T, 1, 1, 0, 0, 0, scr);  // [512,T]
     bt::Tensor v = pconv(text_src, A.conv_v, Ck,   T, 1, 1, 0, 0, 0, scr);  // [512,T]
-    bt::Tensor cosL, sinL, cosT, sinT;
-    rope_tables(A.theta, L, h.device, cosL, sinL);
-    rope_tables(A.theta, T, h.device, cosT, sinT);
     const float inv = 1.0f / kVeAttnScale;
     std::vector<bt::Tensor> heads(nh);
     std::vector<const bt::Tensor*> hp(nh);
@@ -531,8 +547,8 @@ bt::Tensor rope_attention(const bt::Tensor& h, const bt::Tensor& text_src,
         const bt::Tensor qh = sub_view(q, hh * hd * L, hd, L);  // [64,L]
         const bt::Tensor kh = sub_view(k, hh * hd * T, hd, T);  // [64,T]
         const bt::Tensor vh = sub_view(v, hh * hd * T, hd, T);  // [64,T]
-        bt::Tensor qr = rope_apply(qh, half, L, cosL, sinL);    // [64,L]
-        bt::Tensor kr = rope_apply(kh, half, T, cosT, sinT);    // [64,T]
+        bt::Tensor qr = rope_apply(qh, half, L, rt.cosL, rt.sinL);  // [64,L]
+        bt::Tensor kr = rope_apply(kh, half, T, rt.cosT, rt.sinT);  // [64,T]
         bt::Tensor qrT = transpose2d(qr, hd, L);                // [L,64]
         bt::Tensor scores; bt::matmul(qrT, kr, scores);         // [L,T]
         bt::scale_inplace(scores, inv);
@@ -805,7 +821,17 @@ struct Supertonic::Impl {
                            const std::vector<float>& style_dp) const;
     bt::Tensor run_field(const bt::Tensor& h0, const bt::Tensor& time_emb,
                          const bt::Tensor& text_src, const bt::Tensor& style_key,
-                         const bt::Tensor& style_val, int L, int T) const;
+                         const bt::Tensor& style_val, int L, int T,
+                         const RopeTables& rt, const bt::Tensor& onesL) const;
+    // One classifier-free-guided Euler step done entirely on-device, writing the
+    // updated latent back into `noisyT` in place. No host<->device traffic and no
+    // host-built tensors inside, so synthesize() can CUDA-graph-capture it and
+    // replay it per step. All conditioning (text/style/rope/ones/dt) is prebuilt
+    // once per utterance and handed in.
+    void field_step(bt::Tensor& noisyT, const bt::Tensor& time_emb,
+                    const bt::Tensor& text_cond, const bt::Tensor& text_unc,
+                    const bt::Tensor& style_val_cond, const bt::Tensor& onesL,
+                    const RopeTables& rt, int L, int T, float dt) const;
     std::vector<float> denoise(const std::vector<float>& noisy, int channels,
                                int frames, const std::vector<float>& text_emb,
                                int text_len, const std::vector<float>& style_ttl,
@@ -1261,7 +1287,8 @@ void Supertonic::Impl::load_vector_estimator(const fs::path& path) {
 bt::Tensor Supertonic::Impl::run_field(
         const bt::Tensor& h0, const bt::Tensor& time_emb,
         const bt::Tensor& text_src, const bt::Tensor& style_key,
-        const bt::Tensor& style_val, int L, int T) const {
+        const bt::Tensor& style_val, int L, int T,
+        const RopeTables& rt, const bt::Tensor& onesL) const {
     bt::Tensor h = h0.clone();
     bt::Tensor scratch;
     for (int i = 0; i < 24; ++i) {
@@ -1275,12 +1302,10 @@ bt::Tensor Supertonic::Impl::run_field(
             bt::Tensor proj; bt::matmul(time_emb, blk.film.w, proj);  // [1,512]
             bt::add_inplace(proj, blk.film.b);
             bt::Tensor pcol = transpose2d(proj, 1, kVeC);             // [512,1]
-            std::vector<float> ones(static_cast<std::size_t>(L), 1.0f);
-            bt::Tensor onesT = bt::Tensor::from_host_on(dev, ones.data(), 1, L);
-            bt::Tensor tiled; bt::matmul(pcol, onesT, tiled);         // [512,L]
+            bt::Tensor tiled; bt::matmul(pcol, onesL, tiled);         // [512,L]
             bt::add_inplace(h, tiled);
         } else if (blk.type == 2) {
-            bt::Tensor a = rope_attention(h, text_src, blk.rope, L, T);
+            bt::Tensor a = rope_attention(h, text_src, blk.rope, L, T, rt);
             bt::add_inplace(a, h);                                    // residual
             h = layernorm_chan(a, blk.rope.norm_g, blk.rope.norm_b, kVeC, L);
         } else {  // type 3: style cross-attention
@@ -1292,6 +1317,27 @@ bt::Tensor Supertonic::Impl::run_field(
     for (const ConvNeXtBlock& c : ve_last)
         h = convnext_block(h, c, kVeC, L, 1, scratch);
     return pconv(flat(h), ve_proj_out, kVeC, L, 1, 1, 0, 0, 0, scratch);  // [144,L]
+}
+
+// One CFG Euler step, on-device and host-traffic-free, updating `noisyT` in place
+// (noisyT is the running latent, carried [1, 144*L] channel-major). Same math as
+// denoise() but with every conditioning input prebuilt: this is what synthesize()
+// CUDA-graph-captures and replays per step.
+void Supertonic::Impl::field_step(
+        bt::Tensor& noisyT, const bt::Tensor& time_emb,
+        const bt::Tensor& text_cond, const bt::Tensor& text_unc,
+        const bt::Tensor& style_val_cond, const bt::Tensor& onesL,
+        const RopeTables& rt, int L, int T, float dt) const {
+    bt::Tensor scratch;
+    const int channels = cfg.latent_dim * cfg.chunk;  // 144
+    // proj_in is shared by the conditional + unconditional passes (same noisy).
+    bt::Tensor h0 = pconv(noisyT, ve_proj_in, channels, L, 1, 1, 0, 0, 0, scratch);  // [512,L]
+    bt::Tensor fc = run_field(h0, time_emb, text_cond, ve_style_key_proto, style_val_cond, L, T, rt, onesL);
+    bt::Tensor fu = run_field(h0, time_emb, text_unc,  ve_style_key_unc,   ve_style_val_unc,  L, T, rt, onesL);
+    // CFG guidance + one Euler step: noisyT += (1/total_step)*(4*cond - 3*uncond).
+    bt::axpby_inplace(fc, fu, ve_guid_cond, -ve_guid_uncond);  // fc = 4*cond - 3*uncond
+    bt::scale_inplace(fc, dt);
+    bt::add_inplace(noisyT, fc);  // in-place feedback; noisyT is both step input and output
 }
 
 std::vector<float> Supertonic::Impl::denoise(
@@ -1346,8 +1392,11 @@ std::vector<float> Supertonic::Impl::denoise(
         for (int p = 0; p < T; ++p) tu[static_cast<std::size_t>(c) * T + p] = ve_text_uncond[c];
     bt::Tensor text_unc = bt::Tensor::from_host_on(dev, tu.data(), 1, kTeC * T);
 
-    bt::Tensor field_cond = run_field(h0, time_emb, text_cond, ve_style_key_proto, style_val_cond, L, T);
-    bt::Tensor field_unc  = run_field(h0, time_emb, text_unc,  ve_style_key_unc,    ve_style_val_unc,  L, T);
+    const RopeTables rt = build_rope_tables(ve_blocks[3].rope.theta, L, T, dev);
+    std::vector<float> onesh(static_cast<std::size_t>(L), 1.0f);
+    const bt::Tensor onesL = bt::Tensor::from_host_on(dev, onesh.data(), 1, L);
+    bt::Tensor field_cond = run_field(h0, time_emb, text_cond, ve_style_key_proto, style_val_cond, L, T, rt, onesL);
+    bt::Tensor field_unc  = run_field(h0, time_emb, text_unc,  ve_style_key_unc,    ve_style_val_unc,  L, T, rt, onesL);
 
     // CFG guidance + one Euler step: denoised = noisy + (1/total_step)*(4*cond - 3*uncond).
     bt::axpby_inplace(field_cond, field_unc, ve_guid_cond, -ve_guid_uncond);
@@ -1400,16 +1449,97 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     if (latent_len < 1) latent_len = 1;
     const int channels = cfg.latent_dim * cfg.chunk;            // 24*6 = 144
 
-    // seed the flow from N(0,1) on-device. For a single unpadded sentence the
-    // upstream latent_mask is all-ones, so the seed is the raw noise.
-    bt::Tensor noiseT = bt::Tensor::empty_on(dev, channels, latent_len);
-    bt::randn(seed, 0, noiseT);
-    std::vector<float> xt = noiseT.to_host_vector();
+    const int L = latent_len;
 
-    // total_step classifier-free-guided Euler steps, feeding xt back each time.
-    for (int step = 0; step < total_step; ++step)
-        xt = denoise(xt, channels, latent_len, text_emb, T, voice.ttl, step, total_step);
+    // running latent: seed from N(0,1) on-device, carried as [1, 144*L]
+    // channel-major. For a single unpadded sentence the upstream latent_mask is
+    // all-ones, so the seed is the raw noise (filled flat — same layout as the
+    // old [144,L] seed). field_step updates it in place each step.
+    bt::Tensor noisyT = bt::Tensor::empty_on(dev, 1, channels * L);
+    bt::randn(seed, 0, noisyT);
 
+    // ── per-utterance conditioning, built once (L, T fixed across all steps) ──
+    // conditional text [256,T]; style value = style_ttl transposed to chan-major.
+    bt::Tensor text_cond = bt::Tensor::from_host_on(dev, text_emb.data(), 1, kTeC * T);
+    std::vector<float> sv(static_cast<std::size_t>(kTeC) * kNStyle);
+    for (int s = 0; s < kNStyle; ++s)
+        for (int c = 0; c < kTeC; ++c)
+            sv[static_cast<std::size_t>(c) * kNStyle + s] =
+                voice.ttl[static_cast<std::size_t>(s) * kTeC + c];
+    bt::Tensor style_val_cond = bt::Tensor::from_host_on(dev, sv.data(), 1, kTeC * kNStyle);
+
+    // unconditional text: the special token broadcast over T positions.
+    std::vector<float> tu(static_cast<std::size_t>(kTeC) * T);
+    for (int c = 0; c < kTeC; ++c)
+        for (int p = 0; p < T; ++p) tu[static_cast<std::size_t>(c) * T + p] = ve_text_uncond[c];
+    bt::Tensor text_unc = bt::Tensor::from_host_on(dev, tu.data(), 1, kTeC * T);
+
+    // RoPE tables + the all-ones broadcast row — shared across every step.
+    const RopeTables rt = build_rope_tables(ve_blocks[3].rope.theta, L, T, dev);
+    std::vector<float> onesh(static_cast<std::size_t>(L), 1.0f);
+    const bt::Tensor onesL = bt::Tensor::from_host_on(dev, onesh.data(), 1, L);
+    const float dt = (total_step != 0) ? 1.0f / total_step : 0.0f;
+
+    // Every step's time embedding (sinusoidal -> Gemm -> Mish -> Gemm, [1,64])
+    // depends only on step/total_step, so precompute them all host-side, upload
+    // once, and stage one row per step on-device (a device copy, capture-safe).
+    std::vector<float> all_tev(static_cast<std::size_t>(total_step) * 64);
+    for (int step = 0; step < total_step; ++step) {
+        const float t = (total_step != 0) ? static_cast<float>(step) / total_step : 0.0f;
+        std::vector<float> sino(2 * kVeHalf);
+        for (int fr = 0; fr < kVeHalf; ++fr) {
+            const float a = t * 1000.0f * ve_sin_freqs[fr];
+            sino[fr] = std::sin(a); sino[kVeHalf + fr] = std::cos(a);
+        }
+        std::vector<float> m0(256);
+        for (int o = 0; o < 256; ++o) {
+            float s = ve_t0b[o];
+            for (int i = 0; i < 64; ++i) s += ve_t0w[static_cast<std::size_t>(o) * 64 + i] * sino[i];
+            const float sp = std::log1p(std::exp(s));
+            m0[o] = s * std::tanh(sp);  // Mish
+        }
+        for (int o = 0; o < 64; ++o) {
+            float s = ve_t1b[o];
+            for (int i = 0; i < 256; ++i) s += ve_t1w[static_cast<std::size_t>(o) * 256 + i] * m0[i];
+            all_tev[static_cast<std::size_t>(step) * 64 + o] = s;
+        }
+    }
+    bt::Tensor time_all = bt::Tensor::from_host_on(dev, all_tev.data(), total_step, 64);
+    bt::Tensor time_emb = bt::Tensor::empty_on(dev, 1, 64);
+    auto stage_time = [&](int step) { bt::copy_d2d(time_all, step * 64, time_emb, 0, 64); };
+
+    // Step 0 runs eagerly — it also warms every scratch buffer so a subsequent
+    // capture allocates nothing new. On CUDA the identical body is then captured
+    // once and replayed for steps 1..N-1: the per-step kernel-launch overhead,
+    // not GPU compute, dominates this 99M-param field, and the graph removes it.
+    stage_time(0);
+    field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+
+#ifdef BROSOUNDML_HAS_CUDA
+    if (dev == bt::Device::CUDA && total_step > 1) {
+        bt::sync_all();
+        stage_time(1);
+        bt::CudaGraph graph;
+        {
+            bt::CudaGraphCapture cap;
+            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+            graph = cap.finish();
+        }
+        for (int step = 1; step < total_step; ++step) {
+            stage_time(step);   // stream-ordered ahead of the replay
+            graph.launch();
+        }
+        bt::sync_all();
+    } else
+#endif
+    {
+        for (int step = 1; step < total_step; ++step) {
+            stage_time(step);
+            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+        }
+    }
+
+    std::vector<float> xt = noisyT.to_host_vector();
     return decode(xt.data(), channels, latent_len);
 }
 

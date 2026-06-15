@@ -15,6 +15,7 @@
 
 #include <brotensor/runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -73,20 +74,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    t0 = clk::now();
+    // One warm-up synth (CUDA context / cuBLAS handles / pool blocks) then a few
+    // timed iterations — the steady-state RT is what the perf work targets.
+    const int iters = (argc > 8) ? std::atoi(argv[8]) : 3;
     brosoundml::AudioBuffer wav;
     try {
-        wav = model.synthesize(text, lang, style, steps, speed);
+        wav = model.synthesize(text, lang, style, steps, speed);  // warm-up (discarded timing)
+        brotensor::sync_all();
     } catch (const std::exception& e) {
         std::printf("synthesize failed: %s\n", e.what());
         return 1;
     }
-    brotensor::sync_all();
-    const double synth_ms = ms_since(t0);
+    double best_ms = 1e30;
+    for (int it = 0; it < iters; ++it) {
+        t0 = clk::now();
+        wav = model.synthesize(text, lang, style, steps, speed);
+        brotensor::sync_all();
+        const double m = ms_since(t0);
+        best_ms = std::min(best_ms, m);
+    }
+    const double synth_ms = best_ms;
     const double audio_s  = static_cast<double>(wav.samples.size()) / wav.sample_rate;
-    std::printf("synthesize: %.0f ms  audio=%.2fs  RT=%.2fx  (voice=%s lang=%s steps=%d speed=%.2f)\n",
+    std::printf("synthesize: %.0f ms  audio=%.2fs  RT=%.2fx  (voice=%s lang=%s steps=%d speed=%.2f, best of %d)\n",
                 synth_ms, audio_s, audio_s / (synth_ms / 1000.0),
-                voice.c_str(), lang.c_str(), steps, speed);
+                voice.c_str(), lang.c_str(), steps, speed, iters);
 
     wav.write_wav(out);
     std::printf("wrote %s\n", out.c_str());
