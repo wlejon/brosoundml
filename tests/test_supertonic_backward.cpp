@@ -299,6 +299,98 @@ static void test_rope_attention() {
     fd_directional(h, dH, loss, rng, "rope_attn.dH");
 }
 
+// ─── flow-field single-step backward (cond pass), synthetic 5-block field ─────
+//
+// Covers all FOUR VeBlock types — type 0 (two ConvNeXt sub-blocks, dil 1,2),
+// type 1 FiLM (additive-only), type 2 RoPE text-attn, and TWO type-3 style
+// blocks at different depths (so the value-grad accumulation AND the upstream
+// threading past one style block to the next are both exercised). The field
+// hidden width is fixed at 512 (the rope/style atoms hardcode kVeC=512); L/T/S
+// are kept tiny. FD-checks the returned d(style_val) — the only escaping
+// gradient — against a directional central difference of the field MSE.
+static st::VeBlock make_convnext_pair_block(int C, int inter, std::mt19937& rng) {
+    st::VeBlock blk; blk.type = 0;
+    blk.conv.push_back(make_convnext(C, inter, /*dil=*/1, rng));  // sub-block s=0
+    blk.conv.push_back(make_convnext(C, inter, /*dil=*/2, rng));  // sub-block s=1
+    return blk;
+}
+
+static st::VeBlock make_film_block(int C, std::mt19937& rng) {
+    st::VeBlock blk; blk.type = 1;
+    blk.film.w = make_random(64, C, rng, 0.1f);   // [64,512] (in,out)
+    blk.film.b = make_random(1,  C, rng, 0.1f);   // [1,512]
+    return blk;
+}
+
+static st::VeBlock make_rope_block(int C, int Ck, int half, std::mt19937& rng) {
+    st::VeBlock blk; blk.type = 2;
+    blk.rope.conv_q = make_convw(/*cout=*/C, /*cin_pg=*/C,  1, true, rng, 0.08f);
+    blk.rope.conv_k = make_convw(/*cout=*/C, /*cin_pg=*/Ck, 1, true, rng, 0.08f);
+    blk.rope.conv_v = make_convw(/*cout=*/C, /*cin_pg=*/Ck, 1, true, rng, 0.08f);
+    blk.rope.conv_o = make_convw(/*cout=*/C, /*cin_pg=*/C,  1, true, rng, 0.08f);
+    blk.rope.theta.resize(half);
+    for (int f = 0; f < half; ++f)
+        blk.rope.theta[f] = 1.0f / std::pow(10000.0f, static_cast<float>(f) / half);
+    blk.rope.norm_g = make_random(C, 1, rng, 0.4f);
+    blk.rope.norm_b = make_random(C, 1, rng, 0.3f);
+    return blk;
+}
+
+static st::VeBlock make_style_block(int C, int Ck, int inner, std::mt19937& rng) {
+    st::VeBlock blk; blk.type = 3;
+    blk.style.attn.wq = make_convw(/*cout=*/inner, /*cin_pg=*/C,     1, true, rng, 0.08f);
+    blk.style.attn.wk = make_convw(/*cout=*/inner, /*cin_pg=*/Ck,    1, true, rng, 0.08f);
+    blk.style.attn.wv = make_convw(/*cout=*/inner, /*cin_pg=*/Ck,    1, true, rng, 0.08f);
+    blk.style.attn.wo = make_convw(/*cout=*/C,     /*cin_pg=*/inner, 1, true, rng, 0.08f);
+    blk.style.norm_g  = make_random(C, 1, rng, 0.4f);
+    blk.style.norm_b  = make_random(C, 1, rng, 0.3f);
+    return blk;
+}
+
+static void test_field_backward() {
+    std::mt19937 rng(0x57F3u);
+    const int C = 512, Ck = 256, inner = 256, half = 32;  // model-fixed widths
+    const int L = 4, T = 5, S = 5;                         // tiny seq dims
+
+    std::vector<st::VeBlock> blocks;
+    blocks.push_back(make_convnext_pair_block(C, /*inter=*/16, rng));  // type 0
+    blocks.push_back(make_film_block(C, rng));                          // type 1
+    blocks.push_back(make_style_block(C, Ck, inner, rng));             // type 3 (A)
+    blocks.push_back(make_rope_block(C, Ck, half, rng));               // type 2
+    blocks.push_back(make_style_block(C, Ck, inner, rng));             // type 3 (B)
+
+    std::vector<st::ConvNeXtBlock> ve_last;
+    ve_last.push_back(make_convnext(C, /*inter=*/16, /*dil=*/1, rng));
+    ve_last.push_back(make_convnext(C, /*inter=*/16, /*dil=*/1, rng));
+
+    st::ConvW ve_proj_out = make_convw(/*cout=*/144, /*cin_pg=*/C, 1, /*bias=*/false, rng, 0.08f);
+
+    Tensor h0        = make_random(1, C  * L, rng, 0.3f);
+    Tensor time_emb  = make_random(1, 64,     rng, 0.3f);  // FROZEN
+    Tensor text_src  = make_random(1, Ck * T, rng, 0.3f);  // FROZEN text encoding
+    Tensor style_key = make_random(1, Ck * S, rng, 0.3f);  // FROZEN prototype
+    Tensor style_val = make_random(1, Ck * S, rng, 0.3f);  // = style (optimisation target)
+    Tensor target    = make_random(1, 144 * L, rng, 0.4f);
+
+    std::vector<float> onesh(static_cast<std::size_t>(L), 1.0f);
+    Tensor onesL = Tensor::from_host_on(Device::CPU, onesh.data(), 1, L);
+
+    st::FieldCache cache; Tensor field_out;
+    auto fwd = [&]() {
+        st::field_forward_train(h0, time_emb, text_src, style_key, style_val,
+                                L, T, S, blocks, ve_last, ve_proj_out, onesL,
+                                field_out, cache);
+    };
+    fwd();
+    Tensor dY = Tensor::mat(1, field_out.size());
+    for (int i = 0; i < dY.size(); ++i) dY[i] = field_out[i] - target[i];
+    Tensor dStyleVal;
+    st::field_backward(blocks, ve_last, ve_proj_out, cache, dY, dStyleVal);
+
+    auto loss = [&]() { fwd(); return mse_loss(field_out, target)(); };
+    fd_directional(style_val, dStyleVal, loss, rng, "field.dStyleVal");
+}
+
 int main() {
     brotensor::init();
     test_pconv_1x1();
@@ -310,6 +402,7 @@ int main() {
     test_convnext(/*dil=*/2, 0xC0DE02u, "convnext_dil2");
     test_style_attention();
     test_rope_attention();
+    test_field_backward();
 
     if (g_failures) { std::printf("test_supertonic_backward: %d failure(s)\n", g_failures); return 1; }
     std::printf("test_supertonic_backward: OK\n");

@@ -508,5 +508,157 @@ void rope_attention_backward(const VeRope& A, const RopeAttnCache& cache,
     dH.rows = 1; dH.cols = C * L;
 }
 
+// ─── flow-field (vector-estimator) single-step backward ──────────────────────
+
+void field_forward_train(const bt::Tensor& h0, const bt::Tensor& time_emb,
+                         const bt::Tensor& text_src, const bt::Tensor& style_key,
+                         const bt::Tensor& style_val, int L, int T, int S,
+                         const std::vector<VeBlock>& blocks,
+                         const std::vector<ConvNeXtBlock>& ve_last,
+                         const ConvW& ve_proj_out,
+                         const bt::Tensor& onesL,
+                         bt::Tensor& field_out, FieldCache& cache) {
+    const int C = kVeC;
+    cache.C = C; cache.L = L; cache.S = S;
+    cache.blocks.assign(blocks.size(), FieldBlockCache{});
+
+    bt::Tensor h = h0.clone();
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const VeBlock&    blk = blocks[i];
+        FieldBlockCache&  bc  = cache.blocks[i];
+        bc.type = blk.type;
+
+        if (blk.type == 0) {
+            // ConvNeXt sub-blocks in sequence, dilation 1<<s (own residual each).
+            bc.conv.assign(blk.conv.size(), ConvNeXtCache{});
+            for (std::size_t s = 0; s < blk.conv.size(); ++s) {
+                bt::Tensor y;
+                convnext_block_forward_train(h, blk.conv[s], C, L,
+                                             1 << static_cast<int>(s), y, bc.conv[s]);
+                h = y;
+            }
+        } else if (blk.type == 1) {
+            // FiLM (additive-only): h += (time_emb @ W + b) broadcast across L.
+            bt::Tensor proj; bt::matmul(time_emb, blk.film.w, proj);  // [1,512]
+            bt::add_inplace(proj, blk.film.b);
+            bt::Tensor pcol = transpose2d(proj, 1, C);                // [512,1]
+            bt::Tensor tiled; bt::matmul(pcol, onesL, tiled);         // [512,L]
+            bt::add_inplace(h, flat(tiled));
+            // no cache: backward is the identity on dH.
+        } else if (blk.type == 2) {
+            bt::Tensor y;
+            rope_attention_forward_train(h, text_src, blk.rope, L, T, y, bc.rope);
+            h = y;
+        } else {  // type 3: style cross-attention + residual + post-attn LN.
+            bt::Tensor a;
+            style_attention_forward_train(h, style_key, style_val, blk.style.attn,
+                                          L, S, a, bc.style);          // [512,L]
+            bt::add_inplace(a, h);                                     // r = a + h
+            bt::Tensor seq, seqn, mean_r;
+            bt::nchw_to_sequence(a, 1, C, 1, L, seq);                  // [L,C]
+            bt::layernorm_forward_batched_with_caches(seq, blk.style.norm_g,
+                                                      blk.style.norm_b, seqn,
+                                                      bc.ln_xhat, mean_r,
+                                                      bc.ln_rstd, 1.0e-6f);
+            bt::Tensor hn;
+            bt::sequence_to_nchw(seqn, 1, C, 1, L, hn);                // [C,L]
+            hn.rows = 1; hn.cols = C * L;
+            h = hn;
+        }
+    }
+
+    // ve_last ConvNeXt blocks (dilation 1).
+    cache.last.assign(ve_last.size(), ConvNeXtCache{});
+    for (std::size_t i = 0; i < ve_last.size(); ++i) {
+        bt::Tensor y;
+        convnext_block_forward_train(h, ve_last[i], C, L, 1, y, cache.last[i]);
+        h = y;
+    }
+
+    // ve_proj_out: 512 -> 144 (1×1).
+    pconv_forward_train(flat(h), ve_proj_out, C, L, 1, 1, 0, 0, 0,
+                        field_out, cache.proj_out);
+}
+
+void field_backward(const std::vector<VeBlock>& blocks,
+                    const std::vector<ConvNeXtBlock>& ve_last,
+                    const ConvW& ve_proj_out,
+                    const FieldCache& cache,
+                    const bt::Tensor& dY, bt::Tensor& dStyleVal) {
+    const bt::Device dev = dY.device;
+    const int C = cache.C, L = cache.L, S = cache.S;
+
+    // The style gradient accumulator (channel-major [256, S]); set lazily.
+    bool have_style = false;
+    dStyleVal = bt::Tensor{};
+
+    // ve_proj_out backward -> grad on h after ve_last.
+    bt::Tensor dH;
+    pconv_backward(ve_proj_out, cache.proj_out, dY, dH);     // (1, C*L)
+
+    // ve_last ConvNeXt blocks in reverse.
+    for (std::size_t i = ve_last.size(); i-- > 0;) {
+        bt::Tensor dX;
+        convnext_block_backward(ve_last[i], cache.last[i], dH, dX);
+        dH = dX;
+    }
+
+    // VeBlocks in reverse order.
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const VeBlock&         blk = blocks[i];
+        const FieldBlockCache& bc  = cache.blocks[i];
+
+        if (blk.type == 0) {
+            // ConvNeXt sub-blocks in reverse (undo s = size-1 .. 0).
+            for (std::size_t s = blk.conv.size(); s-- > 0;) {
+                bt::Tensor dX;
+                convnext_block_backward(blk.conv[s], bc.conv[s], dH, dX);
+                dH = dX;
+            }
+        } else if (blk.type == 1) {
+            // FiLM additive-only: identity on dH — nothing to do.
+        } else if (blk.type == 2) {
+            bt::Tensor dHn;
+            rope_attention_backward(blk.rope, bc.rope, dH, dHn);
+            dH = dHn;
+        } else {  // type 3: style block.
+            // post-attn LayerNorm backward (frozen affine -> dGamma/dBeta dropped).
+            bt::Tensor dSeqn;
+            bt::nchw_to_sequence(dH, 1, C, 1, L, dSeqn);              // [L,C]
+            bt::Tensor dSeq;
+            bt::Tensor dG = bt::Tensor::zeros_on(dev, C, 1);
+            bt::Tensor dB = bt::Tensor::zeros_on(dev, C, 1);
+            bt::layernorm_backward_batched_with_caches(dSeqn, bc.ln_xhat,
+                                                       blk.style.norm_g, bc.ln_rstd,
+                                                       dSeq, dG, dB);
+            bt::Tensor dR;
+            bt::sequence_to_nchw(dSeq, 1, C, 1, L, dR);              // [C,L] as (1,C*L)
+            dR.rows = 1; dR.cols = C * L;
+
+            // residual r = a + h: dA = dR (into style attn), dH_resid = dR.
+            bt::Tensor dQuery, dValue;
+            style_attention_backward(blk.style.attn, bc.style, dR, dQuery, dValue);
+
+            // accumulate d(value) across all style blocks (sum).
+            if (!have_style) { dStyleVal = dValue.clone(); have_style = true; }
+            else             { bt::add_inplace(dStyleVal, dValue); }
+
+            // dH = d(query) + residual grad.
+            bt::add_inplace(dQuery, dR);
+            dH = dQuery;
+            dH.rows = 1; dH.cols = C * L;
+        }
+    }
+
+    // grad into h0 (proj_in input — fixed noise/time/text) is discarded.
+    // No style blocks -> a zero gradient sized to the value channels.
+    if (!have_style) {
+        int Ck = 0;
+        for (const VeBlock& blk : blocks)
+            if (blk.type == 3) { Ck = blk.style.attn.wk.cin_pg; break; }
+        dStyleVal = bt::Tensor::zeros_on(dev, 1, Ck * S);
+    }
+}
+
 }  // namespace st_detail
 }  // namespace brosoundml

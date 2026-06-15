@@ -199,5 +199,82 @@ void rope_attention_forward_train(const brotensor::Tensor& h,
 void rope_attention_backward(const VeRope& A, const RopeAttnCache& cache,
                              const brotensor::Tensor& dY, brotensor::Tensor& dH);
 
+// ─── flow-field (vector-estimator) single-step backward ──────────────────────
+//
+// Assembles the per-op atoms above into the WHOLE conditional vector-estimator
+// pass — the body of supertonic.cpp's run_field — and threads the running
+// hidden-gradient in reverse through all 24 VeBlocks, harvesting the style
+// (value) gradient at every VeStyle block. Every weight is FROZEN; the ONLY
+// gradient that leaves field_backward is d(style_val), accumulated (summed) over
+// all style blocks, in the channel-major [256, S] layout the forward consumed
+// (the caller adjoint-transposes it back to token-major [50,256] style_ttl).
+//
+// Block handling, exactly mirroring run_field (see supertonic.cpp):
+//   • type 0: blk.conv.size() ConvNeXt sub-blocks in sequence, dilation 1<<s.
+//   • type 1 FiLM: ADDITIVE-ONLY (h += time_emb@W + b, broadcast over L) — the
+//     bias is independent of h, so its backward is the IDENTITY on dH and it
+//     contributes nothing to any gradient. No cache, no work in the reverse pass.
+//   • type 2 rope: the rope_attention atom (attention + residual + post-attn LN
+//     already bundled) — rope_attention_backward gives d(h) only (text frozen).
+//   • type 3 style: style_attention + residual + post-attn channel LayerNorm at
+//     the call site. Backward = LN back -> dR; residual splits dR into the
+//     style-attention output grad and the straight-through term; style_attention
+//     _backward yields d(query) [folded back into dH via the residual: dH =
+//     dQuery + dR] and d(value) [accumulated into the style gradient].
+//
+// proj_in (the 144->512 conv ahead of run_field) is NOT part of this unit: it is
+// driven by the fixed noisy latent in field_step, so the gradient into the field
+// input h0 is discarded — field_backward stops at h0.
+
+// Per-VeBlock sub-caches, tagged by block type (matches VeBlock::type).
+struct FieldBlockCache {
+    int                        type = 0;
+    std::vector<ConvNeXtCache> conv;     // type 0: one cache per ConvNeXt sub-block
+    RopeAttnCache              rope;      // type 2
+    StyleAttnCache             style;     // type 3: the style cross-attention
+    brotensor::Tensor          ln_xhat;   // type 3: post-attn LN normalised input (L,C)
+    brotensor::Tensor          ln_rstd;   // type 3: post-attn LN 1/sqrt(var+eps)  (L,1)
+};
+
+// Everything field_backward needs to replay the conditional run_field in reverse.
+struct FieldCache {
+    std::vector<FieldBlockCache> blocks;    // one per VeBlock, in forward order
+    std::vector<ConvNeXtCache>   last;       // ve_last ConvNeXt blocks (dil = 1)
+    PConvCache                   proj_out;   // ve_proj_out (512 -> 144, 1×1)
+    int C = 0, L = 0, S = 0;                 // field channels / frames / style tokens
+};
+
+// Conditional run_field forward (identical math), emitting the FieldCache.
+//   h0:        (1, 512*L)  field hidden after proj_in.
+//   time_emb:  (1, 64)     frozen time embedding (FiLM input).
+//   text_src:  (1, 256*T)  frozen text encoding (rope k/v source).
+//   style_key: (1, 256*S)  frozen learned style prototype (attn key source).
+//   style_val: (1, 256*S)  the style matrix being optimised (attn value source).
+//   onesL:     (1, L)      row of ones (FiLM broadcast across L positions).
+//   field_out: (1, 144*L)  velocity field, overwritten.
+void field_forward_train(const brotensor::Tensor& h0,
+                         const brotensor::Tensor& time_emb,
+                         const brotensor::Tensor& text_src,
+                         const brotensor::Tensor& style_key,
+                         const brotensor::Tensor& style_val,
+                         int L, int T, int S,
+                         const std::vector<VeBlock>& blocks,
+                         const std::vector<ConvNeXtBlock>& ve_last,
+                         const ConvW& ve_proj_out,
+                         const brotensor::Tensor& onesL,
+                         brotensor::Tensor& field_out, FieldCache& cache);
+
+// Reverse pass: thread dY back to the accumulated style-value gradient.
+//   dY:        (1, 144*L)  gradient on the field output.
+//   dStyleVal: (1, 256*S)  d(style_val), summed over all VeStyle blocks,
+//                          channel-major [256, S]; overwritten.
+// The gradient into h0 (noise/time/text path) is discarded.
+void field_backward(const std::vector<VeBlock>& blocks,
+                    const std::vector<ConvNeXtBlock>& ve_last,
+                    const ConvW& ve_proj_out,
+                    const FieldCache& cache,
+                    const brotensor::Tensor& dY,
+                    brotensor::Tensor& dStyleVal);
+
 }  // namespace st_detail
 }  // namespace brosoundml
