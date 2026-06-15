@@ -146,6 +146,7 @@ target_sources(brosoundml PRIVATE
     src/fastconformer.cpp
     src/parakeet.cpp
     src/sortformer.cpp
+    src/cluster_diarizer.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
@@ -258,6 +259,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_sortformer_diarize tools/sortformer_diarize.cpp)
     target_link_libraries(brosoundml_sortformer_diarize PRIVATE brosoundml)
+
+    add_executable(brosoundml_speaker_embed_probe tools/speaker_embed_probe.cpp)
+    target_link_libraries(brosoundml_speaker_embed_probe PRIVATE brosoundml)
+
+    add_executable(brosoundml_cluster_diarize tools/cluster_diarize.cpp)
+    target_link_libraries(brosoundml_cluster_diarize PRIVATE brosoundml)
 endif()
 
 # --- Tests ---
