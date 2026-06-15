@@ -257,6 +257,11 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_executable(brosoundml_supertonic_synth tools/supertonic_synth.cpp)
     target_link_libraries(brosoundml_supertonic_synth PRIVATE brosoundml)
 
+    # masc<->fem voice axis from the model's own labeled F*/M* preset means (the
+    # realizable within-group contrast); writes masc_fem_basis.json beside the model.
+    add_executable(brosoundml_supertonic_preset_gender tools/supertonic_preset_gender.cpp)
+    target_link_libraries(brosoundml_supertonic_preset_gender PRIVATE brosoundml)
+
     add_executable(brosoundml_sortformer_diarize tools/sortformer_diarize.cpp)
     target_link_libraries(brosoundml_sortformer_diarize PRIVATE brosoundml)
 
