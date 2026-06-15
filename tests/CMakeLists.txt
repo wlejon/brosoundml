@@ -30,6 +30,9 @@ target_include_directories(brosoundml_test_kokoro_decoder_backward PRIVATE
 brosoundml_add_test(brosoundml_test_supertonic_backward test_supertonic_backward.cpp)
 target_include_directories(brosoundml_test_supertonic_backward PRIVATE
     "${CMAKE_SOURCE_DIR}/src")
+brosoundml_add_test(brosoundml_test_supertonic_spec test_supertonic_spec.cpp)
+target_include_directories(brosoundml_test_supertonic_spec PRIVATE
+    "${CMAKE_SOURCE_DIR}/src")
 brosoundml_add_test(brosoundml_test_wake     test_wake.cpp)
 brosoundml_add_test(brosoundml_test_wake_data test_wake_data.cpp)
 brosoundml_add_test(brosoundml_test_phoneme_data test_phoneme_data.cpp)

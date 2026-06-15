@@ -129,6 +129,7 @@ target_sources(brosoundml PRIVATE
     src/rave.cpp
     src/supertonic.cpp
     src/supertonic_backward.cpp
+    src/supertonic_spec.cpp
     src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp
