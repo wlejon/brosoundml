@@ -1,6 +1,7 @@
 #pragma once
 
 #include "brosoundml/audio.h"
+#include "brosoundml/fastconformer.h"
 
 #include <brotensor/tensor.h>
 
@@ -55,23 +56,10 @@ namespace brosoundml {
 // Metal), the same bar Qwen3-TTS / Qwen3-ASR meet. FP32 throughout.
 
 // Encoder hyperparameters — the nested `encoder_config` of the HF config.json.
-struct ParakeetEncoderConfig {
-    int  num_mel_bins                 = 128;
-    int  hidden_size                  = 1024;   // d_model
-    int  num_hidden_layers            = 24;
-    int  num_attention_heads          = 8;
-    int  intermediate_size            = 4096;   // FFN inner width
-    int  conv_kernel_size             = 9;      // depthwise conv module kernel
-    int  subsampling_factor           = 8;
-    int  subsampling_conv_channels    = 256;
-    int  subsampling_conv_kernel_size = 3;
-    int  subsampling_conv_stride      = 2;
-    int  max_position_embeddings      = 5000;
-    bool scale_input                  = false;  // sqrt(d_model) input scaling
-    bool attention_bias               = false;  // q/k/v/o + FFN linear biases
-    bool convolution_bias             = false;  // conv-module conv biases
-    // hidden_act is SiLU/Swish (fixed for the FastConformer encoder).
-};
+// Parakeet rides the shared FastConformer encoder (see fastconformer.h); the
+// HF Parakeet export carries no projection/conv biases and does not xscale, so
+// the defaults already match.
+using ParakeetEncoderConfig = FastConformerConfig;
 
 // Top-level Parakeet-TDT hyperparameters — the HF config.json.
 struct ParakeetConfig {

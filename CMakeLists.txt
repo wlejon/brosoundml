@@ -142,8 +142,9 @@ target_sources(brosoundml PRIVATE
     src/mel.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
+    src/fastconformer.cpp
     src/parakeet.cpp
-    src/parakeet_encoder.cpp
+    src/sortformer.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
@@ -253,6 +254,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_supertonic_synth tools/supertonic_synth.cpp)
     target_link_libraries(brosoundml_supertonic_synth PRIVATE brosoundml)
+
+    add_executable(brosoundml_sortformer_diarize tools/sortformer_diarize.cpp)
+    target_link_libraries(brosoundml_sortformer_diarize PRIVATE brosoundml)
 endif()
 
 # --- Tests ---

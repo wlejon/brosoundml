@@ -6,7 +6,7 @@ TTS / STT / neural-codec / wake-word models, the same way `brodiffusion`
 composes the diffusion ops and `brolm` composes the text-model ops. One flat
 namespace, `brosoundml::`.
 
-**Status: operational.** Eight model families are complete (CPU FP32; CUDA where
+**Status: operational.** Nine model families are complete (CPU FP32; CUDA where
 noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
 
 - **Kokoro-82M** — text-to-speech (StyleTTS 2 derivative, 24 kHz). Device-neutral
@@ -21,6 +21,11 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   validated bit-faithful against the reference checkpoint.
 - **Qwen3-ASR** — speech-to-text (AuT audio encoder + Qwen3 decoder, 52-language
   + language ID, context biasing). Device-neutral CPU + CUDA.
+- **Sortformer** — streaming speaker diarization (NVIDIA `diar_streaming_sortformer_4spk`:
+  NEST FastConformer encoder + 18-layer transformer, Arrival-Order Speaker Cache,
+  4 speakers). Device-neutral CPU + CUDA; offline + streaming forwards validated
+  to ~1e-6 against the reference NeMo model. Shares the FastConformer encoder with
+  Parakeet.
 - **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ editable
   PCA-sorted latent. Device-neutral CPU / CUDA / Metal; library-only (no CLI).
 - **Wake-word** — a 2D BC-ResNet (PCEN) streaming single-keyword spotter + its
@@ -49,8 +54,14 @@ include/brosoundml/
   speaker_encoder.h  standalone ECAPA voice-clone enroller (lifted from Qwen3-TTS)
   whisper.h          Whisper: WhisperConfig + the encoder/decoder pipeline
   whisper_modules.h  Whisper-specific modules (conv stems, cross-attn decoder)
+  fastconformer.h    FastConformerConfig — the shared NEST/FastConformer encoder
+                     config (Parakeet + Sortformer; module graph in
+                     src/fastconformer_modules.h + src/fastconformer.cpp)
   parakeet.h         Parakeet-TDT: ParakeetConfig + the FastConformer/TDT
-                     pipeline (src/parakeet_modules.h holds the module graph)
+                     pipeline (src/parakeet_modules.h holds the TDT module graph)
+  sortformer.h       Sortformer: SortformerConfig + diarize / streaming session
+                     (FastConformer encoder + transformer head + AOSC;
+                     src/sortformer_modules.h + src/sortformer.cpp)
   qwen_asr.h         Qwen3-ASR: QwenAsrConfig + AuT encoder / Qwen3 decoder
                      (src/qwen_asr_encoder.h + qwen_asr_decoder.h)
   rave.h             RAVE: encode/decode, stereo decode_multi, noise synth
@@ -203,6 +214,8 @@ CLI drivers, built when brosoundml is the top-level project
   `BROSOUNDML_KOKORO_PROFILE=1` for the library's per-stage breakdown.
 - `brosoundml_transcribe` — Whisper WAV → text.
 - `brosoundml_parakeet_transcribe` — Parakeet-TDT WAV → text (+ `--timestamps`).
+- `brosoundml_sortformer_diarize` — Sortformer WAV → RTTM speaker segments
+  (`--streaming` for the AOSC session path; `--probs-out` dumps the T×4 matrix).
 - `brosoundml_qwen_tts_bench` / `_roundtrip` / `_clone` — Qwen3-TTS synthesis,
   codec encode↔decode round-trip, and zero-shot voice clone.
 - `brosoundml_wake_synth` / `_inspect` / `_train` / `_test` / `_probe` /

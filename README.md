@@ -26,6 +26,7 @@ tail).
 | [Whisper](docs/whisper.md) | speech → text | CPU + CUDA | encoder-decoder; HF checkpoints tiny → large-v3 |
 | [Parakeet-TDT](docs/parakeet.md) | speech → text | CPU + CUDA | FastConformer + TDT transducer; multilingual 0.6B-v3 + timestamps |
 | [Qwen3-ASR](docs/qwen-asr.md) | speech → text | CPU + CUDA | AuT encoder + Qwen3 decoder; 52-language + language ID, context biasing |
+| [Sortformer](docs/sortformer.md) | speaker diarization | CPU + CUDA | NEST FastConformer + 18-layer transformer; streaming Arrival-Order Speaker Cache, 4 speakers |
 | [RAVE](docs/rave.md) | waveform ⇄ latent | CPU + CUDA + Metal | ACIDS/IRCAM v2 neural audio autoencoder; editable PCA latent |
 | [Wake-word](docs/wake-word.md) | keyword spotting | CPU + CUDA | 2D BC-ResNet (PCEN) single-keyword streaming spotter + training toolchain |
 | [Phoneme spotter](docs/phoneme-spotter.md) | open-vocab spotting | CPU + CUDA | PhonemeNet posteriors + streaming template matcher; "type a word, spot it" |
@@ -99,6 +100,7 @@ tools, caveats) lives in [`docs/`](docs):
 
 - [Kokoro-82M](docs/kokoro.md) · [Qwen3-TTS](docs/qwen-tts.md) — text-to-speech
 - [Whisper](docs/whisper.md) · [Parakeet-TDT](docs/parakeet.md) · [Qwen3-ASR](docs/qwen-asr.md) — speech-to-text
+- [Sortformer](docs/sortformer.md) — streaming speaker diarization
 - [RAVE](docs/rave.md) — neural audio autoencoder
 - [Wake-word](docs/wake-word.md) · [Phoneme spotter](docs/phoneme-spotter.md) — keyword spotting
 - [G2P](docs/g2p.md) — in-tree English grapheme-to-phoneme
