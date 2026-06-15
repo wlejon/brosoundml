@@ -88,6 +88,14 @@ public:
     AudioBuffer decode(const std::vector<float>& latent, int channels,
                        int frames) const;
 
+    // Decode a REAL (de-chunked, de-normalised) latent [latent_dim, frames_dechunked]
+    // straight through the vocoder conv stack — the inverse pairing for the AE
+    // encoder, whose output is exactly this. Unlike decode(), it does no de-chunk
+    // or de-normalise; it synthesises base_chunk (512) samples per de-chunked
+    // frame. Used by the encoder reconstruction loop. Throws if not loaded.
+    AudioBuffer decode_real(const float* latent_real, int latent_dim,
+                            int frames_dechunked) const;
+
     // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
     //
     // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor

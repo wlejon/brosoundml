@@ -882,6 +882,12 @@ struct Supertonic::Impl {
     void load_duration_predictor(const fs::path& path);
     void load_vector_estimator(const fs::path& path);
     AudioBuffer decode(const float* latent, int channels, int frames) const;
+    // The vocoder conv stack over a de-chunked, de-normalised real latent
+    // [latent_dim, LF] (conv_in -> 10 ConvNeXt -> BN -> head -> waveform).
+    // decode() builds `dn` (de-chunk + de-normalise) then calls this; the AE
+    // encoder's reconstruction path feeds its real latent straight in.
+    AudioBuffer decode_dn(const std::vector<float>& dn, int LF) const;
+    AudioBuffer decode_real(const float* latent_real, int latent_dim, int LF) const;
     std::vector<float> encode_text(const std::vector<int>& ids,
                                    const std::vector<float>& style) const;
     float predict_duration(const std::vector<int>& ids,
@@ -1669,6 +1675,25 @@ AudioBuffer Supertonic::Impl::decode(const float* latent, int channels,
         }
     }
 
+    return decode_dn(dn, LF);
+}
+
+// Decode a real (de-chunked, de-normalised) latent [latent_dim, LF] directly —
+// the inverse pairing for the AE encoder, which produces exactly this. Skips the
+// de-chunk + de-normalise that decode() does for the flow-domain latent.
+AudioBuffer Supertonic::Impl::decode_real(const float* latent_real, int latent_dim,
+                                          int LF) const {
+    if (!ready) fail("decode_real() before load()");
+    if (latent_dim != cfg.latent_dim)
+        fail("decode_real latent_dim (" + std::to_string(latent_dim) +
+             ") != model latent_dim");
+    if (LF <= 0) fail("LF must be positive");
+    return decode_dn(std::vector<float>(latent_real,
+                     latent_real + static_cast<std::size_t>(latent_dim) * LF), LF);
+}
+
+AudioBuffer Supertonic::Impl::decode_dn(const std::vector<float>& dn, int LF) const {
+    const int D = cfg.latent_dim;           // 24
     bt::Tensor scratch;
     bt::Tensor h = rconv(bt::Tensor::from_host_on(dev, dn.data(), 1, D * LF),
                          conv_in, D, LF, /*dilation=*/1, /*groups=*/1, scratch);
@@ -1742,6 +1767,11 @@ AudioBuffer Supertonic::decode(const float* latent, int channels, int frames) co
 AudioBuffer Supertonic::decode(const std::vector<float>& latent, int channels,
                                int frames) const {
     return impl_->decode(latent.data(), channels, frames);
+}
+
+AudioBuffer Supertonic::decode_real(const float* latent_real, int latent_dim,
+                                    int frames_dechunked) const {
+    return impl_->decode_real(latent_real, latent_dim, frames_dechunked);
 }
 
 std::vector<float> Supertonic::encode_text(const std::vector<int>& text_ids,
