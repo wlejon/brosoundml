@@ -391,6 +391,50 @@ static void test_field_backward() {
     fd_directional(style_val, dStyleVal, loss, rng, "field.dStyleVal");
 }
 
+// ─── vocoder decode (de-chunk + causal ConvNeXt + BN + leaky head + interleave)
+static void test_vocoder() {
+    std::mt19937 rng(0x5706u);
+    const int D = 3, CC = 2, frames = 4, LF = CC * frames;   // 8
+    const int C = 6, inter = 10, h1c = 5, BC = 4;
+    const float inv_scale = 0.9f, bn_eps = 1.0e-5f, slope = 0.1f;
+
+    st::ConvW conv_in = make_convw(C, D, /*k=*/3, /*bias=*/true, rng);   // causal k3
+    std::vector<st::ConvNeXtBlock> blocks;
+    blocks.push_back(make_convnext(C, inter, /*dil=*/1, rng));
+    blocks.push_back(make_convnext(C, inter, /*dil=*/2, rng));
+    st::ConvW head1 = make_convw(h1c, C, /*k=*/3, /*bias=*/true, rng);
+    st::ConvW head2 = make_convw(BC, h1c, /*k=*/1, /*bias=*/true, rng);
+
+    Tensor bn_g    = make_random(C, 1, rng, 0.5f);
+    Tensor bn_b    = make_random(C, 1, rng, 0.3f);
+    Tensor bn_mean = make_random(C, 1, rng, 0.2f);
+    Tensor bn_var  = make_random(C, 1, rng, 0.4f);
+    for (int i = 0; i < bn_var.size(); ++i) bn_var[i] = std::fabs(bn_var[i]) + 0.5f;
+
+    std::vector<float> lmean(D), lstd(D);
+    { std::uniform_real_distribution<float> u(-0.3f, 0.3f);
+      for (int d = 0; d < D; ++d) { lmean[d] = u(rng); lstd[d] = std::fabs(u(rng)) + 0.5f; } }
+
+    Tensor latent = make_random(1, D * CC * frames, rng, 0.6f);
+    Tensor target = make_random(1, BC * LF, rng, 0.5f);
+
+    st::VocoderCache cache; Tensor wave;
+    auto fwd = [&]() {
+        st::vocoder_decode_forward_train(latent, D, CC, frames, inv_scale, lmean, lstd,
+                                         conv_in, blocks, bn_g, bn_b, bn_mean, bn_var,
+                                         bn_eps, head1, slope, head2, wave, cache);
+    };
+    fwd();
+    Tensor dW = Tensor::mat(1, wave.size());
+    for (int i = 0; i < dW.size(); ++i) dW[i] = wave[i] - target[i];
+    Tensor dL;
+    st::vocoder_decode_backward(conv_in, blocks, head1, slope, head2, inv_scale,
+                                lstd, cache, dW, dL);
+
+    auto loss = [&]() { fwd(); return mse_loss(wave, target)(); };
+    fd_directional(latent, dL, loss, rng, "vocoder.dLatent");
+}
+
 int main() {
     brotensor::init();
     test_pconv_1x1();
@@ -403,6 +447,7 @@ int main() {
     test_style_attention();
     test_rope_attention();
     test_field_backward();
+    test_vocoder();
 
     if (g_failures) { std::printf("test_supertonic_backward: %d failure(s)\n", g_failures); return 1; }
     std::printf("test_supertonic_backward: OK\n");

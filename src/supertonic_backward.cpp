@@ -660,5 +660,149 @@ void field_backward(const std::vector<VeBlock>& blocks,
     }
 }
 
+// ─── vocoder (autoencoder decoder) ───────────────────────────────────────────
+
+void vocoder_convnext_forward_train(const bt::Tensor& h, const ConvNeXtBlock& blk,
+                                    int C, int L, int dil, bt::Tensor& y,
+                                    ConvNeXtCache& cache) {
+    cache.C = C; cache.L = L; cache.dil = dil;
+
+    // depthwise conv — CAUSAL left-replicate pad (rconv), the vocoder variant.
+    bt::Tensor dwy;
+    rconv_forward_train(h, blk.dw, C, L, dil, /*groups=*/C, dwy, cache.dw);
+
+    // channel-wise LayerNorm (inference math == training math; cache for backward).
+    bt::Tensor seq; bt::nchw_to_sequence(dwy, 1, C, 1, L, seq);   // [L,C]
+    bt::Tensor seqn, mean_r;
+    bt::layernorm_forward_batched_with_caches(seq, blk.ln_g, blk.ln_b, seqn,
+                                              cache.ln_xhat, mean_r,
+                                              cache.ln_rstd, 1.0e-6f);
+    bt::Tensor normed; bt::sequence_to_nchw(seqn, 1, C, 1, L, normed);  // [C,L]
+
+    // 1×1 expand -> GELU -> 1×1 project (1×1 rconv == pconv matmul path).
+    pconv_forward_train(normed, blk.pw1, C, L, 1, 1, 0, 0, 0, cache.a, cache.pw1);
+    bt::Tensor ga; bt::gelu_exact_forward(cache.a, ga);
+    pconv_forward_train(ga, blk.pw2, blk.pw1.cout, L, 1, 1, 0, 0, 0, y, cache.pw2);
+
+    bt::add_inplace(y, h);                                       // residual
+}
+
+void vocoder_decode_forward_train(const bt::Tensor& latent_in,
+                                  int D, int CC, int frames, float inv_scale,
+                                  const std::vector<float>& latent_mean,
+                                  const std::vector<float>& latent_std,
+                                  const ConvW& conv_in,
+                                  const std::vector<ConvNeXtBlock>& blocks,
+                                  const bt::Tensor& bn_g, const bt::Tensor& bn_b,
+                                  const bt::Tensor& bn_mean, const bt::Tensor& bn_var,
+                                  float bn_eps, const ConvW& head1, float prelu_slope,
+                                  const ConvW& head2, bt::Tensor& wave,
+                                  VocoderCache& cache) {
+    const bt::Device dev = latent_in.device;
+    const int LF = CC * frames;
+    cache.D = D; cache.CC = CC; cache.frames = frames; cache.LF = LF;
+
+    // de-chunk + de-normalise (host): (d*CC+jx, t) -> dn[d, t*CC+jx].
+    const std::vector<float> lin = latent_in.to_host_vector();
+    std::vector<float> dn(static_cast<std::size_t>(D) * LF);
+    for (int d = 0; d < D; ++d) {
+        const float sd = latent_std[d], mn = latent_mean[d];
+        for (int t = 0; t < frames; ++t)
+            for (int jx = 0; jx < CC; ++jx) {
+                const float v = lin[static_cast<std::size_t>(d * CC + jx) * frames + t];
+                dn[static_cast<std::size_t>(d) * LF + (t * CC + jx)] = v * inv_scale * sd + mn;
+            }
+    }
+    bt::Tensor dnt = bt::Tensor::from_host_on(dev, dn.data(), 1, D * LF);
+
+    bt::Tensor h;
+    rconv_forward_train(dnt, conv_in, D, LF, 1, 1, h, cache.conv_in);
+    const int C = conv_in.cout; cache.C = C;
+
+    cache.blocks.resize(blocks.size());
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        bt::Tensor y;
+        vocoder_convnext_forward_train(h, blocks[i], C, LF, blocks[i].dil, y,
+                                       cache.blocks[i]);
+        h = std::move(y);
+    }
+
+    // final BatchNorm (inference): per-channel affine. Cache the diagonal scale.
+    bt::Tensor hb;
+    bt::batch_norm_inference(h, bn_g, bn_b, bn_mean, bn_var, 1, C, 1, LF, bn_eps, hb);
+    const std::vector<float> gh = bn_g.to_host_vector(), vh = bn_var.to_host_vector();
+    std::vector<float> sc(C);
+    for (int c = 0; c < C; ++c) sc[c] = gh[c] / std::sqrt(vh[c] + bn_eps);
+    cache.bn_scale = bt::Tensor::from_host_on(dev, sc.data(), C, 1);
+
+    // head: rconv(k3) -> leaky_relu -> rconv(k1).
+    bt::Tensor hh;
+    rconv_forward_train(hb, head1, C, LF, 1, 1, hh, cache.head1);
+    cache.head1_out = hh.clone();
+    bt::Tensor hp; bt::leaky_relu_forward(hh, prelu_slope, hp);
+    bt::Tensor out;
+    rconv_forward_train(hp, head2, head1.cout, LF, 1, 1, out, cache.head2);
+    const int BC = head2.cout; cache.BC = BC;
+
+    // output interleave (host): waveform[s*BC+c] = out[c*LF+s].
+    const std::vector<float> od = out.to_host_vector();
+    std::vector<float> wv(static_cast<std::size_t>(BC) * LF);
+    for (int c = 0; c < BC; ++c)
+        for (int s = 0; s < LF; ++s)
+            wv[static_cast<std::size_t>(s) * BC + c] = od[static_cast<std::size_t>(c) * LF + s];
+    wave = bt::Tensor::from_host_on(dev, wv.data(), 1, BC * LF);
+}
+
+void vocoder_decode_backward(const ConvW& conv_in,
+                             const std::vector<ConvNeXtBlock>& blocks,
+                             const ConvW& head1, float prelu_slope,
+                             const ConvW& head2, float inv_scale,
+                             const std::vector<float>& latent_std,
+                             const VocoderCache& cache, const bt::Tensor& dWave,
+                             bt::Tensor& dLatent) {
+    const bt::Device dev = dWave.device;
+    const int LF = cache.LF, C = cache.C, BC = cache.BC,
+              D = cache.D, CC = cache.CC, frames = cache.frames;
+
+    // output interleave adjoint: dOut[c*LF+s] = dWave[s*BC+c].
+    const std::vector<float> dwv = dWave.to_host_vector();
+    std::vector<float> dout(static_cast<std::size_t>(BC) * LF);
+    for (int c = 0; c < BC; ++c)
+        for (int s = 0; s < LF; ++s)
+            dout[static_cast<std::size_t>(c) * LF + s] = dwv[static_cast<std::size_t>(s) * BC + c];
+    bt::Tensor dOut = bt::Tensor::from_host_on(dev, dout.data(), 1, BC * LF);
+
+    bt::Tensor dHp; pconv_backward(head2, cache.head2, dOut, dHp);
+    bt::Tensor dHh; bt::leaky_relu_backward(cache.head1_out, dHp, prelu_slope, dHh);
+    bt::Tensor dHb; pconv_backward(head1, cache.head1, dHh, dHb);
+
+    // BatchNorm inference adjoint: diagonal scale gamma/sqrt(var+eps).
+    const std::vector<float> sc = cache.bn_scale.to_host_vector();
+    std::vector<float> dhv = dHb.to_host_vector();
+    for (int c = 0; c < C; ++c)
+        for (int l = 0; l < LF; ++l) dhv[static_cast<std::size_t>(c) * LF + l] *= sc[c];
+    bt::Tensor dH = bt::Tensor::from_host_on(dev, dhv.data(), 1, C * LF);
+
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        bt::Tensor dX;
+        convnext_block_backward(blocks[i], cache.blocks[i], dH, dX);
+        dH = std::move(dX);
+    }
+
+    bt::Tensor dDn; pconv_backward(conv_in, cache.conv_in, dH, dDn);  // (1, D*LF)
+
+    // de-chunk + de-norm adjoint (mn is a constant -> no grad; scale by inv_scale*std).
+    const std::vector<float> ddn = dDn.to_host_vector();
+    std::vector<float> dl(static_cast<std::size_t>(D) * CC * frames, 0.0f);
+    for (int d = 0; d < D; ++d) {
+        const float sd = inv_scale * latent_std[d];
+        for (int t = 0; t < frames; ++t)
+            for (int jx = 0; jx < CC; ++jx)
+                dl[static_cast<std::size_t>(d * CC + jx) * frames + t] =
+                    ddn[static_cast<std::size_t>(d) * LF + (t * CC + jx)] * sd;
+    }
+    dLatent = bt::Tensor::from_host_on(dev, dl.data(), 1, D * CC * frames);
+}
+
 }  // namespace st_detail
 }  // namespace brosoundml

@@ -276,5 +276,71 @@ void field_backward(const std::vector<VeBlock>& blocks,
                     const brotensor::Tensor& dY,
                     brotensor::Tensor& dStyleVal);
 
+// ─── vocoder (autoencoder decoder) backward ──────────────────────────────────
+//
+// Forward (supertonic.cpp decode): latent [D*CC, frames] -> waveform.
+//   1. de-chunk + de-normalise (host): channel (d*CC+j) at frame t lands at
+//      de-chunked position t*CC+j; value = v*inv_scale*std[d] + mean[d]. Gives
+//      dn [D, LF] (LF = CC*frames).
+//   2. conv_in: causal rconv (D -> C), kernel 7, dilation 1.
+//   3. `blocks.size()` ConvNeXt blocks, each CAUSAL (the depthwise + pointwise
+//      use rconv, not the symmetric-pad pconv of the field/encoder blocks) — so
+//      vocoder_convnext_forward_train fills the SAME ConvNeXtCache the shared
+//      convnext_block_backward consumes (pconv_backward replays either pad type
+//      from the cache, so the backward needs no vocoder-specific variant).
+//   4. final BatchNorm in INFERENCE mode (frozen running stats): a per-channel
+//      affine, so its adjoint is the diagonal scale gamma/sqrt(var+eps) — NOT
+//      batch_norm_backward (that is the training-mode gradient with the
+//      cross-sample mean/var terms, wrong for frozen stats).
+//   5. head1 (rconv k3) -> leaky_relu(slope) -> head2 (rconv k1) -> [BC, LF].
+//   6. output interleave (host): waveform[s*BC+c] = out[c*LF+s].
+// All weights FROZEN; only d(latent) is produced.
+
+struct VocoderCache {
+    int D = 0, CC = 0, frames = 0, LF = 0, C = 0, BC = 0;
+    PConvCache                 conv_in;
+    std::vector<ConvNeXtCache> blocks;   // causal ConvNeXt blocks (rconv depthwise)
+    brotensor::Tensor          bn_scale; // (C,1) gamma/sqrt(var+eps), BN-inference adjoint
+    PConvCache                 head1;    // rconv k3
+    brotensor::Tensor          head1_out;// leaky_relu input (rconv head1 output) (1, h1c*LF)
+    PConvCache                 head2;    // rconv k1
+};
+
+// One causal (rconv-depthwise) ConvNeXt block, filling a ConvNeXtCache that the
+// shared convnext_block_backward reverses unchanged.
+//   h: (1, C*L).  y: (1, C*L), overwritten.
+void vocoder_convnext_forward_train(const brotensor::Tensor& h,
+                                    const ConvNeXtBlock& blk, int C, int L, int dil,
+                                    brotensor::Tensor& y, ConvNeXtCache& cache);
+
+// Decoder forward (identical math to decode), emitting the VocoderCache.
+//   latent_in: (1, D*CC*frames) channel-major (the field/denoise output).
+//   wave:      (1, BC*LF), overwritten.
+void vocoder_decode_forward_train(const brotensor::Tensor& latent_in,
+                                  int D, int CC, int frames, float inv_scale,
+                                  const std::vector<float>& latent_mean,
+                                  const std::vector<float>& latent_std,
+                                  const ConvW& conv_in,
+                                  const std::vector<ConvNeXtBlock>& blocks,
+                                  const brotensor::Tensor& bn_g,
+                                  const brotensor::Tensor& bn_b,
+                                  const brotensor::Tensor& bn_mean,
+                                  const brotensor::Tensor& bn_var, float bn_eps,
+                                  const ConvW& head1, float prelu_slope,
+                                  const ConvW& head2,
+                                  brotensor::Tensor& wave, VocoderCache& cache);
+
+// Reverse pass.
+//   dWave:   (1, BC*LF)        gradient on the output waveform.
+//   dLatent: (1, D*CC*frames)  gradient on the decoder input; overwritten.
+void vocoder_decode_backward(const ConvW& conv_in,
+                             const std::vector<ConvNeXtBlock>& blocks,
+                             const ConvW& head1, float prelu_slope,
+                             const ConvW& head2, float inv_scale,
+                             const std::vector<float>& latent_std,
+                             const VocoderCache& cache,
+                             const brotensor::Tensor& dWave,
+                             brotensor::Tensor& dLatent);
+
 }  // namespace st_detail
 }  // namespace brosoundml
