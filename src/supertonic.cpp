@@ -223,6 +223,23 @@ Gemm load_gemm(const sf::File& f, const std::string& wname,
 bt::Tensor pconv(const bt::Tensor& x, const ConvW& c, int Cin, int L,
                  int dilation, int groups, int pad_left, int pad_right,
                  int mode, bt::Tensor& scratch) {
+    // A pointwise (1x1, full, unpadded) conv is exactly Y[Cout,L] = W[Cout,Cin] @
+    // X[Cin,L] — a GEMM. brotensor's conv1d routes through the naive direct-conv
+    // conv2d kernel (no FP32 fast path), which is ~20x slower than the tiled
+    // matmul for these channel-heavy shapes, so express it as a matmul + a
+    // channel-broadcast bias. (Depthwise / kernel>1 / padded convs stay convs.)
+    if (c.k == 1 && groups == 1 && pad_left == 0 && pad_right == 0) {
+        bt::Tensor y;
+        const bt::Tensor xv = bt::Tensor::view(x.device, x.data, Cin, L, x.dtype);
+        bt::matmul(c.w, xv, y);                 // [Cout, L], channel-major data
+        if (c.has_b) bt::add_channel_bias_inplace(y, c.b, c.cout, L);
+        // conv1d tags its output (1, Cout*L); the matmul tags it (Cout, L) with
+        // the same channel-major bytes. Re-tag so the downstream shape checks
+        // (pad1d / nchw_to_sequence expect rows==N) accept it — no data move.
+        y.rows = 1;
+        y.cols = c.cout * L;
+        return y;
+    }
     bt::Tensor y;
     const bt::Tensor* in = &x;
     int Lp = L;
