@@ -12,6 +12,7 @@
 // test order never perturbs another's inputs. CPU-resident FP32.
 
 #include "supertonic_backward.h"
+#include "qwen_tts_speaker_encoder.h"   // QwenTtsSpkConv / QwenTtsSpkSERes2
 
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
@@ -435,6 +436,209 @@ static void test_vocoder() {
     fd_directional(latent, dL, loss, rng, "vocoder.dLatent");
 }
 
+// ─── ECAPA-TDNN speaker-encoder backward ─────────────────────────────────────
+//
+// Sub-atoms are FD-checked in ISOLATION (mel frontend, res2net chunk chain,
+// SE gate, attentive pooling) before the full mel->embedding pass, so a sign
+// error deep in pooling localises instead of vanishing into an end-to-end check.
+// The mel basis is an arbitrary POSITIVE frozen matrix (not the real librosa
+// slaney basis) — the backward math is basis-agnostic, and positivity keeps the
+// log argument clear of the 1e-5 clamp so the central difference is clean.
+
+namespace bsm = brosoundml;
+
+// QwenTtsSpkConv with random weights (reuses make_convw's OIL layout; carries
+// the explicit dilation conv_same needs for its reflect-pad width).
+static bsm::QwenTtsSpkConv spk(int cout, int cin, int k, int dil,
+                               std::mt19937& rng, float scale = 0.3f) {
+    st::ConvW c = make_convw(cout, cin, k, /*bias=*/true, rng, scale);
+    bsm::QwenTtsSpkConv q;
+    q.w = c.w; q.b = c.b;
+    q.cin = cin; q.cout = cout; q.k = k; q.dilation = dil;
+    return q;
+}
+
+static Tensor make_hann(int win) {
+    std::vector<float> w(static_cast<std::size_t>(win));
+    for (int i = 0; i < win; ++i)
+        w[i] = 0.5f - 0.5f * std::cos(2.0f * 3.14159265358979323846f * i / win);
+    return Tensor::from_host_on(Device::CPU, w.data(), 1, win);
+}
+
+static Tensor make_basis(int M, int nb, std::mt19937& rng) {
+    std::uniform_real_distribution<float> u(0.1f, 0.6f);   // positive -> acc >> clamp
+    std::vector<float> v(static_cast<std::size_t>(M) * nb);
+    for (auto& x : v) x = u(rng);
+    return Tensor::from_host_on(Device::CPU, v.data(), M, nb);
+}
+
+// mel frontend alone: d(wav) of an MSE on the log-mel output.
+static void test_ecapa_mel() {
+    std::mt19937 rng(0x5710u);
+    const int n_fft = 16, hop = 4, win = 16, M = 8, n = 96;  // frames T = 24
+    Tensor hann = make_hann(win);
+    Tensor basis = make_basis(M, n_fft / 2 + 1, rng);
+
+    Tensor wav    = make_random(1, n, rng, 1.0f);
+    st::MelCache cache; std::vector<float> out;
+    auto fwd = [&]() {
+        st::mel_forward_train(wav.host_f32(), n, hann, basis, n_fft, hop, win, M, out, cache);
+    };
+    fwd();
+    std::vector<float> target(out.size());
+    { std::uniform_real_distribution<float> u(-0.5f, 0.5f); for (auto& v : target) v = u(rng); }
+
+    std::vector<float> dOut(out.size()), dWav;
+    fwd();
+    for (std::size_t i = 0; i < out.size(); ++i) dOut[i] = out[i] - target[i];
+    st::mel_backward(hann, basis, cache, dOut, dWav);
+    Tensor analytic = Tensor::from_host_on(Device::CPU, dWav.data(), 1, n);
+
+    auto loss = [&]() {
+        fwd(); double s = 0.0;
+        for (std::size_t i = 0; i < out.size(); ++i) { double d = out[i] - target[i]; s += 0.5 * d * d; }
+        return s;
+    };
+    fd_directional(wav, analytic, loss, rng, "ecapa_mel.dWav", 8e-3, 1.5e-2);
+}
+
+// res2net alone (scale=4 -> exercises the sequential chunk chain).
+static void test_ecapa_res2net() {
+    std::mt19937 rng(0x5711u);
+    const int C = 12, L = 10, scale = 4, hc = C / scale;  // hc = 3
+    std::vector<bsm::QwenTtsSpkConv> res2;
+    for (int r = 0; r < scale - 1; ++r) res2.push_back(spk(hc, hc, /*k=*/3, /*dil=*/2, rng));
+
+    Tensor x      = make_random(1, C * L, rng, 0.6f);
+    Tensor target = make_random(1, C * L, rng, 0.5f);
+    st::Res2NetCache cache; std::vector<float> y;
+    auto fwd = [&]() {
+        std::vector<float> xv(x.host_f32(), x.host_f32() + C * L);
+        st::res2net_forward_train(res2, xv, C, L, scale, y, cache);
+    };
+    fwd();
+    std::vector<float> dY(y.size());
+    for (int i = 0; i < C * L; ++i) dY[i] = y[i] - target[i];
+    std::vector<float> dX; st::res2net_backward(res2, cache, dY, dX);
+    Tensor analytic = Tensor::from_host_on(Device::CPU, dX.data(), 1, C * L);
+
+    auto loss = [&]() {
+        fwd(); double s = 0.0;
+        for (int i = 0; i < C * L; ++i) { double d = y[i] - target[i]; s += 0.5 * d * d; }
+        return s;
+    };
+    fd_directional(x, analytic, loss, rng, "ecapa_res2net.dX");
+}
+
+// squeeze-excitation gate alone.
+static void test_ecapa_se() {
+    std::mt19937 rng(0x5712u);
+    const int C = 10, L = 8, se = 4;
+    bsm::QwenTtsSpkConv se1 = spk(se, C, 1, 1, rng);
+    bsm::QwenTtsSpkConv se2 = spk(C, se, 1, 1, rng);
+
+    Tensor x      = make_random(1, C * L, rng, 0.6f);
+    Tensor target = make_random(1, C * L, rng, 0.5f);
+    st::SeCache cache; std::vector<float> y;
+    auto fwd = [&]() {
+        std::vector<float> xv(x.host_f32(), x.host_f32() + C * L);
+        st::se_forward_train(se1, se2, xv, C, L, y, cache);
+    };
+    fwd();
+    std::vector<float> dY(y.size());
+    for (int i = 0; i < C * L; ++i) dY[i] = y[i] - target[i];
+    std::vector<float> dX; st::se_backward(se1, se2, cache, dY, dX);
+    Tensor analytic = Tensor::from_host_on(Device::CPU, dX.data(), 1, C * L);
+
+    auto loss = [&]() {
+        fwd(); double s = 0.0;
+        for (int i = 0; i < C * L; ++i) { double d = y[i] - target[i]; s += 0.5 * d * d; }
+        return s;
+    };
+    fd_directional(x, analytic, loss, rng, "ecapa_se.dX");
+}
+
+// attentive statistics pooling alone (small agg, T).
+static void test_ecapa_asp() {
+    std::mt19937 rng(0x5713u);
+    const int agg = 6, T = 7, attn_ch = 5;
+    bsm::QwenTtsSpkConv asp_tdnn = spk(attn_ch, 3 * agg, 1, 1, rng);
+    bsm::QwenTtsSpkConv asp_conv = spk(agg, attn_ch, 1, 1, rng);
+
+    Tensor a      = make_random(1, agg * T, rng, 0.6f);
+    Tensor target = make_random(1, 2 * agg, rng, 0.5f);
+    st::AspCache cache; std::vector<float> pooled;
+    auto fwd = [&]() {
+        std::vector<float> av(a.host_f32(), a.host_f32() + agg * T);
+        st::asp_forward_train(av, agg, T, asp_tdnn, asp_conv, pooled, cache);
+    };
+    fwd();
+    std::vector<float> dP(pooled.size());
+    for (int i = 0; i < 2 * agg; ++i) dP[i] = pooled[i] - target[i];
+    std::vector<float> dA; st::asp_backward(asp_tdnn, asp_conv, cache, dP, dA);
+    Tensor analytic = Tensor::from_host_on(Device::CPU, dA.data(), 1, agg * T);
+
+    auto loss = [&]() {
+        fwd(); double s = 0.0;
+        for (int i = 0; i < 2 * agg; ++i) { double d = pooled[i] - target[i]; s += 0.5 * d * d; }
+        return s;
+    };
+    fd_directional(a, analytic, loss, rng, "ecapa_asp.dA");
+}
+
+static bsm::QwenTtsSpkSERes2 make_seres2(int C, int scale, int se, int k, int dil,
+                                         std::mt19937& rng) {
+    bsm::QwenTtsSpkSERes2 b;
+    b.tdnn1 = spk(C, C, 1, 1, rng);
+    const int hc = C / scale;
+    for (int r = 0; r < scale - 1; ++r) b.res2net.push_back(spk(hc, hc, k, dil, rng));
+    b.tdnn2 = spk(C, C, 1, 1, rng);
+    b.se1 = spk(se, C, 1, 1, rng);
+    b.se2 = spk(C, se, 1, 1, rng);
+    return b;
+}
+
+// full ECAPA: d(embedding) -> d(waveform) on a tiny synthetic encoder.
+static void test_ecapa_full() {
+    std::mt19937 rng(0x5714u);
+    const int n_fft = 16, hop = 4, win = 16, M = 8, n = 96;  // frames T = 24
+    const int C = 12, scale = 4, agg = 3 * C, se = 5, attn_ch = 7, enc_dim = 4;
+    Tensor hann = make_hann(win);
+    Tensor basis = make_basis(M, n_fft / 2 + 1, rng);
+
+    bsm::QwenTtsSpkConv block0 = spk(C, M, /*k=*/5, /*dil=*/1, rng);
+    std::vector<bsm::QwenTtsSpkSERes2> blocks;
+    for (int i = 0; i < 3; ++i) blocks.push_back(make_seres2(C, scale, se, /*k=*/3, /*dil=*/2, rng));
+    bsm::QwenTtsSpkConv mfa      = spk(agg, agg, 1, 1, rng);        // cin = 3C = agg
+    bsm::QwenTtsSpkConv asp_tdnn = spk(attn_ch, 3 * agg, 1, 1, rng);
+    bsm::QwenTtsSpkConv asp_conv = spk(agg, attn_ch, 1, 1, rng);
+    bsm::QwenTtsSpkConv fc       = spk(enc_dim, 2 * agg, 1, 1, rng);
+
+    Tensor wav = make_random(1, n, rng, 1.0f);
+    std::vector<float> target(enc_dim);
+    { std::uniform_real_distribution<float> u(-0.5f, 0.5f); for (auto& v : target) v = u(rng); }
+
+    st::EcapaCache cache; std::vector<float> emb, dWav, dEmb;
+    auto fwd = [&]() {
+        st::ecapa_forward_train(wav.host_f32(), n, hann, basis, n_fft, hop, win, M,
+                                block0, blocks, scale, mfa, asp_tdnn, asp_conv, fc,
+                                emb, cache);
+    };
+    fwd();
+    dEmb.assign(emb.size(), 0.0f);
+    for (std::size_t i = 0; i < emb.size(); ++i) dEmb[i] = emb[i] - target[i];
+    st::ecapa_backward(block0, blocks, scale, mfa, asp_tdnn, asp_conv, fc,
+                       hann, basis, cache, dEmb, dWav);
+    Tensor analytic = Tensor::from_host_on(Device::CPU, dWav.data(), 1, n);
+
+    auto loss = [&]() {
+        fwd(); double s = 0.0;
+        for (std::size_t i = 0; i < emb.size(); ++i) { double d = emb[i] - target[i]; s += 0.5 * d * d; }
+        return s;
+    };
+    fd_directional(wav, analytic, loss, rng, "ecapa_full.dWav", 1.0e-2, 2.0e-2);
+}
+
 int main() {
     brotensor::init();
     test_pconv_1x1();
@@ -448,6 +652,20 @@ int main() {
     test_rope_attention();
     test_field_backward();
     test_vocoder();
+
+    // ECAPA sub-atoms + full pass, with per-check pass/fail reporting.
+    struct { const char* name; void (*fn)(); } ecapa[] = {
+        {"ecapa_mel",     test_ecapa_mel},
+        {"ecapa_res2net", test_ecapa_res2net},
+        {"ecapa_se",      test_ecapa_se},
+        {"ecapa_asp",     test_ecapa_asp},
+        {"ecapa_full",    test_ecapa_full},
+    };
+    for (const auto& e : ecapa) {
+        int before = g_failures;
+        e.fn();
+        std::printf("  %-14s %s\n", e.name, (g_failures == before) ? "PASS" : "FAIL");
+    }
 
     if (g_failures) { std::printf("test_supertonic_backward: %d failure(s)\n", g_failures); return 1; }
     std::printf("test_supertonic_backward: OK\n");

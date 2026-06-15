@@ -1,8 +1,10 @@
 #include "supertonic_backward.h"
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -802,6 +804,517 @@ void vocoder_decode_backward(const ConvW& conv_in,
                     ddn[static_cast<std::size_t>(d) * LF + (t * CC + jx)] * sd;
     }
     dLatent = bt::Tensor::from_host_on(dev, dl.data(), 1, D * CC * frames);
+}
+
+// ─── ECAPA-TDNN speaker-encoder backward ─────────────────────────────────────
+
+namespace {
+
+// relu adjoint mask helper: dpre[i] = dpost[i] * (post[i] > 0).
+void relu_mask_(const std::vector<float>& post, std::vector<float>& d) {
+    for (std::size_t i = 0; i < d.size(); ++i) if (post[i] <= 0.0f) d[i] = 0.0f;
+}
+
+}  // namespace
+
+// ── conv_same ─────────────────────────────────────────────────────────────────
+
+void conv_same_forward_train(const QwenTtsSpkConv& c, const std::vector<float>& x,
+                             int L, std::vector<float>& y, ConvSameCache& cache) {
+    const bt::Device dev = c.w.device;   // weights pin the compute device
+    bt::DeviceScope scope(dev);
+    const int p = c.dilation * (c.k - 1) / 2;
+    cache.cin = c.cin; cache.cout = c.cout; cache.k = c.k; cache.dilation = c.dilation;
+    cache.L = L; cache.p = p; cache.Lp = L + 2 * p; cache.L_out = L;
+
+    bt::Tensor X = bt::Tensor::from_host_on(dev, x.data(), 1, c.cin * L);
+    bt::Tensor Xp;
+    if (p > 0) bt::pad1d_forward(X, 1, c.cin, L, p, p, /*mode=*/1, Xp);  // reflect
+    const bt::Tensor& in = (p > 0) ? Xp : X;
+    bt::Tensor Y;
+    bt::conv1d(in, c.w, &c.b, /*N=*/1, c.cin, cache.Lp, c.cout, c.k, /*stride=*/1,
+               /*padding=*/0, c.dilation, Y);
+    bt::Tensor Yh = (Y.device == bt::Device::CPU) ? std::move(Y) : Y.to(bt::Device::CPU);
+    const float* yp = Yh.host_f32();
+    y.assign(yp, yp + static_cast<std::size_t>(c.cout) * L);
+}
+
+void conv_same_backward(const QwenTtsSpkConv& c, const ConvSameCache& cache,
+                        const std::vector<float>& dY, std::vector<float>& dX) {
+    const bt::Device dev = c.w.device;
+    bt::DeviceScope scope(dev);
+    bt::Tensor dYt = bt::Tensor::from_host_on(dev, dY.data(), 1, cache.cout * cache.L_out);
+    bt::Tensor dXp;  // grad over the (reflect-)padded input (1, cin*Lp)
+    bt::conv1d_backward_input(c.w, dYt, /*N=*/1, cache.cin, cache.Lp, cache.cout,
+                              cache.k, /*stride=*/1, /*padding=*/0, cache.dilation, dXp);
+    bt::Tensor dXt;
+    if (cache.p > 0)
+        bt::pad1d_backward(dXp, /*N=*/1, cache.cin, cache.L, cache.p, cache.p,
+                           /*mode=*/1, dXt);
+    else
+        dXt = std::move(dXp);
+    bt::Tensor dXh = (dXt.device == bt::Device::CPU) ? std::move(dXt)
+                                                     : dXt.to(bt::Device::CPU);
+    const float* xp = dXh.host_f32();
+    dX.assign(xp, xp + static_cast<std::size_t>(cache.cin) * cache.L);
+}
+
+// ── mel frontend ──────────────────────────────────────────────────────────────
+
+void mel_forward_train(const float* wav, int n, const bt::Tensor& hann,
+                       const bt::Tensor& mel_basis, int n_fft, int hop, int win,
+                       int mel_dim, std::vector<float>& out, MelCache& cache) {
+    bt::DeviceScope cpu(bt::Device::CPU);
+    const int p = (n_fft - hop) / 2;
+    const int Lp = n + 2 * p;
+    const int nb = n_fft / 2 + 1;
+    const int frames = 1 + (Lp - n_fft) / hop;
+    const int M = mel_dim;
+    cache.n = n; cache.Lp = Lp; cache.frames = frames; cache.nb = nb; cache.M = M;
+    cache.n_fft = n_fft; cache.hop = hop; cache.win = win; cache.p_mel = p;
+
+    bt::Tensor sig = bt::Tensor::from_host_on(bt::Device::CPU, wav, 1, n);
+    bt::Tensor sigp;
+    bt::pad1d_forward(sig, 1, 1, n, p, p, /*mode=*/1, sigp);   // reflect
+    bt::Tensor spec;
+    bt::stft(sigp, hann, /*N=*/1, n_fft, hop, win, /*center=*/false,
+             /*normalized=*/false, spec);
+    const float* s = spec.host_f32();          // (frames, 2*nb) interleaved
+    const float* B = mel_basis.host_f32();      // (M, nb)
+
+    cache.mag.assign(static_cast<std::size_t>(frames) * nb, 0.0f);
+    cache.re.assign(cache.mag.size(), 0.0f);
+    cache.im.assign(cache.mag.size(), 0.0f);
+    for (int t = 0; t < frames; ++t) {
+        const float* row = s + static_cast<std::size_t>(t) * 2 * nb;
+        for (int b = 0; b < nb; ++b) {
+            const float re = row[2 * b], im = row[2 * b + 1];
+            const std::size_t idx = static_cast<std::size_t>(t) * nb + b;
+            cache.re[idx] = re; cache.im[idx] = im;
+            cache.mag[idx] = std::sqrt(re * re + im * im + 1e-9f);
+        }
+    }
+    out.assign(static_cast<std::size_t>(M) * frames, 0.0f);
+    cache.acc.assign(out.size(), 0.0f);
+    for (int m = 0; m < M; ++m) {
+        const float* bw = B + static_cast<std::size_t>(m) * nb;
+        for (int t = 0; t < frames; ++t) {
+            const float* mg = cache.mag.data() + static_cast<std::size_t>(t) * nb;
+            double acc = 0.0;
+            for (int b = 0; b < nb; ++b) acc += static_cast<double>(bw[b]) * mg[b];
+            cache.acc[static_cast<std::size_t>(m) * frames + t] = static_cast<float>(acc);
+            const float v = static_cast<float>(acc < 1e-5 ? 1e-5 : acc);
+            out[static_cast<std::size_t>(m) * frames + t] = std::log(v);
+        }
+    }
+}
+
+void mel_backward(const bt::Tensor& hann, const bt::Tensor& mel_basis,
+                  const MelCache& cache, const std::vector<float>& dOut,
+                  std::vector<float>& dWav) {
+    bt::DeviceScope cpu(bt::Device::CPU);
+    const int frames = cache.frames, nb = cache.nb, M = cache.M;
+    const float* B = mel_basis.host_f32();      // (M, nb)
+
+    // log adjoint: v = max(acc,1e-5); d_acc = dOut/acc when acc>=1e-5 else 0.
+    std::vector<float> d_acc(static_cast<std::size_t>(M) * frames, 0.0f);
+    for (std::size_t i = 0; i < d_acc.size(); ++i) {
+        const float a = cache.acc[i];
+        d_acc[i] = (a >= 1e-5f) ? dOut[i] / a : 0.0f;
+    }
+    // mel = basis @ mag  ->  d_mag[t,b] = Σ_m basis[m,b] * d_acc[m,t].
+    std::vector<float> d_mag(static_cast<std::size_t>(frames) * nb, 0.0f);
+    for (int m = 0; m < M; ++m) {
+        const float* bw = B + static_cast<std::size_t>(m) * nb;
+        for (int t = 0; t < frames; ++t) {
+            const float da = d_acc[static_cast<std::size_t>(m) * frames + t];
+            float* dm = d_mag.data() + static_cast<std::size_t>(t) * nb;
+            for (int b = 0; b < nb; ++b) dm[b] += bw[b] * da;
+        }
+    }
+    // mag = sqrt(re²+im²+1e-9): d_re = d_mag·re/mag, d_im = d_mag·im/mag.
+    std::vector<float> dspec(static_cast<std::size_t>(frames) * 2 * nb, 0.0f);
+    for (int t = 0; t < frames; ++t)
+        for (int b = 0; b < nb; ++b) {
+            const std::size_t idx = static_cast<std::size_t>(t) * nb + b;
+            const float mg = cache.mag[idx];
+            const float dm = d_mag[idx];
+            dspec[static_cast<std::size_t>(t) * 2 * nb + 2 * b]     = dm * cache.re[idx] / mg;
+            dspec[static_cast<std::size_t>(t) * 2 * nb + 2 * b + 1] = dm * cache.im[idx] / mg;
+        }
+    bt::Tensor dSpec = bt::Tensor::from_host_on(bt::Device::CPU, dspec.data(),
+                                                frames, 2 * nb);
+    bt::Tensor dSigp;
+    bt::stft_backward(dSpec, hann, /*N=*/1, cache.Lp, cache.n_fft, cache.hop,
+                      cache.win, /*center=*/false, /*normalized=*/false, dSigp);
+    bt::Tensor dWavT;
+    bt::pad1d_backward(dSigp, /*N=*/1, /*C=*/1, cache.n, cache.p_mel, cache.p_mel,
+                       /*mode=*/1, dWavT);
+    dWav = dWavT.to_host_vector();
+}
+
+// ── Res2Net ───────────────────────────────────────────────────────────────────
+
+void res2net_forward_train(const std::vector<QwenTtsSpkConv>& res2net,
+                           const std::vector<float>& x, int C, int L, int scale,
+                           std::vector<float>& y, Res2NetCache& cache) {
+    const int hc = C / scale;
+    cache.C = C; cache.L = L; cache.scale = scale; cache.hc = hc;
+    cache.conv.assign(scale - 1, ConvSameCache{});
+    cache.part.assign(scale - 1, std::vector<float>{});
+    y.assign(static_cast<std::size_t>(C) * L, 0.0f);
+    std::vector<float> prev;
+    for (int i = 0; i < scale; ++i) {
+        const float* chunk = x.data() + static_cast<std::size_t>(i) * hc * L;
+        std::vector<float> part;
+        if (i == 0) {
+            part.assign(chunk, chunk + static_cast<std::size_t>(hc) * L);
+        } else {
+            std::vector<float> in(static_cast<std::size_t>(hc) * L);
+            if (i == 1) std::copy(chunk, chunk + in.size(), in.begin());
+            else for (std::size_t j = 0; j < in.size(); ++j) in[j] = chunk[j] + prev[j];
+            conv_same_forward_train(res2net[i - 1], in, L, part, cache.conv[i - 1]);
+            for (float& v : part) if (v < 0.0f) v = 0.0f;   // relu
+            cache.part[i - 1] = part;
+        }
+        std::copy(part.begin(), part.end(),
+                  y.begin() + static_cast<std::size_t>(i) * hc * L);
+        prev = std::move(part);
+    }
+}
+
+void res2net_backward(const std::vector<QwenTtsSpkConv>& res2net,
+                      const Res2NetCache& cache, const std::vector<float>& dY,
+                      std::vector<float>& dX) {
+    const int C = cache.C, L = cache.L, scale = cache.scale, hc = cache.hc;
+    dX.assign(static_cast<std::size_t>(C) * L, 0.0f);
+    // chunk 0 passes straight through.
+    std::copy(dY.begin(), dY.begin() + static_cast<std::size_t>(hc) * L, dX.begin());
+    // per-chunk post-relu output gradients, seeded from dY chunks.
+    std::vector<std::vector<float>> dpart(scale);
+    for (int i = 1; i < scale; ++i) {
+        const float* d = dY.data() + static_cast<std::size_t>(i) * hc * L;
+        dpart[i].assign(d, d + static_cast<std::size_t>(hc) * L);
+    }
+    for (int i = scale - 1; i >= 1; --i) {
+        std::vector<float> dpre = dpart[i];                  // relu' (mask = part>0)
+        relu_mask_(cache.part[i - 1], dpre);
+        std::vector<float> d_in;
+        conv_same_backward(res2net[i - 1], cache.conv[i - 1], dpre, d_in);  // (hc*L)
+        float* dxc = dX.data() + static_cast<std::size_t>(i) * hc * L;
+        for (std::size_t j = 0; j < d_in.size(); ++j) dxc[j] += d_in[j];    // chunk_i
+        if (i >= 2)                                                          // + prev=part_{i-1}
+            for (std::size_t j = 0; j < d_in.size(); ++j) dpart[i - 1][j] += d_in[j];
+    }
+}
+
+// ── Squeeze-excitation ──────────────────────────────────────────────────────
+
+void se_forward_train(const QwenTtsSpkConv& se1, const QwenTtsSpkConv& se2,
+                      const std::vector<float>& x, int C, int L,
+                      std::vector<float>& y, SeCache& cache) {
+    cache.C = C; cache.L = L; cache.x = x;
+    std::vector<float> m(C, 0.0f);
+    for (int c = 0; c < C; ++c) {
+        const float* row = x.data() + static_cast<std::size_t>(c) * L;
+        double s = 0.0;
+        for (int t = 0; t < L; ++t) s += row[t];
+        m[c] = static_cast<float>(s / L);
+    }
+    conv_same_forward_train(se1, m, /*L=*/1, cache.g1, cache.se1c);  // (se)
+    for (float& v : cache.g1) if (v < 0.0f) v = 0.0f;                // relu
+    conv_same_forward_train(se2, cache.g1, /*L=*/1, cache.g, cache.se2c);  // (C)
+    for (float& v : cache.g) v = 1.0f / (1.0f + std::exp(-v));       // sigmoid
+    y.assign(x.size(), 0.0f);
+    for (int c = 0; c < C; ++c)
+        for (int t = 0; t < L; ++t)
+            y[static_cast<std::size_t>(c) * L + t] =
+                x[static_cast<std::size_t>(c) * L + t] * cache.g[c];
+}
+
+void se_backward(const QwenTtsSpkConv& se1, const QwenTtsSpkConv& se2,
+                 const SeCache& cache, const std::vector<float>& dY,
+                 std::vector<float>& dX) {
+    const int C = cache.C, L = cache.L;
+    dX.assign(static_cast<std::size_t>(C) * L, 0.0f);
+    std::vector<float> dg(C, 0.0f);
+    for (int c = 0; c < C; ++c) {
+        const float gc = cache.g[c];
+        double acc = 0.0;
+        for (int t = 0; t < L; ++t) {
+            const std::size_t i = static_cast<std::size_t>(c) * L + t;
+            dX[i] = dY[i] * gc;                       // through the multiply
+            acc += static_cast<double>(dY[i]) * cache.x[i];
+        }
+        dg[c] = static_cast<float>(acc);
+    }
+    // sigmoid: g=σ(pre2) -> d_pre2 = dg·g·(1-g).
+    std::vector<float> d_pre2(C, 0.0f);
+    for (int c = 0; c < C; ++c) d_pre2[c] = dg[c] * cache.g[c] * (1.0f - cache.g[c]);
+    std::vector<float> d_g1;
+    conv_same_backward(se2, cache.se2c, d_pre2, d_g1);   // (se)
+    relu_mask_(cache.g1, d_g1);                          // relu'
+    std::vector<float> d_m;
+    conv_same_backward(se1, cache.se1c, d_g1, d_m);      // (C)
+    // time-mean adjoint: dx[c,t] += d_m[c]/L.
+    for (int c = 0; c < C; ++c) {
+        const float dmc = d_m[c] / static_cast<float>(L);
+        for (int t = 0; t < L; ++t) dX[static_cast<std::size_t>(c) * L + t] += dmc;
+    }
+}
+
+// ── Attentive statistics pooling ────────────────────────────────────────────
+
+void asp_forward_train(const std::vector<float>& a, int agg, int T,
+                       const QwenTtsSpkConv& asp_tdnn, const QwenTtsSpkConv& asp_conv,
+                       std::vector<float>& pooled, AspCache& cache) {
+    cache.agg = agg; cache.attn_ch = asp_tdnn.cout; cache.T = T; cache.a = a;
+    // global mean / std per channel (uniform weights).
+    cache.gmean.assign(agg, 0.0f); cache.gstd.assign(agg, 0.0f);
+    cache.gvar.assign(agg, 0.0f);
+    for (int c = 0; c < agg; ++c) {
+        const float* row = a.data() + static_cast<std::size_t>(c) * T;
+        double s = 0.0;
+        for (int t = 0; t < T; ++t) s += row[t];
+        const double mu = s / T;
+        double var = 0.0;
+        for (int t = 0; t < T; ++t) { const double d = row[t] - mu; var += d * d; }
+        var /= T;
+        cache.gmean[c] = static_cast<float>(mu);
+        cache.gvar[c]  = static_cast<float>(var);
+        cache.gstd[c]  = static_cast<float>(std::sqrt(std::max(var, 1e-12)));
+    }
+    // context = cat([a, gmean.expand, gstd.expand]) -> (3*agg, T).
+    std::vector<float> ctx(static_cast<std::size_t>(3) * agg * T, 0.0f);
+    std::copy(a.begin(), a.end(), ctx.begin());
+    for (int c = 0; c < agg; ++c)
+        for (int t = 0; t < T; ++t) {
+            ctx[(static_cast<std::size_t>(agg) + c) * T + t] = cache.gmean[c];
+            ctx[(static_cast<std::size_t>(2 * agg) + c) * T + t] = cache.gstd[c];
+        }
+    // attn = asp_conv(tanh(relu(asp_tdnn(ctx)))).
+    conv_same_forward_train(asp_tdnn, ctx, T, cache.r, cache.tdnn_c);  // (attn_ch, T)
+    for (float& v : cache.r) if (v < 0.0f) v = 0.0f;                   // relu
+    cache.tanh_out.assign(cache.r.size(), 0.0f);
+    for (std::size_t i = 0; i < cache.r.size(); ++i) cache.tanh_out[i] = std::tanh(cache.r[i]);
+    std::vector<float> att;
+    conv_same_forward_train(asp_conv, cache.tanh_out, T, att, cache.conv_c);  // (agg, T)
+    // softmax over time per channel.
+    cache.w.assign(static_cast<std::size_t>(agg) * T, 0.0f);
+    for (int c = 0; c < agg; ++c) {
+        float* row = att.data() + static_cast<std::size_t>(c) * T;
+        float mx = row[0];
+        for (int t = 1; t < T; ++t) mx = std::max(mx, row[t]);
+        double sum = 0.0;
+        for (int t = 0; t < T; ++t) { row[t] = std::exp(row[t] - mx); sum += row[t]; }
+        const float inv = static_cast<float>(1.0 / sum);
+        for (int t = 0; t < T; ++t) cache.w[static_cast<std::size_t>(c) * T + t] = row[t] * inv;
+    }
+    // attentive mean / std -> pooled (2*agg).
+    cache.mu.assign(agg, 0.0f); cache.var.assign(agg, 0.0f);
+    pooled.assign(static_cast<std::size_t>(2) * agg, 0.0f);
+    for (int c = 0; c < agg; ++c) {
+        const float* ar = a.data() + static_cast<std::size_t>(c) * T;
+        const float* wr = cache.w.data() + static_cast<std::size_t>(c) * T;
+        double mu = 0.0;
+        for (int t = 0; t < T; ++t) mu += static_cast<double>(wr[t]) * ar[t];
+        double var = 0.0;
+        for (int t = 0; t < T; ++t) { const double d = ar[t] - mu; var += static_cast<double>(wr[t]) * d * d; }
+        cache.mu[c]  = static_cast<float>(mu);
+        cache.var[c] = static_cast<float>(var);
+        pooled[c]       = static_cast<float>(mu);
+        pooled[agg + c] = static_cast<float>(std::sqrt(std::max(var, 1e-12)));
+    }
+}
+
+void asp_backward(const QwenTtsSpkConv& asp_tdnn, const QwenTtsSpkConv& asp_conv,
+                  const AspCache& cache, const std::vector<float>& dPooled,
+                  std::vector<float>& dA) {
+    const int agg = cache.agg, T = cache.T;
+    dA.assign(static_cast<std::size_t>(agg) * T, 0.0f);
+    std::vector<float> d_w(static_cast<std::size_t>(agg) * T, 0.0f);
+    // pooled -> attentive mean (mu) and std contributions to w and a.
+    for (int c = 0; c < agg; ++c) {
+        const float d_mu_out  = dPooled[c];
+        const float std_out   = std::sqrt(std::max(cache.var[c], 1e-12f));
+        const float d_var = (cache.var[c] > 1e-12f) ? dPooled[agg + c] * 0.5f / std_out : 0.0f;
+        const float mu = cache.mu[c];
+        for (int t = 0; t < T; ++t) {
+            const std::size_t i = static_cast<std::size_t>(c) * T + t;
+            const float a_ct = cache.a[i], w_ct = cache.w[i];
+            const float diff = a_ct - mu;
+            d_w[i] += d_mu_out * a_ct + d_var * diff * diff;         // mu + var explicit (w)
+            dA[i]  += d_mu_out * w_ct + d_var * 2.0f * w_ct * diff;  // mu + var explicit (a)
+        }
+    }
+    // softmax-over-time adjoint per channel: dscore = w·(d_w - Σ_t w·d_w).
+    std::vector<float> d_score(static_cast<std::size_t>(agg) * T, 0.0f);
+    for (int c = 0; c < agg; ++c) {
+        double s = 0.0;
+        for (int t = 0; t < T; ++t) {
+            const std::size_t i = static_cast<std::size_t>(c) * T + t;
+            s += static_cast<double>(cache.w[i]) * d_w[i];
+        }
+        for (int t = 0; t < T; ++t) {
+            const std::size_t i = static_cast<std::size_t>(c) * T + t;
+            d_score[i] = cache.w[i] * (d_w[i] - static_cast<float>(s));
+        }
+    }
+    // asp_conv back -> tanh' -> relu' -> asp_tdnn back -> d_ctx (3*agg, T).
+    std::vector<float> d_tanh;
+    conv_same_backward(asp_conv, cache.conv_c, d_score, d_tanh);   // (attn_ch*T)
+    std::vector<float> d_r(d_tanh.size(), 0.0f);
+    for (std::size_t i = 0; i < d_tanh.size(); ++i)
+        d_r[i] = d_tanh[i] * (1.0f - cache.tanh_out[i] * cache.tanh_out[i]);  // tanh'
+    relu_mask_(cache.r, d_r);                                      // relu'
+    std::vector<float> d_ctx;
+    conv_same_backward(asp_tdnn, cache.tdnn_c, d_r, d_ctx);        // (3*agg*T)
+    // context split: rows [0,agg) -> a directly; [agg,2agg) -> gmean; [2agg,3agg) -> gstd.
+    for (int c = 0; c < agg; ++c)
+        for (int t = 0; t < T; ++t)
+            dA[static_cast<std::size_t>(c) * T + t] += d_ctx[static_cast<std::size_t>(c) * T + t];
+    for (int c = 0; c < agg; ++c) {
+        double dgmean = 0.0, dgstd = 0.0;
+        for (int t = 0; t < T; ++t) {
+            dgmean += d_ctx[(static_cast<std::size_t>(agg) + c) * T + t];
+            dgstd  += d_ctx[(static_cast<std::size_t>(2 * agg) + c) * T + t];
+        }
+        const float d_gvar = (cache.gvar[c] > 1e-12f)
+                                 ? static_cast<float>(dgstd) * 0.5f / cache.gstd[c] : 0.0f;
+        const float gmean = cache.gmean[c];
+        for (int t = 0; t < T; ++t) {
+            const std::size_t i = static_cast<std::size_t>(c) * T + t;
+            dA[i] += static_cast<float>(dgmean) / T;                       // gmean adjoint
+            dA[i] += d_gvar * (2.0f / T) * (cache.a[i] - gmean);           // gstd adjoint
+        }
+    }
+}
+
+// ── full ECAPA encoder ──────────────────────────────────────────────────────
+
+void ecapa_forward_train(const float* wav, int n, const bt::Tensor& hann,
+                         const bt::Tensor& mel_basis, int n_fft, int hop, int win,
+                         int mel_dim, const QwenTtsSpkConv& block0,
+                         const std::vector<QwenTtsSpkSERes2>& blocks, int scale,
+                         const QwenTtsSpkConv& mfa, const QwenTtsSpkConv& asp_tdnn,
+                         const QwenTtsSpkConv& asp_conv, const QwenTtsSpkConv& fc,
+                         std::vector<float>& embedding, EcapaCache& cache) {
+    // mel -> (mel_dim, T)
+    std::vector<float> x;
+    mel_forward_train(wav, n, hann, mel_basis, n_fft, hop, win, mel_dim, x, cache.mel);
+    const int T = cache.mel.frames;
+    const int C = block0.cout;
+    const int agg = mfa.cout;            // == 3*C
+    cache.M = mel_dim; cache.T = T; cache.C = C; cache.agg = agg; cache.scale = scale;
+
+    // initial TDNN + ReLU
+    std::vector<float> hs;
+    conv_same_forward_train(block0, x, T, hs, cache.block0);
+    for (float& v : hs) if (v < 0.0f) v = 0.0f;
+    cache.x0_relu = hs;
+
+    // three SE-Res2Net blocks; collect outputs for aggregation.
+    cache.blocks.assign(blocks.size(), EcapaBlockCache{});
+    std::vector<std::vector<float>> outs;
+    for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+        const QwenTtsSpkSERes2& blk = blocks[bi];
+        EcapaBlockCache& bc = cache.blocks[bi];
+        std::vector<float> y;
+        conv_same_forward_train(blk.tdnn1, hs, T, y, bc.tdnn1);
+        for (float& v : y) if (v < 0.0f) v = 0.0f;
+        bc.a1_relu = y;
+        std::vector<float> r;
+        res2net_forward_train(blk.res2net, y, C, T, scale, r, bc.res2);
+        std::vector<float> z;
+        conv_same_forward_train(blk.tdnn2, r, T, z, bc.tdnn2);
+        for (float& v : z) if (v < 0.0f) v = 0.0f;
+        bc.a3_relu = z;
+        std::vector<float> se_out;
+        se_forward_train(blk.se1, blk.se2, z, C, T, se_out, bc.se);
+        for (std::size_t j = 0; j < se_out.size(); ++j) se_out[j] += hs[j];  // residual
+        hs = se_out;
+        outs.push_back(hs);
+    }
+
+    // aggregate (cat 3 block outputs along channels) -> MFA + ReLU.
+    std::vector<float> cat(static_cast<std::size_t>(agg) * T, 0.0f);
+    for (std::size_t b = 0; b < outs.size(); ++b)
+        std::copy(outs[b].begin(), outs[b].end(),
+                  cat.begin() + static_cast<std::size_t>(b) * C * T);
+    std::vector<float> a;
+    conv_same_forward_train(mfa, cat, T, a, cache.mfa);
+    for (float& v : a) if (v < 0.0f) v = 0.0f;
+
+    // attentive statistics pooling -> pooled (2*agg).
+    std::vector<float> pooled;
+    asp_forward_train(a, agg, T, asp_tdnn, asp_conv, pooled, cache.asp);
+
+    // final projection (2*agg -> enc_dim).
+    conv_same_forward_train(fc, pooled, /*L=*/1, embedding, cache.fc);
+}
+
+void ecapa_backward(const QwenTtsSpkConv& block0,
+                    const std::vector<QwenTtsSpkSERes2>& blocks, int scale,
+                    const QwenTtsSpkConv& mfa, const QwenTtsSpkConv& asp_tdnn,
+                    const QwenTtsSpkConv& asp_conv, const QwenTtsSpkConv& fc,
+                    const bt::Tensor& hann, const bt::Tensor& mel_basis,
+                    const EcapaCache& cache, const std::vector<float>& dEmbedding,
+                    std::vector<float>& dWav) {
+    (void)scale;   // res2net_backward reads scale from the cache; kept for API symmetry
+    const int T = cache.T, C = cache.C;
+
+    // fc back -> d_pooled (2*agg).
+    std::vector<float> d_pooled;
+    conv_same_backward(fc, cache.fc, dEmbedding, d_pooled);
+    // attentive pooling back -> d_a (agg*T), gradient on relu(mfa) output.
+    std::vector<float> d_a;
+    asp_backward(asp_tdnn, asp_conv, cache.asp, d_pooled, d_a);
+    // relu(mfa) back (mask = a>0, cached as asp.a) -> mfa back -> d_cat (agg*T).
+    relu_mask_(cache.asp.a, d_a);
+    std::vector<float> d_cat;
+    conv_same_backward(mfa, cache.mfa, d_a, d_cat);
+
+    // split d_cat into the three block-output gradients (C*T each).
+    const int nblk = static_cast<int>(blocks.size());
+    std::vector<std::vector<float>> g(nblk);
+    for (int j = 0; j < nblk; ++j) {
+        const float* p = d_cat.data() + static_cast<std::size_t>(j) * C * T;
+        g[j].assign(p, p + static_cast<std::size_t>(C) * T);
+    }
+
+    // reverse the residual/sequential block stack.
+    std::vector<float> d_x0;   // gradient on block0 relu output (hs_0)
+    for (int j = nblk - 1; j >= 0; --j) {
+        const QwenTtsSpkSERes2& blk = blocks[j];
+        const EcapaBlockCache& bc = cache.blocks[j];
+        const std::vector<float>& d_yfinal = g[j];   // grad on outs[j]
+        // residual: outs[j] = se_out + hs_in -> d_se_out = d_yfinal, straight = d_yfinal.
+        std::vector<float> d_y3;
+        se_backward(blk.se1, blk.se2, bc.se, d_yfinal, d_y3);  // grad on relu(tdnn2) output
+        relu_mask_(bc.a3_relu, d_y3);
+        std::vector<float> d_y2;
+        conv_same_backward(blk.tdnn2, bc.tdnn2, d_y3, d_y2);
+        std::vector<float> d_y1;
+        res2net_backward(blk.res2net, bc.res2, d_y2, d_y1);
+        relu_mask_(bc.a1_relu, d_y1);
+        std::vector<float> d_hsin_path;
+        conv_same_backward(blk.tdnn1, bc.tdnn1, d_y1, d_hsin_path);
+        // grad on hs_in = straight-through (d_yfinal) + conv path.
+        std::vector<float> hsin(static_cast<std::size_t>(C) * T, 0.0f);
+        for (std::size_t i = 0; i < hsin.size(); ++i) hsin[i] = d_yfinal[i] + d_hsin_path[i];
+        if (j > 0)
+            for (std::size_t i = 0; i < hsin.size(); ++i) g[j - 1][i] += hsin[i];
+        else
+            d_x0 = std::move(hsin);
+    }
+
+    // block0 relu back -> block0 conv back -> d_mel (M*T).
+    relu_mask_(cache.x0_relu, d_x0);
+    std::vector<float> d_mel;
+    conv_same_backward(block0, cache.block0, d_x0, d_mel);
+
+    // mel frontend back -> d(waveform).
+    mel_backward(hann, mel_basis, cache.mel, d_mel, dWav);
 }
 
 }  // namespace st_detail

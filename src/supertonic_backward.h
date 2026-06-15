@@ -21,8 +21,11 @@
 // Private to the brosoundml build (lives under src/).
 
 #include "supertonic_internal.h"
+#include "qwen_tts_speaker_encoder.h"   // QwenTtsSpkConv / QwenTtsSpkSERes2
 
 #include <brotensor/tensor.h>
+
+#include <vector>
 
 namespace brosoundml {
 namespace st_detail {
@@ -341,6 +344,169 @@ void vocoder_decode_backward(const ConvW& conv_in,
                              const VocoderCache& cache,
                              const brotensor::Tensor& dWave,
                              brotensor::Tensor& dLatent);
+
+// ─── ECAPA-TDNN speaker-encoder backward ─────────────────────────────────────
+//
+// Hand-composed reverse-mode through the FROZEN Qwen-TTS ECAPA-TDNN x-vector
+// encoder (src/qwen_tts_speaker_encoder.cpp): given d(embedding), thread back to
+// d(waveform). The forward math is reproduced EXACTLY here in *_forward_train
+// helpers (host buffers + brotensor conv/pad/stft ops, mirroring the reference
+// `mel`/`embed`); each helper fills a cache its matching *_backward consumes.
+// All weights FROZEN — only the input (waveform) gradient is produced. CPU FP32:
+// the host-loop math (magnitude, log-mel, ReLU/sigmoid/tanh, softmax-over-time,
+// SE gate, the global + attentive mean/std reductions) is differentiated by hand
+// as host loops; only conv1d / pad1d / stft route through brotensor *_backward.
+//
+// Activation layout: channel-major [C, L] flattened (1, C*L), element (c,l) at
+// c*L + l — the same convention the reference encoder's host buffers use.
+
+// ── conv_same: torch padding="same", padding_mode="reflect" 1-D conv ──────────
+//   p = dilation*(k-1)/2 reflect-pad each side (no-op for k==1), then a valid
+//   conv1d (groups=1). Backward = conv1d_backward_input + pad1d_backward(mode=1).
+//   Weights FROZEN. The QwenTtsSpkConv carries cin/cout/k/dilation; bias used.
+struct ConvSameCache {
+    int cin = 0, cout = 0, k = 1, dilation = 1;
+    int L = 0, p = 0, Lp = 0, L_out = 0;   // L_out == L (same padding)
+};
+
+//   x: host (cin*L) channel-major.  y: host (cout*L), overwritten.
+void conv_same_forward_train(const QwenTtsSpkConv& c, const std::vector<float>& x,
+                             int L, std::vector<float>& y, ConvSameCache& cache);
+//   dY: host (cout*L).  dX: host (cin*L), overwritten.
+void conv_same_backward(const QwenTtsSpkConv& c, const ConvSameCache& cache,
+                        const std::vector<float>& dY, std::vector<float>& dX);
+
+// ── mel frontend: reflect-pad -> STFT -> magnitude -> mel basis -> log ────────
+//   Reproduces QwenTtsSpeakerEncoder::mel exactly. p_mel = (n_fft-hop)/2.
+//   out: host (mel_dim * frames) channel-major out[m*frames+t]. n_frames cached.
+//   Backward: log'(clamp)·(basis^T)·(mag adjoint: re/mag,im/mag)·stft_backward·
+//   pad1d_backward(reflect). mel_basis (mel_dim, nb), hann (1, win) FROZEN.
+struct MelCache {
+    int n = 0, Lp = 0, frames = 0, nb = 0, M = 0;
+    int n_fft = 0, hop = 0, win = 0, p_mel = 0;
+    std::vector<float> mag;          // (frames*nb)  sqrt(re²+im²+1e-9)
+    std::vector<float> re, im;       // (frames*nb)  raw STFT real/imag
+    std::vector<float> acc;          // (M*frames)   pre-clamp basis@mag (for log adjoint)
+};
+void mel_forward_train(const float* wav, int n,
+                       const brotensor::Tensor& hann,
+                       const brotensor::Tensor& mel_basis,
+                       int n_fft, int hop, int win, int mel_dim,
+                       std::vector<float>& out, MelCache& cache);
+void mel_backward(const brotensor::Tensor& hann,
+                  const brotensor::Tensor& mel_basis,
+                  const MelCache& cache,
+                  const std::vector<float>& dOut, std::vector<float>& dWav);
+
+// ── Res2Net: scale chunks of hc=C/scale; chunk 0 passthrough, chunk i (i>=1) =
+//    relu(conv_same(res2net[i-1], chunk_i + prev_output)), prev = chunk i-1's
+//    output (sequential chain). Backward runs chunks in REVERSE; the gradient
+//    into `prev` accumulates onto chunk (i-1)'s output gradient before it is
+//    processed. res2net carries `scale-1` convs (hc->hc, k, dil). ──────────────
+struct Res2NetCache {
+    int C = 0, L = 0, scale = 0, hc = 0;
+    std::vector<ConvSameCache>     conv;   // size scale-1 (chunks 1..scale-1)
+    std::vector<std::vector<float>> part;  // post-relu outputs, scale-1 (relu mask)
+};
+void res2net_forward_train(const std::vector<QwenTtsSpkConv>& res2net,
+                           const std::vector<float>& x, int C, int L, int scale,
+                           std::vector<float>& y, Res2NetCache& cache);
+void res2net_backward(const std::vector<QwenTtsSpkConv>& res2net,
+                      const Res2NetCache& cache, const std::vector<float>& dY,
+                      std::vector<float>& dX);
+
+// ── Squeeze-excitation: per-channel time-mean -> conv(se1)+relu ->
+//    conv(se2)+sigmoid -> per-channel gate g; out[c,t]=x[c,t]*g[c]. Backward:
+//    dx=dy*g, dg=Σ_t dy*x; sigmoid'; conv; relu'; conv; time-mean adjoint
+//    dx[c,t] += dm[c]/L. ──────────────────────────────────────────────────────
+struct SeCache {
+    int C = 0, L = 0;
+    ConvSameCache se1c, se2c;
+    std::vector<float> g1;   // (se)  post-relu se1 output (relu mask)
+    std::vector<float> g;    // (C)   sigmoid gate
+    std::vector<float> x;    // (C*L) input (for dg)
+};
+void se_forward_train(const QwenTtsSpkConv& se1, const QwenTtsSpkConv& se2,
+                      const std::vector<float>& x, int C, int L,
+                      std::vector<float>& y, SeCache& cache);
+void se_backward(const QwenTtsSpkConv& se1, const QwenTtsSpkConv& se2,
+                 const SeCache& cache, const std::vector<float>& dY,
+                 std::vector<float>& dX);
+
+// ── Attentive statistics pooling: global per-channel mean gmean / std gstd ->
+//    context cat([a, gmean.expand, gstd.expand]) (3*agg,T) -> conv(asp_tdnn)+relu
+//    -> tanh -> conv(asp_conv) -> softmax over TIME per channel w -> attentive
+//    mean mu[c]=Σ_t w·a, std sqrt(max(Σ_t w·(a-mu)²,1e-12)) -> pooled (2*agg).
+//    `a` feeds the gradient through FOUR paths: the attentive mean, the
+//    attentive std, the context's first block (asp_tdnn), and the gmean/gstd
+//    reductions — all summed into d_a. (Σ_t w_t = 1 makes the var->mu and
+//    gvar->gmean adjoint terms vanish exactly.) ─────────────────────────────────
+struct AspCache {
+    int agg = 0, attn_ch = 0, T = 0;
+    std::vector<float> a;            // (agg*T)  pooling input (= relu(mfa) output)
+    std::vector<float> gmean, gstd;  // (agg)    global mean / std
+    std::vector<float> gvar;         // (agg)    global pre-clamp var (std clamp adjoint)
+    ConvSameCache      tdnn_c, conv_c;
+    std::vector<float> r;            // (attn_ch*T)  relu(asp_tdnn(ctx)) (relu mask + tanh in)
+    std::vector<float> tanh_out;     // (attn_ch*T)  tanh(r)
+    std::vector<float> w;            // (agg*T)  softmax-over-time weights
+    std::vector<float> mu, var;      // (agg)    attentive mean / pre-clamp var
+};
+void asp_forward_train(const std::vector<float>& a, int agg, int T,
+                       const QwenTtsSpkConv& asp_tdnn, const QwenTtsSpkConv& asp_conv,
+                       std::vector<float>& pooled, AspCache& cache);
+void asp_backward(const QwenTtsSpkConv& asp_tdnn, const QwenTtsSpkConv& asp_conv,
+                  const AspCache& cache, const std::vector<float>& dPooled,
+                  std::vector<float>& dA);
+
+// ── full ECAPA encoder: mel -> block0(conv+relu) -> 3 SE-Res2Net blocks
+//    (tdnn1+relu -> res2net -> tdnn2+relu -> se -> +residual) -> channel-cat the
+//    three block outputs -> mfa(conv+relu) -> attentive pooling -> fc(1x1).
+//    Reproduces QwenTtsSpeakerEncoder::embed exactly (block working width
+//    C = block0.cout; agg = mfa.cout = 3*C). Backward threads d(embedding) ->
+//    d(waveform) through the reversed residual/sequential block stack. FROZEN. ─
+struct EcapaBlockCache {
+    ConvSameCache      tdnn1, tdnn2;
+    std::vector<float> a1_relu;   // (C*T) relu(tdnn1) output (relu mask)
+    std::vector<float> a3_relu;   // (C*T) relu(tdnn2) output (relu mask)
+    Res2NetCache       res2;
+    SeCache            se;
+};
+struct EcapaCache {
+    int M = 0, T = 0, C = 0, agg = 0, scale = 0;
+    MelCache           mel;
+    ConvSameCache      block0;
+    std::vector<float> x0_relu;          // (C*T) relu(block0) output (relu mask)
+    std::vector<EcapaBlockCache> blocks; // 3
+    ConvSameCache      mfa;              // a = relu(mfa(cat)) ; mask is cache.asp.a > 0
+    AspCache           asp;
+    ConvSameCache      fc;
+};
+
+//   wav: host PCM, n samples (24 kHz mono).  embedding: host (enc_dim), overwritten.
+void ecapa_forward_train(const float* wav, int n,
+                         const brotensor::Tensor& hann,
+                         const brotensor::Tensor& mel_basis,
+                         int n_fft, int hop, int win, int mel_dim,
+                         const QwenTtsSpkConv& block0,
+                         const std::vector<QwenTtsSpkSERes2>& blocks, int scale,
+                         const QwenTtsSpkConv& mfa,
+                         const QwenTtsSpkConv& asp_tdnn,
+                         const QwenTtsSpkConv& asp_conv,
+                         const QwenTtsSpkConv& fc,
+                         std::vector<float>& embedding, EcapaCache& cache);
+
+//   dEmbedding: host (enc_dim).  dWav: host (n), overwritten.
+void ecapa_backward(const QwenTtsSpkConv& block0,
+                    const std::vector<QwenTtsSpkSERes2>& blocks, int scale,
+                    const QwenTtsSpkConv& mfa,
+                    const QwenTtsSpkConv& asp_tdnn,
+                    const QwenTtsSpkConv& asp_conv,
+                    const QwenTtsSpkConv& fc,
+                    const brotensor::Tensor& hann,
+                    const brotensor::Tensor& mel_basis,
+                    const EcapaCache& cache,
+                    const std::vector<float>& dEmbedding, std::vector<float>& dWav);
 
 }  // namespace st_detail
 }  // namespace brosoundml
