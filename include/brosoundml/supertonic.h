@@ -156,11 +156,16 @@ public:
     // through the vector estimator seeded from N(0,1) noise (Philox `seed`), and
     // the vocoder. `speed` > 1 shortens the utterance (upstream default 1.05);
     // `total_step` is the number of flow-matching steps (upstream default 8).
-    // Returns mono FP32 PCM at config().sample_rate. Throws if any stage's
-    // weights or the frontend tables are absent.
+    // `guidance` is the classifier-free-guidance scale w: each Euler step applies
+    // field = (1+w)*cond - w*uncond, so w=3 (default) reproduces upstream; raise
+    // it to push harder toward the text/style conditioning (crisper, more
+    // articulated), lower it to relax toward the unconditional field (flatter,
+    // breathier). Clamped to >= 0. Returns mono FP32 PCM at config().sample_rate.
+    // Throws if any stage's weights or the frontend tables are absent.
     AudioBuffer synthesize(const std::string& text, const std::string& lang,
                            const VoiceStyle& voice, int total_step = 8,
-                           float speed = 1.05f, std::uint64_t seed = 0) const;
+                           float speed = 1.05f, std::uint64_t seed = 0,
+                           float guidance = 3.0f) const;
 
     // Long-form synthesis: split `text` into sentences, synthesize each through
     // synthesize() (so each chunk gets its own predicted duration and flow-field
@@ -176,10 +181,12 @@ public:
     // so no single chunk drives the field to an unwieldy latent length. `seed` is
     // advanced per chunk (seed + chunk_index) so chunks differ yet stay
     // deterministic. With a single sentence this is just synthesize() (no gap).
+    // `guidance` is the classifier-free-guidance scale (see synthesize()).
     AudioBuffer synthesize_long(const std::string& text, const std::string& lang,
                                 const VoiceStyle& voice, int total_step = 8,
                                 float speed = 1.05f, std::uint64_t seed = 0,
-                                float gap_seconds = 0.3f, int max_chars = 300) const;
+                                float gap_seconds = 0.3f, int max_chars = 300,
+                                float guidance = 3.0f) const;
 
     // The sentence splitter used by synthesize_long, exposed for callers that
     // want to chunk text themselves (e.g. to stream or batch). Stateless — needs

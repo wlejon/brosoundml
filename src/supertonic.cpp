@@ -956,7 +956,8 @@ struct Supertonic::Impl {
     void field_step(bt::Tensor& noisyT, const bt::Tensor& time_emb,
                     const bt::Tensor& text_cond, const bt::Tensor& text_unc,
                     const bt::Tensor& style_val_cond, const bt::Tensor& onesL,
-                    const RopeTables& rt, int L, int T, float dt) const;
+                    const RopeTables& rt, int L, int T, float dt,
+                    float guid_cond, float guid_uncond) const;
     std::vector<float> denoise(const std::vector<float>& noisy, int channels,
                                int frames, const std::vector<float>& text_emb,
                                int text_len, const std::vector<float>& style_ttl,
@@ -965,11 +966,11 @@ struct Supertonic::Impl {
                                  const std::string& lang) const;
     AudioBuffer synthesize(const std::string& text, const std::string& lang,
                            const VoiceStyle& voice, int total_step, float speed,
-                           std::uint64_t seed) const;
+                           std::uint64_t seed, float guidance) const;
     AudioBuffer synthesize_long(const std::string& text, const std::string& lang,
                                 const VoiceStyle& voice, int total_step, float speed,
                                 std::uint64_t seed, float gap_seconds,
-                                int max_chars) const;
+                                int max_chars, float guidance) const;
 };
 
 void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
@@ -1456,15 +1457,16 @@ void Supertonic::Impl::field_step(
         bt::Tensor& noisyT, const bt::Tensor& time_emb,
         const bt::Tensor& text_cond, const bt::Tensor& text_unc,
         const bt::Tensor& style_val_cond, const bt::Tensor& onesL,
-        const RopeTables& rt, int L, int T, float dt) const {
+        const RopeTables& rt, int L, int T, float dt,
+        float guid_cond, float guid_uncond) const {
     bt::Tensor scratch;
     const int channels = cfg.latent_dim * cfg.chunk;  // 144
     // proj_in is shared by the conditional + unconditional passes (same noisy).
     bt::Tensor h0 = pconv(noisyT, ve_proj_in, channels, L, 1, 1, 0, 0, 0, scratch);  // [512,L]
     bt::Tensor fc = run_field(h0, time_emb, text_cond, ve_style_key_proto, style_val_cond, L, T, rt, onesL);
     bt::Tensor fu = run_field(h0, time_emb, text_unc,  ve_style_key_unc,   ve_style_val_unc,  L, T, rt, onesL);
-    // CFG guidance + one Euler step: noisyT += (1/total_step)*(4*cond - 3*uncond).
-    bt::axpby_inplace(fc, fu, ve_guid_cond, -ve_guid_uncond);  // fc = 4*cond - 3*uncond
+    // CFG guidance + one Euler step: noisyT += (1/total_step)*((1+w)*cond - w*uncond).
+    bt::axpby_inplace(fc, fu, guid_cond, -guid_uncond);  // fc = (1+w)*cond - w*uncond
     bt::scale_inplace(fc, dt);
     bt::add_inplace(noisyT, fc);  // in-place feedback; noisyT is both step input and output
 }
@@ -1553,7 +1555,7 @@ std::vector<int> Supertonic::Impl::text_to_ids(const std::string& text,
 
 AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
         const std::string& lang, const VoiceStyle& voice, int total_step,
-        float speed, std::uint64_t seed) const {
+        float speed, std::uint64_t seed, float guidance) const {
     if (!ready)    fail("synthesize() before load()");
     if (!te_ready) fail("synthesize() needs the text encoder");
     if (!dp_ready) fail("synthesize() needs the duration predictor");
@@ -1609,6 +1611,13 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     const bt::Tensor onesL = bt::Tensor::from_host_on(dev, onesh.data(), 1, L);
     const float dt = (total_step != 0) ? 1.0f / total_step : 0.0f;
 
+    // Classifier-free-guidance scale w: field = (1+w)*cond - w*uncond. w=3 (the
+    // upstream default) reproduces the original 4/3 weights; higher w pushes the
+    // flow harder toward the text/style conditioning (crisper, more articulated),
+    // lower w relaxes it (flatter, breathier). Clamp to >= 0 (w<0 inverts CFG).
+    const float guid = (guidance < 0.0f) ? 0.0f : guidance;
+    const float gc = 1.0f + guid, gu = guid;
+
     // Every step's time embedding (sinusoidal -> Gemm -> Mish -> Gemm, [1,64])
     // depends only on step/total_step, so precompute them all host-side, upload
     // once, and stage one row per step on-device (a device copy, capture-safe).
@@ -1642,7 +1651,7 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     // once and replayed for steps 1..N-1: the per-step kernel-launch overhead,
     // not GPU compute, dominates this 99M-param field, and the graph removes it.
     stage_time(0);
-    field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+    field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt, gc, gu);
 
 #ifdef BROSOUNDML_HAS_CUDA
     if (dev == bt::Device::CUDA && total_step > 1) {
@@ -1651,7 +1660,7 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
         bt::CudaGraph graph;
         {
             bt::CudaGraphCapture cap;
-            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt, gc, gu);
             graph = cap.finish();
         }
         for (int step = 1; step < total_step; ++step) {
@@ -1664,7 +1673,7 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     {
         for (int step = 1; step < total_step; ++step) {
             stage_time(step);
-            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt);
+            field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt, gc, gu);
         }
     }
 
@@ -1675,7 +1684,7 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
 AudioBuffer Supertonic::Impl::synthesize_long(
         const std::string& text, const std::string& lang, const VoiceStyle& voice,
         int total_step, float speed, std::uint64_t seed,
-        float gap_seconds, int max_chars) const {
+        float gap_seconds, int max_chars, float guidance) const {
     if (max_chars < 16) max_chars = 16;
     std::vector<std::string> chunks = split_sentences_impl(text, max_chars);
     if (chunks.empty()) chunks.push_back(text);  // all-whitespace / unsplittable
@@ -1686,7 +1695,7 @@ AudioBuffer Supertonic::Impl::synthesize_long(
         ? static_cast<int>(gap_seconds * static_cast<float>(cfg.sample_rate)) : 0;
     for (std::size_t k = 0; k < chunks.size(); ++k) {
         const AudioBuffer w = synthesize(chunks[k], lang, voice, total_step, speed,
-                                         seed + static_cast<std::uint64_t>(k));
+                                         seed + static_cast<std::uint64_t>(k), guidance);
         if (k > 0 && gap > 0)
             out.samples.insert(out.samples.end(), static_cast<std::size_t>(gap), 0.0f);
         out.samples.insert(out.samples.end(), w.samples.begin(), w.samples.end());
@@ -1838,16 +1847,17 @@ std::vector<int> Supertonic::text_to_ids(const std::string& text,
 
 AudioBuffer Supertonic::synthesize(const std::string& text, const std::string& lang,
                                    const VoiceStyle& voice, int total_step,
-                                   float speed, std::uint64_t seed) const {
-    return impl_->synthesize(text, lang, voice, total_step, speed, seed);
+                                   float speed, std::uint64_t seed, float guidance) const {
+    return impl_->synthesize(text, lang, voice, total_step, speed, seed, guidance);
 }
 
 AudioBuffer Supertonic::synthesize_long(const std::string& text, const std::string& lang,
                                         const VoiceStyle& voice, int total_step,
                                         float speed, std::uint64_t seed,
-                                        float gap_seconds, int max_chars) const {
+                                        float gap_seconds, int max_chars,
+                                        float guidance) const {
     return impl_->synthesize_long(text, lang, voice, total_step, speed, seed,
-                                  gap_seconds, max_chars);
+                                  gap_seconds, max_chars, guidance);
 }
 
 std::vector<std::string> Supertonic::split_sentences(const std::string& text,
