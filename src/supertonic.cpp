@@ -531,6 +531,137 @@ bt::Tensor rope_attention(const bt::Tensor& h, const bt::Tensor& text_src,
     return pconv(flat(cat), A.conv_o, kVeC, L, 1, 1, 0, 0, 0, scr2);  // [512,L]
 }
 
+// ─── UnicodeProcessor frontend (mirrors py/helper.py UnicodeProcessor) ─────────
+
+// Decode UTF-8 bytes to a codepoint sequence; malformed leads -> U+FFFD.
+std::u32string utf8_to_u32(const std::string& s) {
+    std::u32string out;
+    const std::size_t n = s.size();
+    for (std::size_t i = 0; i < n;) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        char32_t cp; int extra;
+        if (c < 0x80)            { cp = c;         extra = 0; }
+        else if ((c >> 5) == 0x6){ cp = c & 0x1F; extra = 1; }
+        else if ((c >> 4) == 0xE){ cp = c & 0x0F; extra = 2; }
+        else if ((c >> 3) == 0x1E){ cp = c & 0x07; extra = 3; }
+        else                     { cp = 0xFFFD;   extra = 0; }
+        ++i;
+        for (int k = 0; k < extra && i < n; ++k, ++i)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i]) & 0x3F);
+        out.push_back(cp);
+    }
+    return out;
+}
+
+bool is_emoji_cp(char32_t c) {
+    return (c >= 0x1F600 && c <= 0x1F64F) || (c >= 0x1F300 && c <= 0x1F5FF) ||
+           (c >= 0x1F680 && c <= 0x1F6FF) || (c >= 0x1F700 && c <= 0x1F77F) ||
+           (c >= 0x1F780 && c <= 0x1F7FF) || (c >= 0x1F800 && c <= 0x1F8FF) ||
+           (c >= 0x1F900 && c <= 0x1F9FF) || (c >= 0x1FA00 && c <= 0x1FA6F) ||
+           (c >= 0x1FA70 && c <= 0x1FAFF) || (c >= 0x2600  && c <= 0x26FF)  ||
+           (c >= 0x2700  && c <= 0x27BF)  || (c >= 0x1F1E6 && c <= 0x1F1FF);
+}
+
+// The final-character set that suppresses the auto-appended period (the upstream
+// regex [.!?;:,'"')\]}…。」』】〉》›»]).
+bool ends_with_punct(char32_t c) {
+    switch (c) {
+        case U'.': case U'!': case U'?': case U';': case U':': case U',':
+        case U'\'': case U'"': case U')': case U']': case U'}':
+        case 0x2026: case 0x3002: case 0x300D: case 0x300F: case 0x3011:
+        case 0x3009: case 0x300B: case 0x203A: case 0x00BB:
+            return true;
+        default: return false;
+    }
+}
+
+void replace_all(std::u32string& s, const std::u32string& from,
+                 const std::u32string& to) {
+    if (from.empty()) return;
+    std::size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::u32string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+// NFKD compatibility decomposition. ASCII (and any codepoint with no
+// decomposition) is identity, which is exact for English / Latin-ASCII text.
+// TODO(next): vendored BMP decomposition + canonical reorder for accented / CJK.
+std::u32string nfkd(std::u32string s) { return s; }
+
+// The full _preprocess_text pipeline, codepoint-exact with the upstream.
+std::u32string preprocess_text(const std::string& utf8, const std::string& lang) {
+    static const char* kLangs[] = {
+        "en","ko","ja","ar","bg","cs","da","de","el","es","et","fi","fr","hi",
+        "hr","hu","id","it","lt","lv","nl","pl","pt","ro","ru","sk","sl","sv",
+        "tr","uk","vi","na"};
+    bool ok = false;
+    for (const char* l : kLangs) if (lang == l) { ok = true; break; }
+    if (!ok) fail("invalid language: " + lang);
+
+    std::u32string t = nfkd(utf8_to_u32(utf8));
+
+    // remove emoji
+    { std::u32string o; o.reserve(t.size());
+      for (char32_t c : t) if (!is_emoji_cp(c)) o.push_back(c);
+      t.swap(o); }
+
+    // single-codepoint dash/quote/symbol replacements, then special-symbol strip
+    { std::u32string o; o.reserve(t.size());
+      for (char32_t c : t) {
+        switch (c) {
+            case 0x2013: case 0x2011: case 0x2014: o.push_back(U'-'); break;
+            case U'_':                              o.push_back(U' '); break;
+            case 0x201C: case 0x201D:               o.push_back(U'"'); break;
+            case 0x2018: case 0x2019: case 0x00B4: case U'`':
+                                                    o.push_back(U'\''); break;
+            case U'[': case U']': case U'|': case U'/': case U'#':
+            case 0x2192: case 0x2190:               o.push_back(U' '); break;
+            case 0x2665: case 0x2606: case 0x2661: case 0x00A9: case U'\\':
+                break;  // remove ♥ ☆ ♡ © backslash
+            default:                                o.push_back(c);
+        }
+      }
+      t.swap(o); }
+
+    // known-expression replacements
+    replace_all(t, U"@",      U" at ");
+    replace_all(t, U"e.g.,",  U"for example, ");
+    replace_all(t, U"i.e.,",  U"that is, ");
+
+    // tighten spacing before punctuation
+    replace_all(t, U" ,", U",");
+    replace_all(t, U" .", U".");
+    replace_all(t, U" !", U"!");
+    replace_all(t, U" ?", U"?");
+    replace_all(t, U" ;", U";");
+    replace_all(t, U" :", U":");
+    replace_all(t, U" '", U"'");
+
+    // collapse duplicate quotes
+    while (t.find(U"\"\"") != std::u32string::npos) replace_all(t, U"\"\"", U"\"");
+    while (t.find(U"''")   != std::u32string::npos) replace_all(t, U"''",   U"'");
+
+    // collapse whitespace runs to a single space, then strip ends
+    { std::u32string o; o.reserve(t.size()); bool sp = false;
+      for (char32_t c : t) {
+        const bool ws = (c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' ||
+                         c == U'\f' || c == 0x0B);
+        if (ws) { sp = true; continue; }
+        if (sp && !o.empty()) o.push_back(U' ');
+        sp = false; o.push_back(c);
+      }
+      t.swap(o); }
+
+    // ensure a sentence-final punctuation
+    if (t.empty() || !ends_with_punct(t.back())) t.push_back(U'.');
+
+    // language tag wrap
+    std::u32string lt(lang.begin(), lang.end());
+    return U"<" + lt + U">" + t + U"</" + lt + U">";
+}
+
 }  // namespace
 
 // ─── Impl ────────────────────────────────────────────────────────────────────
@@ -586,6 +717,11 @@ struct Supertonic::Impl {
     bt::Tensor                 ve_style_val_unc;   // [256,50] uncond style value
     float                      ve_guid_cond = 4.0f, ve_guid_uncond = 3.0f;  // CFG
 
+    // UnicodeProcessor frontend: codepoint -> token id. Loaded from
+    // unicode_indexer.json (a flat 65536-entry uint16->id table, -1 = OOV).
+    bool                       frontend_ready = false;
+    std::vector<int>           unicode_index;      // 65536 entries (-1 = OOV)
+
     void load(const std::string& dir, bt::Device device);
     void load_text_encoder(const fs::path& path);
     void load_duration_predictor(const fs::path& path);
@@ -602,6 +738,11 @@ struct Supertonic::Impl {
                                int frames, const std::vector<float>& text_emb,
                                int text_len, const std::vector<float>& style_ttl,
                                int current_step, int total_step) const;
+    std::vector<int> text_to_ids(const std::string& text,
+                                 const std::string& lang) const;
+    AudioBuffer synthesize(const std::string& text, const std::string& lang,
+                           const VoiceStyle& voice, int total_step, float speed,
+                           std::uint64_t seed) const;
 };
 
 void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
@@ -677,6 +818,18 @@ void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
 
     const fs::path ve = root / "vector_estimator.safetensors";
     if (fs::exists(ve)) load_vector_estimator(ve);
+
+    // UnicodeProcessor table: a flat list of 65536 ids (codepoint -> id, -1 OOV).
+    const fs::path uix = root / "unicode_indexer.json";
+    if (fs::exists(uix)) {
+        const j::Value arr = j::parse(slurp(uix));
+        const j::Value::Array& a = arr.as_array();
+        unicode_index.assign(65536, -1);
+        const std::size_t n = std::min<std::size_t>(a.size(), 65536);
+        for (std::size_t i = 0; i < n; ++i)
+            unicode_index[i] = static_cast<int>(a[i].as_number());
+        frontend_ready = true;
+    }
 }
 
 void Supertonic::Impl::load_text_encoder(const fs::path& path) {
@@ -1132,6 +1285,62 @@ std::vector<float> Supertonic::Impl::denoise(
     return field_cond.to_host_vector();
 }
 
+std::vector<int> Supertonic::Impl::text_to_ids(const std::string& text,
+                                               const std::string& lang) const {
+    if (!frontend_ready) fail("text_to_ids() before unicode_indexer.json load");
+    if (!te_ready) fail("text_to_ids() needs the text encoder (vocab) loaded");
+    const std::u32string s = preprocess_text(text, lang);
+    std::vector<int> ids;
+    ids.reserve(s.size());
+    for (char32_t c : s) {
+        // numpy uint16 cast wraps codepoints >= 0x10000; -1 (OOV) -> last row.
+        int id = unicode_index[static_cast<std::uint16_t>(c)];
+        if (id < 0) id += te_vocab;
+        ids.push_back(id);
+    }
+    return ids;
+}
+
+AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
+        const std::string& lang, const VoiceStyle& voice, int total_step,
+        float speed, std::uint64_t seed) const {
+    if (!ready)    fail("synthesize() before load()");
+    if (!te_ready) fail("synthesize() needs the text encoder");
+    if (!dp_ready) fail("synthesize() needs the duration predictor");
+    if (!ve_ready) fail("synthesize() needs the vector estimator");
+    if (total_step < 1) fail("total_step must be >= 1");
+    if (speed <= 0.0f)  fail("speed must be > 0");
+    if (static_cast<int>(voice.ttl.size()) != kNStyle * kTeC)
+        fail("voice.ttl must be 50*256");
+    if (voice.dp.empty()) fail("voice.dp is empty");
+
+    const std::vector<int> ids = text_to_ids(text, lang);
+    const int T = static_cast<int>(ids.size());
+
+    // total length (seconds), shortened by 1/speed, then conditioning embedding.
+    const float dur = predict_duration(ids, voice.dp) / speed;
+    const std::vector<float> text_emb = encode_text(ids, voice.ttl);
+
+    // duration -> latent frame count: ceil(dur*sr / (base_chunk*chunk)).
+    const int chunk_size = cfg.base_chunk * cfg.chunk;          // 512*6 = 3072
+    const float wav_len  = dur * static_cast<float>(cfg.sample_rate);
+    int latent_len = static_cast<int>((wav_len + chunk_size - 1) / chunk_size);
+    if (latent_len < 1) latent_len = 1;
+    const int channels = cfg.latent_dim * cfg.chunk;            // 24*6 = 144
+
+    // seed the flow from N(0,1) on-device. For a single unpadded sentence the
+    // upstream latent_mask is all-ones, so the seed is the raw noise.
+    bt::Tensor noiseT = bt::Tensor::empty_on(dev, channels, latent_len);
+    bt::randn(seed, 0, noiseT);
+    std::vector<float> xt = noiseT.to_host_vector();
+
+    // total_step classifier-free-guided Euler steps, feeding xt back each time.
+    for (int step = 0; step < total_step; ++step)
+        xt = denoise(xt, channels, latent_len, text_emb, T, voice.ttl, step, total_step);
+
+    return decode(xt.data(), channels, latent_len);
+}
+
 AudioBuffer Supertonic::Impl::decode(const float* latent, int channels,
                                      int frames) const {
     if (!ready) fail("decode() before load()");
@@ -1203,6 +1412,16 @@ AudioBuffer Supertonic::Impl::decode(const float* latent, int channels,
 
 // ─── public shell ────────────────────────────────────────────────────────────
 
+namespace {
+// Flatten a (possibly nested) JSON array of numbers into `out`, in order.
+void flatten_numbers(const j::Value& v, std::vector<float>& out) {
+    if (v.is_array())
+        for (const j::Value& e : v.as_array()) flatten_numbers(e, out);
+    else if (v.is_number())
+        out.push_back(static_cast<float>(v.as_number()));
+}
+}  // namespace
+
 Supertonic::Supertonic() : impl_(std::make_unique<Impl>()) {}
 Supertonic::~Supertonic() = default;
 Supertonic::Supertonic(Supertonic&&) noexcept = default;
@@ -1239,6 +1458,35 @@ std::vector<float> Supertonic::denoise(const std::vector<float>& noisy_latent,
                                        int current_step, int total_step) const {
     return impl_->denoise(noisy_latent, channels, frames, text_emb, text_len,
                           style_ttl, current_step, total_step);
+}
+
+VoiceStyle Supertonic::load_voice_style(const std::string& path) const {
+    const j::Value root = j::parse(slurp(fs::path(path)));
+    const j::Value* ttl = root.find("style_ttl");
+    const j::Value* dp  = root.find("style_dp");
+    if (!ttl || !dp) fail("voice style '" + path + "' missing style_ttl/style_dp");
+    const j::Value* ttl_d = ttl->find("data");
+    const j::Value* dp_d  = dp->find("data");
+    if (!ttl_d || !dp_d) fail("voice style '" + path + "' missing data arrays");
+
+    VoiceStyle vs;
+    flatten_numbers(*ttl_d, vs.ttl);
+    flatten_numbers(*dp_d,  vs.dp);
+    if (static_cast<int>(vs.ttl.size()) != kNStyle * kTeC)
+        fail("voice style ttl is " + std::to_string(vs.ttl.size()) + ", expected 50*256");
+    if (vs.dp.empty()) fail("voice style dp is empty");
+    return vs;
+}
+
+std::vector<int> Supertonic::text_to_ids(const std::string& text,
+                                         const std::string& lang) const {
+    return impl_->text_to_ids(text, lang);
+}
+
+AudioBuffer Supertonic::synthesize(const std::string& text, const std::string& lang,
+                                   const VoiceStyle& voice, int total_step,
+                                   float speed, std::uint64_t seed) const {
+    return impl_->synthesize(text, lang, voice, total_step, speed, seed);
 }
 
 const SupertonicConfig& Supertonic::config() const { return impl_->cfg; }

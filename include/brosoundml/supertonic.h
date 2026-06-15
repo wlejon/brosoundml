@@ -4,6 +4,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,13 +29,20 @@ namespace brosoundml {
 // frontend tables + voice_styles/ presets), as hosted under
 // brosoundml-data/supertonic.
 //
-// THIS BUILD implements all four graphs as standalone stages: the text encoder
-// (text_ids + TTL style -> text_emb), the duration predictor (text_ids + DP
-// style -> scalar total duration), the flow-matching vector estimator (one
-// guided denoising step), and the vocoder (latent -> waveform). The top-level
-// synthesize() that chains them (with the UnicodeProcessor frontend and the
-// flow-matching loop) lands next; until then the public entry points are
-// encode_text(), predict_duration(), denoise(), and decode().
+// THIS BUILD synthesizes end to end: synthesize() runs the UnicodeProcessor
+// frontend (codepoint -> id, no G2P), then chains the four graphs — duration
+// predictor (length), text encoder (conditioning), the flow-matching vector
+// estimator (total_step guided Euler steps), and the vocoder (latent ->
+// waveform). The four graphs are also exposed as standalone stages
+// (encode_text / predict_duration / denoise / decode) for parity testing.
+
+// A voice preset: the two style matrices a preset JSON carries, as consumed by
+// the duration predictor and the rest of the pipeline. Load one with
+// Supertonic::load_voice_style().
+struct VoiceStyle {
+    std::vector<float> ttl;  // 50*256 token-major (style_ttl[s*256 + c])
+    std::vector<float> dp;   // 8*16 row-major   (style_dp[i*16 + j])
+};
 
 // Model hyperparameters, read from the converted tts.json by Supertonic::load.
 struct SupertonicConfig {
@@ -125,6 +133,34 @@ public:
                                const std::vector<float>& text_emb, int text_len,
                                const std::vector<float>& style_ttl,
                                int current_step, int total_step) const;
+
+    // Load a voice preset JSON (the converted layout's voice_styles/<name>.json:
+    // an object with style_ttl / style_dp, each {"dims":[1,N,M],"data":[...]}).
+    // `path` is the only filesystem touch and is handed in by the caller. Throws
+    // if the file is missing / malformed or a style matrix is mis-sized.
+    VoiceStyle load_voice_style(const std::string& path) const;
+
+    // UnicodeProcessor frontend: a UTF-8 string + ISO language tag -> token ids.
+    // Mirrors the upstream codepoint pipeline — NFKD normalize, emoji/symbol
+    // strip, punctuation tidy-up, a `<lang>…</lang>` wrap — then maps each
+    // codepoint through unicode_indexer.json (out-of-vocab wraps to the embedding
+    // table's last row, as ONNX Gather does). `lang` must be one of the 31
+    // supported codes (or "na"). Throws if the frontend tables are absent.
+    std::vector<int> text_to_ids(const std::string& text,
+                                 const std::string& lang) const;
+
+    // End-to-end synthesis: text + language + voice preset -> waveform.
+    //
+    // Runs the full pipeline — text_to_ids, predict_duration (scaled by 1/speed),
+    // encode_text, a `total_step`-iteration classifier-free-guided Euler loop
+    // through the vector estimator seeded from N(0,1) noise (Philox `seed`), and
+    // the vocoder. `speed` > 1 shortens the utterance (upstream default 1.05);
+    // `total_step` is the number of flow-matching steps (upstream default 8).
+    // Returns mono FP32 PCM at config().sample_rate. Throws if any stage's
+    // weights or the frontend tables are absent.
+    AudioBuffer synthesize(const std::string& text, const std::string& lang,
+                           const VoiceStyle& voice, int total_step = 8,
+                           float speed = 1.05f, std::uint64_t seed = 0) const;
 
     const SupertonicConfig& config() const;
     bool loaded() const;

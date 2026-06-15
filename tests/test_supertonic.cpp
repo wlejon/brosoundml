@@ -41,6 +41,7 @@ static float max_abs_err(const std::vector<float>& a, const std::vector<float>& 
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: survive a crash
+    brotensor::init();  // probe + register GPU backends (CPU is always present)
     std::string dir;
     if (const char* e = std::getenv("BROSOUNDML_SUPERTONIC_DIR"); e && *e) {
         dir = e;
@@ -71,9 +72,16 @@ int main() {
         return 1;
     }
 
+    // Run on CUDA when the backend is present (the flow loop is heavy on CPU);
+    // parity tolerances below hold on either backend (device-neutral bit-faithful).
+    const brotensor::Device dev = brotensor::is_available(brotensor::Device::CUDA)
+                                      ? brotensor::Device::CUDA
+                                      : brotensor::Device::CPU;
+    std::printf("device: %s\n", dev == brotensor::Device::CUDA ? "CUDA" : "CPU");
+
     brosoundml::Supertonic model;
     try {
-        model.load(dir, brotensor::Device::CPU);
+        model.load(dir, dev);
     } catch (const std::exception& e) {
         std::printf("FAIL: load threw: %s\n", e.what());
         return 1;
@@ -222,5 +230,81 @@ int main() {
         return 1;
     }
     std::printf("PASS: vector_estimator matches ONNX reference within %.1e\n", ve_tol);
+
+    // ── end-to-end synthesis (UnicodeProcessor frontend + flow loop + vocoder) ──
+    const fs::path m1 = fs::path(dir) / "voice_styles" / "M1.json";
+    if (!fs::exists(m1)) {
+        std::printf("SKIP: voice_styles/M1.json absent\n");
+        return 0;
+    }
+    brosoundml::VoiceStyle voice;
+    try {
+        voice = model.load_voice_style(m1.string());
+    } catch (const std::exception& e) {
+        std::printf("FAIL: load_voice_style threw: %s\n", e.what());
+        return 1;
+    }
+
+    // Frontend: a known string -> non-empty ids, all in [0, vocab); the lang tag
+    // wrap means the id stream is strictly longer than the bare text.
+    const std::string sample = "Hello, world.";
+    std::vector<int> ids;
+    try {
+        ids = model.text_to_ids(sample, "en");
+    } catch (const std::exception& e) {
+        std::printf("FAIL: text_to_ids threw: %s\n", e.what());
+        return 1;
+    }
+    std::printf("text_to_ids(\"%s\", en) -> %zu ids\n", sample.c_str(), ids.size());
+    if (ids.size() < sample.size()) {  // "<en>" + text + "</en>" is longer
+        std::printf("FAIL: id stream %zu shorter than text %zu\n",
+                    ids.size(), sample.size());
+        return 1;
+    }
+    for (int id : ids)
+        if (id < 0) { std::printf("FAIL: negative id %d leaked\n", id); return 1; }
+
+    const int total_step = 8;
+    brosoundml::AudioBuffer syn, syn2;
+    try {
+        syn  = model.synthesize(sample, "en", voice, total_step, 1.05f, /*seed=*/7);
+        syn2 = model.synthesize(sample, "en", voice, total_step, 1.05f, /*seed=*/7);
+    } catch (const std::exception& e) {
+        std::printf("FAIL: synthesize threw: %s\n", e.what());
+        return 1;
+    }
+    std::printf("synthesize: %zu samples (%.2fs) @ %d Hz\n", syn.samples.size(),
+                syn.samples.size() / static_cast<double>(syn.sample_rate),
+                syn.sample_rate);
+
+    if (syn.sample_rate != model.config().sample_rate) {
+        std::printf("FAIL: sample_rate %d != config %d\n",
+                    syn.sample_rate, model.config().sample_rate);
+        return 1;
+    }
+    // Output length is a whole number of de-chunked frames (chunk*base_chunk).
+    const std::size_t frame_samples =
+        static_cast<std::size_t>(model.config().chunk) * model.config().base_chunk;
+    if (syn.samples.empty() || syn.samples.size() % frame_samples != 0) {
+        std::printf("FAIL: %zu samples not a multiple of %zu\n",
+                    syn.samples.size(), frame_samples);
+        return 1;
+    }
+    // Finite and not pure silence.
+    float peak = 0.0f;
+    for (float s : syn.samples) {
+        if (!std::isfinite(s)) { std::printf("FAIL: non-finite sample\n"); return 1; }
+        peak = std::max(peak, std::fabs(s));
+    }
+    if (peak < 1.0e-4f) { std::printf("FAIL: output is silent (peak %.2e)\n", peak); return 1; }
+    // Same seed -> bit-identical (deterministic, no hidden global RNG state).
+    if (syn2.samples.size() != syn.samples.size() ||
+        max_abs_err(syn.samples, syn2.samples) != 0.0f) {
+        std::printf("FAIL: synthesis not deterministic for a fixed seed\n");
+        return 1;
+    }
+    std::printf("PASS: synthesize produced %.2fs of finite, non-silent, "
+                "deterministic audio (peak %.3f)\n",
+                syn.samples.size() / static_cast<double>(syn.sample_rate), peak);
     return 0;
 }
