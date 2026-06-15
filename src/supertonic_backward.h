@@ -121,5 +121,83 @@ void convnext_block_forward_train(const brotensor::Tensor& h,
 void convnext_block_backward(const ConvNeXtBlock& blk, const ConvNeXtCache& cache,
                              const brotensor::Tensor& dY, brotensor::Tensor& dX);
 
+// ─── tanh-gated style cross-attention backward ───────────────────────────────
+//
+// Forward (supertonic.cpp style_attention), all channel-major:
+//   q = pconv(query,   wq)  [inner,Lq]      k = pconv(key_src, wk)  [inner,S]
+//   v = pconv(val_src, wv)  [inner,S]
+//   per head (kSpteHeads=2, hd=inner/nh):
+//     ktanh = tanh(kh)                                 # tanh GATE on keys
+//     scores = (qhᵀ @ ktanh) * (1/16)  -> softmax over S keys   # scale 1/16
+//     outh   = scores @ vhᵀ
+//   y = pconv(concat_heads, wo)  [Cout,Lq]
+// The KEY path is FROZEN (a fixed learned prototype): the backward threads
+// through tanh+softmax w.r.t. scores to reach d(query), but does NOT emit
+// d(key) — dKtanh is discarded. Two input grads are produced: d(query) (a field
+// activation needing upstream grad) and d(value) (= style_ttl, the optimisation
+// target). All weights FROZEN.
+
+struct StyleAttnCache {
+    PConvCache        qc, vc, oc;  // q / v / o projection conv geometry (key frozen)
+    brotensor::Tensor q;           // (inner, Lq)  q projection output
+    brotensor::Tensor ktanh;       // (inner, S)   tanh(k projection)
+    brotensor::Tensor v;           // (inner, S)   v projection output
+    brotensor::Tensor scores;      // (nh*Lq, S)   softmaxed weights, heads stacked
+    int   nh = 0, hd = 0, Lq = 0, S = 0, inner = 0, Cq = 0, Ck = 0;
+    float inv = 1.0f;              // attention scale (1/16)
+};
+
+//   query: (1, Cq*Lq).  key_src/val_src: (1, Ck*S).  y: (1, Cout*Lq), overwritten.
+void style_attention_forward_train(const brotensor::Tensor& query,
+                                   const brotensor::Tensor& key_src,
+                                   const brotensor::Tensor& val_src,
+                                   const StyleAttn& A, int Lq, int S,
+                                   brotensor::Tensor& y, StyleAttnCache& cache);
+
+//   dY: (1, Cout*Lq).  dQuery: (1, Cq*Lq), dValue: (1, Ck*S), both overwritten.
+void style_attention_backward(const StyleAttn& A, const StyleAttnCache& cache,
+                              const brotensor::Tensor& dY,
+                              brotensor::Tensor& dQuery, brotensor::Tensor& dValue);
+
+// ─── RoPE text cross-attention block backward ────────────────────────────────
+//
+// This atom is the WHOLE flow-field text-attention block (main_blocks %6==3),
+// not just the bare attention: forward_train reproduces supertonic.cpp's
+// rope_attention AND the residual + post-attention LayerNorm applied at its call
+// site, so agent 3 can chain it as one unit. Forward (kVeC=512, kVeHeads=8,
+// kVeHd=64, kVeHalf=32, scale 1/16), channel-major:
+//   q = pconv(h, conv_q) [512,L]   k = pconv(text, conv_k) [512,T]   v = pconv(text, conv_v) [512,T]
+//   per head: qr = RoPE(qh, posL), kr = RoPE(kh, posT)   # position p angle (p/len)*theta[f]
+//             scores = (qrᵀ @ kr) * (1/16) -> softmax over T;  outh = scores @ vhᵀ
+//   attn = pconv(concat_heads, conv_o) [512,L]
+//   y    = LayerNorm_chan(attn + h, norm_g, norm_b)       # residual + post-attn LN
+// key/value come from the FROZEN text encoding: only d(query)=d(h) is produced
+// (dKr/dVhT discarded). RoPE is an orthogonal rotation, so its adjoint is the
+// rotation by the negated angle (transpose of the rotation matrix), applied to
+// the incoming q-gradient. LayerNorm affine FROZEN — dGamma/dBeta discarded.
+
+struct RopeAttnCache {
+    PConvCache        qc, oc;     // q / o projection conv geometry (k/v frozen)
+    brotensor::Tensor qr;         // (inner, L)  RoPE'd q
+    brotensor::Tensor kr;         // (inner, T)  RoPE'd k
+    brotensor::Tensor v;          // (inner, T)  v projection output
+    brotensor::Tensor scores;     // (nh*L, T)   softmaxed weights, heads stacked
+    brotensor::Tensor cosL, sinL; // (half, L)   query-position RoPE tables (adjoint)
+    brotensor::Tensor ln_xhat;    // (L, C)      post-attn LN normalised input
+    brotensor::Tensor ln_rstd;    // (L, 1)      post-attn LN 1/sqrt(var+eps)
+    int   nh = 0, hd = 0, half = 0, L = 0, T = 0, C = 0, inner = 0;
+    float inv = 1.0f;             // attention scale (1/16)
+};
+
+//   h: (1, 512*L).  text_src: (1, Ck*T).  y: (1, 512*L), overwritten.
+void rope_attention_forward_train(const brotensor::Tensor& h,
+                                  const brotensor::Tensor& text_src,
+                                  const VeRope& A, int L, int T,
+                                  brotensor::Tensor& y, RopeAttnCache& cache);
+
+//   dY: (1, 512*L).  dH: (1, 512*L), overwritten (= d(query)).
+void rope_attention_backward(const VeRope& A, const RopeAttnCache& cache,
+                             const brotensor::Tensor& dY, brotensor::Tensor& dH);
+
 }  // namespace st_detail
 }  // namespace brosoundml

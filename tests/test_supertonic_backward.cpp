@@ -233,6 +233,72 @@ static void test_convnext(int dil, std::uint32_t seed, const char* label) {
     fd_directional(x, dX, loss, rng, std::string(label) + ".dX");
 }
 
+// ─── tanh-gated style cross-attention ────────────────────────────────────────
+static void test_style_attention() {
+    std::mt19937 rng(0x57A1u);
+    const int nh = 2, hd = 4, inner = nh * hd;  // kSpteHeads=2
+    const int Cq = 8, Ck = 6, Cout = 8, Lq = 7, S = 5;
+
+    st::StyleAttn A;
+    A.wq = make_convw(/*cout=*/inner, /*cin_pg=*/Cq, 1, /*bias=*/true, rng);
+    A.wk = make_convw(/*cout=*/inner, /*cin_pg=*/Ck, 1, /*bias=*/true, rng);
+    A.wv = make_convw(/*cout=*/inner, /*cin_pg=*/Ck, 1, /*bias=*/true, rng);
+    A.wo = make_convw(/*cout=*/Cout,  /*cin_pg=*/inner, 1, /*bias=*/true, rng);
+
+    Tensor query  = make_random(1, Cq * Lq, rng, 0.6f);
+    Tensor keysrc = make_random(1, Ck * S,  rng, 0.6f);  // FROZEN prototype
+    Tensor valsrc = make_random(1, Ck * S,  rng, 0.6f);  // = style_ttl (target)
+    Tensor target = make_random(1, Cout * Lq, rng, 0.5f);
+
+    st::StyleAttnCache cache; Tensor y;
+    auto fwd = [&]() {
+        st::style_attention_forward_train(query, keysrc, valsrc, A, Lq, S, y, cache);
+    };
+    fwd();
+    Tensor dY = Tensor::mat(1, y.size());
+    for (int i = 0; i < dY.size(); ++i) dY[i] = y[i] - target[i];
+    Tensor dQuery, dValue;
+    st::style_attention_backward(A, cache, dY, dQuery, dValue);
+
+    auto loss = [&]() { fwd(); return mse_loss(y, target)(); };
+    fd_directional(query,  dQuery, loss, rng, "style_attn.dQuery");
+    fd_directional(valsrc, dValue, loss, rng, "style_attn.dValue");
+}
+
+// ─── RoPE text cross-attention block (attention + residual + post-attn LN) ────
+static void test_rope_attention() {
+    std::mt19937 rng(0x57B2u);
+    const int C = 512, Ck = 256, L = 4, T = 5, half = 32;  // model-fixed dims
+
+    st::VeRope A;
+    A.conv_q = make_convw(/*cout=*/C, /*cin_pg=*/C,  1, /*bias=*/true, rng, 0.08f);
+    A.conv_k = make_convw(/*cout=*/C, /*cin_pg=*/Ck, 1, /*bias=*/true, rng, 0.08f);
+    A.conv_v = make_convw(/*cout=*/C, /*cin_pg=*/Ck, 1, /*bias=*/true, rng, 0.08f);
+    A.conv_o = make_convw(/*cout=*/C, /*cin_pg=*/C,  1, /*bias=*/true, rng, 0.08f);
+    A.theta.resize(half);
+    for (int f = 0; f < half; ++f)
+        A.theta[f] = 1.0f / std::pow(10000.0f, static_cast<float>(f) / half);
+    A.norm_g = make_random(C, 1, rng, 0.4f);
+    A.norm_b = make_random(C, 1, rng, 0.3f);
+
+    Tensor h        = make_random(1, C  * L, rng, 0.4f);
+    Tensor text_src = make_random(1, Ck * T, rng, 0.4f);  // FROZEN text encoding
+    Tensor target   = make_random(1, C  * L, rng, 0.5f);
+
+    st::RopeAttnCache cache; Tensor y;
+    auto fwd = [&]() {
+        st::rope_attention_forward_train(h, text_src, A, L, T, y, cache);
+    };
+    fwd();
+    Tensor dY = Tensor::mat(1, y.size());
+    for (int i = 0; i < dY.size(); ++i) dY[i] = y[i] - target[i];
+    Tensor dH;
+    st::rope_attention_backward(A, cache, dY, dH);
+
+    auto loss = [&]() { fwd(); return mse_loss(y, target)(); };
+    fd_directional(h, dH, loss, rng, "rope_attn.dH");
+}
+
 int main() {
     brotensor::init();
     test_pconv_1x1();
@@ -242,6 +308,8 @@ int main() {
     test_transpose();
     test_convnext(/*dil=*/1, 0xC0DE01u, "convnext_dil1");
     test_convnext(/*dil=*/2, 0xC0DE02u, "convnext_dil2");
+    test_style_attention();
+    test_rope_attention();
 
     if (g_failures) { std::printf("test_supertonic_backward: %d failure(s)\n", g_failures); return 1; }
     std::printf("test_supertonic_backward: OK\n");
