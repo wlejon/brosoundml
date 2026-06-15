@@ -290,12 +290,11 @@ bt::Tensor transpose2d(const bt::Tensor& x, int R, int C) {
     return y;
 }
 
-// In-place row softmax over a [R x Cn] matrix (each row independently).
+// In-place row softmax over a [R x Cn] matrix (each row independently). One
+// batched kernel launch over all R rows — not R per-row softmax_forward calls
+// (the attention score matrices dominate the launch count otherwise).
 void softmax_rows(bt::Tensor& m, int R, int Cn) {
-    for (int r = 0; r < R; ++r) {
-        bt::Tensor row = sub_view(m, r * Cn, 1, Cn);
-        bt::softmax_forward(row, row);
-    }
+    bt::softmax_rows_forward(m, m, R, Cn);
 }
 
 // Glow-TTS window-sliced relative embeddings: emb [2w+1, kc] -> [2T-1, kc].
