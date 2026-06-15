@@ -1,5 +1,7 @@
 #include "brosoundml/supertonic.h"
 
+#include "supertonic_internal.h"
+
 #include "brosoundml/detail/json.h"
 
 #include <brotensor/ops.h>
@@ -27,6 +29,12 @@ namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
 namespace j  = detail::json;
 namespace fs = std::filesystem;
+
+// The weight structs (ConvW, ConvNeXtBlock, AttnLayer, StyleAttn, Gemm,
+// VeFilm, VeRope, VeStyle, VeBlock) now live in supertonic_internal.h so the
+// backward TU can compose against the same types. Pulled into this scope so
+// every existing reference below resolves unchanged.
+using namespace st_detail;
 
 namespace {
 
@@ -67,13 +75,6 @@ std::string slurp(const fs::path& p) {
 }
 
 // ── parameter blocks ─────────────────────────────────────────────────────────
-
-// A conv1d weight flattened to brotensor's (Cout, (Cin/groups)*K) OIL layout.
-struct ConvW {
-    bt::Tensor w, b;
-    bool       has_b = false;
-    int        cin_pg = 0, cout = 0, k = 0;  // cin_pg = weight.shape[1] = Cin/groups
-};
 
 // Load an ONNX conv weight (Cout, Cin/groups, K) by its exact tensor name.
 ConvW load_conv(const sf::File& f, const std::string& wname,
@@ -118,65 +119,6 @@ ConvW load_pwconv2_scaled(const sf::File& f, const std::string& prefix,
     out.b = bt::Tensor::from_host_on(dev, b.data(), cout, 1);
     return out;
 }
-
-struct ConvNeXtBlock {
-    ConvW      dw;          // depthwise conv (groups = channels), kernel 7, dilated
-    int        dil = 1;
-    bt::Tensor ln_g, ln_b;  // channel-wise LayerNorm affine
-    ConvW      pw1;         // 1x1, channels -> intermediate
-    ConvW      pw2;         // 1x1, intermediate -> channels (gamma folded)
-};
-
-// One Glow-TTS relative-position attention block (text encoder attn_encoder):
-// 1x1 q/k/v/o projections, windowed relative key/value embeddings, two
-// channel-wise LayerNorms, and a 1x1-conv FFN (conv_1 -> relu -> conv_2).
-struct AttnLayer {
-    ConvW      conv_q, conv_k, conv_v, conv_o;  // 1x1
-    bt::Tensor emb_rel_k, emb_rel_v;            // [2*window+1, kc]
-    bt::Tensor n1_g, n1_b, n2_g, n2_b;          // post-attn / post-ffn LN
-    ConvW      ffn1, ffn2;                      // 1x1 (C->filter, filter->C)
-};
-
-// One speech-prompted style cross-attention (tanh-gated, query=text,
-// key=learned style prototype, value=style_ttl). Folded linears carried as
-// 1x1 convs over channel-major activations.
-struct StyleAttn {
-    ConvW wq, wk, wv, wo;  // 1x1, from the transposed onnx::MatMul_* weights
-};
-
-// A plain Linear (ONNX Gemm, transB=1): y = x @ W^T + b. The weight is stored
-// transposed to [in, out] so a row-vector matmul needs no further transpose.
-struct Gemm {
-    bt::Tensor wt;  // [in, out]
-    bt::Tensor b;   // [1, out]
-    int in = 0, out = 0;
-};
-
-// ─── flow-field (vector estimator) block types ───────────────────────────────
-
-struct VeFilm {        // time FiLM (main_blocks %6==1): h += time_emb @ W + b
-    bt::Tensor w;      // [64, 512] (in,out) for the row matmul
-    bt::Tensor b;      // [1, 512]
-};
-
-struct VeRope {        // text cross-attention with RoPE (main_blocks %6==3)
-    ConvW conv_q, conv_k, conv_v, conv_o;  // q:512->512, k/v:256->512, o:512->512
-    std::vector<float> theta;              // [32] RoPE base frequencies (host)
-    bt::Tensor norm_g, norm_b;             // post-attention LayerNorm
-};
-
-struct VeStyle {       // tanh-gated style cross-attention (main_blocks %6==5)
-    StyleAttn  attn;   // q:512->256, k/v:256->256, o:256->512
-    bt::Tensor norm_g, norm_b;             // post-attention LayerNorm
-};
-
-struct VeBlock {
-    int type = 0;                          // 0 convnext(x2), 1 film, 2 rope, 3 style
-    std::vector<ConvNeXtBlock> conv;       // type 0: two ConvNeXt sub-blocks
-    VeFilm  film;
-    VeRope  rope;
-    VeStyle style;
-};
 
 // Load a folded ONNX MatMul weight [in, out] (a Linear, x @ W) + bias as a 1x1
 // conv: conv weight is [out, in], so transpose host-side. Bias is [out].
