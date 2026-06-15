@@ -162,6 +162,35 @@ public:
                            const VoiceStyle& voice, int total_step = 8,
                            float speed = 1.05f, std::uint64_t seed = 0) const;
 
+    // Long-form synthesis: split `text` into sentences, synthesize each through
+    // synthesize() (so each chunk gets its own predicted duration and flow-field
+    // pass at a tractable length), and concatenate with `gap_seconds` of silence
+    // between sentences. The flow loop is graph-accelerated per chunk, and the
+    // fixed per-chunk overheads amortise better over longer text.
+    //
+    // Sentence boundaries are found by a Unicode-aware scanner (not std::regex —
+    // it can't express the lookbehind needed): a split lands at sentence-final
+    // punctuation (. ! ? … and the CJK 。！？) followed by whitespace or end of
+    // text, skipping decimals (a '.' between digits). Any sentence still longer
+    // than `max_chars` codepoints is further split at a whitespace near the limit
+    // so no single chunk drives the field to an unwieldy latent length. `seed` is
+    // advanced per chunk (seed + chunk_index) so chunks differ yet stay
+    // deterministic. With a single sentence this is just synthesize() (no gap).
+    AudioBuffer synthesize_long(const std::string& text, const std::string& lang,
+                                const VoiceStyle& voice, int total_step = 8,
+                                float speed = 1.05f, std::uint64_t seed = 0,
+                                float gap_seconds = 0.3f, int max_chars = 300) const;
+
+    // The sentence splitter used by synthesize_long, exposed for callers that
+    // want to chunk text themselves (e.g. to stream or batch). Stateless — needs
+    // no loaded model. Boundaries land at sentence-final punctuation (. ! ? … and
+    // the CJK 。！？) followed by whitespace or end of text, skipping decimals and
+    // common abbreviations / single-letter initials; trailing quotes/brackets
+    // stay with the sentence; any chunk longer than `max_chars` codepoints is
+    // broken at a nearby whitespace. Returns trimmed, non-empty UTF-8 chunks.
+    static std::vector<std::string> split_sentences(const std::string& text,
+                                                    int max_chars = 300);
+
     const SupertonicConfig& config() const;
     bool loaded() const;
 

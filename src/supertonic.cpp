@@ -750,6 +750,131 @@ std::u32string preprocess_text(const std::string& utf8, const std::string& lang)
     return U"<" + lt + U">" + t + U"</" + lt + U">";
 }
 
+// ─── sentence splitting for long-form synthesis ──────────────────────────────
+
+// Encode a codepoint sequence back to UTF-8 (inverse of utf8_to_u32) — each
+// split sentence is handed back to synthesize() as a UTF-8 string.
+std::string u32_to_utf8(const std::u32string& s) {
+    std::string out;
+    for (char32_t c : s) {
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+        } else if (c < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        } else if (c < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (c >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (c >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+    }
+    return out;
+}
+
+bool is_space_cp(char32_t c) {
+    return c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' || c == U'\f' ||
+           c == 0x0B || c == 0xA0 /*nbsp*/ || c == 0x3000 /*ideographic space*/;
+}
+bool is_digit_cp(char32_t c) { return c >= U'0' && c <= U'9'; }
+bool is_alpha_cp(char32_t c) {
+    return (c >= U'a' && c <= U'z') || (c >= U'A' && c <= U'Z');
+}
+
+// The lowercased ASCII-alpha run ending just before `i` (the punctuation), used
+// to suppress a sentence split after a known abbreviation or a single-letter
+// initial. Empty if the char before `i` is not alpha.
+std::u32string preceding_word(const std::u32string& s, std::size_t i) {
+    std::size_t b = i;
+    while (b > 0 && is_alpha_cp(s[b - 1])) --b;
+    std::u32string w = s.substr(b, i - b);
+    for (char32_t& ch : w) if (ch >= U'A' && ch <= U'Z') ch = ch - U'A' + U'a';
+    return w;
+}
+
+// A '.' right after one of these (case-insensitive) is an abbreviation, not a
+// sentence end — splitting there would strand a tiny "Dr." / "etc." chunk. The
+// list errs toward under-splitting (a slightly longer chunk is harmless; the
+// flow field handles it and max_chars still bounds runaways).
+bool is_abbrev(const std::u32string& w) {
+    if (w.size() == 1) return true;  // single-letter initial: "J. R. R. Tolkien"
+    static const std::u32string kAbbrev[] = {
+        U"mr", U"mrs", U"ms", U"dr", U"prof", U"st", U"sr", U"jr", U"vs", U"etc",
+        U"inc", U"ltd", U"co", U"corp", U"no", U"fig", U"al", U"dept", U"gov",
+        U"sen", U"rep", U"gen", U"col", U"capt", U"lt", U"sgt", U"rev", U"hon",
+        U"approx", U"e.g", U"i.e", U"a.m", U"p.m", U"u.s"};
+    for (const std::u32string& a : kAbbrev) if (w == a) return true;
+    return false;
+}
+bool is_sentence_end_cp(char32_t c) {
+    return c == U'.' || c == U'!' || c == U'?' || c == 0x2026 /*…*/ ||
+           c == 0x3002 /*。*/ || c == 0xFF01 /*！*/ || c == 0xFF1F /*？*/ ||
+           c == 0xFF0E /*．*/;
+}
+// Closers that ride along after the terminal punctuation (quotes / brackets).
+bool is_closer_cp(char32_t c) {
+    return is_sentence_end_cp(c) || c == U'"' || c == U'\'' || c == U')' ||
+           c == U']' || c == U'}' || c == 0x201D /*”*/ || c == 0x2019 /*’*/ ||
+           c == 0x300D /*」*/ || c == 0x300F /*』*/ || c == 0x3011 /*】*/;
+}
+std::u32string trim_u32(const std::u32string& s, std::size_t a, std::size_t b) {
+    while (a < b && is_space_cp(s[a])) ++a;
+    while (b > a && is_space_cp(s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+// Split text into sentence chunks (UTF-8). A boundary is sentence-final
+// punctuation — skipping a '.' between digits (decimal) — followed by whitespace
+// or end of text; trailing quote/bracket closers stay with the sentence. Any
+// chunk still longer than max_chars codepoints is broken again at the last
+// whitespace before the limit (hard cut if a single token is longer), so no
+// chunk drives the flow field to an unwieldy latent length.
+std::vector<std::string> split_sentences_impl(const std::string& text, int max_chars) {
+    const std::u32string s = utf8_to_u32(text);
+    const std::size_t n = s.size();
+    std::vector<std::u32string> raw;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!is_sentence_end_cp(s[i])) continue;
+        if (s[i] == U'.' && i > 0 && i + 1 < n &&
+            is_digit_cp(s[i - 1]) && is_digit_cp(s[i + 1]))
+            continue;  // decimal point — not a sentence end
+        if (s[i] == U'.' && i > 0 && is_alpha_cp(s[i - 1]) &&
+            is_abbrev(preceding_word(s, i)))
+            continue;  // abbreviation / initial — not a sentence end
+        std::size_t j = i + 1;
+        while (j < n && is_closer_cp(s[j])) ++j;  // absorb e.g. ?!").  runs
+        if (j >= n || is_space_cp(s[j])) {
+            raw.push_back(s.substr(start, j - start));
+            while (j < n && is_space_cp(s[j])) ++j;  // skip the gap
+            start = j;
+            i = (j > 0) ? j - 1 : 0;
+        }
+    }
+    if (start < n) raw.push_back(s.substr(start, n - start));
+
+    std::vector<std::string> out;
+    for (const std::u32string& c0 : raw) {
+        std::u32string c = trim_u32(c0, 0, c0.size());
+        while (static_cast<int>(c.size()) > max_chars) {
+            std::size_t cut = static_cast<std::size_t>(max_chars);
+            while (cut > 0 && !is_space_cp(c[cut])) --cut;  // back up to a space
+            if (cut == 0) cut = static_cast<std::size_t>(max_chars);  // no space: hard cut
+            std::u32string head = trim_u32(c, 0, cut);
+            if (!head.empty()) out.push_back(u32_to_utf8(head));
+            std::size_t rest = cut;
+            while (rest < c.size() && is_space_cp(c[rest])) ++rest;
+            c = trim_u32(c, rest, c.size());
+        }
+        if (!c.empty()) out.push_back(u32_to_utf8(c));
+    }
+    return out;
+}
+
 }  // namespace
 
 // ─── Impl ────────────────────────────────────────────────────────────────────
@@ -841,6 +966,10 @@ struct Supertonic::Impl {
     AudioBuffer synthesize(const std::string& text, const std::string& lang,
                            const VoiceStyle& voice, int total_step, float speed,
                            std::uint64_t seed) const;
+    AudioBuffer synthesize_long(const std::string& text, const std::string& lang,
+                                const VoiceStyle& voice, int total_step, float speed,
+                                std::uint64_t seed, float gap_seconds,
+                                int max_chars) const;
 };
 
 void Supertonic::Impl::load(const std::string& dir, bt::Device device) {
@@ -1543,6 +1672,28 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     return decode(xt.data(), channels, latent_len);
 }
 
+AudioBuffer Supertonic::Impl::synthesize_long(
+        const std::string& text, const std::string& lang, const VoiceStyle& voice,
+        int total_step, float speed, std::uint64_t seed,
+        float gap_seconds, int max_chars) const {
+    if (max_chars < 16) max_chars = 16;
+    std::vector<std::string> chunks = split_sentences_impl(text, max_chars);
+    if (chunks.empty()) chunks.push_back(text);  // all-whitespace / unsplittable
+
+    AudioBuffer out;
+    out.sample_rate = cfg.sample_rate;
+    const int gap = gap_seconds > 0.0f
+        ? static_cast<int>(gap_seconds * static_cast<float>(cfg.sample_rate)) : 0;
+    for (std::size_t k = 0; k < chunks.size(); ++k) {
+        const AudioBuffer w = synthesize(chunks[k], lang, voice, total_step, speed,
+                                         seed + static_cast<std::uint64_t>(k));
+        if (k > 0 && gap > 0)
+            out.samples.insert(out.samples.end(), static_cast<std::size_t>(gap), 0.0f);
+        out.samples.insert(out.samples.end(), w.samples.begin(), w.samples.end());
+    }
+    return out;
+}
+
 AudioBuffer Supertonic::Impl::decode(const float* latent, int channels,
                                      int frames) const {
     if (!ready) fail("decode() before load()");
@@ -1689,6 +1840,20 @@ AudioBuffer Supertonic::synthesize(const std::string& text, const std::string& l
                                    const VoiceStyle& voice, int total_step,
                                    float speed, std::uint64_t seed) const {
     return impl_->synthesize(text, lang, voice, total_step, speed, seed);
+}
+
+AudioBuffer Supertonic::synthesize_long(const std::string& text, const std::string& lang,
+                                        const VoiceStyle& voice, int total_step,
+                                        float speed, std::uint64_t seed,
+                                        float gap_seconds, int max_chars) const {
+    return impl_->synthesize_long(text, lang, voice, total_step, speed, seed,
+                                  gap_seconds, max_chars);
+}
+
+std::vector<std::string> Supertonic::split_sentences(const std::string& text,
+                                                     int max_chars) {
+    if (max_chars < 16) max_chars = 16;
+    return split_sentences_impl(text, max_chars);
 }
 
 const SupertonicConfig& Supertonic::config() const { return impl_->cfg; }

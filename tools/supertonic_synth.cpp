@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     const int iters = (argc > 8) ? std::atoi(argv[8]) : 3;
     brosoundml::AudioBuffer wav;
     try {
-        wav = model.synthesize(text, lang, style, steps, speed);  // warm-up (discarded timing)
+        wav = model.synthesize_long(text, lang, style, steps, speed);  // warm-up (discarded timing)
         brotensor::sync_all();
     } catch (const std::exception& e) {
         std::printf("synthesize failed: %s\n", e.what());
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     double best_ms = 1e30;
     for (int it = 0; it < iters; ++it) {
         t0 = clk::now();
-        wav = model.synthesize(text, lang, style, steps, speed);
+        wav = model.synthesize_long(text, lang, style, steps, speed);
         brotensor::sync_all();
         const double m = ms_since(t0);
         best_ms = std::min(best_ms, m);

@@ -333,5 +333,68 @@ int main() {
     std::printf("PASS: synthesize produced %.2fs of finite, non-silent, "
                 "deterministic audio (peak %.3f)\n",
                 syn.samples.size() / static_cast<double>(syn.sample_rate), peak);
+
+    // ── long-form sentence splitter contract ──
+    {
+        const std::vector<std::string> got = brosoundml::Supertonic::split_sentences(
+            "The pi constant is about 3.14159. Dr. Smith said, \"It works!\" "
+            "Does it? Yes, it does. J. R. R. Tolkien wrote books.");
+        const std::vector<std::string> want = {
+            "The pi constant is about 3.14159.",
+            "Dr. Smith said, \"It works!\"",
+            "Does it?",
+            "Yes, it does.",
+            "J. R. R. Tolkien wrote books.",
+        };
+        if (got != want) {
+            std::printf("FAIL: split_sentences produced %zu chunks:\n", got.size());
+            for (const std::string& c : got) std::printf("    [%s]\n", c.c_str());
+            return 1;
+        }
+        // A run-on with no punctuation must still be bounded by max_chars.
+        std::string runon;
+        for (int i = 0; i < 80; ++i) runon += "word ";
+        const std::vector<std::string> caps =
+            brosoundml::Supertonic::split_sentences(runon, /*max_chars=*/40);
+        if (caps.size() < 2) {
+            std::printf("FAIL: run-on not split by max_chars (%zu chunks)\n", caps.size());
+            return 1;
+        }
+        std::printf("PASS: split_sentences boundaries correct (decimals, abbrevs, "
+                    "initials, quotes; %zu run-on chunks)\n", caps.size());
+    }
+
+    // ── long-form synthesis: multi-sentence concatenation with gaps ──
+    {
+        const std::string para =
+            "Hello there. This is the second sentence. And a third one follows.";
+        brosoundml::AudioBuffer lon, lon2;
+        try {
+            lon  = model.synthesize_long(para, "en", voice, total_step, 1.05f, /*seed=*/7);
+            lon2 = model.synthesize_long(para, "en", voice, total_step, 1.05f, /*seed=*/7);
+        } catch (const std::exception& e) {
+            std::printf("FAIL: synthesize_long threw: %s\n", e.what());
+            return 1;
+        }
+        // Three sentences + two 0.3s gaps -> longer than the single first sentence.
+        brosoundml::AudioBuffer one = model.synthesize("Hello there.", "en", voice,
+                                                       total_step, 1.05f, /*seed=*/7);
+        if (lon.samples.size() <= one.samples.size()) {
+            std::printf("FAIL: long-form (%zu) not longer than one sentence (%zu)\n",
+                        lon.samples.size(), one.samples.size());
+            return 1;
+        }
+        for (float s : lon.samples)
+            if (!std::isfinite(s)) { std::printf("FAIL: long-form non-finite\n"); return 1; }
+        if (lon2.samples.size() != lon.samples.size() ||
+            max_abs_err(lon.samples, lon2.samples) != 0.0f) {
+            std::printf("FAIL: long-form not deterministic for a fixed seed\n");
+            return 1;
+        }
+        std::printf("PASS: synthesize_long produced %.2fs of deterministic audio "
+                    "across %zu sentences\n",
+                    lon.samples.size() / static_cast<double>(lon.sample_rate),
+                    brosoundml::Supertonic::split_sentences(para).size());
+    }
     return 0;
 }
