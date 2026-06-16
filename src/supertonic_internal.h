@@ -1,15 +1,11 @@
 #pragma once
 
-// brosoundml/src/supertonic_internal.h — the anonymous-namespace weight structs
-// that supertonic.cpp builds its forward graph from, surfaced into a named
-// namespace so a separate backward translation unit
-// (supertonic_backward.{h,cpp}) can compose against the exact same types.
+// brosoundml/src/supertonic_internal.h — the weight structs that supertonic.cpp
+// builds its forward graph from, in a named namespace (st_detail).
 //
 // These are pure type definitions (no free functions with internal linkage), so
 // living in a shared header changes nothing about linkage: supertonic.cpp pulls
-// them in with `using namespace st_detail;` and behaves identically; the
-// backward TU reimplements the forward math it needs (composing brotensor ops
-// directly, mirroring kokoro_decoder_backward.h) against these same structs.
+// them in with `using namespace st_detail;` and behaves identically.
 //
 // Private to the brosoundml build (lives under src/, not installed).
 

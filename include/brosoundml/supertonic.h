@@ -88,48 +88,6 @@ public:
     AudioBuffer decode(const std::vector<float>& latent, int channels,
                        int frames) const;
 
-    // Decode a REAL (de-chunked, de-normalised) latent [latent_dim, frames_dechunked]
-    // straight through the vocoder conv stack — the inverse pairing for the AE
-    // encoder, whose output is exactly this. Unlike decode(), it does no de-chunk
-    // or de-normalise; it synthesises base_chunk (512) samples per de-chunked
-    // frame. Used by the encoder reconstruction loop. Throws if not loaded.
-    AudioBuffer decode_real(const float* latent_real, int latent_dim,
-                            int frames_dechunked) const;
-
-    // Reconstruction objective for training the AE encoder against the FROZEN
-    // decoder. Given the encoder's real latent `z_real` [latent_dim, LF]
-    // (channel-major; LF a multiple of chunk), packs + normalises it to the flow
-    // domain, runs the frozen vocoder, and computes a multi-resolution
-    // STFT-magnitude loss against `target` (time-domain, target_len samples).
-    // Returns the loss and fills `dZReal` (latent_dim*LF) with d(loss)/d(z_real)
-    // — feed straight into SupertonicEncoder::backward. Decoder weights frozen.
-    float recon_loss_and_grad(const float* z_real, int latent_dim, int LF,
-                              const float* target, int target_len,
-                              std::vector<float>& dZReal) const;
-
-    // Fully on-device reconstruction objective: `z_real` [latent_dim, LF] and
-    // `target` [1, target_len] (or [latent_dim*LF] / [target_len]) stay on the
-    // GPU, and `dZReal` [latent_dim, LF] is returned on-device — no per-step host
-    // round-trips. Same objective as the host overload but an L2 STFT magnitude
-    // loss (linear gradient). This is the training hot-path.
-    float recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
-                              const brotensor::Tensor& target,
-                              brotensor::Tensor& dZReal) const;
-
-    // Precomputed-target variant of the on-device objective. The target STFT
-    // magnitudes are constant across epochs, so a trainer computes them once via
-    // recon_target_mags() (or caches them to disk) and passes them here, skipping
-    // the per-step target STFT (~50 ms/clip). `n` is the comparison length
-    // (min(nwave, target_len)) the mags were built for.
-    float recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
-                              const std::vector<brotensor::Tensor>& target_mags,
-                              int n, brotensor::Tensor& dZReal) const;
-
-    // Multi-resolution target STFT magnitudes for the recon loss — one tensor per
-    // applicable resolution, in the loss's fixed config order. Cache and replay.
-    std::vector<brotensor::Tensor> recon_target_mags(const brotensor::Tensor& target,
-                                                     int n) const;
-
     // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
     //
     // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor
@@ -245,8 +203,7 @@ public:
 
     // The AE latent normalisation stats (per latent channel). The decoder expects
     // a real latent distributed around `latent_mean` (after which it normalises to
-    // the ~unit flow latent). An encoder trained against the frozen decoder should
-    // start here so the decoder sees in-distribution input. Empty until load().
+    // the ~unit flow latent). Empty until load().
     const std::vector<float>& latent_mean() const;
     const std::vector<float>& latent_std() const;
 
