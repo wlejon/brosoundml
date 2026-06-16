@@ -47,18 +47,33 @@ struct Args {
     std::string out   = "encoder.safetensors";
     std::string cache;           // spec-cache dir (empty = no caching)
     int    epochs    = 4;
-    float  lr        = 5.0e-6f;  // backprop through the frozen vocoder is ill-
-                                 // conditioned; higher lr overshoots/diverges.
+    float  lr        = 5.0e-6f;  // peak lr (after warmup). Backprop through the
+                                 // frozen vocoder is ill-conditioned; higher lr
+                                 // overshoots/diverges.
+    int    warmup    = 200;      // linear lr warmup steps (0 = off). Ramping in
+                                 // from ~0 avoids the cold-start grad explosion.
+    float  lr_floor_frac = 0.1f; // cosine-decay floor as a fraction of peak lr;
+                                 // decaying near the optimum kills the bounce.
     int    max_clips = 0;        // 0 = all
     float  max_secs  = 4.0f;     // trim each clip to bound compute
     float  val_frac  = 0.02f;
     int    overfit   = 0;        // >0: overfit N clips (smoke), ignores epochs/val
     int    save_every = 1;
-    float  clip      = 1.0f;     // global grad L2-norm clip (0 = off). Backprop
-                                 // through the frozen vocoder from a cold encoder
-                                 // explodes without it.
-    float  init_scale = 0.01f;   // proj_out weight scale at init (small => z_real
-                                 // starts ≈ latent_mean, in the decoder's regime).
+    int    accum     = 16;       // gradient-accumulation batch: per-clip grads are
+                                 // norm-clipped then averaged over this many clips
+                                 // before one Adam step. Batch-1 SGD diverges on the
+                                 // ill-conditioned frozen-vocoder objective; the
+                                 // per-clip gradient is far too noisy to step on.
+    float  clip      = 1.0f;     // per-clip grad L2-norm clip (0 = off). Bounds each
+                                 // clip's contribution to the batch so loud clips
+                                 // (huge residual) can't dominate the step, and tames
+                                 // the cold-start frozen-vocoder explosion.
+    float  init_scale = 0.0f;    // proj_out weight scale at init. 0 => z_real ==
+                                 // latent_mean EXACTLY for every clip at step 0
+                                 // (ControlNet-style zero init): a guaranteed
+                                 // in-distribution start the blocks deviate from only
+                                 // as training earns it. Nonzero lets loud-clip specs
+                                 // push z_real off-mean at init -> decode diverges.
     float  dlatent_clamp = 1.0e3f; // clamp |dLatent| (decode-backward output) to
                                    // tame frozen-vocoder Inf spikes (0 = off).
     std::uint64_t seed = 1234;
@@ -82,11 +97,14 @@ Args parse(int argc, char** argv) {
         else if (k == "--cache")      a.cache = need(i);
         else if (k == "--epochs")     a.epochs = std::stoi(need(i));
         else if (k == "--lr")         a.lr = std::stof(need(i));
+        else if (k == "--warmup")     a.warmup = std::stoi(need(i));
+        else if (k == "--lr-floor-frac") a.lr_floor_frac = std::stof(need(i));
         else if (k == "--max-clips")  a.max_clips = std::stoi(need(i));
         else if (k == "--max-secs")   a.max_secs = std::stof(need(i));
         else if (k == "--val-frac")   a.val_frac = std::stof(need(i));
         else if (k == "--overfit")    a.overfit = std::stoi(need(i));
         else if (k == "--save-every") a.save_every = std::stoi(need(i));
+        else if (k == "--accum")      a.accum = std::max(1, std::stoi(need(i)));
         else if (k == "--clip")       a.clip = std::stof(need(i));
         else if (k == "--init-scale") a.init_scale = std::stof(need(i));
         else if (k == "--dlatent-clamp") a.dlatent_clamp = std::stof(need(i));
@@ -310,13 +328,17 @@ int main(int argc, char** argv) {
         std::printf("clip cache: %s (spec + target mags, build-on-demand)\n", a.cache.c_str());
     }
 
-    // Adam state (m, v) + per-step grads, all matching the encoder weight layout.
-    bsm::SupertonicEncoderGrads grads, mst, vst;
-    grads.zero(enc); mst.zero(enc); vst.zero(enc);
-    std::vector<bt::Tensor*> W = gather_w(enc);
-    std::vector<bt::Tensor*> G = gather_g(grads);
-    std::vector<bt::Tensor*> M = gather_g(mst);
-    std::vector<bt::Tensor*> V = gather_g(vst);
+    // Adam state (m, v) + per-clip grads + a batch accumulator, all matching the
+    // encoder weight layout. `grads` holds one clip's backward; `gacc` sums the
+    // norm-clipped per-clip grads across an accumulation batch; Adam steps on the
+    // averaged accumulator.
+    bsm::SupertonicEncoderGrads grads, gacc, mst, vst;
+    grads.zero(enc); gacc.zero(enc); mst.zero(enc); vst.zero(enc);
+    std::vector<bt::Tensor*> W  = gather_w(enc);
+    std::vector<bt::Tensor*> G  = gather_g(grads);
+    std::vector<bt::Tensor*> GA = gather_g(gacc);
+    std::vector<bt::Tensor*> M  = gather_g(mst);
+    std::vector<bt::Tensor*> V  = gather_g(vst);
     const int max_samp = static_cast<int>(a.max_secs * SR);
 
     using Clock = std::chrono::steady_clock;
@@ -356,6 +378,30 @@ int main(int argc, char** argv) {
 
     int step = 0;
     const int epochs = (a.overfit > 0) ? std::max(a.epochs, 40) : a.epochs;
+
+    // lr schedule: linear warmup from ~0 to peak over `warmup` steps, then cosine
+    // decay to lr_floor_frac·peak across the rest. Warmup avoids the cold-start
+    // grad explosion; the decay tail removes the optimum-region bounce. A "step" is
+    // one Adam update — one per accumulation batch, not per clip — so total steps is
+    // epochs × ceil(clips/accum). Warmup is capped so it can't swallow a short run.
+    const long batches_per_epoch =
+        (static_cast<long>(clips.size()) + a.accum - 1) / a.accum;
+    const long total_steps = static_cast<long>(epochs) * batches_per_epoch;
+    const int warmup = std::min<int>(a.warmup,
+                                     std::max<int>(1, static_cast<int>(total_steps / 10)));
+    const float lr_floor = a.lr * a.lr_floor_frac;
+    auto lr_at = [&](int s) -> float {                 // s = 1-based applied step
+        if (s <= warmup) return a.lr * static_cast<float>(s) / static_cast<float>(warmup);
+        const long denom = std::max<long>(1, total_steps - warmup);
+        float t = static_cast<float>(s - warmup) / static_cast<float>(denom);
+        if (t > 1.0f) t = 1.0f;
+        const float c = 0.5f * (1.0f + std::cos(3.14159265358979f * t));
+        return lr_floor + (a.lr - lr_floor) * c;
+    };
+    std::printf("lr schedule: warmup %d steps -> peak %.3g -> cosine floor %.3g "
+                "over %ld steps (accum %d clips/step)\n",
+                warmup, a.lr, lr_floor, total_steps, a.accum);
+    long accn = 0;  // clips accumulated into the current batch
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::shuffle(clips.begin(), clips.end(), rng);
         double loss_sum = 0.0; int seen = 0;
@@ -409,13 +455,25 @@ int main(int argc, char** argv) {
             enc.backward(cache, dLatent, grads);
             const auto t4 = tp();
 
+            // Per-clip: norm-clip (skip if non-finite) so each clip contributes a
+            // bounded gradient, then add into the batch accumulator. Adam steps only
+            // once the batch is full — averaging over `accum` clips gives a stable
+            // descent direction that batch-1 SGD can't on this objective.
             const bool grad_ok = clip_grads();
             if (grad_ok) {
-                ++step;
-                for (std::size_t i = 0; i < W.size(); ++i)
-                    bt::adam_step(*W[i], *G[i], *M[i], *V[i], a.lr, 0.9f, 0.999f, 1.0e-8f, step);
+                for (std::size_t i = 0; i < GA.size(); ++i) bt::add_inplace(*GA[i], *G[i]);
+                ++accn;
             } else {
-                ++skipped;  // non-finite grad: skip so it can't poison the weights
+                ++skipped;  // non-finite grad: drop this clip from the batch
+            }
+            if (accn >= a.accum) {
+                for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
+                ++step;
+                const float lr = lr_at(step);
+                for (std::size_t i = 0; i < W.size(); ++i)
+                    bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, 0.999f, 1.0e-8f, step);
+                gacc.zero(enc);
+                accn = 0;
             }
             const auto t5 = tp();
             if (a.profile) {
@@ -427,6 +485,16 @@ int main(int argc, char** argv) {
             if (seen % 200 == 0)
                 std::printf("  epoch %d  %d/%zu  loss %.5f\n", epoch, seen, clips.size(),
                             loss_sum / seen);
+        }
+        // Flush a partial final batch so its clips aren't dropped.
+        if (accn > 0) {
+            for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
+            ++step;
+            const float lr = lr_at(step);
+            for (std::size_t i = 0; i < W.size(); ++i)
+                bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, 0.999f, 1.0e-8f, step);
+            gacc.zero(enc);
+            accn = 0;
         }
         std::printf("epoch %d: mean loss %.6f over %d clips (%ld non-finite grads skipped)\n",
                     epoch, seen ? loss_sum / seen : 0.0, seen, skipped);
