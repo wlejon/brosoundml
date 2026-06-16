@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -68,6 +69,12 @@ struct Args {
     float  val_frac  = 0.02f;
     int    overfit   = 0;        // >0: overfit N clips (smoke), ignores epochs/val
     int    save_every = 1;
+    int    eval_every = 4;       // evaluate held-out recon loss every N optimizer
+                                 // steps and checkpoint the BEST. The trajectory
+                                 // passes through the ~2 recon basin around step ~37
+                                 // then kicks out to a degenerate (clipped, input-
+                                 // independent) state; last-epoch weights are garbage,
+                                 // so we must capture the best point, not the last.
     int    accum     = 16;       // gradient-accumulation batch: per-clip grads are
                                  // norm-clipped then averaged over this many clips
                                  // before one Adam step. Batch-1 SGD diverges on the
@@ -115,6 +122,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--val-frac")   a.val_frac = std::stof(need(i));
         else if (k == "--overfit")    a.overfit = std::stoi(need(i));
         else if (k == "--save-every") a.save_every = std::stoi(need(i));
+        else if (k == "--eval-every") a.eval_every = std::max(1, std::stoi(need(i)));
         else if (k == "--accum")      a.accum = std::max(1, std::stoi(need(i)));
         else if (k == "--clip")       a.clip = std::stof(need(i));
         else if (k == "--init-scale") a.init_scale = std::stof(need(i));
@@ -352,6 +360,55 @@ int main(int argc, char** argv) {
     std::vector<bt::Tensor*> V  = gather_g(vst);
     const int max_samp = static_cast<int>(a.max_secs * SR);
 
+    // ── held-out eval + best-checkpoint capture ──────────────────────────────
+    // Precompute each val clip's spec + target samples once (constant), so the
+    // periodic recon-loss eval is cheap. The training trajectory dips into the ~2
+    // recon basin then kicks out to a degenerate state, so we snapshot the weights
+    // whenever held-out loss improves and restore that best point at the end.
+    struct ValItem { bt::Tensor spec; int T, L_used, n; std::vector<float> samples; std::string path; };
+    std::vector<ValItem> vitems;
+    for (const std::string& vp : val) {
+        bsm::AudioBuffer wav;
+        try { wav = bsm::read_wav(vp); } catch (...) { continue; }
+        if (wav.sample_rate != SR || wav.empty()) continue;
+        int L = static_cast<int>(wav.samples.size());
+        if (max_samp > 0 && L > max_samp) L = max_samp;
+        int L_used = 0;
+        const int T = aligned_T(L, hop, CC, L_used);
+        if (T == 0) continue;
+        ValItem it;
+        it.spec = spec.compute(wav.samples.data(), L_used);
+        it.T = T; it.L_used = L_used;
+        it.n = std::min(static_cast<int>(wav.samples.size()), model.config().base_chunk * T);
+        it.samples = std::move(wav.samples);
+        it.path = vp;
+        vitems.push_back(std::move(it));
+    }
+    auto snapshot = [&]() {
+        std::vector<std::vector<float>> h(W.size());
+        for (std::size_t i = 0; i < W.size(); ++i) h[i] = W[i]->to_host_vector();
+        return h;
+    };
+    auto restore = [&](const std::vector<std::vector<float>>& h) {
+        for (std::size_t i = 0; i < W.size(); ++i)
+            *W[i] = bt::Tensor::from_host_on(dev, h[i].data(), W[i]->rows, W[i]->cols);
+    };
+    auto eval_val = [&]() -> double {           // mean held-out recon loss, no update
+        if (vitems.empty()) return 0.0;
+        double s = 0.0;
+        for (const ValItem& it : vitems) {
+            bt::Tensor latent = enc.forward(it.spec, it.T);
+            const std::vector<float> z = latent.to_host_vector();
+            std::vector<float> dZ;
+            s += model.recon_loss_and_grad(z.data(), enc.latent_dim, it.T,
+                                           it.samples.data(), it.n, dZ);
+        }
+        return s / static_cast<double>(vitems.size());
+    };
+    double best_val = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<float>> best_w;
+    long best_step = -1;
+
     using Clock = std::chrono::steady_clock;
     auto secs = [](Clock::time_point x, Clock::time_point y) {
         return std::chrono::duration<double>(y - x).count();
@@ -424,6 +481,13 @@ int main(int argc, char** argv) {
             bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, a.beta2, 1.0e-8f, step);
         }
     };
+    // After an optimizer step: every eval_every steps, score the held-out set and
+    // keep the best weights seen (the basin we'd otherwise step straight past).
+    auto maybe_eval = [&]() {
+        if (vitems.empty() || step % a.eval_every != 0) return;
+        const double v = eval_val();
+        if (v < best_val) { best_val = v; best_w = snapshot(); best_step = step; }
+    };
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::shuffle(clips.begin(), clips.end(), rng);
         double loss_sum = 0.0; int seen = 0;
@@ -492,6 +556,7 @@ int main(int argc, char** argv) {
                 for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
                 ++step;
                 opt_step(lr_at(step));
+                maybe_eval();
                 gacc.zero(enc);
                 accn = 0;
             }
@@ -511,17 +576,30 @@ int main(int argc, char** argv) {
             for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
             ++step;
             opt_step(lr_at(step));
+            maybe_eval();
             gacc.zero(enc);
             accn = 0;
         }
-        std::printf("epoch %d: mean loss %.6f over %d clips (%ld non-finite grads skipped)\n",
+        std::printf("epoch %d: mean loss %.6f over %d clips (%ld non-finite grads skipped)",
                     epoch, seen ? loss_sum / seen : 0.0, seen, skipped);
-        if (a.overfit == 0 && a.save_every > 0 && (epoch + 1) % a.save_every == 0) {
+        if (!vitems.empty()) std::printf("  | best val %.5f @ step %ld", best_val, best_step);
+        std::printf("\n");
+        // With held-out eval we checkpoint the BEST point live (see below); the
+        // last-epoch weights are the kicked-out degenerate state, so only save per
+        // epoch when there's no val set to choose a better one (e.g. overfit).
+        if (vitems.empty() && a.overfit == 0 && a.save_every > 0 &&
+            (epoch + 1) % a.save_every == 0) {
             save_encoder(a.out, enc);
             std::printf("  saved %s\n", a.out.c_str());
         }
     }
 
+    // Restore the best-held-out checkpoint before saving + the recon gate, so we
+    // ship the basin we passed through rather than the final (degenerate) weights.
+    if (!best_w.empty()) {
+        restore(best_w);
+        std::printf("restored best checkpoint: val loss %.5f @ step %ld\n", best_val, best_step);
+    }
     save_encoder(a.out, enc);
     std::printf("done. saved %s\n", a.out.c_str());
 
