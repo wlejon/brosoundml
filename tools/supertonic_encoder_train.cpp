@@ -27,8 +27,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -43,6 +45,7 @@ struct Args {
     std::string data;
     std::string model = "D:/projects/brosoundml-data/supertonic";
     std::string out   = "encoder.safetensors";
+    std::string cache;           // spec-cache dir (empty = no caching)
     int    epochs    = 4;
     float  lr        = 3.0e-4f;
     int    max_clips = 0;        // 0 = all
@@ -68,6 +71,7 @@ Args parse(int argc, char** argv) {
         if      (k == "--data")       a.data = need(i);
         else if (k == "--model")      a.model = need(i);
         else if (k == "--out")        a.out = need(i);
+        else if (k == "--cache")      a.cache = need(i);
         else if (k == "--epochs")     a.epochs = std::stoi(need(i));
         else if (k == "--lr")         a.lr = std::stof(need(i));
         else if (k == "--max-clips")  a.max_clips = std::stoi(need(i));
@@ -153,6 +157,54 @@ int aligned_T(int L, int hop, int CC, int& L_used) {
     return T;
 }
 
+// ── spec cache ────────────────────────────────────────────────────────────
+// The encoder input spec [idim, T] is a deterministic function of the clip and
+// the (max_secs, hop, idim) config — it never changes across epochs. Caching it
+// turns the ~31 ms/clip recompute into a one-time cost (build-on-demand: the
+// first epoch writes, later epochs read). fp32 on disk (the encoder input; no
+// precision question). Key = clip basename under --cache dir; the header carries
+// the config so a stale cache (different max_secs/hop/idim) is recomputed.
+constexpr std::uint32_t kSpecMagic = 0x53504331;  // "SPC1"
+
+std::string spec_cache_path(const std::string& cache_dir, const std::string& clip) {
+    return (fs::path(cache_dir) / (fs::path(clip).stem().string() + ".spec")).string();
+}
+
+// Returns true and fills out/T/L_used if a valid cache for this config exists.
+bool load_spec_cache(const std::string& path, bt::Device dev, int idim, int hop,
+                     float max_secs, bt::Tensor& out, int& T, int& L_used) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::uint32_t magic = 0; int c_idim = 0, c_T = 0, c_L = 0, c_hop = 0; float c_secs = 0.0f;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    f.read(reinterpret_cast<char*>(&c_idim), sizeof(c_idim));
+    f.read(reinterpret_cast<char*>(&c_T), sizeof(c_T));
+    f.read(reinterpret_cast<char*>(&c_L), sizeof(c_L));
+    f.read(reinterpret_cast<char*>(&c_hop), sizeof(c_hop));
+    f.read(reinterpret_cast<char*>(&c_secs), sizeof(c_secs));
+    if (!f || magic != kSpecMagic || c_idim != idim || c_hop != hop ||
+        c_secs != max_secs || c_T <= 0) return false;
+    std::vector<float> host(static_cast<std::size_t>(c_idim) * c_T);
+    f.read(reinterpret_cast<char*>(host.data()), host.size() * sizeof(float));
+    if (!f) return false;
+    out = bt::Tensor::from_host_on(dev, host.data(), c_idim, c_T);
+    T = c_T; L_used = c_L;
+    return true;
+}
+
+void save_spec_cache(const std::string& path, const std::vector<float>& host,
+                     int idim, int T, int L_used, int hop, float max_secs) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+    f.write(reinterpret_cast<const char*>(&kSpecMagic), sizeof(kSpecMagic));
+    f.write(reinterpret_cast<const char*>(&idim), sizeof(idim));
+    f.write(reinterpret_cast<const char*>(&T), sizeof(T));
+    f.write(reinterpret_cast<const char*>(&L_used), sizeof(L_used));
+    f.write(reinterpret_cast<const char*>(&hop), sizeof(hop));
+    f.write(reinterpret_cast<const char*>(&max_secs), sizeof(max_secs));
+    f.write(reinterpret_cast<const char*>(host.data()), host.size() * sizeof(float));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -197,6 +249,10 @@ int main(int argc, char** argv) {
             clips.resize(a.max_clips);
     }
     std::printf("clips: %zu train, %zu val\n", clips.size(), val.size());
+    if (!a.cache.empty()) {
+        fs::create_directories(a.cache);
+        std::printf("spec cache: %s (build-on-demand)\n", a.cache.c_str());
+    }
 
     // Adam state (m, v) + per-step grads, all matching the encoder weight layout.
     bsm::SupertonicEncoderGrads grads, mst, vst;
@@ -231,7 +287,18 @@ int main(int argc, char** argv) {
             if (T == 0) continue;
 
             const auto t0 = tp();
-            bt::Tensor feat = spec.compute(wav.samples.data(), L_used);   // [1253, T]
+            bt::Tensor feat;
+            const std::string cpath = a.cache.empty() ? std::string()
+                                                      : spec_cache_path(a.cache, path);
+            int cT = 0, cL = 0;
+            const bool hit = !cpath.empty() &&
+                load_spec_cache(cpath, dev, enc.idim, hop, a.max_secs, feat, cT, cL) && cT == T;
+            if (!hit) {
+                feat = spec.compute(wav.samples.data(), L_used);          // [1253, T]
+                if (!cpath.empty())
+                    save_spec_cache(cpath, feat.to_host_vector(), enc.idim, T, L_used,
+                                    hop, a.max_secs);
+            }
             bt::Tensor latent;
             bsm::SupertonicEncoderCache cache;
             const auto t1 = tp();
