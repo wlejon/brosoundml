@@ -47,13 +47,22 @@ struct Args {
     std::string out   = "encoder.safetensors";
     std::string cache;           // spec-cache dir (empty = no caching)
     int    epochs    = 4;
-    float  lr        = 5.0e-6f;  // peak lr (after warmup). Backprop through the
-                                 // frozen vocoder is ill-conditioned; higher lr
-                                 // overshoots/diverges.
+    float  lr        = 1.0e-5f;  // peak lr (after warmup). Backprop through the
+                                 // frozen vocoder is ill-conditioned: this reaches
+                                 // the ~2 recon basin within one epoch; >1.5e-5
+                                 // overshoots/diverges even at beta2 0.95.
     int    warmup    = 200;      // linear lr warmup steps (0 = off). Ramping in
                                  // from ~0 avoids the cold-start grad explosion.
     float  lr_floor_frac = 0.1f; // cosine-decay floor as a fraction of peak lr;
                                  // decaying near the optimum kills the bounce.
+    float  beta2     = 0.95f;    // Adam 2nd-moment decay. The default 0.999 lets the
+                                 // recon loss descend then CLIMB BACK OUT to 1e3+ on
+                                 // this sharp landscape; 0.95 adapts the variance fast
+                                 // enough to stay bounded (no catastrophic divergence
+                                 // across the lr sweep). Lower still if it diverges.
+    float  wd        = 0.0f;     // decoupled weight decay (AdamW): param *= 1-lr·wd
+                                 // each step. Opposes the slow unbounded weight growth
+                                 // that drives the post-descent climb (0 = off).
     int    max_clips = 0;        // 0 = all
     float  max_secs  = 4.0f;     // trim each clip to bound compute
     float  val_frac  = 0.02f;
@@ -99,6 +108,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--lr")         a.lr = std::stof(need(i));
         else if (k == "--warmup")     a.warmup = std::stoi(need(i));
         else if (k == "--lr-floor-frac") a.lr_floor_frac = std::stof(need(i));
+        else if (k == "--beta2")      a.beta2 = std::stof(need(i));
+        else if (k == "--wd")         a.wd = std::stof(need(i));
         else if (k == "--max-clips")  a.max_clips = std::stoi(need(i));
         else if (k == "--max-secs")   a.max_secs = std::stof(need(i));
         else if (k == "--val-frac")   a.val_frac = std::stof(need(i));
@@ -399,9 +410,20 @@ int main(int argc, char** argv) {
         return lr_floor + (a.lr - lr_floor) * c;
     };
     std::printf("lr schedule: warmup %d steps -> peak %.3g -> cosine floor %.3g "
-                "over %ld steps (accum %d clips/step)\n",
-                warmup, a.lr, lr_floor, total_steps, a.accum);
+                "over %ld steps (accum %d clips/step, beta2 %.3g, wd %.3g)\n",
+                warmup, a.lr, lr_floor, total_steps, a.accum, a.beta2, a.wd);
     long accn = 0;  // clips accumulated into the current batch
+
+    // One optimizer step on the averaged accumulator GA: decoupled weight decay
+    // (AdamW) then the Adam update. Shared by the in-loop full-batch step and the
+    // epoch-end partial-batch flush so they stay identical.
+    auto opt_step = [&](float lr) {
+        const float keep = 1.0f - lr * a.wd;
+        for (std::size_t i = 0; i < W.size(); ++i) {
+            if (a.wd > 0.0f) bt::scale_inplace(*W[i], keep);
+            bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, a.beta2, 1.0e-8f, step);
+        }
+    };
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::shuffle(clips.begin(), clips.end(), rng);
         double loss_sum = 0.0; int seen = 0;
@@ -469,9 +491,7 @@ int main(int argc, char** argv) {
             if (accn >= a.accum) {
                 for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
                 ++step;
-                const float lr = lr_at(step);
-                for (std::size_t i = 0; i < W.size(); ++i)
-                    bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, 0.999f, 1.0e-8f, step);
+                opt_step(lr_at(step));
                 gacc.zero(enc);
                 accn = 0;
             }
@@ -490,9 +510,7 @@ int main(int argc, char** argv) {
         if (accn > 0) {
             for (bt::Tensor* g : GA) bt::scale_inplace(*g, 1.0f / static_cast<float>(accn));
             ++step;
-            const float lr = lr_at(step);
-            for (std::size_t i = 0; i < W.size(); ++i)
-                bt::adam_step(*W[i], *GA[i], *M[i], *V[i], lr, 0.9f, 0.999f, 1.0e-8f, step);
+            opt_step(lr_at(step));
             gacc.zero(enc);
             accn = 0;
         }
