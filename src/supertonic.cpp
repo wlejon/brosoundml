@@ -822,6 +822,17 @@ std::vector<std::string> split_sentences_impl(const std::string& text, int max_c
 
 // ─── Impl ────────────────────────────────────────────────────────────────────
 
+// Caches from the on-device decode_real forward, consumed by its reverse pass —
+// shared by the target and precomputed-magnitude recon-loss variants.
+struct ReconDecodeCache {
+    PConvCache                 cin_c;
+    std::vector<ConvNeXtCache> blk_c;
+    PConvCache                 h1_c;
+    bt::Tensor                 head1_out;
+    PConvCache                 h2_c;
+    int                        BC = 0;   // base_chunk (waveform samples per frame)
+};
+
 struct Supertonic::Impl {
     SupertonicConfig cfg;
     bt::Device       dev = bt::Device::CPU;
@@ -899,6 +910,19 @@ struct Supertonic::Impl {
     // composed from the frozen-decoder atoms + an on-device L2 STFT loss.
     float recon_loss_and_grad_dev(const bt::Tensor& z_real, int LF,
                                   const bt::Tensor& target, bt::Tensor& dZReal) const;
+    // Same, but from precomputed target STFT magnitudes (constant across epochs,
+    // so the trainer caches them and skips the per-step target STFT ~50 ms/clip).
+    // `n` is the comparison length (min(nwave, target_len)), matching the mags.
+    float recon_loss_and_grad_dev(const bt::Tensor& z_real, int LF,
+                                  const std::vector<bt::Tensor>& target_mags,
+                                  int n, bt::Tensor& dZReal) const;
+    // The multi-resolution target magnitudes the loss above consumes.
+    std::vector<bt::Tensor> recon_target_mags(const bt::Tensor& target, int n) const;
+    // Shared on-device decode_real fwd (caches for the reverse) / bwd (-> dZReal).
+    bt::Tensor recon_decode_fwd(const bt::Tensor& z_real, int LF,
+                                ReconDecodeCache& c) const;
+    bt::Tensor recon_decode_bwd(int LF, const bt::Tensor& dWave,
+                                const ReconDecodeCache& c) const;
     std::vector<float> encode_text(const std::vector<int>& ids,
                                    const std::vector<float>& style) const;
     float predict_duration(const std::vector<int>& ids,
@@ -1731,42 +1755,70 @@ std::vector<float> hann_periodic(int win) {
 // d(loss)/d(wave) into dWave (1, n) — entirely on-device. L2 (not L1) keeps the
 // gradient linear (dmag = (2/M)*(magw - magt)), so no host abs/sign is needed;
 // only the scalar loss value is read back (a 1-float sync per resolution).
-float mrstft_loss(bt::Device dev, const bt::Tensor& wave, const bt::Tensor& target,
-                  int n, bt::Tensor& dWave) {
-    static const int cfgs[3][2] = {{512, 128}, {1024, 256}, {2048, 512}};
+// The fixed multi-resolution STFT configs (n_fft, hop); window = n_fft.
+constexpr int kStftCfgs[3][2] = {{512, 128}, {1024, 256}, {2048, 512}};
+
+// One resolution's contribution: |STFT(wave)| vs a (precomputed) target
+// magnitude `magt`, accumulating L2 loss and the waveform gradient. `magt` must
+// match wave's STFT shape at (n_fft, hop, win, center, n).
+void mrstft_one(bt::Device dev, const bt::Tensor& wave, const bt::Tensor& magt,
+                int n_fft, int hop, int win, int n, double& loss, bt::Tensor& dWave) {
+    const std::vector<float> wh = hann_periodic(win);
+    bt::Tensor window = bt::Tensor::from_host_on(dev, wh.data(), 1, win);
+    bt::Tensor sw, magw;
+    bt::stft(wave, window, 1, n_fft, hop, win, /*center=*/true, false, sw);
+    bt::complex_abs(sw, magw);
+    const int M = magw.rows * magw.cols;
+    // diff = magw - magt  (device)
+    bt::Tensor diff = magw.clone();
+    bt::Tensor negt = magt.clone();
+    bt::scale_inplace(negt, -1.0f);
+    bt::add_inplace(diff, negt);
+    // loss += mean(diff^2): square, two reductions, read one scalar.
+    bt::Tensor sq = diff.clone();
+    bt::mul_inplace(sq, diff);
+    bt::Tensor rs, cs;
+    bt::sum_rows(sq, rs);       // (frames, 1)
+    bt::sum_cols(rs, cs);       // (1, 1)
+    loss += static_cast<double>(cs.to_host_vector()[0]) / std::max(M, 1);
+    // dmag = (2/M)*diff ; backprop to the waveform (device).
+    bt::scale_inplace(diff, 2.0f / static_cast<float>(std::max(M, 1)));
+    bt::Tensor dSpec, dWcfg;
+    bt::complex_abs_backward(sw, diff, dSpec);
+    bt::stft_backward(dSpec, window, 1, n, n_fft, hop, win, true, false, dWcfg);
+    bt::add_inplace(dWave, dWcfg);
+}
+
+// The target STFT magnitudes for the recon loss — one per applicable config, in
+// kStftCfgs order. Constant across epochs, so the trainer can cache these and
+// skip recomputing the target STFT every step (~50 ms/clip).
+std::vector<bt::Tensor> stft_target_mags(bt::Device dev, const bt::Tensor& target, int n) {
+    std::vector<bt::Tensor> out;
+    for (const auto& cf : kStftCfgs) {
+        const int n_fft = cf[0], hop = cf[1], win = n_fft;
+        if (n < n_fft) continue;
+        const std::vector<float> wh = hann_periodic(win);
+        bt::Tensor window = bt::Tensor::from_host_on(dev, wh.data(), 1, win);
+        bt::Tensor stg, magt;
+        bt::stft(target, window, 1, n_fft, hop, win, /*center=*/true, false, stg);
+        bt::complex_abs(stg, magt);
+        out.push_back(std::move(magt));
+    }
+    return out;
+}
+
+// Multi-resolution STFT magnitude loss from precomputed target magnitudes.
+float mrstft_loss_cached(bt::Device dev, const bt::Tensor& wave,
+                         const std::vector<bt::Tensor>& target_mags, int n,
+                         bt::Tensor& dWave) {
     dWave = bt::Tensor::zeros_on(dev, 1, n);
     double loss = 0.0;
     int used = 0;
-    for (const auto& cf : cfgs) {
+    for (const auto& cf : kStftCfgs) {
         const int n_fft = cf[0], hop = cf[1], win = n_fft;
         if (n < n_fft) continue;
+        mrstft_one(dev, wave, target_mags[used], n_fft, hop, win, n, loss, dWave);
         ++used;
-        const std::vector<float> wh = hann_periodic(win);
-        bt::Tensor window = bt::Tensor::from_host_on(dev, wh.data(), 1, win);
-        bt::Tensor sw, stg, magw, magt;
-        bt::stft(wave,   window, 1, n_fft, hop, win, /*center=*/true, false, sw);
-        bt::stft(target, window, 1, n_fft, hop, win, /*center=*/true, false, stg);
-        bt::complex_abs(sw,  magw);
-        bt::complex_abs(stg, magt);
-        const int M = magw.rows * magw.cols;
-        // diff = magw - magt  (device)
-        bt::Tensor diff = magw.clone();
-        bt::Tensor negt = magt.clone();
-        bt::scale_inplace(negt, -1.0f);
-        bt::add_inplace(diff, negt);
-        // loss += mean(diff^2): square, two reductions, read one scalar.
-        bt::Tensor sq = diff.clone();
-        bt::mul_inplace(sq, diff);
-        bt::Tensor rs, cs;
-        bt::sum_rows(sq, rs);       // (frames, 1)
-        bt::sum_cols(rs, cs);       // (1, 1)
-        loss += static_cast<double>(cs.to_host_vector()[0]) / std::max(M, 1);
-        // dmag = (2/M)*diff ; backprop to the waveform (device).
-        bt::scale_inplace(diff, 2.0f / static_cast<float>(std::max(M, 1)));
-        bt::Tensor dSpec, dWcfg;
-        bt::complex_abs_backward(sw, diff, dSpec);
-        bt::stft_backward(dSpec, window, 1, n, n_fft, hop, win, true, false, dWcfg);
-        bt::add_inplace(dWave, dWcfg);
     }
     if (used > 0) {
         loss /= used;
@@ -1774,41 +1826,20 @@ float mrstft_loss(bt::Device dev, const bt::Tensor& wave, const bt::Tensor& targ
     }
     return static_cast<float>(loss);
 }
+
+float mrstft_loss(bt::Device dev, const bt::Tensor& wave, const bt::Tensor& target,
+                  int n, bt::Tensor& dWave) {
+    return mrstft_loss_cached(dev, wave, stft_target_mags(dev, target, n), n, dWave);
+}
 }  // namespace
 
 float Supertonic::Impl::recon_loss_and_grad_dev(const bt::Tensor& z_real, int LF,
                                                 const bt::Tensor& target,
                                                 bt::Tensor& dZReal) const {
     if (!ready) fail("recon_loss_and_grad_dev() before load()");
-    const int D = cfg.latent_dim;
-    if (LF <= 0) fail("LF must be positive");
-    bt::Tensor zr = bt::Tensor::view(z_real.device, z_real.data, 1, D * LF, z_real.dtype);
-
-    // ── on-device decode_real (frozen), caching for the reverse pass ──
-    PConvCache cin_c;
-    bt::Tensor h;
-    rconv_forward_train(zr, conv_in, D, LF, 1, 1, h, cin_c);
-    const int C = conv_in.cout;
-    std::vector<ConvNeXtCache> blk_c(blocks.size());
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-        bt::Tensor y;
-        vocoder_convnext_forward_train(h, blocks[i], C, LF, blocks[i].dil, y, blk_c[i]);
-        h = std::move(y);
-    }
-    bt::Tensor hb;
-    bt::batch_norm_inference(h, bn_g, bn_b, bn_mean, bn_var, 1, C, 1, LF, 1.0e-5f, hb);
-    PConvCache h1_c;
-    bt::Tensor hh;
-    rconv_forward_train(hb, head1, C, LF, 1, 1, hh, h1_c);
-    const bt::Tensor head1_out = hh.clone();
-    bt::Tensor hp;
-    bt::leaky_relu_forward(hh, prelu_slope, hp);
-    PConvCache h2_c;
-    bt::Tensor out;
-    rconv_forward_train(hp, head2, head1.cout, LF, 1, 1, out, h2_c);
-    const int BC = head2.cout, nwave = BC * LF;
-    bt::Tensor wave;
-    transpose2d_forward(out, BC, LF, wave);            // (1, LF*BC) waveform
+    ReconDecodeCache c;
+    bt::Tensor wave = recon_decode_fwd(z_real, LF, c);   // (1, nwave)
+    const int nwave = wave.cols;
 
     // ── loss vs target over the first n samples ──
     const int tn = target.rows * target.cols;
@@ -1821,27 +1852,87 @@ float Supertonic::Impl::recon_loss_and_grad_dev(const bt::Tensor& z_real, int LF
     if (n == nwave) dWave = dWaveN;
     else bt::pad1d_forward(dWaveN, 1, 1, n, 0, nwave - n, /*mode=*/0, dWave);
 
-    // ── on-device reverse pass to d(z_real) ──
+    dZReal = recon_decode_bwd(LF, dWave, c);
+    return loss;
+}
+
+float Supertonic::Impl::recon_loss_and_grad_dev(const bt::Tensor& z_real, int LF,
+                                                const std::vector<bt::Tensor>& target_mags,
+                                                int n, bt::Tensor& dZReal) const {
+    if (!ready) fail("recon_loss_and_grad_dev() before load()");
+    ReconDecodeCache c;
+    bt::Tensor wave = recon_decode_fwd(z_real, LF, c);   // (1, nwave)
+    const int nwave = wave.cols;
+    if (n > nwave) n = nwave;                            // mags were built for <= nwave
+    bt::Tensor wave_n = bt::Tensor::view(dev, wave.data, 1, n, wave.dtype);
+    bt::Tensor dWaveN;
+    const float loss = mrstft_loss_cached(dev, wave_n, target_mags, n, dWaveN);
+    bt::Tensor dWave;
+    if (n == nwave) dWave = dWaveN;
+    else bt::pad1d_forward(dWaveN, 1, 1, n, 0, nwave - n, /*mode=*/0, dWave);
+
+    dZReal = recon_decode_bwd(LF, dWave, c);
+    return loss;
+}
+
+std::vector<bt::Tensor> Supertonic::Impl::recon_target_mags(const bt::Tensor& target,
+                                                            int n) const {
+    return stft_target_mags(dev, target, n);
+}
+
+bt::Tensor Supertonic::Impl::recon_decode_fwd(const bt::Tensor& z_real, int LF,
+                                              ReconDecodeCache& c) const {
+    const int D = cfg.latent_dim;
+    if (LF <= 0) fail("LF must be positive");
+    bt::Tensor zr = bt::Tensor::view(z_real.device, z_real.data, 1, D * LF, z_real.dtype);
+
+    // ── on-device decode_real (frozen), caching for the reverse pass ──
+    bt::Tensor h;
+    rconv_forward_train(zr, conv_in, D, LF, 1, 1, h, c.cin_c);
+    const int C = conv_in.cout;
+    c.blk_c.assign(blocks.size(), ConvNeXtCache{});
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        bt::Tensor y;
+        vocoder_convnext_forward_train(h, blocks[i], C, LF, blocks[i].dil, y, c.blk_c[i]);
+        h = std::move(y);
+    }
+    bt::Tensor hb;
+    bt::batch_norm_inference(h, bn_g, bn_b, bn_mean, bn_var, 1, C, 1, LF, 1.0e-5f, hb);
+    bt::Tensor hh;
+    rconv_forward_train(hb, head1, C, LF, 1, 1, hh, c.h1_c);
+    c.head1_out = hh.clone();
+    bt::Tensor hp;
+    bt::leaky_relu_forward(hh, prelu_slope, hp);
+    bt::Tensor out;
+    rconv_forward_train(hp, head2, head1.cout, LF, 1, 1, out, c.h2_c);
+    c.BC = head2.cout;
+    bt::Tensor wave;
+    transpose2d_forward(out, c.BC, LF, wave);            // (1, LF*BC) waveform
+    return wave;
+}
+
+bt::Tensor Supertonic::Impl::recon_decode_bwd(int LF, const bt::Tensor& dWave,
+                                              const ReconDecodeCache& c) const {
+    const int D = cfg.latent_dim, C = conv_in.cout, BC = c.BC;
     bt::Tensor dOut;
     transpose2d_backward(dWave, BC, LF, dOut);          // (BC, LF)
     bt::Tensor dHp;
-    pconv_backward(head2, h2_c, bt::Tensor::view(dev, dOut.data, 1, BC * LF, dOut.dtype), dHp);
+    pconv_backward(head2, c.h2_c, bt::Tensor::view(dev, dOut.data, 1, BC * LF, dOut.dtype), dHp);
     bt::Tensor dHh;
-    bt::leaky_relu_backward(head1_out, dHp, prelu_slope, dHh);
+    bt::leaky_relu_backward(c.head1_out, dHp, prelu_slope, dHh);
     bt::Tensor dHb;
-    pconv_backward(head1, h1_c, dHh, dHb);
+    pconv_backward(head1, c.h1_c, dHh, dHb);
     // frozen-BN-inference input grad = per-channel scale (depthwise 1x1 conv).
     bt::Tensor scratch;
     bt::Tensor dH = pconv(dHb, bn_scale_conv, C, LF, 1, C, 0, 0, 0, scratch);
     for (std::size_t i = blocks.size(); i-- > 0;) {
         bt::Tensor dX;
-        convnext_block_backward(blocks[i], blk_c[i], dH, dX);
+        convnext_block_backward(blocks[i], c.blk_c[i], dH, dX);
         dH = std::move(dX);
     }
     bt::Tensor dzr;
-    pconv_backward(conv_in, cin_c, dH, dzr);            // (1, D*LF)
-    dZReal = bt::Tensor::view(dev, dzr.data, D, LF, dzr.dtype).clone();
-    return loss;
+    pconv_backward(conv_in, c.cin_c, dH, dzr);            // (1, D*LF)
+    return bt::Tensor::view(dev, dzr.data, D, LF, dzr.dtype).clone();
 }
 
 float Supertonic::Impl::recon_loss_and_grad(const float* z_real, int latent_dim,
@@ -1994,6 +2085,17 @@ float Supertonic::recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
                                       const brotensor::Tensor& target,
                                       brotensor::Tensor& dZReal) const {
     return impl_->recon_loss_and_grad_dev(z_real, LF, target, dZReal);
+}
+
+float Supertonic::recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
+                                      const std::vector<brotensor::Tensor>& target_mags,
+                                      int n, brotensor::Tensor& dZReal) const {
+    return impl_->recon_loss_and_grad_dev(z_real, LF, target_mags, n, dZReal);
+}
+
+std::vector<brotensor::Tensor> Supertonic::recon_target_mags(
+    const brotensor::Tensor& target, int n) const {
+    return impl_->recon_target_mags(target, n);
 }
 
 std::vector<float> Supertonic::encode_text(const std::vector<int>& text_ids,

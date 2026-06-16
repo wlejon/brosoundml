@@ -157,22 +157,29 @@ int aligned_T(int L, int hop, int CC, int& L_used) {
     return T;
 }
 
-// ── spec cache ────────────────────────────────────────────────────────────
-// The encoder input spec [idim, T] is a deterministic function of the clip and
-// the (max_secs, hop, idim) config — it never changes across epochs. Caching it
-// turns the ~31 ms/clip recompute into a one-time cost (build-on-demand: the
-// first epoch writes, later epochs read). fp32 on disk (the encoder input; no
-// precision question). Key = clip basename under --cache dir; the header carries
-// the config so a stale cache (different max_secs/hop/idim) is recomputed.
-constexpr std::uint32_t kSpecMagic = 0x53504331;  // "SPC1"
+// ── clip cache ──────────────────────────────────────────────────────────────
+// Per clip, two stages are deterministic functions of the clip + config and so
+// constant across every epoch: the encoder input spec [idim, T], and the target
+// STFT magnitudes for the recon loss (one tensor per resolution). Caching both
+// turns the ~31 ms (spec) + ~50 ms (target STFT) recompute into a one-time cost
+// (build-on-demand: first epoch writes, later epochs read) — and a full hit lets
+// the loop skip reading the wav entirely. fp32 on disk. Key = clip basename under
+// --cache dir; the header carries the config so a stale cache is recomputed.
+constexpr std::uint32_t kClipMagic = 0x53504332;  // "SPC2"
 
-std::string spec_cache_path(const std::string& cache_dir, const std::string& clip) {
-    return (fs::path(cache_dir) / (fs::path(clip).stem().string() + ".spec")).string();
+struct ClipCache {
+    bt::Tensor              spec;   // [idim, T]
+    std::vector<bt::Tensor> mags;   // target STFT magnitudes, one per resolution
+    int T = 0, L_used = 0, n = 0;   // n = recon comparison length the mags match
+};
+
+std::string clip_cache_path(const std::string& cache_dir, const std::string& clip) {
+    return (fs::path(cache_dir) / (fs::path(clip).stem().string() + ".clip")).string();
 }
 
-// Returns true and fills out/T/L_used if a valid cache for this config exists.
-bool load_spec_cache(const std::string& path, bt::Device dev, int idim, int hop,
-                     float max_secs, bt::Tensor& out, int& T, int& L_used) {
+// Returns true and fills `c` if a valid cache for this config exists.
+bool load_clip_cache(const std::string& path, bt::Device dev, int idim, int hop,
+                     float max_secs, ClipCache& c) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::uint32_t magic = 0; int c_idim = 0, c_T = 0, c_L = 0, c_hop = 0; float c_secs = 0.0f;
@@ -182,27 +189,53 @@ bool load_spec_cache(const std::string& path, bt::Device dev, int idim, int hop,
     f.read(reinterpret_cast<char*>(&c_L), sizeof(c_L));
     f.read(reinterpret_cast<char*>(&c_hop), sizeof(c_hop));
     f.read(reinterpret_cast<char*>(&c_secs), sizeof(c_secs));
-    if (!f || magic != kSpecMagic || c_idim != idim || c_hop != hop ||
+    if (!f || magic != kClipMagic || c_idim != idim || c_hop != hop ||
         c_secs != max_secs || c_T <= 0) return false;
-    std::vector<float> host(static_cast<std::size_t>(c_idim) * c_T);
-    f.read(reinterpret_cast<char*>(host.data()), host.size() * sizeof(float));
-    if (!f) return false;
-    out = bt::Tensor::from_host_on(dev, host.data(), c_idim, c_T);
-    T = c_T; L_used = c_L;
+    std::vector<float> spec(static_cast<std::size_t>(c_idim) * c_T);
+    f.read(reinterpret_cast<char*>(spec.data()), spec.size() * sizeof(float));
+    int n = 0, num_mags = 0;
+    f.read(reinterpret_cast<char*>(&n), sizeof(n));
+    f.read(reinterpret_cast<char*>(&num_mags), sizeof(num_mags));
+    if (!f || num_mags < 0 || num_mags > 8) return false;
+    std::vector<bt::Tensor> mags;
+    mags.reserve(num_mags);
+    for (int i = 0; i < num_mags; ++i) {
+        int r = 0, cc = 0;
+        f.read(reinterpret_cast<char*>(&r), sizeof(r));
+        f.read(reinterpret_cast<char*>(&cc), sizeof(cc));
+        if (!f || r <= 0 || cc <= 0) return false;
+        std::vector<float> m(static_cast<std::size_t>(r) * cc);
+        f.read(reinterpret_cast<char*>(m.data()), m.size() * sizeof(float));
+        if (!f) return false;
+        mags.push_back(bt::Tensor::from_host_on(dev, m.data(), r, cc));
+    }
+    c.spec = bt::Tensor::from_host_on(dev, spec.data(), c_idim, c_T);
+    c.mags = std::move(mags);
+    c.T = c_T; c.L_used = c_L; c.n = n;
     return true;
 }
 
-void save_spec_cache(const std::string& path, const std::vector<float>& host,
-                     int idim, int T, int L_used, int hop, float max_secs) {
+void save_clip_cache(const std::string& path, const std::vector<float>& spec, int idim,
+                     int T, int L_used, int hop, float max_secs, int n,
+                     const std::vector<bt::Tensor>& mags) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return;
-    f.write(reinterpret_cast<const char*>(&kSpecMagic), sizeof(kSpecMagic));
+    f.write(reinterpret_cast<const char*>(&kClipMagic), sizeof(kClipMagic));
     f.write(reinterpret_cast<const char*>(&idim), sizeof(idim));
     f.write(reinterpret_cast<const char*>(&T), sizeof(T));
     f.write(reinterpret_cast<const char*>(&L_used), sizeof(L_used));
     f.write(reinterpret_cast<const char*>(&hop), sizeof(hop));
     f.write(reinterpret_cast<const char*>(&max_secs), sizeof(max_secs));
-    f.write(reinterpret_cast<const char*>(host.data()), host.size() * sizeof(float));
+    f.write(reinterpret_cast<const char*>(spec.data()), spec.size() * sizeof(float));
+    f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+    const int num_mags = static_cast<int>(mags.size());
+    f.write(reinterpret_cast<const char*>(&num_mags), sizeof(num_mags));
+    for (const auto& m : mags) {
+        const std::vector<float> h = m.to_host_vector();
+        f.write(reinterpret_cast<const char*>(&m.rows), sizeof(m.rows));
+        f.write(reinterpret_cast<const char*>(&m.cols), sizeof(m.cols));
+        f.write(reinterpret_cast<const char*>(h.data()), h.size() * sizeof(float));
+    }
 }
 
 }  // namespace
@@ -251,7 +284,7 @@ int main(int argc, char** argv) {
     std::printf("clips: %zu train, %zu val\n", clips.size(), val.size());
     if (!a.cache.empty()) {
         fs::create_directories(a.cache);
-        std::printf("spec cache: %s (build-on-demand)\n", a.cache.c_str());
+        std::printf("clip cache: %s (spec + target mags, build-on-demand)\n", a.cache.c_str());
     }
 
     // Adam state (m, v) + per-step grads, all matching the encoder weight layout.
@@ -277,40 +310,44 @@ int main(int argc, char** argv) {
         std::shuffle(clips.begin(), clips.end(), rng);
         double loss_sum = 0.0; int seen = 0;
         for (const std::string& path : clips) {
-            bsm::AudioBuffer wav;
-            try { wav = bsm::read_wav(path); } catch (...) { continue; }
-            if (wav.sample_rate != SR || wav.empty()) continue;
-            int L = static_cast<int>(wav.samples.size());
-            if (max_samp > 0 && L > max_samp) L = max_samp;
-            int L_used = 0;
-            const int T = aligned_T(L, hop, CC, L_used);
-            if (T == 0) continue;
-
-            const auto t0 = tp();
-            bt::Tensor feat;
             const std::string cpath = a.cache.empty() ? std::string()
-                                                      : spec_cache_path(a.cache, path);
-            int cT = 0, cL = 0;
-            const bool hit = !cpath.empty() &&
-                load_spec_cache(cpath, dev, enc.idim, hop, a.max_secs, feat, cT, cL) && cT == T;
-            if (!hit) {
-                feat = spec.compute(wav.samples.data(), L_used);          // [1253, T]
+                                                      : clip_cache_path(a.cache, path);
+            const auto t0 = tp();
+            // Constant-across-epochs prep: spec + target STFT magnitudes. A full
+            // cache hit needs no wav read; a miss builds and (if caching) writes.
+            ClipCache cc;
+            bool have = !cpath.empty() &&
+                        load_clip_cache(cpath, dev, enc.idim, hop, a.max_secs, cc);
+            if (!have) {
+                bsm::AudioBuffer wav;
+                try { wav = bsm::read_wav(path); } catch (...) { continue; }
+                if (wav.sample_rate != SR || wav.empty()) continue;
+                int L = static_cast<int>(wav.samples.size());
+                if (max_samp > 0 && L > max_samp) L = max_samp;
+                int L_used = 0;
+                const int T = aligned_T(L, hop, CC, L_used);
+                if (T == 0) continue;
+                cc.spec = spec.compute(wav.samples.data(), L_used);       // [1253, T]
+                cc.T = T; cc.L_used = L_used;
+                const int nwave = model.config().base_chunk * T;          // LF = T
+                cc.n = std::min(static_cast<int>(wav.samples.size()), nwave);
+                bt::Tensor target = bt::Tensor::from_host_on(dev, wav.samples.data(), 1, cc.n);
+                cc.mags = model.recon_target_mags(target, cc.n);
                 if (!cpath.empty())
-                    save_spec_cache(cpath, feat.to_host_vector(), enc.idim, T, L_used,
-                                    hop, a.max_secs);
+                    save_clip_cache(cpath, cc.spec.to_host_vector(), enc.idim, cc.T,
+                                    cc.L_used, hop, a.max_secs, cc.n, cc.mags);
             }
             bt::Tensor latent;
             bsm::SupertonicEncoderCache cache;
             const auto t1 = tp();
-            enc.forward_train(feat, T, latent, cache);                   // [24, T] device
+            enc.forward_train(cc.spec, cc.T, latent, cache);             // [24, T] device
 
-            // Fully on-device recon: z_real / dLatent never leave the GPU.
-            const int nwave = model.config().base_chunk * T;  // base_chunk * LF, LF = T
-            const int target_len = std::min(static_cast<int>(wav.samples.size()), nwave);
-            bt::Tensor target = bt::Tensor::from_host_on(dev, wav.samples.data(), 1, target_len);
+            // Fully on-device recon: z_real / dLatent never leave the GPU; the
+            // target STFT is replayed from the (cached) magnitudes.
             const auto t2 = tp();
             bt::Tensor dLatent;
-            const float loss = model.recon_loss_and_grad(latent, /*LF=*/T, target, dLatent);
+            const float loss = model.recon_loss_and_grad(latent, /*LF=*/cc.T, cc.mags,
+                                                          cc.n, dLatent);
 
             const auto t3 = tp();
             grads.zero(enc);
@@ -344,7 +381,7 @@ int main(int argc, char** argv) {
 
     if (a.profile && pn > 0) {
         const double tot = pt[0] + pt[1] + pt[2] + pt[3] + pt[4];
-        std::printf("profile over %ld clips (ms/clip): spec %.1f  fwd %.1f  recon %.1f"
+        std::printf("profile over %ld clips (ms/clip): prep %.1f  fwd %.1f  recon %.1f"
                     "  bwd %.1f  adam %.1f  | total %.1f (%.1f clips/s)\n", pn,
                     1e3 * pt[0] / pn, 1e3 * pt[1] / pn, 1e3 * pt[2] / pn,
                     1e3 * pt[3] / pn, 1e3 * pt[4] / pn, 1e3 * tot / pn, pn / tot);

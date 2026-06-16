@@ -116,6 +116,20 @@ public:
                               const brotensor::Tensor& target,
                               brotensor::Tensor& dZReal) const;
 
+    // Precomputed-target variant of the on-device objective. The target STFT
+    // magnitudes are constant across epochs, so a trainer computes them once via
+    // recon_target_mags() (or caches them to disk) and passes them here, skipping
+    // the per-step target STFT (~50 ms/clip). `n` is the comparison length
+    // (min(nwave, target_len)) the mags were built for.
+    float recon_loss_and_grad(const brotensor::Tensor& z_real, int LF,
+                              const std::vector<brotensor::Tensor>& target_mags,
+                              int n, brotensor::Tensor& dZReal) const;
+
+    // Multi-resolution target STFT magnitudes for the recon loss — one tensor per
+    // applicable resolution, in the loss's fixed config order. Cache and replay.
+    std::vector<brotensor::Tensor> recon_target_mags(const brotensor::Tensor& target,
+                                                     int n) const;
+
     // Text encoder: token ids + a TTL style matrix -> conditioning embedding.
     //
     // `text_ids` are codepoint-level vocabulary ids (the UnicodeProcessor
