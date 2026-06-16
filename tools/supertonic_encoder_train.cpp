@@ -47,12 +47,20 @@ struct Args {
     std::string out   = "encoder.safetensors";
     std::string cache;           // spec-cache dir (empty = no caching)
     int    epochs    = 4;
-    float  lr        = 3.0e-4f;
+    float  lr        = 5.0e-6f;  // backprop through the frozen vocoder is ill-
+                                 // conditioned; higher lr overshoots/diverges.
     int    max_clips = 0;        // 0 = all
     float  max_secs  = 4.0f;     // trim each clip to bound compute
     float  val_frac  = 0.02f;
     int    overfit   = 0;        // >0: overfit N clips (smoke), ignores epochs/val
     int    save_every = 1;
+    float  clip      = 1.0f;     // global grad L2-norm clip (0 = off). Backprop
+                                 // through the frozen vocoder from a cold encoder
+                                 // explodes without it.
+    float  init_scale = 0.01f;   // proj_out weight scale at init (small => z_real
+                                 // starts ≈ latent_mean, in the decoder's regime).
+    float  dlatent_clamp = 1.0e3f; // clamp |dLatent| (decode-backward output) to
+                                   // tame frozen-vocoder Inf spikes (0 = off).
     std::uint64_t seed = 1234;
     bool   cpu = false;
     bool   profile = false;   // time each phase (sync-bracketed) over the run
@@ -79,6 +87,9 @@ Args parse(int argc, char** argv) {
         else if (k == "--val-frac")   a.val_frac = std::stof(need(i));
         else if (k == "--overfit")    a.overfit = std::stoi(need(i));
         else if (k == "--save-every") a.save_every = std::stoi(need(i));
+        else if (k == "--clip")       a.clip = std::stof(need(i));
+        else if (k == "--init-scale") a.init_scale = std::stof(need(i));
+        else if (k == "--dlatent-clamp") a.dlatent_clamp = std::stof(need(i));
         else if (k == "--seed")       a.seed = std::stoull(need(i));
         else if (k == "--cpu")        a.cpu = true;
         else if (k == "--profile")    a.profile = true;
@@ -257,8 +268,20 @@ int main(int argc, char** argv) {
     bsm::SupertonicSpec spec(dev, SR, 2048, 2048, hop, 228);
     bsm::SupertonicEncoder enc;
     enc.init(dev, a.seed);
-    std::printf("encoder: idim %d hidden %d latent %d layers %d (%zu weight tensors)\n",
-                enc.idim, enc.hidden, enc.latent_dim, enc.num_layers, gather_w(enc).size());
+    // Start the encoder in the decoder's latent distribution: bias proj_out to the
+    // per-channel latent mean and shrink its weights so z_real ≈ latent_mean (the
+    // normalised flow latent ≈ 0, the vocoder's expected centre) at step 0. Random
+    // init feeds the frozen decoder out-of-distribution latents whose backward gain
+    // explodes the encoder gradient to NaN; clipping can't fix the bad direction.
+    {
+        const std::vector<float>& lm = model.latent_mean();
+        bt::scale_inplace(enc.proj_out.w, a.init_scale);
+        enc.proj_out.b = bt::Tensor::from_host_on(dev, lm.data(), enc.latent_dim, 1);
+    }
+    std::printf("encoder: idim %d hidden %d latent %d layers %d (%zu weight tensors), "
+                "proj_out init_scale %.3g\n",
+                enc.idim, enc.hidden, enc.latent_dim, enc.num_layers,
+                gather_w(enc).size(), a.init_scale);
 
     // Scan wavs.
     std::vector<std::string> clips;
@@ -304,6 +327,33 @@ int main(int argc, char** argv) {
     double pt[5] = {0, 0, 0, 0, 0};  // spec / fwd / recon / bwd / adam
     long pn = 0;
 
+    // Global gradient L2-norm clip — backprop through the frozen vocoder from a
+    // randomly-initialised encoder feeds out-of-distribution latents into the
+    // decoder, whose backward gain runs the encoder grad away (-> NaN). Clipping
+    // the per-step grad norm keeps the encoder in-distribution and convergent.
+    // Returns false if the grad norm is non-finite (Inf/NaN) — the caller then
+    // skips the Adam step so one bad clip can't poison every weight. Otherwise
+    // clips the global norm to a.clip (if enabled).
+    auto clip_grads = [&]() -> bool {
+        double ss = 0.0;
+        for (bt::Tensor* g : G) {
+            bt::Tensor sq = g->clone();
+            bt::mul_inplace(sq, *g);
+            bt::Tensor rs, cs;
+            bt::sum_rows(sq, rs);
+            bt::sum_cols(rs, cs);
+            ss += cs.to_host_vector()[0];
+        }
+        if (!std::isfinite(ss)) return false;
+        const double gn = std::sqrt(ss);
+        if (a.clip > 0.0f && gn > a.clip && gn > 0.0) {
+            const float s = static_cast<float>(a.clip / gn);
+            for (bt::Tensor* g : G) bt::scale_inplace(*g, s);
+        }
+        return true;
+    };
+    long skipped = 0;
+
     int step = 0;
     const int epochs = (a.overfit > 0) ? std::max(a.epochs, 40) : a.epochs;
     for (int epoch = 0; epoch < epochs; ++epoch) {
@@ -348,15 +398,25 @@ int main(int argc, char** argv) {
             bt::Tensor dLatent;
             const float loss = model.recon_loss_and_grad(latent, /*LF=*/cc.T, cc.mags,
                                                           cc.n, dLatent);
+            // The frozen-vocoder backward gain produces occasional Inf spikes in
+            // dLatent (LayerNorm 1/std on low-variance frames); clamp to a finite
+            // range so they don't become non-finite encoder grads (skipped steps).
+            if (a.dlatent_clamp > 0.0f)
+                bt::clamp(dLatent, -a.dlatent_clamp, a.dlatent_clamp);
 
             const auto t3 = tp();
             grads.zero(enc);
             enc.backward(cache, dLatent, grads);
             const auto t4 = tp();
 
-            ++step;
-            for (std::size_t i = 0; i < W.size(); ++i)
-                bt::adam_step(*W[i], *G[i], *M[i], *V[i], a.lr, 0.9f, 0.999f, 1.0e-8f, step);
+            const bool grad_ok = clip_grads();
+            if (grad_ok) {
+                ++step;
+                for (std::size_t i = 0; i < W.size(); ++i)
+                    bt::adam_step(*W[i], *G[i], *M[i], *V[i], a.lr, 0.9f, 0.999f, 1.0e-8f, step);
+            } else {
+                ++skipped;  // non-finite grad: skip so it can't poison the weights
+            }
             const auto t5 = tp();
             if (a.profile) {
                 pt[0] += secs(t0, t1); pt[1] += secs(t1, t2); pt[2] += secs(t2, t3);
@@ -368,8 +428,8 @@ int main(int argc, char** argv) {
                 std::printf("  epoch %d  %d/%zu  loss %.5f\n", epoch, seen, clips.size(),
                             loss_sum / seen);
         }
-        std::printf("epoch %d: mean loss %.6f over %d clips\n", epoch,
-                    seen ? loss_sum / seen : 0.0, seen);
+        std::printf("epoch %d: mean loss %.6f over %d clips (%ld non-finite grads skipped)\n",
+                    epoch, seen ? loss_sum / seen : 0.0, seen, skipped);
         if (a.overfit == 0 && a.save_every > 0 && (epoch + 1) % a.save_every == 0) {
             save_encoder(a.out, enc);
             std::printf("  saved %s\n", a.out.c_str());

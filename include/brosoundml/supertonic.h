@@ -243,6 +243,13 @@ public:
     const SupertonicConfig& config() const;
     bool loaded() const;
 
+    // The AE latent normalisation stats (per latent channel). The decoder expects
+    // a real latent distributed around `latent_mean` (after which it normalises to
+    // the ~unit flow latent). An encoder trained against the frozen decoder should
+    // start here so the decoder sees in-distribution input. Empty until load().
+    const std::vector<float>& latent_mean() const;
+    const std::vector<float>& latent_std() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

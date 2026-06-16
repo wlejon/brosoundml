@@ -2164,5 +2164,7 @@ std::vector<std::string> Supertonic::split_sentences(const std::string& text,
 
 const SupertonicConfig& Supertonic::config() const { return impl_->cfg; }
 bool Supertonic::loaded() const { return impl_->ready; }
+const std::vector<float>& Supertonic::latent_mean() const { return impl_->latent_mean; }
+const std::vector<float>& Supertonic::latent_std() const { return impl_->latent_std; }
 
 }  // namespace brosoundml
