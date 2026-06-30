@@ -38,6 +38,13 @@ namespace brosoundml {
 struct QwenTtsGenState {
     QwenTtsTalkerStepPtr talker_step;   // captured Talker decode session (CUDA)
     CpFramePtr           cp_frame;      // captured Code Predictor frame graph
+    // Unified Philox sampling counter (device INT32 (1,1)): codebook 0 and the
+    // Code Predictor's codebooks 1..15 share it so a fixed seed reproduces the
+    // whole utterance. Device-resident and advanced on-device, which is what
+    // keeps the Code Predictor's per-frame depth pass CUDA-graph-capturable
+    // under sampling. Its buffer must outlive the captured graph (it does — both
+    // live in this per-stream state); reset to 0 at the start of each utterance.
+    brotensor::Tensor    sample_counter;
 };
 
 struct QwenTtsGenParams {
@@ -62,9 +69,11 @@ struct QwenTtsGenParams {
     // Sampling. temperature == 0 keeps the greedy argmax (deterministic, the
     // bit-exact upstream policy and the default). temperature > 0 draws every
     // code — codebook 0 AND the Code Predictor's codebooks 1..15 — through
-    // brotensor::sample_logits (temperature -> softmax -> top_k -> top_p ->
-    // inverse-CDF), seeded by `seed` via a counter that advances one step per
-    // code so the whole utterance is reproducible for a fixed seed.
+    // brotensor::sample_logits_into (temperature -> softmax -> top_k -> top_p ->
+    // inverse-CDF), seeded by `seed` via a shared device counter that advances
+    // one step per code so the whole utterance is reproducible for a fixed seed.
+    // The device counter is what keeps the Code Predictor's depth pass
+    // CUDA-graph-capturable under sampling (sampling runs at ~greedy speed).
     float    temperature = 0.0f;   // 0 = greedy (default); >0 = sample
     int      top_k       = 0;      // 0 = no top-k cap
     float    top_p       = 1.0f;   // 1 = no nucleus cap

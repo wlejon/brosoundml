@@ -121,17 +121,21 @@ struct QwenTtsCodePredictor {
     // the predictor weights stay read-only and concurrent streams never share a
     // captured graph.
     //
-    // Sampling: with temperature == 0 (or counter == nullptr) every codebook is
-    // the greedy argmax — the default, bit-exact with predict(). With
-    // temperature > 0 each codebook 1..15 is drawn through
-    // brotensor::sample_logits seeded by (key, *counter); *counter is advanced
-    // one step per code so the draws compose with the Talker's codebook-0 stream.
+    // Sampling: with temperature == 0 (or sample_counter == nullptr) every
+    // codebook is the greedy argmax — the default, bit-exact with predict().
+    // With temperature > 0 each codebook 1..15 is drawn through
+    // brotensor::sample_logits_into seeded by (key, sample_counter[0]); the
+    // counter is a device INT32 (1,1) tensor advanced one step per code entirely
+    // on-device, so the whole-frame depth pass stays CUDA-graph-capturable (the
+    // greedy fast path also applies to sampling) and the draws compose with the
+    // Talker's codebook-0 stream sharing that same counter. The counter buffer
+    // must outlive the captured graph (it is owned by QwenTtsGenState).
     void predict_dev(CpFramePtr& fs, const brotensor::Tensor& past_hidden,
                      const brotensor::Tensor& c0_embed,
                      std::vector<int>& out_codes,
                      float temperature = 0.0f, int top_k = 0, float top_p = 1.0f,
                      std::uint64_t key = 0,
-                     std::uint64_t* counter = nullptr) const;
+                     brotensor::Tensor* sample_counter = nullptr) const;
 
     // Raw pointer to codec_embedding table `table` row `id` (hidden floats).
     const float* codec_embedding_row(int table, int id) const;

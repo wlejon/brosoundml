@@ -196,9 +196,11 @@ enum class QwenTtsVariant { Base, CustomVoice, VoiceDesign };
 // is the greedy, deterministic policy that reproduces the upstream code stream
 // bit-for-bit. temperature > 0 turns the autoregressive loop stochastic: every
 // code — codebook 0 and the Code Predictor's codebooks 1..15 — is drawn through
-// brotensor::sample_logits (temperature -> softmax -> top_k -> top_p ->
-// inverse-CDF), seeded by `seed` so a fixed seed gives a repeatable utterance
-// and different seeds give natural take-to-take variation.
+// brotensor::sample_logits_into (temperature -> softmax -> top_k -> top_p ->
+// inverse-CDF) off a shared device-resident Philox counter, seeded by `seed` so
+// a fixed seed gives a repeatable utterance and different seeds give natural
+// take-to-take variation. The device counter keeps the Code Predictor's depth
+// pass CUDA-graph-capturable, so sampling runs at ~greedy speed on CUDA.
 struct QwenTtsSampling {
     float         temperature = 0.0f;  // 0 = greedy (deterministic, default)
     int           top_k       = 0;     // 0 = no top-k cap

@@ -96,7 +96,7 @@ struct LayerScratch {
 // Persistent decode state for one predictor instance: the reused scratch for a
 // frame's prefill (n=2) and depth-step (n=1) passes, the depth KV cache, the
 // conditioning-input staging buffer, and the (15,1) INT32 code buffer. On CUDA
-// greedy it also owns the captured whole-frame graph. At namespace scope (not
+// it also owns the captured whole-frame graph (greedy or sampling). At namespace scope (not
 // anonymous) so it is the same brosoundml::CpFrameState the header forward-
 // declares for the predictor's unique_ptr member; it still uses the
 // anonymous-namespace DepthCache / LayerScratch (visible in the enclosing
@@ -114,11 +114,19 @@ struct CpFrameState {
     bt::Tensor hidden_step;    // (1, hidden) step final-norm output
     bt::Tensor logits;         // (1, vocab) lm_head output
     bt::Tensor code_dev;       // (n_out, 1) INT32 accumulated codes
+    bt::Tensor sample_scratch; // (1, 3*vocab) FP32 sampler workspace (sampling)
     DepthCache cache;
 #ifdef BROSOUNDML_HAS_CUDA
-    bt::CudaGraph graph;       // captured whole-frame greedy step (CUDA only)
+    bt::CudaGraph graph;       // captured whole-frame step (CUDA only)
 #endif
     bool captured = false;
+    // The captured graph bakes in the draw policy (argmax vs sample_logits_into)
+    // and, when sampling, the sampling params — so a call whose policy/params
+    // differ from the capture must re-capture. These record what was baked.
+    bool  cap_sampling = false;
+    float cap_temp = 0.0f;
+    int   cap_top_k = 0;
+    float cap_top_p = 1.0f;
 };
 
 namespace {
@@ -203,7 +211,7 @@ const bt::Tensor& cp_project_into(const QwenTtsCodePredictor& cp,
 // conditioning rows must already be staged in st.cond_in and st.cache.len == 0.
 void run_frame_body(const QwenTtsCodePredictor& cp, CpFrameState& st,
                     bool sampling, float temperature, int top_k, float top_p,
-                    std::uint64_t key, std::uint64_t* counter) {
+                    std::uint64_t key, bt::Tensor* counter) {
     const bt::Device dev = cp.final_norm.device;
     const int n_out = cp.num_code_groups - 1;   // 15
     const int hidden = cp.hidden;
@@ -214,15 +222,15 @@ void run_frame_body(const QwenTtsCodePredictor& cp, CpFrameState& st,
     };
     // lm_head[head_idx] over one (1,hidden) row -> winning code id, written as a
     // device INT32 into code_dev[j]; the returned view is the next step's gather
-    // index. Greedy argmax writes in place; sampling copies the seeded draw in.
+    // index. Greedy argmax writes in place; sampling draws the seeded code in
+    // place too — sample_logits_into reads/advances the device counter and uses
+    // the persistent scratch, so the whole pass stays graph-capturable.
     auto emit = [&](const bt::Tensor& row, int head_idx, int j) -> bt::Tensor {
         qtd::linear(cp.lm_head[head_idx], nullptr, row, st.logits);   // (1, vocab)
         bt::Tensor slot = code_slot(j);
         if (sampling) {
-            bt::Tensor idx;
-            bt::sample_logits(st.logits, temperature, top_k, top_p, key, *counter, idx);
-            ++(*counter);
-            bt::copy_d2d(idx, 0, st.code_dev, j, 1);
+            bt::sample_logits_into(st.logits, temperature, top_k, top_p, key,
+                                   *counter, st.sample_scratch, slot);
         } else {
             bt::argmax_rows(st.logits, slot);                        // INT32 in place
         }
@@ -360,7 +368,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
                                        std::vector<int>& out_codes,
                                        float temperature, int top_k, float top_p,
                                        std::uint64_t key,
-                                       std::uint64_t* counter) const {
+                                       bt::Tensor* counter) const {
     const bt::Device dev = final_norm.device;
     bt::DeviceScope scope(dev);
     const int n_out = num_code_groups - 1;   // 15
@@ -385,6 +393,15 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     }
     CpFrameState& st = *fs;
 
+    // Persistent sampler workspace (sampling path only): the prob / sort-work /
+    // order scratch sample_logits_into carves, sized once to 3*vocab and reused
+    // across frames. Allocated before the warm-up so it exists during capture
+    // (capture forbids allocation).
+    if (sampling && st.sample_scratch.rows < 1) {
+        st.sample_scratch =
+            bt::Tensor::empty_on(dev, 1, 3 * vocab, bt::Dtype::FP32);
+    }
+
     // Stage the two conditioning rows into the persistent input buffer in place —
     // the only per-frame input a captured graph reads (everything downstream is
     // deterministic device compute over st's buffers).
@@ -396,29 +413,49 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     if (prof) t0 = clk::now();
 
 #ifdef BROSOUNDML_HAS_CUDA
-    // CUDA greedy: the whole frame is a fixed-shape sequence of device ops with
-    // no host control flow, so capture it once and replay it as a single launch
-    // (~700 tiny kernel launches/frame -> one cudaGraphLaunch). Sampling is NOT
-    // captured: its Philox counter must advance on the host per code per frame.
+    // CUDA: the whole frame is a fixed-shape sequence of device ops with no host
+    // control flow, so capture it once and replay it as a single launch (~700
+    // tiny kernel launches/frame -> one cudaGraphLaunch). This now covers
+    // sampling too: sample_logits_into reads/advances its Philox counter from a
+    // device tensor and draws into the persistent scratch, so a captured replay
+    // advances the RNG with no host involvement (the greedy fast path applies to
+    // both policies). Stream capture records without executing, so the warm-up
+    // run produces frame 0's codes and advances the counter by 15; each replay
+    // then advances 15 more, matching the CPU eager path frame for frame.
     // BROSOUNDML_QWEN_NO_GRAPH forces the eager path (A/B + escape hatch).
     static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
-    const bool use_graph = (dev == bt::Device::CUDA) && !sampling && !no_graph;
+    const bool use_graph = (dev == bt::Device::CUDA) && !no_graph;
     if (use_graph) {
         CpProf::graph() = true;
+        // Drop a captured graph whose baked policy/params differ from this call.
+        if (st.captured &&
+            (st.cap_sampling != sampling ||
+             (sampling && (st.cap_temp != temperature ||
+                           st.cap_top_k != top_k || st.cap_top_p != top_p)))) {
+            st.graph.reset();
+            st.captured = false;
+        }
         if (!st.captured) {
             // Warm-up: an eager run allocates + sizes every scratch buffer (the
             // capture itself must allocate nothing). It also yields this frame's
-            // codes — capture re-runs the identical compute, so they agree.
+            // codes (and, when sampling, advances the device counter by n_out) —
+            // the captured replay re-runs the identical compute for frame 1+.
             st.cache.len = 0;
-            run_frame_body(*this, st, /*sampling=*/false, 0.0f, 0, 1.0f, 0, nullptr);
+            run_frame_body(*this, st, sampling, temperature, top_k, top_p, key,
+                           counter);
             bt::sync_all();
             st.cache.len = 0;   // re-bake offsets 0,1,2,... into the graph
             {
                 bt::CudaGraphCapture cap;
-                run_frame_body(*this, st, /*sampling=*/false, 0.0f, 0, 1.0f, 0, nullptr);
+                run_frame_body(*this, st, sampling, temperature, top_k, top_p,
+                               key, counter);
                 st.graph = cap.finish();
             }
             st.captured = true;
+            st.cap_sampling = sampling;
+            st.cap_temp = temperature;
+            st.cap_top_k = top_k;
+            st.cap_top_p = top_p;
         } else {
             st.graph.launch();   // replay: reads st.cond_in, writes st.code_dev
         }

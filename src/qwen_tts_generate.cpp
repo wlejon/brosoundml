@@ -121,11 +121,23 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
     std::vector<float>   conf;             // per-frame codebook-0 top-1 prob (trace)
     const float kNegInf = -std::numeric_limits<float>::infinity();
 
-    // Philox counter for sampling: advances one step per code drawn (codebook 0
-    // here, codebooks 1..15 inside predict_dev), so a fixed seed reproduces the
-    // whole utterance. Unused on the greedy path (temperature == 0).
-    const bool     sampling = params.temperature > 0.0f;
-    std::uint64_t  rng_counter = 0;
+    // Unified Philox counter for sampling (device INT32 (1,1)): advances one step
+    // per code drawn (codebook 0 here, codebooks 1..15 inside predict_dev), so a
+    // fixed seed reproduces the whole utterance. Device-resident + advanced
+    // on-device by sample_logits_into, which is what keeps the Code Predictor's
+    // per-frame depth pass CUDA-graph-capturable under sampling. Reset to 0 here;
+    // its buffer (in gen) outlives the captured graph. Plus the codebook-0
+    // sampler workspace (3*vocab) and a (1,1) draw target. All unused on the
+    // greedy path (temperature == 0).
+    const bool sampling = params.temperature > 0.0f;
+    bt::Tensor c0_scratch, c0_idx;
+    if (sampling) {
+        if (gen.sample_counter.rows < 1)
+            gen.sample_counter = bt::Tensor::empty_on(dev, 1, 1, bt::Dtype::INT32);
+        gen.sample_counter.zero();     // reset to 0 in place (stable pointer)
+        c0_scratch = bt::Tensor::empty_on(dev, 1, 3 * talker.vocab, bt::Dtype::FP32);
+        c0_idx     = bt::Tensor::empty_on(dev, 1, 1, bt::Dtype::INT32);
+    }
 
     for (int step = 0; step < params.max_frames; ++step) {
         // Cooperative cancellation: poll once per frame (the dominant cost) and
@@ -177,14 +189,16 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
             float eff_temp = params.temperature;
             if (params.adaptive > 0.0f)
                 eff_temp *= 1.0f + params.adaptive * (1.0f - conf_f);
-            // Draw codebook 0 from the edited logits via brotensor's seeded
-            // sampler (the suppress/min_frames -inf entries softmax to 0).
+            // Draw codebook 0 from the edited logits via the seeded sampler,
+            // sharing the unified device counter (advanced on-device). c0 stays
+            // eager — its logits are host-edited (rep. penalty / bias / suppress)
+            // each frame — but it uses the same op + counter as the Code
+            // Predictor, so the Philox stream is one continuous sequence.
             bt::Tensor lgs = bt::Tensor::from_host_on(dev, lp, 1, talker.vocab);
-            bt::Tensor idx;
-            bt::sample_logits(lgs, eff_temp, params.top_k, params.top_p,
-                              params.seed, rng_counter, idx);
-            ++rng_counter;
-            bt::Tensor cidx = idx.to(bt::Device::CPU);
+            bt::sample_logits_into(lgs, eff_temp, params.top_k, params.top_p,
+                                   params.seed, gen.sample_counter, c0_scratch,
+                                   c0_idx);
+            bt::Tensor cidx = c0_idx.to(bt::Device::CPU);
             c0 = *static_cast<const std::int32_t*>(cidx.host_raw());
         }
         prof.add(prof.head, th);
@@ -201,7 +215,7 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
             talker.codec_embedding, {static_cast<std::int32_t>(c0)});   // (1, H) device
         cp.predict_dev(gen.cp_frame, hcur, c0row, rest, params.temperature,
                        params.top_k, params.top_p, params.seed,
-                       sampling ? &rng_counter : nullptr);
+                       sampling ? &gen.sample_counter : nullptr);
         prof.add(prof.predict, tpr);
 
         // emit the frame [c0, c1..c15].

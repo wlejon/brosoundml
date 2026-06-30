@@ -77,6 +77,12 @@ static int run() {
     //
     // CPU and (if available) CUDA. Stage 1 only validates the loader contract;
     // synthesize() must still throw the staged stub.
+    //
+    // Carries the CPU sampled-code stream out of the per-device lambda so the
+    // CUDA run can assert bit-identical sampling parity (device-neutrality for
+    // the stochastic path, not just greedy).
+    std::vector<int32_t> sampled_ref;
+    int sampled_ref_F = -1;
     auto run_real_smoke = [&](brotensor::Device dev, const char* dev_name) {
         const fs::path root = fs::path(BROSOUNDML_REPO_DIR) / "weights" /
                               "qwen-tts" / "0.6B-customvoice";
@@ -613,6 +619,61 @@ static int run() {
                           tag("session A reused matches (graph replay is stable)"));
                     std::printf("    [synth sessions] 2 gen-states over 1 model, "
                                 "interleaved, bit-exact (F=%d)\n", gotF);
+                }
+
+                // Sampling path: temperature > 0 routes codebook 0 AND the Code
+                // Predictor through the seeded device-counter sampler. Verify it
+                // is (a) reproducible for a fixed seed, (b) seed-sensitive, and
+                // (c) bit-identical CPU vs CUDA (device-neutral stochastic path).
+                {
+                    brosoundml::QwenTtsGenParams sp = gp;
+                    sp.temperature = 0.8f;
+                    sp.top_k       = 50;
+                    sp.top_p       = 0.95f;
+                    sp.seed        = 1234;
+
+                    brosoundml::QwenTtsGenState gs1, gs2, gs3;
+                    std::vector<int32_t> s1, s2, s3;
+                    const int f1 = brosoundml::generate_codes(
+                        talker, cp, gs1, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), sp, s1);
+                    // same seed again -> identical stream (reproducible).
+                    const int f2 = brosoundml::generate_codes(
+                        talker, cp, gs2, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), sp, s2);
+                    CHECK(f1 == f2 && s1 == s2,
+                          tag("sampling is reproducible for a fixed seed"));
+                    // reusing one gen-state with the same seed -> still identical
+                    // (the per-utterance counter reset + stable captured graph).
+                    const int f1b = brosoundml::generate_codes(
+                        talker, cp, gs1, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), sp, s3);
+                    CHECK(f1b == f1 && s3 == s1,
+                          tag("sampling reused gen-state reproduces (counter reset)"));
+                    // a different seed -> a different stream (sampling is live).
+                    brosoundml::QwenTtsGenParams sp2 = sp;
+                    sp2.seed = 9876;
+                    std::vector<int32_t> sd;
+                    brosoundml::generate_codes(
+                        talker, cp, gs3, prefill.data(), gotT, pos3.data(),
+                        trailing.data(), gotL, tts_pad.data(), sp2, sd);
+                    CHECK(sd != s1, tag("sampling responds to the seed"));
+
+                    std::printf("    [synth sampling] F=%d  seed-stable=%d  "
+                                "seed-sensitive=%d\n",
+                                f1, (int)(s1 == s2), (int)(sd != s1));
+
+                    // CPU vs CUDA must agree exactly on the sampled stream.
+                    if (dev == brotensor::Device::CPU) {
+                        sampled_ref = s1;
+                        sampled_ref_F = f1;
+                    } else if (sampled_ref_F >= 0) {
+                        CHECK(f1 == sampled_ref_F && s1 == sampled_ref,
+                              tag("sampling stream is bit-identical CPU vs CUDA"));
+                        std::printf("    [synth sampling] CPU/CUDA parity: %s\n",
+                                    (f1 == sampled_ref_F && s1 == sampled_ref)
+                                        ? "exact" : "MISMATCH");
+                    }
                 }
 
                 // (4) the public synthesize() path runs end to end (codes ->
