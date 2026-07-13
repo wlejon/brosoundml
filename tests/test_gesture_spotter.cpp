@@ -154,7 +154,7 @@ void test_rhythm() {
     std::fprintf(stderr, "  [rhythm] intervals = %d, %d frames (%.0f ms each)\n",
                  v.intervals.empty() ? -1 : v.intervals[0],
                  v.intervals.size() < 2 ? -1 : v.intervals[1],
-                 v.intervals.empty() ? 0.0 : v.intervals[0] * v.frame_ms);
+                 v.intervals.empty() ? 0.0 : static_cast<double>(v.intervals[0]) * v.frame_ms);
 
     g.reset();
     auto self = run_clip(g, cfg.sensor, rhythm_clip(0.25));

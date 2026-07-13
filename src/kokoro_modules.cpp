@@ -1316,7 +1316,7 @@ void Generator::load_from(const stf::File& f, const KokoroConfig& cfg) {
     }
 
     // ─── resblocks ────────────────────────────────────────────────────────
-    resblocks.resize(num_upsamples * num_kernels);
+    resblocks.resize(static_cast<std::size_t>(num_upsamples) * num_kernels);
     for (int i = 0; i < num_upsamples; ++i) {
         const int C_cur = init_C / (1 << (i + 1));
         for (int j = 0; j < num_kernels; ++j) {

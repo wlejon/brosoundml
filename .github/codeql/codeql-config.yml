@@ -27,6 +27,20 @@ queries:
 #
 # If brosoundml ever grows a component that takes a path from a network peer, this
 # exclusion is wrong and should be removed.
+#
+# cpp/world-writable-file-creation is excluded for a related reason. Every instance
+# is the same portable idiom — std::fopen(path, "wb") — used to write a checkpoint,
+# a converted dataset, or a test fixture. fopen creates the file with the process
+# umask applied to 0666, so under the conventional 022 umask the file is 0644, not
+# world-writable; the query fires because it cannot prove the umask. The fix the
+# query wants — open(path, …, 0600) then fdopen — is POSIX-only and would break the
+# MSVC build, and a caller who needs tighter bits sets their umask. This is a
+# permission concern for whoever runs the process, not a weakness in a library that
+# writes a file the caller asked it to write. Unlike path-injection this is not tied
+# to a taint source, so no future component reintroduces the risk; the exclusion can
+# stay.
 query-filters:
   - exclude:
       id: cpp/path-injection
+  - exclude:
+      id: cpp/world-writable-file-creation
