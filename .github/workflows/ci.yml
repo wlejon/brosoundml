@@ -59,26 +59,26 @@ jobs:
           - { name: windows-msvc, os: windows-2022 }
           - { name: macos-arm64,  os: macos-14 }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: brosoundml
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/bromath
           path: bromath
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brotensor
           path: brotensor
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brolm
           path: brolm
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/broimage
           path: broimage
@@ -130,26 +130,26 @@ jobs:
     name: Coverage
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: brosoundml
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/bromath
           path: bromath
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brotensor
           path: brotensor
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brolm
           path: brolm
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/broimage
           path: broimage
@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-html
           path: brosoundml/coverage-html/

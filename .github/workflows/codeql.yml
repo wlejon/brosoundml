@@ -28,28 +28,28 @@ jobs:
       actions: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: brosoundml
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/bromath
           path: bromath
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brotensor
           path: brotensor
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/brolm
           path: brolm
 
       # Needed transitively: brolm resolves broimage from the top-level source
       # dir, which here is brosoundml. See the note in ci.yml.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: wlejon/broimage
           path: broimage
@@ -82,7 +82,7 @@ jobs:
       # The query set lives in the config file, which also documents why
       # cpp/path-injection is excluded.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           build-mode: manual
@@ -95,6 +95,6 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:c-cpp
