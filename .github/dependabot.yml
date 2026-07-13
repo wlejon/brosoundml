@@ -1,0 +1,17 @@
+version: 2
+
+# No package manifest to watch: the siblings (bromath, brotensor, brolm, broimage)
+# are vendored by CMake from ../, and there are no third-party libraries. That
+# leaves the pinned actions in .github/workflows/.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [ci]
+    commit-message:
+      prefix: "ci"

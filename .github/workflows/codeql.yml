@@ -1,0 +1,100 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# brosoundml consumes untrusted bytes for a living: WAV/PCM audio handed in by a
+# caller, safetensors checkpoints converted from upstream releases, and the packed
+# lexicon / voice-pack / POS-tagger blobs from the data repo. The DSP and model
+# code downstream indexes buffers using lengths, shapes and offsets those files
+# declare. Out-of-bounds reads and unchecked casts in that path are the realistic
+# memory-safety bug here, and they are what the C++ queries find.
+jobs:
+  analyze:
+    name: Analyze C++
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: brosoundml
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brotensor
+          path: brotensor
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brolm
+          path: brolm
+
+      # Needed transitively: brolm resolves broimage from the top-level source
+      # dir, which here is brosoundml. See the note in ci.yml.
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Configure
+        run: cmake -S brosoundml -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      # The sibling code CMake compiles into this build is built here, ahead of
+      # `init`, and that is what keeps it out of the analysis.
+      #
+      # For a compiled language CodeQL analyses what it observes the compiler
+      # compile while tracing, so anything already built when `init` runs is never
+      # extracted. `paths-ignore` cannot do this job — it does not filter compiled
+      # sources — so the build order is the exclusion mechanism, and moving these
+      # targets into the traced build below silently puts every one of their
+      # findings into this repo's Security tab, attributed to brosoundml.
+      #
+      # Each of these has its own CodeQL workflow in its own repo, which is where
+      # its findings belong. stb_image comes in via broimage and is excluded there
+      # for the same reason. bromath needs no entry: header-only, no TUs of its
+      # own, so its headers are analysed where brosoundml includes them.
+      - name: Pre-build sibling code (outside the traced build)
+        run: |
+          cmake --build build --parallel 4 \
+            --target stb_image broimage brolm brotensor_core brotensor_cpu
+
+      # The query set lives in the config file, which also documents why
+      # cpp/path-injection is excluded.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+          # Relative to the workspace root, and this repo is checked out into
+          # brosoundml/ (not the root) so the siblings can sit beside it.
+          config-file: brosoundml/.github/codeql/codeql-config.yml
+
+      # Only brosoundml's own TUs are left to compile, so only they are traced.
+      - name: Build brosoundml (traced)
+        run: cmake --build build --parallel 4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp

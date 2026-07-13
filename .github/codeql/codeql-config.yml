@@ -1,0 +1,32 @@
+name: brosoundml CodeQL config
+
+queries:
+  - uses: security-extended
+
+# cpp/path-injection does not describe a real weakness in this codebase, so it is
+# excluded rather than left to refile the same alerts every week. The same
+# exclusion, for the same reason, is in brolm.
+#
+# Every instance is the same shape: a test or a CLI tool takes a model directory
+# or an audio file from argv or an environment variable and hands it to a loader,
+# which opens it. Opening the path the caller named is what a loader is for, and
+# brosoundml's whole contract is "here is a converted model directory, run it".
+#
+# The query's threat model is a privileged process — a server, a setuid binary —
+# taking a path from an untrusted remote party and escaping a sandbox with it.
+# brosoundml is a library linked into whatever the caller is building. It crosses
+# no privilege boundary: it reads the checkpoint with exactly the rights of
+# whoever chose the path, and a caller who can pass `../../etc/passwd` could
+# equally have opened it directly. There is no confinement to break out of.
+#
+# This does not blunt the scan where it matters. The real attack surface is the
+# decoders and parsers — WAV/PCM bytes, safetensors checkpoints, packed lexicon
+# and voice-pack blobs — where shapes and offsets come straight out of a file and
+# then index buffers. The memory-safety queries covering them need no taint source
+# from argv and keep running against src/.
+#
+# If brosoundml ever grows a component that takes a path from a network peer, this
+# exclusion is wrong and should be removed.
+query-filters:
+  - exclude:
+      id: cpp/path-injection

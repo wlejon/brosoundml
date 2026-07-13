@@ -1,5 +1,9 @@
 # brosoundml
 
+[![CI](https://github.com/wlejon/brosoundml/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brosoundml/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/brosoundml/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brosoundml/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 brosoundml is a C++ library that runs neural audio models: text-to-speech,
 speech-to-text, a neural audio autoencoder, and keyword spotting. You hand it a
 converted model directory and either text or an `AudioBuffer` of PCM, and it
@@ -46,8 +50,9 @@ happens inside `brotensor`. It depends on three libraries:
 | [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
 
 Each resolves either to a standalone repo at `../<name>` or to a `third_party/`
-submodule fallback (the standard multi-repo pattern — see
-`bro/docs/multi-repo-workflow.md`).
+submodule fallback — see
+[bro/docs/multi-repo-workflow.md](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
+for the layout.
 
 ## Data and weights
 
@@ -109,6 +114,34 @@ Reference dumps: [Qwen3-TTS weight map](docs/qwen-tts-weights.md). G2P component
 specs: [pos_tagger](docs/pos_tagger.md), [lexicon](docs/lexicon.md),
 [morphology](docs/morphology.md), [special_cases](docs/special_cases.md),
 [phonemizer](docs/phonemizer.md).
+
+## CI
+
+Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
+checks out bromath, brotensor, brolm and broimage alongside this repo and builds
+the whole stack from source, so a breaking change in a sibling fails here rather
+than in whoever next builds brosoundml by hand.
+
+What a green run does and does not mean: the trained weights are not in this repo,
+so a runner never has them. Every model test gates on its checkpoint being present
+and skips the real-weight path without it — which is also where nearly all the
+runtime lives, so a CI run is quick precisely because those paths are skipped.
+Green means "brosoundml compiles everywhere and its weight-free tests pass" — the
+DSP, the G2P chain, the tokenizer adapters, the module-level shape and finiteness
+checks. It does not mean the models produce correct audio. That check needs the
+weights and stays on hardware that has them.
+
+Coverage of `src/` + `include/brosoundml/` lands in each run's job summary
+(`-DBROSOUNDML_COVERAGE=ON` locally; GCC/Clang only), and understates the model
+forward passes for the same reason. [CodeQL](.github/workflows/codeql.yml) runs
+weekly and on every push, aimed at the decoders and parsers — PCM buffers,
+safetensors checkpoints, and the packed lexicon / voice-pack / tagger blobs, whose
+declared lengths and offsets then index real buffers.
+
+## Versioning
+
+Pre-1.0. Consumers vendor this repo via `add_subdirectory` and build from source,
+so a tag is a pin point rather than a compatibility promise.
 
 ## License
 

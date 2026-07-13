@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# brosoundml resolves its siblings from ../<name>, so every job reconstructs that
+# layout in the runner workspace before configuring:
+#
+#     $GITHUB_WORKSPACE/
+#       brosoundml/   <- this repo, in a named path, not the workspace root
+#       bromath/
+#       brotensor/
+#       brolm/
+#       broimage/
+#
+# Hence `path:` on every checkout and `cmake -S brosoundml`. A default checkout
+# puts ../bromath outside the workspace and the configure dies on the FATAL_ERROR
+# in CMakeLists.
+#
+# broimage is here even though brosoundml's own CMakeLists never names it. brolm
+# needs it, and brolm resolves it from `${CMAKE_SOURCE_DIR}/../broimage` —
+# CMAKE_SOURCE_DIR being the *top-level* project, which here is brosoundml. So it
+# has to sit beside brosoundml in the workspace like the rest, or brolm's
+# configure dies looking for it.
+#
+# Siblings track main, which is how the stack is developed — so a breaking change
+# landing in brotensor or brolm fails here, rather than in whoever next builds
+# brosoundml by hand.
+#
+# What ctest actually covers here: the trained weights are not in this repo (they
+# live in the brosoundml-data dataset), so a runner never has them. Every model
+# test — Kokoro, Qwen3-TTS, Whisper, Parakeet, Qwen3-ASR, Sortformer, RAVE, the
+# spotters — gates on the checkpoint being present and skips the real-weight path
+# without it. They are also where nearly all the runtime lives: with weights on
+# hand the suite takes ~30 minutes and Kokoro alone is ~7 of them, so a run here
+# is quick precisely because those paths are skipped.
+#
+# So a green run means "brosoundml compiles everywhere and its weight-free tests
+# pass" — the DSP, the G2P chain, the tokenizer adapters, the module-level shape
+# and finiteness checks. It does not mean the models produce correct audio. That
+# check needs the weights and stays on hardware that has them.
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: windows-msvc, os: windows-2022 }
+          - { name: macos-arm64,  os: macos-14 }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: brosoundml
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brotensor
+          path: brotensor
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brolm
+          path: brolm
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: ccache
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: brosoundml-${{ matrix.name }}
+          max-size: 500M
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S brosoundml -B build -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -S brosoundml -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          fi
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  #
+  # Scoped to brosoundml's own src/ and include/. The siblings are measured by
+  # their own coverage jobs; counting them here would report brosoundml's number
+  # against code its tests were never meant to cover.
+  #
+  # No ccache: it interacts badly with --coverage, because the .gcno sidecars are
+  # compile-time artifacts and a cache hit skips emitting them.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: brosoundml
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brotensor
+          path: brotensor
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/brolm
+          path: brolm
+
+      - uses: actions/checkout@v5
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - name: Install gcovr + Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build
+
+      - name: Configure (instrumented)
+        run: |
+          cmake -S brosoundml -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBROSOUNDML_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # pipefail: piping gcovr into tee otherwise hands the step tee's exit
+      # status, so a gcovr crash produces no report and the job still goes green.
+      - name: Report
+        shell: bash
+        working-directory: brosoundml
+        run: |
+          set -o pipefail
+          mkdir -p coverage-html
+          gcovr --root . \
+            --filter 'src/' --filter 'include/brosoundml/' \
+            --exclude 'tests/' --exclude 'tools/' \
+            --exclude-unreachable-branches \
+            --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
+            --print-summary \
+            --html-details coverage-html/index.html \
+            | tee coverage-summary.txt
+          test -s coverage-html/index.html
+
+      - name: Job summary
+        if: always()
+        working-directory: brosoundml
+        run: |
+          {
+            echo '## Coverage — `src/` + `include/brosoundml/`'
+            echo
+            echo 'The model tests skip without the trained weights (they live in the'
+            echo 'brosoundml-data dataset, not this repo), so this measures the'
+            echo 'weight-free tests only — the DSP, the G2P chain, and the module-level'
+            echo 'shape and finiteness checks. It understates the model forward passes'
+            echo 'accordingly.'
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: brosoundml/coverage-html/
+          retention-days: 14
