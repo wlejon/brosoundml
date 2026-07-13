@@ -41,6 +41,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

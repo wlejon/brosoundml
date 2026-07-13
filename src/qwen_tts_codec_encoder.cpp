@@ -6,6 +6,7 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>

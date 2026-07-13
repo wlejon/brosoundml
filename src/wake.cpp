@@ -10,6 +10,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
