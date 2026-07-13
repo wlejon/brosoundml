@@ -9,19 +9,18 @@ speech-to-text, a neural audio autoencoder, and keyword spotting. You hand it a
 converted model directory and either text or an `AudioBuffer` of PCM, and it
 gives you back synthesized audio or token ids.
 
-Each model is built by composing the audio operations in
-[`brotensor`](https://github.com/wlejon/brotensor) FFT/STFT, 1D/2D convolution,
-vocoder/codec activations, codec quantization, resampling, autoregressive
-sampling. A model here is a graph of brotensor op calls plus weight loading and pre/post-processing.
-Everything lives in one flat namespace, `brosoundml::`.
+A model here is a graph of [`brotensor`](https://github.com/wlejon/brotensor) op
+calls plus weight loading and pre/post-processing, composed from that library's
+audio family: FFT/STFT, 1D/2D convolution, vocoder/codec activations, codec
+quantization, resampling, autoregressive sampling. Everything lives in one flat
+namespace, `brosoundml::`.
 
 ## Models
 
-All models are complete and run FP32 on CPU; the device-neutral ones place
-weights on the chosen backend and dispatch the whole forward pass through
-`brotensor` device ops, so a CUDA build reproduces the CPU result (bit-identical
-discrete-token stream for token models, ~1e-5 for the continuous codec/vocoder
-tail).
+Every model runs FP32 on CPU. The device-neutral ones place weights on the chosen
+backend and dispatch the whole forward pass through `brotensor` device ops, so a
+CUDA build reproduces the CPU result — a bit-identical token stream for the
+discrete-token models, ~1e-5 for the continuous codec/vocoder tail.
 
 | Model | Task | Device | Notes |
 |---|---|---|---|
