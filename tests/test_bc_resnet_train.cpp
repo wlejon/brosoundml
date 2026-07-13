@@ -2,7 +2,7 @@
 #  define _CRT_SECURE_NO_WARNINGS 1
 #endif
 
-// Tests for the chunk-6 training surface on BcResnet:
+// Tests for the BcResnet training surface:
 //   • Loss strictly decreases under 50 steps on a fixed (B=8) batch.
 //   • Overfits a B=4 batch to near-zero loss in 200 steps.
 //   • Numerical-gradient sanity-check on a few parameter elements vs. the
@@ -38,10 +38,16 @@ void require(bool ok, const std::string& msg) {
     }
 }
 
+// Only the channel widths shrink from the default. n_mels, the kernel size and
+// the per-block dilations stay put, so the layer set — and therefore the set of
+// parameters the numerical-gradient check probes — is unchanged; the per-step
+// cost, dominated by the pointwise convs at O(c_in·c_out), is what drops. The
+// default widths size the model to the always-on parameter budget, which is a
+// deployment constraint rather than anything these assertions need.
 bsm::BcResnetConfig tiny_cfg() {
     bsm::BcResnetConfig c;
-    // The default 22k-param model — still small enough for fast tests.
     c.n_mels = 40;
+    c.c0 = 10; c.c1 = 10; c.c2 = 14; c.c3 = 16; c.c4 = 20;  // default: 32/32/48/56/64
     return c;
 }
 
