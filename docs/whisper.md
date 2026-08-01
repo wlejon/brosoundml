@@ -69,6 +69,22 @@ one of them:
 Without either, a `<|10.38|>` in the flat stream is 10.38 s into *some* window
 and there is nothing to say which.
 
+### Inputs longer than memory
+
+The `AudioBuffer` overloads hold the whole input: mono 16 kHz float is ~115 MB
+an hour, so a six-hour recording is a 690 MB allocation before the model sees a
+sample. `TranscribeOptions`' sibling overload takes an **`AudioReader`** —
+`(from_sample, dst, frames) -> written` — and holds one 30 s window (1.9 MB) at
+a time, so the length of the input stops being a limit.
+
+It is *seekable* rather than a pull because Whisper's sequential long-form decode
+re-reads: each window advances by the last timestamp the decoder emitted, which
+is usually less than a full 30 s, so consecutive windows overlap. A source that
+could only go forwards could not serve the algorithm.
+
+The buffer overloads are implemented as a reader over the buffer, so there is one
+windowing body and one piece of seek arithmetic rather than two that can drift.
+
 ## brotensor op coverage
 
 `stft` + a host power loop + `matmul` (mel front-end), `conv1d`, `gelu`,

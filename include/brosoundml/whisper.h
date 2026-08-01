@@ -209,6 +209,48 @@ public:
         int no_timestamps_id = -1;
     };
 
+    // A seekable source of 16 kHz mono samples: write up to `frames` samples
+    // starting at `from_sample` into `dst` and answer how many were actually
+    // written (fewer only at the end of the input; zero means there is nothing
+    // there). Whatever is not written is left alone — the caller zero-fills.
+    //
+    // **Seekable rather than a pull**, because Whisper's sequential long-form
+    // decode re-reads: each window advances by the last timestamp the decoder
+    // emitted, which is usually less than a full 30 s, so the next window
+    // overlaps the one before it. A source that could only go forwards could not
+    // serve this algorithm.
+    //
+    // This exists so that "long-form" can mean genuinely long. The AudioBuffer
+    // overloads hold the entire input in memory — mono 16 kHz float is ~115 MB
+    // an hour, so a six-hour recording is a 690 MB allocation before the model
+    // sees a sample — while a reader holds one 30 s window (1.9 MB) at a time
+    // and the length of the input stops being a limit. Called on the decode
+    // thread, between windows.
+    using AudioReader =
+        std::function<std::size_t(std::size_t from_sample, float* dst,
+                                  std::size_t frames)>;
+
+    // Long-form transcribe over a seekable reader instead of a buffer. Same
+    // pipeline, same options, same answer; `total_samples` is how much there is
+    // to read, which the caller knows from the file's duration and the decoder
+    // cannot ask a std::function for.
+    //
+    // Windowing engages exactly as it does for a buffer — with
+    // opts.timestamp_begin_id set and more than 30 s of input — and a shorter
+    // input decodes as one window.
+    Transcription transcribe(const AudioReader& read,
+                             std::size_t total_samples,
+                             int sample_rate,
+                             const std::vector<int32_t>& prompt_ids,
+                             const TranscribeOptions& opts) const;
+
+    Transcription transcribe(WhisperSession& session,
+                             const AudioReader& read,
+                             std::size_t total_samples,
+                             int sample_rate,
+                             const std::vector<int32_t>& prompt_ids,
+                             const TranscribeOptions& opts) const;
+
     // Run the full pipeline: 16 kHz mono PCM -> token ids. `prompt_ids` is
     // the decoder prefix (typically the output of
     // brolm::whisper::Tokenizer::build_prompt(lang, task, with_timestamps)).

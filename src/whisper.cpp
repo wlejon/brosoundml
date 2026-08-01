@@ -156,11 +156,35 @@ struct Whisper::Impl {
     // The shared transcribe body — short-form one-shot or long-form windowed —
     // decoding into the caller-supplied `cache`. Both the legacy and the
     // session transcribe() overloads funnel through here. Defined out-of-line.
+    //
+    // Reader-based rather than buffer-based so that one body serves both: an
+    // AudioBuffer is wrapped in a reader that memcpys out of it, which costs one
+    // copy of a 30 s window (1.9 MB) per window and buys a single code path. Two
+    // bodies would be two places for the seek arithmetic to disagree.
     Transcription run_transcribe(WhisperKVCache& cache,
-                                 const AudioBuffer& audio,
+                                 const AudioReader& read,
+                                 std::size_t total_samples,
+                                 int sample_rate,
                                  const std::vector<int32_t>& prompt_ids,
                                  const TranscribeOptions& opts) const;
 };
+
+namespace {
+
+// Wrap a buffer as a reader. Copies rather than viewing because a window is
+// materialised into an AudioBuffer either way — decode_window takes one.
+brosoundml::Whisper::AudioReader readerOver(const AudioBuffer& audio) {
+    return [&audio](std::size_t from, float* dst, std::size_t frames) -> std::size_t {
+        if (from >= audio.samples.size()) return 0;
+        const std::size_t n = std::min(frames, audio.samples.size() - from);
+        std::copy(audio.samples.begin() + static_cast<std::ptrdiff_t>(from),
+                  audio.samples.begin() + static_cast<std::ptrdiff_t>(from + n),
+                  dst);
+        return n;
+    };
+}
+
+} // namespace
 
 Whisper::Whisper() : impl_(std::make_unique<Impl>()) {}
 Whisper::~Whisper() = default;
@@ -353,16 +377,21 @@ Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
 
 Whisper::Transcription Whisper::Impl::run_transcribe(
     WhisperKVCache& cache,
-    const AudioBuffer& audio,
+    const AudioReader& read,
+    std::size_t total_samples,
+    int sample_rate,
     const std::vector<int32_t>& prompt_ids,
     const TranscribeOptions& opts) const {
     if (!loaded) {
         fail("Whisper::transcribe", "no model loaded; call Whisper::load() first");
     }
-    if (audio.samples.empty()) {
+    if (!read) {
+        fail("Whisper::transcribe", "no audio reader was given");
+    }
+    if (total_samples == 0) {
         fail("Whisper::transcribe", "audio buffer is empty");
     }
-    if (audio.sample_rate != config.sample_rate) {
+    if (static_cast<int>(sample_rate) != config.sample_rate) {
         fail("Whisper::transcribe",
              "audio.sample_rate must be 16000 Hz (Whisper-fixed); "
              "resampling is the caller's responsibility");
@@ -384,19 +413,35 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
     if (budget <= 0 || budget > hard_cap) budget = hard_cap;
 
     const int   window_samples = config.sample_rate * 30;  // 30 s
-    const std::size_t total     = audio.samples.size();
+    const std::size_t total     = total_samples;
     const bool long_form = opts.timestamp_begin_id >= 0 &&
                            total > static_cast<std::size_t>(window_samples);
 
     Transcription out;
     out.token_ids = prompt_ids;
 
+    // One window's worth, reused across every window. The encoder pads to 30 s
+    // regardless, so a short tail is zero-filled rather than handed over short.
+    AudioBuffer window;
+    window.sample_rate = static_cast<uint32_t>(sample_rate);
+
+    /// Fill `window` with [from, from + len) from the reader, zero-filling
+    /// whatever the reader did not supply. Answers what it actually read, which
+    /// is how the tail is recognised.
+    auto fill = [&](std::size_t from, std::size_t len) {
+        window.samples.assign(len, 0.0f);
+        return read(from, window.samples.data(), len);
+    };
+
     // ── Short form (legacy): one window over the whole (truncated) clip. ──
     if (!long_form) {
+        const std::size_t len =
+            std::min<std::size_t>(total, static_cast<std::size_t>(window_samples));
+        fill(0, len);
         std::vector<int32_t> generated;
         generated.reserve(static_cast<std::size_t>(budget));
         bool cancelled = false;
-        decode_window(cache, audio, prompt_ids, budget, opts.cancel,
+        decode_window(cache, window, prompt_ids, budget, opts.cancel,
                       opts.on_token, opts.timestamp_begin_id,
                       opts.no_timestamps_id, generated, &cancelled);
         out.token_ids.insert(out.token_ids.end(),
@@ -414,11 +459,10 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
         const std::size_t win_len =
             std::min<std::size_t>(window_samples, total - seek);
 
-        AudioBuffer window;
-        window.sample_rate = audio.sample_rate;
-        window.samples.assign(audio.samples.begin() + static_cast<std::ptrdiff_t>(seek),
-                              audio.samples.begin() +
-                                  static_cast<std::ptrdiff_t>(seek + win_len));
+        // A reader that comes up short at the end shortens the window with it,
+        // so `advance` below cannot run past what was actually read.
+        const std::size_t got = fill(seek, win_len);
+        if (got == 0) break;
 
         // Where this window's <|0.00|> lands on the whole input's clock. Noted
         // before the window decodes, because everything it emits is relative to
@@ -426,7 +470,7 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
         // `first_token` is an index into the FINAL token_ids, which begins with
         // the prompt prefix — hence the prompt length here.
         const double window_start =
-            static_cast<double>(seek) / static_cast<double>(audio.sample_rate);
+            static_cast<double>(seek) / static_cast<double>(sample_rate);
         out.windows.push_back({window_start,
                                prompt_ids.size() + generated.size()});
         if (opts.on_window) opts.on_window(window_start);
@@ -442,17 +486,17 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
         // Advance the window. A timestamp token id maps to seconds via
         // 0.02 * (id - timestamp_begin_id); advance to that point so the next
         // window resumes where this segment's last emitted timestamp lands.
-        std::size_t advance = win_len;  // default: whole window consumed
+        std::size_t advance = got;  // default: the whole window that was read
         if (last_ts_rel >= 0) {
             const int32_t ts_id = generated[gen_before +
                                             static_cast<std::size_t>(last_ts_rel)];
             const double  ts_sec = 0.02 * static_cast<double>(
                                        ts_id - opts.timestamp_begin_id);
             const std::size_t ts_samples = static_cast<std::size_t>(
-                ts_sec * static_cast<double>(audio.sample_rate));
-            if (ts_samples > 0 && ts_samples <= win_len) advance = ts_samples;
+                ts_sec * static_cast<double>(sample_rate));
+            if (ts_samples > 0 && ts_samples <= got) advance = ts_samples;
         }
-        if (advance == 0) advance = win_len;  // never stall
+        if (advance == 0) advance = got;  // never stall
         seek += advance;
     }
 
@@ -465,7 +509,19 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
 Whisper::Transcription Whisper::transcribe(const AudioBuffer& audio,
                                            const std::vector<int32_t>& prompt_ids,
                                            const TranscribeOptions& opts) const {
-    return impl_->run_transcribe(impl_->owned_cache, audio, prompt_ids, opts);
+    return impl_->run_transcribe(impl_->owned_cache, readerOver(audio),
+                                 audio.samples.size(),
+                                 static_cast<int>(audio.sample_rate),
+                                 prompt_ids, opts);
+}
+
+Whisper::Transcription Whisper::transcribe(const AudioReader& read,
+                                           std::size_t total_samples,
+                                           int sample_rate,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           const TranscribeOptions& opts) const {
+    return impl_->run_transcribe(impl_->owned_cache, read, total_samples,
+                                 sample_rate, prompt_ids, opts);
 }
 
 // ─── WhisperSession (per-decode KV-cache) ──────────────────────────────────
@@ -517,7 +573,20 @@ Whisper::Transcription Whisper::transcribe(WhisperSession& session,
                                            const AudioBuffer& audio,
                                            const std::vector<int32_t>& prompt_ids,
                                            const TranscribeOptions& opts) const {
-    return impl_->run_transcribe(session.state_->cache, audio, prompt_ids, opts);
+    return impl_->run_transcribe(session.state_->cache, readerOver(audio),
+                                 audio.samples.size(),
+                                 static_cast<int>(audio.sample_rate),
+                                 prompt_ids, opts);
+}
+
+Whisper::Transcription Whisper::transcribe(WhisperSession& session,
+                                           const AudioReader& read,
+                                           std::size_t total_samples,
+                                           int sample_rate,
+                                           const std::vector<int32_t>& prompt_ids,
+                                           const TranscribeOptions& opts) const {
+    return impl_->run_transcribe(session.state_->cache, read, total_samples,
+                                 sample_rate, prompt_ids, opts);
 }
 
 const WhisperConfig& Whisper::config() const { return impl_->config; }
