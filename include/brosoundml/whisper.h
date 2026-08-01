@@ -111,9 +111,29 @@ public:
     // sequence (including SOT/lang/task prompt + content + EOS); callers
     // detokenize via brolm::whisper::Tokenizer::decode. In long-form mode the
     // prompt prefix is emitted once, followed by the concatenated content of
-    // every 30 s window (see TranscribeOptions::timestamp_begin_id).
+    // every 30 s window (see TranscribeOptions::timestamp_begin_id) — and
+    // `windows` below says where each of those windows began, without which the
+    // timestamps in the stream cannot be read as absolute times.
     struct Transcription {
         std::vector<int32_t> token_ids;
+
+        // Where each long-form window began, and which token it began at.
+        //
+        // **Without this a long-form transcript cannot be placed in time**, and
+        // that is why it exists rather than being a convenience. Every window
+        // restarts its timestamps at `<|0.00|>`, so a `<|10.38|>` in the flat
+        // stream above is 10.38 s into *some* window and the stream itself does
+        // not say which. Absolute time is `windows[i].start_seconds` plus the
+        // relative timestamp, for the `i` whose `first_token` range contains
+        // that token.
+        //
+        // Empty for a short-form decode, where there is one window at zero and
+        // the relative times are already absolute.
+        struct WindowMark {
+            double      start_seconds = 0.0;  // absolute offset of this window's <|0.00|>
+            std::size_t first_token   = 0;    // index into token_ids
+        };
+        std::vector<WindowMark> windows;
     };
 
     // Streaming sink: invoked once per generated token, in decode order, with
@@ -124,6 +144,15 @@ public:
     // Runs synchronously on the decode thread between steps — keep it cheap.
     // Empty (the default) = no streaming.
     using TokenCallback = std::function<void(int32_t token_id)>;
+
+    // Invoked as each long-form window opens, with the absolute offset in
+    // seconds of that window's `<|0.00|>` — the streaming counterpart of
+    // Transcription::windows, and needed for the same reason: a caller reading
+    // tokens live otherwise has no way to place the timestamps among them.
+    // Fires once before any of that window's tokens reach on_token, including
+    // for the first window (at 0.0). Not called for a short-form decode.
+    // Runs synchronously on the decode thread — keep it cheap.
+    using WindowCallback = std::function<void(double window_start_seconds)>;
 
     // Options for the richer transcribe() overload — streaming emission and
     // long-form (>30 s) windowing on top of the legacy one-shot decode.
@@ -139,6 +168,11 @@ public:
         // Invoked once per generated token, as it is produced (see
         // TokenCallback). Empty (the default) = no streaming.
         TokenCallback on_token = {};
+
+        // Invoked as each long-form window opens (see WindowCallback). Pair it
+        // with on_token whenever the tokens are being placed in time. Empty
+        // (the default) = no notification.
+        WindowCallback on_window = {};
 
         // Long-form seek anchor: the id of the `<|0.00|>` timestamp token
         // (brolm::whisper::Tokenizer::first_timestamp_id()). When set (>= 0)

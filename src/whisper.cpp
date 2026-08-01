@@ -420,6 +420,17 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
                               audio.samples.begin() +
                                   static_cast<std::ptrdiff_t>(seek + win_len));
 
+        // Where this window's <|0.00|> lands on the whole input's clock. Noted
+        // before the window decodes, because everything it emits is relative to
+        // it and the flat token stream does not carry that anywhere else.
+        // `first_token` is an index into the FINAL token_ids, which begins with
+        // the prompt prefix — hence the prompt length here.
+        const double window_start =
+            static_cast<double>(seek) / static_cast<double>(audio.sample_rate);
+        out.windows.push_back({window_start,
+                               prompt_ids.size() + generated.size()});
+        if (opts.on_window) opts.on_window(window_start);
+
         const std::size_t gen_before = generated.size();
         bool cancelled = false;
         const int last_ts_rel =

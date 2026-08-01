@@ -54,11 +54,20 @@ run returns 0 timestamps; with it, `<|0.00|> … <|11.00|>`.
 The CLI's `--stream` flag and its automatic long-form for >30 s clips drive
 both.
 
-Long-form callers should know that the timestamps a segment emits are
-**window-relative** — every 30 s window restarts at `<|0.00|>` — and the
-returned token stream does not mark where one window ended and the next began.
-A caller that needs absolute times should drive the 30 s windows itself and add
-each window's own offset, rather than reading them out of one long-form run.
+The timestamps a segment emits are **window-relative** — every 30 s window
+restarts at `<|0.00|>` — so absolute time needs to know which window a token
+fell in. Two things answer that, and a long-form caller placing timestamps needs
+one of them:
+
+- **`Transcription::windows`** — `{start_seconds, first_token}` per window,
+  indexing the returned id stream. Enough to place every timestamp after the
+  fact.
+- **`TranscribeOptions::on_window`** — the same offset, delivered as each window
+  opens and before any of its tokens reach `on_token`. For a caller emitting
+  text live.
+
+Without either, a `<|10.38|>` in the flat stream is 10.38 s into *some* window
+and there is nothing to say which.
 
 ## brotensor op coverage
 
