@@ -152,6 +152,27 @@ public:
         // hops. brosoundml stays tokenizer-free — only this single int crosses
         // the boundary; the caller still owns build_prompt / decode.
         int timestamp_begin_id = -1;
+
+        // The id of `<|notimestamps|>`
+        // (brolm::whisper::Tokenizer::no_timestamps_id()). When set (>= 0) the
+        // greedy loop never selects it, taking the next-best logit instead.
+        //
+        // This is not a refinement, it is what makes timestamps reliable. A
+        // prompt built with_timestamps=true only *omits* <|notimestamps|> from
+        // the prefix — it cannot stop the decoder from generating it as its
+        // first token, which is exactly what whisper-tiny does on a clean 11 s
+        // clip. Once it does, the segment carries no timestamp at all: seek
+        // falls back to blind 30 s hops and a caller asking "when was this
+        // said?" has nothing to read. HF's own Whisper does exactly this: it
+        // names the token in generation_config.json (`no_timestamps_token_id`,
+        // 50364 on large-v3) and forces its logit to -inf whenever timestamps
+        // are asked for. brosoundml reads no generation_config, so the id
+        // arrives from the caller instead. Left at -1 the decoder is free to
+        // choose it, matching the previous behaviour.
+        //
+        // The second and last int to cross the tokenizer boundary; the caller
+        // still owns build_prompt / decode.
+        int no_timestamps_id = -1;
     };
 
     // Run the full pipeline: 16 kHz mono PCM -> token ids. `prompt_ids` is

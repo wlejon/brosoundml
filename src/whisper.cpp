@@ -149,6 +149,7 @@ struct Whisper::Impl {
                       const CancelCheck& cancel,
                       const TokenCallback& on_token,
                       int timestamp_begin_id,
+                      int no_timestamps_id,
                       std::vector<int32_t>& generated,
                       bool* cancelled) const;
 
@@ -230,7 +231,12 @@ namespace {
 // runs once per generated token, so we materialise the single (1, V) last
 // row on the host and pick its argmax with a scalar loop — cheaper than
 // allocating a (T, 1) argmax_rows output and downloading one int32.
-int32_t argmax_last_row(const brotensor::Tensor& logits) {
+//
+// `suppress` (>= 0) is skipped by the scan, so the caller gets the next-best
+// token instead. Suppression is free here precisely because the row is already
+// on the host — masking on the device would cost a kernel launch per token to
+// forbid one id.
+int32_t argmax_last_row(const brotensor::Tensor& logits, int32_t suppress = -1) {
     const int T = logits.rows;
     const int V = logits.cols;
     std::vector<float> row(static_cast<std::size_t>(V));
@@ -249,14 +255,20 @@ int32_t argmax_last_row(const brotensor::Tensor& logits) {
         const float* p = last_host.host_f32();
         std::copy(p, p + V, row.begin());
     }
-    int   best_i = 0;
-    float best_v = row[0];
-    for (int v = 1; v < V; ++v) {
-        if (row[static_cast<std::size_t>(v)] > best_v) {
-            best_v = row[static_cast<std::size_t>(v)];
+    int   best_i = -1;
+    float best_v = 0.0f;
+    for (int v = 0; v < V; ++v) {
+        if (v == suppress) continue;
+        const float x = row[static_cast<std::size_t>(v)];
+        if (best_i < 0 || x > best_v) {
+            best_v = x;
             best_i = v;
         }
     }
+    // Only reachable for a one-column vocabulary that is itself suppressed;
+    // answer the suppressed id rather than a negative one the caller would
+    // push into the token stream.
+    if (best_i < 0) best_i = suppress >= 0 ? suppress : 0;
     return static_cast<int32_t>(best_i);
 }
 
@@ -271,6 +283,7 @@ int Whisper::Impl::decode_window(WhisperKVCache& cache,
                                  const CancelCheck& cancel,
                                  const TokenCallback& on_token,
                                  int timestamp_begin_id,
+                                 int no_timestamps_id,
                                  std::vector<int32_t>& generated,
                                  bool* cancelled) const {
     const int prompt_len = static_cast<int>(prompt_ids.size());
@@ -308,7 +321,7 @@ int Whisper::Impl::decode_window(WhisperKVCache& cache,
         // Cooperative cancellation: a barge-in drops the in-flight turn, so
         // stop decoding and return what we have (the caller discards it).
         if (cancel && cancel()) { if (cancelled) *cancelled = true; break; }
-        const int32_t next_id = argmax_last_row(logits);
+        const int32_t next_id = argmax_last_row(logits, no_timestamps_id);
         if (next_id == config.eos_token_id) break;
         if (timestamp_begin_id >= 0 && next_id >= timestamp_begin_id) {
             last_ts_rel = static_cast<int>(generated.size() - gen_start);
@@ -384,8 +397,8 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
         generated.reserve(static_cast<std::size_t>(budget));
         bool cancelled = false;
         decode_window(cache, audio, prompt_ids, budget, opts.cancel,
-                      opts.on_token, opts.timestamp_begin_id, generated,
-                      &cancelled);
+                      opts.on_token, opts.timestamp_begin_id,
+                      opts.no_timestamps_id, generated, &cancelled);
         out.token_ids.insert(out.token_ids.end(),
                              generated.begin(), generated.end());
         return out;
@@ -412,7 +425,7 @@ Whisper::Transcription Whisper::Impl::run_transcribe(
         const int last_ts_rel =
             decode_window(cache, window, prompt_ids, budget, opts.cancel,
                           opts.on_token, opts.timestamp_begin_id,
-                          generated, &cancelled);
+                          opts.no_timestamps_id, generated, &cancelled);
         if (cancelled) break;
 
         // Advance the window. A timestamp token id maps to seconds via
