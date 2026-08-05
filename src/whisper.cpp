@@ -531,8 +531,27 @@ Whisper::Transcription Whisper::transcribe(const AudioReader& read,
 // the model; transcribe(session, ...) funnels through the same run_transcribe()
 // the legacy path uses, but against the session's own cache.
 
+#include <atomic>
+#include <stdexcept>
+
 struct WhisperSessionState {
     WhisperKVCache cache;
+    std::atomic<bool> busy{false};
+};
+
+struct WhisperSessionBusyGuard {
+    std::atomic<bool>& flag;
+    bool claimed = false;
+    explicit WhisperSessionBusyGuard(std::atomic<bool>& f) : flag(f) {
+        bool expected = false;
+        if (!flag.compare_exchange_strong(expected, true)) {
+            throw std::runtime_error("brosoundml::Whisper: single-owner precondition violated - session operation already in progress");
+        }
+        claimed = true;
+    }
+    ~WhisperSessionBusyGuard() {
+        if (claimed) flag.store(false, std::memory_order_release);
+    }
 };
 
 WhisperSession::WhisperSession()
@@ -563,6 +582,7 @@ Whisper::Transcription Whisper::transcribe(WhisperSession& session,
                                            const std::vector<int32_t>& prompt_ids,
                                            int max_new_tokens,
                                            const CancelCheck& cancel) const {
+    WhisperSessionBusyGuard guard(session.state_->busy);
     TranscribeOptions opts;
     opts.max_new_tokens = max_new_tokens;
     opts.cancel         = cancel;
