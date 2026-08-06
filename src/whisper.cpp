@@ -7,6 +7,7 @@
 #include <brotensor/safetensors.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -530,9 +531,6 @@ Whisper::Transcription Whisper::transcribe(const AudioReader& read,
 // internals stay in the shared Whisper. make_session() sizes a fresh cache to
 // the model; transcribe(session, ...) funnels through the same run_transcribe()
 // the legacy path uses, but against the session's own cache.
-
-#include <atomic>
-#include <stdexcept>
 
 struct WhisperSessionState {
     WhisperKVCache cache;
