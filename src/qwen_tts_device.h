@@ -34,7 +34,7 @@ inline bt::Tensor upload_idx(bt::Device dev, const std::int32_t* h, int n) {
         std::memcpy(t.data, h, static_cast<std::size_t>(n) * sizeof(std::int32_t));
     } else {
         bt::detail::alloc_for(dev).memcpy_h2d(
-            t.data, h, static_cast<std::size_t>(n) * sizeof(std::int32_t));
+            t.data, h, static_cast<std::size_t>(n) * sizeof(std::int32_t), dev.index);
     }
     return t;
 }

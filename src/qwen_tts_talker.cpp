@@ -423,7 +423,7 @@ void QwenTtsTalker::decode_prefill(QwenTtsTalkerStepState& st, const float* embe
     std::vector<float> hmask(static_cast<std::size_t>(st.cap), 0.0f);
     std::fill(hmask.begin(), hmask.begin() + T, 1.0f);
     bt::detail::alloc_for(dev).memcpy_h2d(
-        st.mask.data, hmask.data(), static_cast<std::size_t>(st.cap) * sizeof(float));
+        st.mask.data, hmask.data(), static_cast<std::size_t>(st.cap) * sizeof(float), dev.index);
 }
 
 void QwenTtsTalker::decode_step(QwenTtsTalkerStepState& st, const bt::Tensor& embed,

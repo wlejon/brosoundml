@@ -78,7 +78,7 @@ bt::Tensor upload_int32_idx(bt::Device dev, const std::int32_t* host_idx, int n)
     } else {
         bt::detail::alloc_for(dev).memcpy_h2d(
             t.data, host_idx,
-            static_cast<std::size_t>(n) * sizeof(std::int32_t));
+            static_cast<std::size_t>(n) * sizeof(std::int32_t), dev.index);
     }
     return t;
 }

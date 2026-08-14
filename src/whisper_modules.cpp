@@ -46,7 +46,7 @@ bt::Tensor upload_int32_idx(bt::Device dev, const std::int32_t* host_idx, int n)
     } else {
         bt::detail::alloc_for(dev).memcpy_h2d(
             t.data, host_idx,
-            static_cast<std::size_t>(n) * sizeof(std::int32_t));
+            static_cast<std::size_t>(n) * sizeof(std::int32_t), dev.index);
     }
     return t;
 }
@@ -1191,7 +1191,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
         std::vector<float> zeros(static_cast<std::size_t>(cap), 0.0f);
         bt::detail::alloc_for(dev).memcpy_h2d(
             st.mask.data, zeros.data(),
-            static_cast<std::size_t>(cap) * sizeof(float));
+            static_cast<std::size_t>(cap) * sizeof(float), dev.index);
     }
 
     // Validate the baked device pointers; a mismatch (first session, or a
@@ -1225,7 +1225,7 @@ void WhisperDecoder::step_mask_prefill(int T) const {
     std::fill(hmask.begin(), hmask.begin() + T, 1.0f);
     bt::detail::alloc_for(dev).memcpy_h2d(
         st.mask.data, hmask.data(),
-        static_cast<std::size_t>(st.cap) * sizeof(float));
+        static_cast<std::size_t>(st.cap) * sizeof(float), dev.index);
 }
 
 void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
