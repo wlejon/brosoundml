@@ -4,11 +4,21 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
 
 namespace brosoundml {
+
+static inline float sigmoidf(float x) {
+    if (x >= 0.0f) {
+        const float z = std::exp(-x);
+        return 1.0f / (1.0f + z);
+    }
+    const float z = std::exp(x);
+    return z / (1.0f + z);
+}
 
 struct VoiceAgent::Impl {
     VoiceAgentConfig config;
@@ -79,8 +89,8 @@ struct VoiceAgent::Impl {
         if (stt_handler) {
             transcript = stt_handler(utterance);
         } else if (whisper) {
-            Whisper::Transcription res = whisper->transcribe(utterance);
-            // If tokens exist but no custom text decoder, provide token count info
+            std::vector<int32_t> prompt = {whisper->config().decoder_start_token_id};
+            Whisper::Transcription res = whisper->transcribe(utterance, prompt);
             transcript = "transcript_" + std::to_string(res.token_ids.size()) + "_tokens";
         } else if (parakeet) {
             Parakeet::Transcription res = parakeet->transcribe(utterance);
@@ -129,17 +139,15 @@ struct VoiceAgent::Impl {
                 }
             });
         } else if (kokoro && voice.has_value()) {
-            // Default mock or token synthesis
             std::vector<int32_t> phoneme_tokens = {1, 2, 3};
             AudioBuffer audio = kokoro->synthesize(phoneme_tokens, *voice);
             if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
                 on_audio_output_cb(audio);
             }
         } else {
-            // Simulated TTS chunk
             AudioBuffer dummy;
             dummy.sample_rate = config.tts_sample_rate;
-            dummy.samples.assign(4800, 0.05f); // 200ms tone
+            dummy.samples.assign(4800, 0.05f);
             if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
                 on_audio_output_cb(dummy);
             }
@@ -234,18 +242,23 @@ void VoiceAgent::feed(const float* samples, int num_samples) {
     // Extract Mel frames
     int new_frames = impl_->mel_fe->consume(samples, num_samples, impl_->mel_buffer);
 
-    for (int f = 0; f < new_frames; ++f) {
-        float vad_score = 0.0f;
+    std::vector<float> vad_scores;
+    if (new_frames > 0) {
         if (impl_->vad_model && impl_->vad_session) {
-            // Slice 1 frame (n_mels, 1)
-            brotensor::Tensor frame_mel = impl_->mel_buffer.slice(1, f, f + 1);
-            impl_->vad_model->forward_streaming(*impl_->vad_session, frame_mel, impl_->vad_logits);
-            float logit = impl_->vad_logits.data<float>()[0];
-            vad_score = 1.0f / (1.0f + std::exp(-logit));
+            impl_->vad_model->forward_streaming(*impl_->vad_session, impl_->mel_buffer, impl_->vad_logits);
+            std::vector<float> logits = impl_->vad_logits.to_host_vector();
+            vad_scores.resize(logits.size());
+            for (size_t i = 0; i < logits.size(); ++i) {
+                vad_scores[i] = sigmoidf(logits[i]);
+            }
         } else {
-            // Energy-based VAD fallback
-            vad_score = (chunk_energy >= impl_->config.vad_energy_threshold) ? 1.0f : 0.0f;
+            float e_score = (chunk_energy >= impl_->config.vad_energy_threshold) ? 1.0f : 0.0f;
+            vad_scores.assign(new_frames, e_score);
         }
+    }
+
+    for (int f = 0; f < new_frames; ++f) {
+        float vad_score = (f < static_cast<int>(vad_scores.size())) ? vad_scores[f] : 0.0f;
         impl_->last_vad_score = vad_score;
 
         bool is_speech = (vad_score >= impl_->config.vad_threshold) &&
