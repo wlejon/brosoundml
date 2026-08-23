@@ -148,8 +148,8 @@ target_sources(brosoundml PRIVATE
     src/wake.cpp
     src/wake_data.cpp
     src/phoneme_data.cpp
-    src/bc_resnet.cpp
     src/bc_resnet2d.cpp
+    src/voice_agent.cpp
     src/phoneme_model.cpp
     src/phoneme_spotter.cpp
     src/gesture_spotter.cpp
