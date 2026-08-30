@@ -7,7 +7,10 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -58,6 +61,66 @@ bt::Tensor up_opt_vec(const sf::File& f, const std::string& name, int n,
 // &t if t carries data, else nullptr — drives "apply bias only when present".
 const bt::Tensor* opt(const bt::Tensor& t) { return t.rows > 0 ? &t : nullptr; }
 
+// ─── Stage profiler ─────────────────────────────────────────────────────────
+//
+// Env-gated (BROSOUNDML_FASTCONFORMER_PROFILE=1), in `kokoro_profile_mark`'s
+// convention but *accumulating* rather than printing per mark: there are 24
+// blocks of five stages each and one line per stage per block is 120 lines
+// nobody can add up. One line per encoder forward, summed over the blocks.
+//
+// It exists because this encoder's cost kept turning out to be somewhere nobody
+// would have guessed, and each time it was found by bracketing rather than by
+// reasoning. On a 4090 over an 18-second window, before and after:
+//
+//     mel 212 → 30    pre  21 → 16    pos 3.6 → 3.6
+//     ff1 149 → 14    bias 60 →  9    attn 19 → 19    conv 30 → 30
+//     ff2 148 → 14    ln  0.4 → 0.3   total 643 → 136 ms  (27x → 115x realtime)
+//
+// Twice it was somewhere with no matrix multiply in it at all: a
+// relative-position bias built on the host (the `bias` column, and the comment
+// at the call site), and a single-threaded double-precision STFT (`mel`, fixed
+// in brotensor's CPU backend). The third was the FFNs reading the whole weight
+// matrix once per frame — `linear_forward_batched`'s wide-batch path.
+//
+// Every stage syncs the device, so the numbers are real and the profile is much
+// slower than the run it measures.
+struct FcProfile {
+    double mel = 0, pre = 0, pos = 0;
+    double ff1 = 0, attn_prep = 0, attn = 0, conv = 0, ff2 = 0, ln = 0;
+    void clear() { *this = FcProfile{}; }
+};
+
+bool fc_profile_enabled() {
+    static const bool on = []() {
+        const char* v = std::getenv("BROSOUNDML_FASTCONFORMER_PROFILE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+
+FcProfile& fc_profile() {
+    static thread_local FcProfile p;
+    return p;
+}
+
+/// Sync the device and add the interval to one accumulator. A no-op — one bool
+/// — when the profile is off, so the stages can be bracketed unconditionally.
+struct FcStage {
+    double* slot;
+    bt::Device dev;
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    FcStage(double* s, bt::Device d) : slot(s), dev(d), on(fc_profile_enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~FcStage() {
+        if (!on) return;
+        bt::sync(dev);
+        *slot += std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
 // Mel front-end constants (NeMo FastConformer AudioToMelSpectrogram).
 constexpr int   kNFft       = 512;
 constexpr int   kWinLength  = 400;    // 25 ms @ 16 kHz
@@ -72,39 +135,10 @@ constexpr float kBnEps      = 1e-5f;           // nn.BatchNorm1d default
 // Output length of one conv axis (kernel 3, stride 2, pad 1): (n - 1)/2 + 1.
 int conv_len(int n) { return (n - 1) / 2 + 1; }
 
-// Build the Transformer-XL relative-position additive bias for one attention
-// layer, fully on the host. matrix_bd[q,j] = Qv_h[q] . p_h[j] (Qv already
-// scaled by 1/sqrt(head_dim)); the NeMo rel_shift then maps it to
-//   bias[h, q, k] = matrix_bd[q, (T-1-q) + k].
-// Returns a row-major (num_heads*T, T) FP32 buffer (row h*T+q is head h,
-// query q). Qv_host: (T, C); p_host: (2T-1, C), C = num_heads*head_dim.
-std::vector<float> build_rel_pos_bias(const std::vector<float>& Qv_host,
-                                      const std::vector<float>& p_host,
-                                      int T, int num_heads, int head_dim) {
-    const int C = num_heads * head_dim;
-    const int P = 2 * T - 1;
-    std::vector<float> bias(static_cast<std::size_t>(num_heads) * T * T, 0.0f);
-    for (int h = 0; h < num_heads; ++h) {
-        const int co = h * head_dim;
-        for (int q = 0; q < T; ++q) {
-            const float* qv = Qv_host.data() +
-                              static_cast<std::size_t>(q) * C + co;
-            const int base = (T - 1 - q);   // column offset of k=0 in matrix_bd
-            float* out = bias.data() +
-                         (static_cast<std::size_t>(h) * T + q) * T;
-            for (int k = 0; k < T; ++k) {
-                const int j = base + k;     // in [0, P)
-                const float* pj = p_host.data() +
-                                  static_cast<std::size_t>(j) * C + co;
-                float s = 0.0f;
-                for (int d = 0; d < head_dim; ++d) s += qv[d] * pj[d];
-                out[k] = s;
-            }
-        }
-    }
-    (void)P;
-    return bias;
-}
+// The Transformer-XL relative-position additive bias used to be built here, on
+// the host, with a download of Qv and p and an upload of the result once per
+// layer. It is `brotensor::rel_pos_bias_xl_forward` now — same arithmetic, on
+// the device the layer is already on. See the call site.
 
 }  // namespace
 
@@ -124,6 +158,7 @@ void FastConformerBlock::forward(bt::Tensor& x,
 
     // ── ½-FFN macaron #1 ────────────────────────────────────────────────────
     {
+        FcStage stage(&fc_profile().ff1, dev);
         bt::Tensor xn;
         bt::layernorm_forward_inference_batched(x, n_ff1_w, n_ff1_b, xn, kLnEps);
         bt::Tensor h; qtd::linear(ff1_l1_w, opt(ff1_l1_b), xn, h);   // (T, inter)
@@ -136,28 +171,37 @@ void FastConformerBlock::forward(bt::Tensor& x,
     // ── Relative-position self-attention ────────────────────────────────────
     {
         bt::Tensor xn;
-        bt::layernorm_forward_inference_batched(x, n_att_w, n_att_b, xn, kLnEps);
+        bt::Tensor Qv, p, attn_bias;
+        {
+            FcStage stage(&fc_profile().attn_prep, dev);
+            bt::layernorm_forward_inference_batched(x, n_att_w, n_att_b, xn,
+                                                    kLnEps);
 
-        // Position term query: Qv = (xn @ q_w^T + bias_v) * 1/sqrt(dk).
-        // bias_v already carries the q-projection bias folded in (load()).
-        bt::Tensor Qv; qtd::linear(q_w, &bias_v, xn, Qv);      // (T, C)
-        bt::scale_inplace(Qv, attn_scale);
-        // Relative key projection of the positional encoding.
-        bt::Tensor p; qtd::linear(rel_k_w, nullptr, pos_emb, p);  // (2T-1, C)
+            // Position term query: Qv = (xn @ q_w^T + bias_v) * 1/sqrt(dk).
+            // bias_v already carries the q-projection bias folded in (load()).
+            qtd::linear(q_w, &bias_v, xn, Qv);                     // (T, C)
+            bt::scale_inplace(Qv, attn_scale);
+            // Relative key projection of the positional encoding.
+            qtd::linear(rel_k_w, nullptr, pos_emb, p);             // (2T-1, C)
 
-        // rel_shift bias on host, then upload.
-        std::vector<float> Qv_h(static_cast<std::size_t>(T) * C);
-        std::vector<float> p_h(static_cast<std::size_t>(2 * T - 1) * C);
-        qtd::to_host(Qv, Qv_h.data());
-        qtd::to_host(p,  p_h.data());
-        std::vector<float> bias_h = build_rel_pos_bias(Qv_h, p_h, T, nh, dk);
-        bt::Tensor attn_bias = bt::Tensor::from_host_on(dev, bias_h.data(),
-                                                        nh * T, T);
+            // The rel_shift bias, on whichever device the layer is on.
+            //
+            // **This was the encoder.** It used to download Qv and p, build the
+            // (num_heads*T, T) bias with a scalar host loop — num_heads·T²·
+            // head_dim multiply-adds, 52 million of them for an 18-second
+            // window — and upload the result, once per layer. Measured on a
+            // 4090: 1 112 ms of a 1 134 ms transcribe, with the card at 40% and
+            // dipping to 0% while one host core did the work.
+            // `bt::rel_pos_bias_xl_forward` is the same arithmetic as a device
+            // op; see the comment on it.
+            bt::rel_pos_bias_xl_forward(Qv, p, nh, dk, attn_bias);
+        }
 
         // Content term: bias_u (= pos_bias_u + q-bias) is the Q projection bias;
         // k/v/o projection biases are applied when present. The scale applies
         // 1/sqrt(dk) to the QK dot; attn_bias carries the (pre-scaled) position
         // term.
+        FcStage stage(&fc_profile().attn, dev);
         bt::Tensor O = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         bt::self_attention_bias_forward(xn, q_w, k_w, v_w, o_w,
                                         &bias_u, opt(k_b), opt(v_b), opt(o_b),
@@ -168,6 +212,7 @@ void FastConformerBlock::forward(bt::Tensor& x,
 
     // ── Convolution module ──────────────────────────────────────────────────
     {
+        FcStage stage(&fc_profile().conv, dev);
         bt::Tensor xn;
         bt::layernorm_forward_inference_batched(x, n_conv_w, n_conv_b, xn, kLnEps);
         // (T, C) -> NCL (1, C*T).
@@ -211,6 +256,7 @@ void FastConformerBlock::forward(bt::Tensor& x,
 
     // ── ½-FFN macaron #2 ────────────────────────────────────────────────────
     {
+        FcStage stage(&fc_profile().ff2, dev);
         bt::Tensor xn;
         bt::layernorm_forward_inference_batched(x, n_ff2_w, n_ff2_b, xn, kLnEps);
         bt::Tensor h; qtd::linear(ff2_l1_w, opt(ff2_l1_b), xn, h);
@@ -222,6 +268,7 @@ void FastConformerBlock::forward(bt::Tensor& x,
 
     // ── Final LayerNorm ─────────────────────────────────────────────────────
     {
+        FcStage stage(&fc_profile().ln, dev);
         bt::Tensor xn;
         bt::layernorm_forward_inference_batched(x, n_out_w, n_out_b, xn, kLnEps);
         x = std::move(xn);
@@ -587,6 +634,7 @@ void FastConformerEncoder::encode_layers(const bt::Tensor& embs,
     // (T-1) .. -(T-1); pe[idx, 2i]=sin(pos*inv_freq_i), pe[idx,2i+1]=cos.
     bt::Tensor pos_emb;
     {
+        FcStage stage(&fc_profile().pos, dev);
         const int P    = 2 * T - 1;
         const int half = C / 2;
         std::vector<float> pe(static_cast<std::size_t>(P) * C);
@@ -623,13 +671,33 @@ int FastConformerEncoder::valid_output_frames(int num_samples) const {
 // ─── FastConformerEncoder::forward ─────────────────────────────────────────
 
 void FastConformerEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
+    if (fc_profile_enabled()) fc_profile().clear();
     int frames = 0;
-    const std::vector<float> mel = log_mel(audio, frames);   // (frames, n_mels)
+    std::vector<float> mel;
+    {
+        FcStage stage(&fc_profile().mel, device);
+        mel = log_mel(audio, frames);                        // (frames, n_mels)
+    }
     bt::Tensor embs;
-    pre_encode(mel, frames, embs);                           // (T, C)
+    {
+        FcStage stage(&fc_profile().pre, device);
+        pre_encode(mel, frames, embs);                       // (T, C)
+    }
     const int valid = valid_output_frames(
         static_cast<int>(audio.samples.size()));
     encode_layers(embs, out, valid);                         // (T, C)
+
+    if (fc_profile_enabled()) {
+        const FcProfile& p = fc_profile();
+        const double total = p.mel + p.pre + p.pos + p.ff1 + p.attn_prep +
+                             p.attn + p.conv + p.ff2 + p.ln;
+        std::fprintf(stderr,
+            "[fastconformer-prof] mel %7.2f · pre %7.2f · pos %7.2f | "
+            "ff1 %7.2f · bias %7.2f · attn %7.2f · conv %7.2f · ff2 %7.2f · "
+            "ln %7.2f | total %8.2f ms (%d frames, %d layers)\n",
+            p.mel, p.pre, p.pos, p.ff1, p.attn_prep, p.attn, p.conv, p.ff2,
+            p.ln, total, out.rows, static_cast<int>(layers.size()));
+    }
 }
 
 }  // namespace brosoundml

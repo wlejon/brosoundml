@@ -9,7 +9,10 @@
 #include <brotensor/safetensors.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +29,17 @@ namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
 
 namespace {
+
+// Env-gated stage profiling, in `kokoro_profile_mark`'s convention:
+// BROSOUNDML_PARAKEET_PROFILE=1 prints one line per transcribe() to stderr.
+// Read once — this is asked on a path that runs a few hundred times a second.
+bool parakeet_profile_enabled() {
+    static const bool on = []() {
+        const char* v = std::getenv("BROSOUNDML_PARAKEET_PROFILE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
 
 [[noreturn]] void fail(const std::string& where, const std::string& msg) {
     throw std::runtime_error("brosoundml: " + where + ": " + msg);
@@ -317,6 +331,20 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
     bt::DeviceScope scope(dev);
     const int H = cfg.decoder_hidden_size;
 
+    // Env-gated (BROSOUNDML_PARAKEET_PROFILE=1) stage split, in kokoro's
+    // convention. **Two costs of completely different shapes live in this
+    // function** — an encoder whose self-attention is quadratic in the window,
+    // and a greedy decode that is a sequence of tiny steps each ending in a
+    // device→host download — and which of them dominates decides what is worth
+    // optimising. Guessing got it wrong once already.
+    const bool prof = parakeet_profile_enabled();
+    const auto clock_now = [] { return std::chrono::steady_clock::now(); };
+    const auto since_ms = [](std::chrono::steady_clock::time_point a,
+                             std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto t_begin = clock_now();
+
     // ── Encoder + projector: audio -> (T, 640) ──
     bt::Tensor enc;
     encoder.forward(audio, enc);                           // (T, 1024)
@@ -324,6 +352,9 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
     bt::Tensor enc_proj;
     bt::linear_forward_batched(enc_proj_w, enc_proj_b,
                                enc, enc_proj);              // (T, 640)
+
+    if (prof) bt::sync(dev);
+    const auto t_encoded = clock_now();
 
     // ── Greedy TDT decode ──
     // One-shot: re-init the prediction state to the zero state so a reused
@@ -338,6 +369,7 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
     const int max_sym = cfg.max_symbols_per_step;
 
     int time = 0;
+    long long steps = 0;      // joint evaluations, which is what a decode costs
     bool stop = false;
     while (time < T && !stop) {
         if (opts.cancel && opts.cancel()) break;
@@ -352,6 +384,7 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
         bool advanced = false;
         while (symbols < max_sym) {
             int32_t token; int duration;
+            ++steps;
             joint_argmax(enc_row, dec_proj, token, duration);
 
             if (token == cfg.blank_token_id) {
@@ -378,6 +411,22 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
             // duration == 0: stay on this frame, emit another symbol.
         }
         if (!advanced) ++time;   // forced progress after max_symbols at one frame
+    }
+
+    if (prof) {
+        bt::sync(dev);
+        const auto t_end = clock_now();
+        const double enc_ms = since_ms(t_begin, t_encoded);
+        const double dec_ms = since_ms(t_encoded, t_end);
+        const double secs = audio.duration_seconds();
+        const double total = enc_ms + dec_ms;
+        std::fprintf(stderr,
+                     "[parakeet-prof] audio %6.2f s · encoder %8.2f ms · "
+                     "decode %8.2f ms · frames %5d · steps %6lld · tokens %5zu · "
+                     "%6.3f ms a step · %6.2fx realtime\n",
+                     secs, enc_ms, dec_ms, T, steps, out.token_ids.size(),
+                     steps ? dec_ms / static_cast<double>(steps) : 0.0,
+                     total > 0.0 ? secs * 1000.0 / total : 0.0);
     }
 
     return out;
