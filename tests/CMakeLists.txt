@@ -14,6 +14,16 @@ brosoundml_add_test(brosoundml_test_audio    test_audio.cpp)
 brosoundml_add_test(brosoundml_test_modules  test_modules.cpp)
 brosoundml_add_test(brosoundml_test_kokoro   test_kokoro.cpp)
 brosoundml_add_test(brosoundml_test_qwen_tts test_qwen_tts.cpp)
+brosoundml_add_test(brosoundml_test_higgs_codec test_higgs_codec.cpp)
+target_compile_definitions(brosoundml_test_higgs_codec PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(brosoundml_test_higgs_codec PRIVATE
+    "${CMAKE_SOURCE_DIR}/src")
+brosoundml_add_test(brosoundml_test_omnivoice test_omnivoice.cpp)
+target_compile_definitions(brosoundml_test_omnivoice PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(brosoundml_test_omnivoice PRIVATE
+    "${CMAKE_SOURCE_DIR}/src")
 brosoundml_add_test(brosoundml_test_qwen_asr test_qwen_asr.cpp)
 brosoundml_add_test(brosoundml_test_rave     test_rave.cpp)
 brosoundml_add_test(brosoundml_test_supertonic test_supertonic.cpp)

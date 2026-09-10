@@ -139,6 +139,11 @@ target_sources(brosoundml PRIVATE
     src/qwen_tts_talker.cpp
     src/qwen_tts_code_predictor.cpp
     src/qwen_tts_generate.cpp
+    src/higgs_codec.cpp
+    src/hubert.cpp
+    src/omnivoice.cpp
+    src/omnivoice_lm.cpp
+    src/omnivoice_prompt.cpp
     src/qwen_asr.cpp
     src/qwen_asr_encoder.cpp
     src/qwen_asr_decoder.cpp
@@ -265,6 +270,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_qwen_tts_say tools/qwen_tts_say.cpp)
     target_link_libraries(brosoundml_qwen_tts_say PRIVATE brosoundml)
+
+    add_executable(brosoundml_higgs_codec_roundtrip tools/higgs_codec_roundtrip.cpp)
+    target_link_libraries(brosoundml_higgs_codec_roundtrip PRIVATE brosoundml)
+
+    add_executable(brosoundml_omnivoice_say tools/omnivoice_say.cpp)
+    target_link_libraries(brosoundml_omnivoice_say PRIVATE brosoundml)
 
     add_executable(brosoundml_build_speaker_encoder tools/build_speaker_encoder.cpp)
     target_link_libraries(brosoundml_build_speaker_encoder PRIVATE brosoundml)

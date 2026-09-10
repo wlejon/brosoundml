@@ -28,6 +28,14 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   Parakeet.
 - **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ editable
   PCA-sorted latent. Device-neutral CPU / CUDA / Metal; library-only (no CLI).
+- **HiggsAudio v2 codec** — the 25 Hz x 8-codebook RVQ audio tokenizer OmniVoice
+  speaks (DAC encoder/decoder + a HuBERT-base semantic branch). Device-neutral
+  CPU + CUDA; codes 100% and waveform ~1e-6 against transformers' reference.
+- **OmniVoice** — 600-language zero-shot text-to-speech (k2-fsa): a Qwen3-0.6B
+  trunk with eight audio heads decoded by masked diffusion over the Higgs codec,
+  in-context voice cloning, voice-design instructs, rule-based duration. CUDA
+  (the LM is not run on CPU); codes + unmask order 100% against the upstream
+  model on the deterministic fixtures, ~0.5 s for 10 s of speech in BF16.
 - **Wake-word** — a 2D BC-ResNet (PCEN) streaming single-keyword spotter + its
   training toolchain. (The legacy 1D `bc_resnet` is retained for tests only; the
   runtime requires the 2D 'BWK2' model.)
@@ -52,6 +60,11 @@ include/brosoundml/
   qwen_tts.h         Qwen3-TTS: QwenTts pipeline, Talker/CodePredictor/codec
                      configs, synthesize / synthesize_clone / encode/decode
   speaker_encoder.h  standalone ECAPA voice-clone enroller (lifted from Qwen3-TTS)
+  higgs_codec.h      HiggsAudio v2 codec: HiggsCodecConfig + encode / decode
+                     (src/higgs_codec_model.h + src/hubert.h hold the graph)
+  omnivoice.h        OmniVoice: masked-diffusion TTS over the Higgs codec —
+                     OmniVoiceParams / Prompt / Init / Trace, synthesize /
+                     generate_codes / create_prompt (src/omnivoice_lm.h is the LM)
   whisper.h          Whisper: WhisperConfig + the encoder/decoder pipeline
   whisper_modules.h  Whisper-specific modules (conv stems, cross-attn decoder)
   fastconformer.h    FastConformerConfig — the shared NEST/FastConformer encoder
@@ -218,6 +231,9 @@ CLI drivers, built when brosoundml is the top-level project
   (`--streaming` for the AOSC session path; `--probs-out` dumps the T×4 matrix).
 - `brosoundml_qwen_tts_bench` / `_roundtrip` / `_clone` — Qwen3-TTS synthesis,
   codec encode↔decode round-trip, and zero-shot voice clone.
+- `brosoundml_omnivoice_say` — OmniVoice text → WAV (language, instruct, reference
+  clip or saved .ovcp prompt, schedule knobs, `--trace` unmask-order heatmap).
+- `brosoundml_higgs_codec_roundtrip` — HiggsAudio v2 encode↔decode round-trip.
 - `brosoundml_wake_synth` / `_inspect` / `_train` / `_test` / `_probe` /
   `_melcmp` — the wake-word training toolchain (Kokoro-driven dataset builder,
   validator, trainer, evaluator, front-end diagnostics).
