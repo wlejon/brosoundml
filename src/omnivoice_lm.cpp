@@ -106,7 +106,7 @@ struct Session {
     bt::Tensor cond_idx, uncond_idx;   // (T, 1) INT32
     bt::Tensor kv_idx;                 // (L*n_q, 1) INT32: kv-head row of each (row, q head)
     bt::Tensor tokens, unmask, pred;   // (C, T) INT32
-    bt::Tensor scores;                 // (C, T) FP32
+    bt::Tensor scores, conf;           // (C, T) FP32 (conf = raw, unpenalised)
     bt::Tensor frame, tmp;             // (T, H)
     bt::Tensor htar, hnorm;            // (R, H)
     bt::Tensor logits;                 // (R, C*V)
@@ -338,6 +338,7 @@ struct OmniVoiceLm::Impl {
         s.unmask = bt::Tensor::zeros_on(dev, C_, T, N);
         s.pred   = bt::Tensor::zeros_on(dev, C_, T, N);
         s.scores = bt::Tensor::zeros_on(dev, C_, T, F);
+        s.conf   = bt::Tensor::zeros_on(dev, C_, T, F);
         if (bf16) {
             const bt::Dtype Bf = bt::Dtype::BF16;
             s.sc.xb_h = bt::Tensor::zeros_on(dev, s.L, H_, Bf);
@@ -530,8 +531,14 @@ OmniVoiceLmResult OmniVoiceLm::generate(const std::vector<int32_t>& text_ids,
 
     OmniVoiceLmResult res;
     std::vector<int32_t> pred_h;
-    std::vector<float> scores_h;
+    std::vector<float> scores_h, conf_h;
     const bool want_hooks = static_cast<bool>(on_step) || (dbg && dbg->on_scores);
+    // The raw confidence only leaves the device when somebody asked for it: a
+    // per-step callback, the white-box hook, or the trace.
+    const bool want_conf = want_hooks || run.want_confidence;
+    std::vector<float> conf_final;
+    std::vector<int32_t> idx_h;
+    if (run.want_confidence) conf_final.assign(cells, 0.0f);
     const auto t0 = std::chrono::steady_clock::now();
 
     for (int step = 0; step < run.num_steps; ++step) {
@@ -555,43 +562,71 @@ OmniVoiceLmResult OmniVoiceLm::generate(const std::vector<int32_t>& text_ids,
         const float cls_temp = run.gumbel_noise ? run.class_temperature : 0.0f;
         bt::masked_diffusion_scores(s.logits, s.tokens, T, C, V, MASK, run.guidance_scale,
                                     run.layer_penalty, pos_temp, cls_temp, 0.1f, seed_step,
-                                    s.pred, s.scores);
+                                    s.pred, s.scores, s.conf);
 
         const int k = schedule[static_cast<std::size_t>(step)];
+        bool scores_copied = false;
         if (dbg && dbg->on_scores) {
             pred_h.resize(cells);
             scores_h.resize(cells);
             d2h(m.dev, pred_h.data(), s.pred.data, cells * sizeof(int32_t));
             d2h(m.dev, scores_h.data(), s.scores.data, cells * sizeof(float));
+            scores_copied = true;
+        }
+        if (want_conf) {
+            conf_h.resize(cells);
+            d2h(m.dev, conf_h.data(), s.conf.data, cells * sizeof(float));
         }
         if (k > 0) {
             bt::Tensor row = bt::Tensor::view(m.dev, s.scores.data, 1, static_cast<int>(cells), bt::Dtype::FP32);
             bt::top_k_rows(row, k, s.vals, s.idx);
             bt::masked_diffusion_commit(s.pred, s.idx, k, step, s.tokens, s.unmask);
+            // The cells this step fixed take this step's confidence; the rest
+            // keep whatever step fixes them later (or the last step's value).
+            if (run.want_confidence) {
+                idx_h.resize(static_cast<std::size_t>(k));
+                d2h(m.dev, idx_h.data(), s.idx.data, static_cast<std::size_t>(k) * sizeof(int32_t));
+                for (int i = 0; i < k; ++i) {
+                    const int32_t p = idx_h[static_cast<std::size_t>(i)];
+                    if (p >= 0 && static_cast<std::size_t>(p) < cells) conf_final[static_cast<std::size_t>(p)] = conf_h[static_cast<std::size_t>(p)];
+                }
+            }
         }
         res.steps_run = step + 1;
 
         if (want_hooks) {
             d2h(m.dev, tokens.data(), s.tokens.data, cells * sizeof(int32_t));
             if (on_step) {
-                if (scores_h.size() != cells) {
+                // Once per step, not once per run: the buffer keeps its size
+                // across steps, so a size check would hand every later step the
+                // FIRST step's scores.
+                if (!scores_copied) {
                     scores_h.resize(cells);
                     d2h(m.dev, scores_h.data(), s.scores.data, cells * sizeof(float));
                 }
                 OmniVoiceStep st;
                 st.step = step; st.num_steps = run.num_steps;
+                st.chunk = static_cast<int>(run.chunk); st.num_chunks = run.num_chunks;
                 st.num_frames = T; st.num_codebooks = C;
                 st.unmasked = k;
                 st.tokens = tokens.data();
                 st.scores = scores_h.data();
+                st.confidence = conf_h.data();
                 on_step(st);
             }
-            if (dbg && dbg->on_scores) dbg->on_scores(step, k, pred_h, scores_h, tokens);
+            if (dbg && dbg->on_scores) dbg->on_scores(step, k, pred_h, scores_h, conf_h, tokens);
         }
     }
 
     d2h(m.dev, tokens.data(), s.tokens.data, cells * sizeof(int32_t));
     d2h(m.dev, unmask.data(), s.unmask.data, cells * sizeof(int32_t));
+    if (run.want_confidence && conf_h.size() == cells) {
+        // A cell an init grid kept is never committed, so it has no "step it
+        // was decided at" — give it the last step's confidence.
+        for (std::size_t i = 0; i < cells; ++i)
+            if (unmask[i] < 0) conf_final[i] = conf_h[i];
+        res.confidence = std::move(conf_final);
+    }
     res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     res.codes = std::move(tokens);
     res.unmask_step = std::move(unmask);

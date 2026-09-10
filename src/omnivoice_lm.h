@@ -55,11 +55,18 @@ struct OmniVoiceLmRun {
     bool  gumbel_noise         = true;
     std::uint64_t seed         = 0;
     std::uint64_t chunk        = 0;   // salts the per-step noise seed per text chunk
+    int   num_chunks           = 1;   // chunks in the whole synthesis (reported to on_step)
+    bool  want_confidence      = false;  // fill OmniVoiceLmResult::confidence
 };
 
 struct OmniVoiceLmResult {
     std::vector<int32_t> codes;        // C * T, [c * T + t]
     std::vector<int32_t> unmask_step;  // C * T, step index (-1 = fixed by init)
+    // C * T raw confidence (max CFG log-prob, no penalty, no noise) sampled at
+    // the step each position was committed, or at the last step for a position
+    // an init grid kept. Only filled when run.want_confidence; empty otherwise
+    // and when the run was cancelled before its first step.
+    std::vector<float>   confidence;
     bool   cancelled = false;
     int    steps_run = 0;
     double seconds   = 0;              // wall time of the step loop
@@ -73,11 +80,13 @@ struct OmniVoiceLmDebug {
     bool capture_forward0 = false;
     int L = 0, Lc = 0, R = 0;
     std::vector<float> embeds0, hidden0, logits0;
-    // Per step, after the scores op and before the commit: the predicted id
-    // and the score of every cell (scores are -inf where already fixed), then
-    // the grid after the commit.
+    // Per step, after the scores op and before the commit: the predicted id,
+    // the score (-inf where already fixed) and the raw confidence (finite
+    // everywhere, no penalty, no noise) of every cell, then the grid after the
+    // commit.
     std::function<void(int step, int k, const std::vector<int32_t>& pred,
                        const std::vector<float>& scores,
+                       const std::vector<float>& confidence,
                        const std::vector<int32_t>& tokens_after)> on_scores;
 };
 

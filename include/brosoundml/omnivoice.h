@@ -169,14 +169,34 @@ struct OmniVoiceInit {
 };
 
 // Per-step observation for a lab: the token grid so far (audio_mask_id where
-// still masked), this step's scores (-inf where already fixed), and how many
-// positions were just unmasked. Pointers are valid only during the callback.
+// still masked), this step's scores (-inf where already fixed), this step's raw
+// confidence, and how many positions were just unmasked. Pointers are valid
+// only during the callback.
+//
+// scores vs confidence — they are not the same signal:
+//   scores      the selection score the op ranked positions by: the raw
+//               confidence minus codebook * layer_penalty, then divided by
+//               position_temperature with Gumbel noise added when it is > 0,
+//               and -inf at every position that is already fixed. It answers
+//               "which cell won this step", and its magnitudes are dominated
+//               by the per-codebook penalty and the noise.
+//   confidence  the model's raw max CFG log-prob at the position, before the
+//               penalty and before any noise, written for EVERY position —
+//               already-unmasked ones included, since the model predicts every
+//               target position on every forward. It answers "how sure was the
+//               model here", which is what a heat map wants.
+//
+// `step` restarts at 0 for every chunk of a long-form synthesize; `chunk` says
+// which chunk this is (0-based) and `num_chunks` how many there are in total
+// (1 for an unchunked run and for generate_codes).
 struct OmniVoiceStep {
     int step = 0, num_steps = 0;
+    int chunk = 0, num_chunks = 1;    // long-form chunk index / count
     int num_frames = 0, num_codebooks = 0;
     int unmasked = 0;                 // positions fixed this step
     const int32_t* tokens = nullptr;  // num_codebooks * num_frames
     const float*   scores = nullptr;  // num_codebooks * num_frames
+    const float*   confidence = nullptr;  // num_codebooks * num_frames, raw
 };
 using OmniVoiceStepFn = std::function<void(const OmniVoiceStep&)>;
 
@@ -186,6 +206,13 @@ struct OmniVoiceTrace {
     int num_frames = 0;                  // frames generated (all chunks)
     std::vector<int32_t> codes;          // num_codebooks * num_frames, [q * num_frames + t]
     std::vector<int32_t> unmask_step;    // step at which each position was fixed (-1 = initial)
+    // Raw max CFG log-prob at each position — the same signal as
+    // OmniVoiceStep::confidence, sampled at the step that position was
+    // committed (so it pairs cell-for-cell with unmask_step). A position an
+    // init grid kept, which is therefore never committed, carries its last
+    // step's confidence instead. Same layout as codes; empty if the run was
+    // cancelled before its first step.
+    std::vector<float>   confidence;
     std::vector<int32_t> chunk_frames;   // per-chunk frame counts (1 entry when unchunked)
     double lm_seconds = 0, codec_seconds = 0;
 };

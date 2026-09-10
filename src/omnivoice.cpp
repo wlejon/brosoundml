@@ -165,7 +165,8 @@ struct OmniVoice::Impl {
         return ids;
     }
 
-    OmniVoiceLmRun lm_run(const OmniVoiceParams& p, std::uint64_t chunk) const {
+    OmniVoiceLmRun lm_run(const OmniVoiceParams& p, std::uint64_t chunk,
+                          int num_chunks, bool want_confidence) const {
         OmniVoiceLmRun r;
         r.num_steps = p.num_steps;
         r.t_shift = p.t_shift;
@@ -176,6 +177,8 @@ struct OmniVoice::Impl {
         r.gumbel_noise = p.gumbel_noise;
         r.seed = p.seed;
         r.chunk = chunk;
+        r.num_chunks = num_chunks;
+        r.want_confidence = want_confidence;
         return r;
     }
 
@@ -184,12 +187,15 @@ struct OmniVoice::Impl {
     ChunkRun run_chunk(const std::string& text, int T, const std::string& lang,
                        const std::string& instruct, const OmniVoiceParams& p,
                        const std::vector<int32_t>& ref_codes, int n_ref, const std::string& ref_text,
-                       const OmniVoiceInit* init, std::uint64_t chunk, const CancelCheck& cancel,
+                       const OmniVoiceInit* init, std::uint64_t chunk, int num_chunks,
+                       bool want_confidence, const CancelCheck& cancel,
                        const OmniVoiceStepFn& on_step) const {
         ChunkRun cr;
         cr.T = T;
         cr.text_ids = prompt_ids(text, lang, instruct, p.denoise, n_ref > 0 ? &ref_text : nullptr, n_ref > 0);
-        cr.result = lm.generate(cr.text_ids, ref_codes, n_ref, T, init, lm_run(p, chunk), cancel, on_step, nullptr);
+        cr.result = lm.generate(cr.text_ids, ref_codes, n_ref, T, init,
+                                lm_run(p, chunk, num_chunks, want_confidence),
+                                cancel, on_step, nullptr);
         return cr;
     }
 
@@ -343,9 +349,10 @@ AudioBuffer OmniVoice::synthesize(const std::string& text, const OmniVoiceParams
         return !cancelled;
     };
 
+    const bool want_conf = trace != nullptr;
     if (T <= threshold || params.audio_chunk_duration <= 0.0f) {
         if (!finish_run(m.run_chunk(text, T, lang, instruct, params, ref_codes, n_ref, ref_text,
-                                    nullptr, 0, cancel, on_step)))
+                                    nullptr, 0, 1, want_conf, cancel, on_step)))
             return AudioBuffer({}, sr);
     } else {
         // _generate_chunked: split at punctuation into ~audio_chunk_duration
@@ -355,25 +362,28 @@ AudioBuffer OmniVoice::synthesize(const std::string& text, const OmniVoiceParams
         const int chunk_len = static_cast<int>(static_cast<double>(params.audio_chunk_duration) * m.cfg.frame_rate / avg);
         const std::vector<std::string> chunks = ovp::chunk_text(text, chunk_len, 3);
         if (chunks.empty()) fail("text chunking produced nothing");
+        const int nc = static_cast<int>(chunks.size());
         if (n_ref > 0) {
             for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
                 const int Tc = ovp::estimate_target_tokens(chunks[ci], &ref_text, n_ref, ratio);
                 if (!finish_run(m.run_chunk(chunks[ci], Tc, lang, instruct, params, ref_codes, n_ref, ref_text,
-                                            nullptr, static_cast<std::uint64_t>(ci), cancel, on_step)))
+                                            nullptr, static_cast<std::uint64_t>(ci), nc, want_conf,
+                                            cancel, on_step)))
                     return AudioBuffer({}, sr);
             }
         } else {
             // Chunk 0 alone, then it becomes the reference for the rest.
             const int T0 = ovp::estimate_target_tokens(chunks[0], nullptr, -1, ratio);
             if (!finish_run(m.run_chunk(chunks[0], T0, lang, instruct, params, no_codes, 0, std::string(),
-                                        nullptr, 0, cancel, on_step)))
+                                        nullptr, 0, nc, want_conf, cancel, on_step)))
                 return AudioBuffer({}, sr);
             const std::vector<int32_t> codes0 = runs[0].result.codes;
             const std::string& text0 = chunks[0];
             for (std::size_t ci = 1; ci < chunks.size(); ++ci) {
                 const int Tc = ovp::estimate_target_tokens(chunks[ci], &text0, T0, ratio);
                 if (!finish_run(m.run_chunk(chunks[ci], Tc, lang, instruct, params, codes0, T0, text0,
-                                            nullptr, static_cast<std::uint64_t>(ci), cancel, on_step)))
+                                            nullptr, static_cast<std::uint64_t>(ci), nc, want_conf,
+                                            cancel, on_step)))
                     return AudioBuffer({}, sr);
             }
         }
@@ -403,12 +413,17 @@ AudioBuffer OmniVoice::synthesize(const std::string& text, const OmniVoiceParams
         trace->num_frames = total;
         trace->codes.assign(static_cast<std::size_t>(C) * total, 0);
         trace->unmask_step.assign(static_cast<std::size_t>(C) * total, -1);
+        trace->confidence.assign(static_cast<std::size_t>(C) * total, 0.0f);
         int off = 0;
         for (const ChunkRun& cr : runs) {
+            const bool has_conf = cr.result.confidence.size() ==
+                                  static_cast<std::size_t>(C) * static_cast<std::size_t>(cr.T);
             for (int q = 0; q < C; ++q)
                 for (int t = 0; t < cr.T; ++t) {
                     trace->codes[static_cast<std::size_t>(q) * total + off + t] = cr.result.codes[static_cast<std::size_t>(q) * cr.T + t];
                     trace->unmask_step[static_cast<std::size_t>(q) * total + off + t] = cr.result.unmask_step[static_cast<std::size_t>(q) * cr.T + t];
+                    if (has_conf)
+                        trace->confidence[static_cast<std::size_t>(q) * total + off + t] = cr.result.confidence[static_cast<std::size_t>(q) * cr.T + t];
                 }
             off += cr.T;
         }
@@ -439,12 +454,13 @@ std::vector<int32_t> OmniVoice::generate_codes(const std::string& text, int num_
     std::vector<int32_t> no_codes;
     ChunkRun cr = m.run_chunk(text, T, lang, instruct, params, prompt ? prompt->codes : no_codes,
                               prompt ? prompt->num_frames : 0, prompt ? prompt->text : std::string(),
-                              init, 0, cancel, on_step);
+                              init, 0, 1, trace != nullptr, cancel, on_step);
     if (trace) {
         trace->text_ids = cr.text_ids;
         trace->num_frames = T;
         trace->codes = cr.result.codes;
         trace->unmask_step = cr.result.unmask_step;
+        trace->confidence = cr.result.confidence;
         trace->chunk_frames = {T};
         trace->lm_seconds = cr.result.seconds;
         trace->codec_seconds = 0;

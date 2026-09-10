@@ -114,8 +114,26 @@ so CPU and CUDA draw identical noise and a seed reproduces an utterance;
 `gumbel_noise = false` passes temperature 0 (argmax order, no noise).
 `OmniVoiceInit` fixes cells before the schedule: kept cells start with their
 token, are excluded from `total_masked`, and keep `unmask_step = −1`.
-`cancel` is polled once per step; `on_step` receives the host grid and scores
-after each commit.
+`cancel` is polled once per step; `on_step` receives the host grid, the scores
+and the raw confidence after each commit, plus `chunk` / `num_chunks` (the
+long-form chunk this step belongs to — `step` restarts at 0 for every chunk).
+
+**Scores vs confidence.** `masked_diffusion_scores` writes two grids and they
+answer different questions. `scores` is the *selection* score: the raw
+confidence minus `codebook · layer_penalty`, then `/ position_temperature +
+Gumbel` when that temperature is on, and −inf at every already-fixed cell — it
+ranks the competition, and with `layer_penalty = 5` its range is dominated by
+which codebook a cell sits in. `confidence` is the model's raw
+`max(log_probs)` at the cell, before the penalty and before any noise, and it
+is written for *every* cell including the already-unmasked ones (the model
+predicts every target position on every forward, so those logits exist and
+their max is a real number). That is the honest "where did the model hedge"
+signal; a heat map wants `confidence`, the unmask order wants `scores`. With
+`position_temperature = 0` the two are related exactly, in FP32:
+`scores[c][t] == confidence[c][t] − c · layer_penalty` at every masked cell.
+`OmniVoiceTrace::confidence` carries, per position, the confidence at the step
+that position was committed (so it pairs with `unmask_step`); a cell an
+`OmniVoiceInit` kept is never committed and carries the last step's value.
 
 **CUDA graphs.** The per-shape session (one per distinct `(n_text, n_ref, T,
 cfg)`, four cached) pre-allocates every buffer so the step body never
@@ -196,7 +214,12 @@ with chunks under 3 characters merged into a neighbour. With a reference every
 chunk is estimated against it (times the speed ratio) and generated with it;
 without one the first chunk is generated alone and its codes + text become
 the reference for the rest. The trace concatenates the chunk grids along the
-frame axis and lists `chunk_frames`.
+frame axis and lists `chunk_frames`. Each chunk restarts the diffusion
+schedule, so `OmniVoiceStep::step` runs `0 … num_steps-1` once per chunk;
+`OmniVoiceStep::chunk` (0-based) and `num_chunks` say which one, and a
+consumer that wants a single timeline should key on `(chunk, step)`. An
+unchunked `synthesize` and every `generate_codes` report `chunk = 0`,
+`num_chunks = 1`.
 
 ## Prompt files (`OmniVoicePrompt::save` / `load`)
 
@@ -254,7 +277,12 @@ is unavailable — the upstream fixtures, generated on CUDA, are the oracle:
   Whisper transcript of the BF16 end-to-end synthesis.
 * **D** 16-step deterministic generation (Gumbel uniform fixed) — per-step
   unmask counts exact, per-step predictions and scores, final codes and the
-  unmask-order grid; decode + post-processing of the reference codes.
+  unmask-order grid; the raw confidence is checked against the score it is
+  derived from (`score == confidence − codebook · layer_penalty` bit-exactly,
+  the run having `position_temperature = 0`) at every masked cell of every
+  step, is finite everywhere including the already-fixed cells, and the trace
+  confidence is finite at every position; decode + post-processing of the
+  reference codes.
 * **E** voice clone — preprocessing reproduces the encoder input exactly,
   prompt codes 100 %, the OVCP round trip, the cloned generation.
 * **F** `remove_silence` / gain / `fade_and_pad` on two signals x 3 variants,

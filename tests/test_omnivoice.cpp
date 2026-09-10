@@ -47,6 +47,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -508,19 +509,39 @@ static void run_lm_parts(brotensor::Device dev, const char* dev_name, const fs::
         run.num_steps = g.num_step; run.t_shift = fd->t_shift; run.guidance_scale = fd->guidance;
         run.layer_penalty = fd->penalty; run.position_temperature = fd->pos_temp;
         run.class_temperature = fd->class_temp; run.gumbel_noise = false; run.seed = 0;
+        run.want_confidence = true;
 
         brosoundml::OmniVoiceLmDebug dbg;
         int steps_seen = 0, pred_mismatch_total = 0, k_mismatch = 0;
         float score_max = 0.0f;
         std::vector<int> step_pred_mismatch;
         std::vector<float> step_score_max;
+        // The raw confidence has no fixture of its own (upstream never exposes
+        // it), but it is exactly the quantity the score is built from: with
+        // position_temperature 0 — which gumbel_noise = false forces — the op
+        // computes score = confidence - codebook * layer_penalty in one FP32
+        // subtraction, so the relation holds bit-for-bit on every masked cell.
+        // Confidence must also be finite at the ALREADY-FIXED cells, where the
+        // score is -inf: their logits exist just the same.
+        int conf_rel_bad = 0, conf_nonfinite = 0, conf_fixed_seen = 0;
+        const int Tframes = T;
         dbg.on_scores = [&](int step, int k, const std::vector<int32_t>& pred, const std::vector<float>& scores,
-                            const std::vector<int32_t>&) {
+                            const std::vector<float>& confidence, const std::vector<int32_t>&) {
             ++steps_seen;
             if (k != g.k[static_cast<std::size_t>(step)]) ++k_mismatch;
             int pm = 0;
             float sm = 0.0f;
+            if (confidence.size() != cells) { ++conf_nonfinite; return; }
             for (std::size_t i = 0; i < cells; ++i) {
+                if (!std::isfinite(confidence[i])) ++conf_nonfinite;
+                if (std::isfinite(scores[i])) {
+                    const int cb = static_cast<int>(i / static_cast<std::size_t>(Tframes));
+                    const float pen_term = static_cast<float>(cb) * fd->penalty;
+                    const float want = confidence[i] - pen_term;
+                    if (want != scores[i]) ++conf_rel_bad;
+                } else {
+                    ++conf_fixed_seen;   // fixed cell: -inf score, real confidence
+                }
                 const bool masked_then = g.unmask[i] >= step;   // still masked at this step in the reference run
                 if (!masked_then) continue;
                 if (pred[i] != g.pred[static_cast<std::size_t>(step) * cells + i]) ++pm;
@@ -552,6 +573,24 @@ static void run_lm_parts(brotensor::Device dev, const char* dev_name, const fs::
         CHECK(grid >= 95.0, "Part D: unmask-step grid agrees >= 95% with the fixture");
         CHECK(score_max < 5e-2f, "Part D: per-step scores within 5e-2 (masked cells)");
         for (int32_t c : res.codes) if (c < 0 || c >= V - 1) { CHECK(false, "Part D: a code is out of range / still MASK"); break; }
+        // Raw confidence.
+        std::printf("    confidence: %d cells violate score = conf - codebook*penalty, %d non-finite, "
+                    "%d already-fixed cells scored -inf with a real confidence\n",
+                    conf_rel_bad, conf_nonfinite, conf_fixed_seen);
+        CHECK(conf_rel_bad == 0, "Part D: raw confidence = score + codebook * layer_penalty exactly (pos_temp 0)");
+        CHECK(conf_nonfinite == 0, "Part D: raw confidence is finite at every cell, every step");
+        CHECK(conf_fixed_seen > 0, "Part D: already-fixed cells were seen (their score is -inf)");
+        {
+            bool ok = res.confidence.size() == cells;
+            float lo = 1e30f, hi = -1e30f;
+            for (std::size_t i = 0; ok && i < cells; ++i) {
+                if (!std::isfinite(res.confidence[i])) { ok = false; break; }
+                lo = std::min(lo, res.confidence[i]);
+                hi = std::max(hi, res.confidence[i]);
+            }
+            std::printf("    trace confidence: %zu values, range [%.4g, %.4g]\n", res.confidence.size(), lo, hi);
+            CHECK(ok, "Part D: the committed-step confidence grid is complete and finite");
+        }
     }
 }
 
@@ -920,11 +959,46 @@ static void run_pipeline_parts(brotensor::Device dev, const char* dev_name, cons
         for (int t = 0; t < 10; ++t) { init.tokens[static_cast<std::size_t>(t)] = 7; init.keep[static_cast<std::size_t>(t)] = 1; }
         int steps = 0;
         brosoundml::OmniVoiceTrace tr;
+        int step_field_bad = 0;
+        std::vector<int> fixed_per_step;   // cells whose score is -inf, i.e. already decided
         const std::vector<int32_t> c2 = ov->generate_codes("Hello there.", 10, p, nullptr, &init, {}, &tr,
-                                                          [&](const brosoundml::OmniVoiceStep& s) { ++steps; CHECK(s.tokens && s.scores && s.num_frames == 10, "step hook fields"); });
+                                                          [&](const brosoundml::OmniVoiceStep& s) {
+                                                              ++steps;
+                                                              CHECK(s.tokens && s.scores && s.confidence && s.num_frames == 10, "step hook fields");
+                                                              // generate_codes is never chunked.
+                                                              if (s.chunk != 0 || s.num_chunks != 1) ++step_field_bad;
+                                                              int fixed = 0;
+                                                              for (int i = 0; i < s.num_codebooks * s.num_frames; ++i) {
+                                                                  if (!std::isfinite(s.confidence[i])) ++step_field_bad;
+                                                                  if (s.scores[i] == -std::numeric_limits<float>::infinity()) ++fixed;
+                                                              }
+                                                              fixed_per_step.push_back(fixed);
+                                                          });
+        CHECK(step_field_bad == 0, "contract: on_step reports chunk 0 of 1 with a finite confidence grid");
+        // Each step's scores are THIS step's: more cells are already decided
+        // every step, so the -inf count strictly grows. (A buffer reused across
+        // steps without a fresh copy back would report a constant count.)
+        {
+            bool grows = fixed_per_step.size() == static_cast<std::size_t>(p.num_steps) &&
+                         !fixed_per_step.empty() && fixed_per_step[0] >= 10;   // the init-kept cells
+            for (std::size_t i = 1; grows && i < fixed_per_step.size(); ++i)
+                grows = fixed_per_step[i] > fixed_per_step[i - 1];
+            std::printf("    on_step already-decided cells per step:");
+            for (int v : fixed_per_step) std::printf(" %d", v);
+            std::printf("\n");
+            CHECK(grows, "contract: on_step delivers this step's scores, not the first step's");
+        }
         bool kept = c2.size() == static_cast<std::size_t>(C) * 10;
         for (int t = 0; kept && t < 10; ++t) kept = c2[static_cast<std::size_t>(t)] == 7 && tr.unmask_step[static_cast<std::size_t>(t)] == -1;
         CHECK(kept && steps == 2, "contract: init cells stay fixed (unmask_step -1) and on_step fires per step");
+        // The trace's confidence pairs with unmask_step: one value per cell,
+        // finite everywhere including the init-kept cells (which never commit
+        // and take the last step's value).
+        {
+            bool ok = tr.confidence.size() == static_cast<std::size_t>(C) * 10;
+            for (std::size_t i = 0; ok && i < tr.confidence.size(); ++i) ok = std::isfinite(tr.confidence[i]);
+            CHECK(ok, "contract: trace confidence is one finite value per cell, init-kept cells included");
+        }
         for (int32_t c : c2) if (c == MASK) { CHECK(false, "contract: a cell stayed MASK"); break; }
         CHECK(ov->languages().size() > 600 && ov->instruct_attributes().size() == 6 && ov->nonverbal_tags().size() == 13,
               "contract: languages / instruct_attributes / nonverbal_tags");
@@ -1027,8 +1101,19 @@ static void run_pipeline_parts(brotensor::Device dev, const char* dev_name, cons
             p.language = "English";
             p.num_steps = 8;
             brosoundml::OmniVoiceTrace tr;
+            // Every step of every chunk, so the chunk index can be checked:
+            // step restarts at 0 per chunk, chunk counts up, num_chunks is
+            // constant and matches the trace's chunk_frames.
+            std::vector<std::pair<int, int>> seen;   // (chunk, step)
+            int nc_seen = -1, chunk_field_bad = 0;
             const auto t0 = std::chrono::steady_clock::now();
-            brosoundml::AudioBuffer out = ov->synthesize(text, p, nullptr, {}, &tr);
+            brosoundml::AudioBuffer out = ov->synthesize(text, p, nullptr, {}, &tr,
+                                                         [&](const brosoundml::OmniVoiceStep& s) {
+                                                             seen.emplace_back(s.chunk, s.step);
+                                                             if (nc_seen < 0) nc_seen = s.num_chunks;
+                                                             else if (nc_seen != s.num_chunks) ++chunk_field_bad;
+                                                             if (!s.confidence) ++chunk_field_bad;
+                                                         });
             std::printf("    chunked synthesize: %zu chunks, %d frames, %.2fs audio in %.2fs (LM %.2fs, codec %.2fs)\n",
                         tr.chunk_frames.size(), tr.num_frames, out.samples.size() / 24000.0,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), tr.lm_seconds, tr.codec_seconds);
@@ -1036,6 +1121,25 @@ static void run_pipeline_parts(brotensor::Device dev, const char* dev_name, cons
             int sum = 0;
             for (int f : tr.chunk_frames) sum += f;
             CHECK(sum == tr.num_frames && tr.codes.size() == static_cast<std::size_t>(C) * tr.num_frames, "e2e: trace frame bookkeeping");
+            CHECK(tr.confidence.size() == tr.codes.size(), "e2e: trace confidence spans every chunk");
+            {
+                bool finite = true;
+                for (float v : tr.confidence) if (!std::isfinite(v)) { finite = false; break; }
+                CHECK(finite, "e2e: chunked trace confidence is finite everywhere");
+            }
+            // (chunk, step) is exactly chunk-major 0..num_chunks-1 x 0..steps-1.
+            {
+                const int nc = static_cast<int>(tr.chunk_frames.size());
+                bool ok = nc_seen == nc && seen.size() == static_cast<std::size_t>(nc) * p.num_steps;
+                for (std::size_t i = 0; ok && i < seen.size(); ++i) {
+                    ok = seen[i].first == static_cast<int>(i) / p.num_steps &&
+                         seen[i].second == static_cast<int>(i) % p.num_steps;
+                }
+                std::printf("    on_step saw %zu steps over %d chunks (num_chunks reported %d)\n",
+                            seen.size(), nc, nc_seen);
+                CHECK(ok && chunk_field_bad == 0,
+                      "e2e: on_step reports chunk 0..n-1 with step restarting at 0 in each");
+            }
         }
     }
 }
