@@ -1194,34 +1194,35 @@ void load_adain_resblock1(const stf::File& f, const std::string& prefix,
     }
 }
 
+// Streamlined AdaIN1D + Snake Activation: evaluates AdaIN1D directly into out_ncl
+// followed by in-place Snake1D activation, avoiding intermediate tensor reallocations.
+inline void ada_in_1d_snake(const AdaIN1dWeights& w, const bt::Tensor& alpha,
+                            int N, int C, int L,
+                            const bt::Tensor& x_ncl, const bt::Tensor& style,
+                            bt::Tensor& out_ncl) {
+    ada_in_1d_styled(w, N, C, L, x_ncl, style, out_ncl);
+    bt::snake_forward(out_ncl, alpha, /*beta=*/nullptr, N, C, L, out_ncl);
+}
+
 void adain_resblock1_forward(const AdaINResBlock1Weights& w,
                              bt::Tensor& x, int C, int L,
                              const bt::Tensor& style) {
     const bt::Device dev = x.device;
+    bt::Tensor xt = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor c1_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+    bt::Tensor c2_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
+
     for (int i = 0; i < 3; ++i) {
-        bt::Tensor xt = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
-        // n1(x, s)
-        ada_in_1d_styled(w.adain1[i], 1, C, L, x, style, xt);
-        // Snake1D: xt += (1/alpha) * sin(alpha*x)^2
-        {
-            bt::Tensor snake_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
-            bt::snake_forward(xt, w.alpha1[i], /*beta=*/nullptr, 1, C, L, snake_out);
-            xt = std::move(snake_out);
-        }
+        // Streamlined n1(x, s) + Snake1D in-place
+        ada_in_1d_snake(w.adain1[i], w.alpha1[i], 1, C, L, x, style, xt);
+
         // c1 (dilated conv)
-        bt::Tensor c1_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         w.convs1[i].forward(xt, /*N=*/1, /*L=*/L, c1_out);
 
-        // n2
-        ada_in_1d_styled(w.adain2[i], 1, C, L, c1_out, style, xt);
-        // Snake1D
-        {
-            bt::Tensor snake_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
-            bt::snake_forward(xt, w.alpha2[i], /*beta=*/nullptr, 1, C, L, snake_out);
-            xt = std::move(snake_out);
-        }
+        // Streamlined n2(c1_out, s) + Snake1D in-place
+        ada_in_1d_snake(w.adain2[i], w.alpha2[i], 1, C, L, c1_out, style, xt);
+
         // c2
-        bt::Tensor c2_out = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         w.convs2[i].forward(xt, /*N=*/1, /*L=*/L, c2_out);
 
         // x = xt + x  (residual)
