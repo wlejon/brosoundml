@@ -92,6 +92,42 @@ if(NOT TARGET brolm)
     endif()
 endif()
 
+# broaudio — sibling audio engine library
+set(BROAUDIO_DIR "${CMAKE_SOURCE_DIR}/../broaudio" CACHE PATH
+    "Path to standalone broaudio repo (set to a missing path to force submodule fallback)")
+if(NOT TARGET broaudio)
+    if(EXISTS "${BROAUDIO_DIR}/CMakeLists.txt")
+        add_subdirectory("${BROAUDIO_DIR}" "${CMAKE_BINARY_DIR}/broaudio" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broaudio/CMakeLists.txt")
+        add_subdirectory(third_party/broaudio EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR
+            "broaudio not found at ${BROAUDIO_DIR} or third_party/broaudio. "
+            "Clone the broaudio repo next to this repo, or override with -DBROAUDIO_DIR=...")
+    endif()
+endif()
+
+# bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze fallback)
+if(NOT TARGET bronze_runtime_shared)
+    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
+    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BRONZE_WITH_LLVM ON CACHE BOOL "Build bronze's LLVM codegen backend")
+    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        # Explicit BRONZE_DIR supplied
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze AOT compiler source tree")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze" CACHE PATH "bronze AOT compiler source tree")
+    endif()
+
+    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "bronze not found. Either provide ../bronze, third_party/bronze, or pass -DBRONZE_DIR=<path>.")
+    endif()
+
+    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
+endif()
+
 # --- brosoundml library ---
 
 add_library(brosoundml STATIC)
@@ -296,6 +332,12 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_cluster_diarize tools/cluster_diarize.cpp)
     target_link_libraries(brosoundml_cluster_diarize PRIVATE brosoundml)
+endif()
+
+# --- Standalone Bronze JavaScript API ---
+option(BROSOUNDML_ENABLE_API "Build Bronze JavaScript API" ON)
+if(BROSOUNDML_ENABLE_API)
+    add_subdirectory(src/api)
 endif()
 
 # --- Tests ---
