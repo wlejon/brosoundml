@@ -121,3 +121,39 @@ target_compile_definitions(brosoundml_test_kokoro_modules PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_definitions(brosoundml_test_whisper PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+
+# Bronze standalone JavaScript API test (weights-free: mounts, TypeErrors)
+if(BROSOUNDML_ENABLE_API)
+    add_executable(brosoundml_test_api test_soundml_api.cpp)
+    target_include_directories(brosoundml_test_api PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
+    )
+    target_link_libraries(brosoundml_test_api PRIVATE
+        brosoundml_api
+        bronze_runtime_shared
+    )
+    if(MSVC)
+        target_compile_options(brosoundml_test_api PRIVATE /W4)
+    else()
+        target_compile_options(brosoundml_test_api PRIVATE -Wall -Wextra)
+    endif()
+    # bronze's shared runtime is built into BRONZE_SHARED_RUNTIME_DIR, not
+    # beside this executable, and the PE loader only looks beside the .exe
+    # (0xc0000135 + a modal "dll was not found" otherwise). Stage it next to
+    # the test as a post-build step and put both dirs on ctest's PATH.
+    if(WIN32)
+        add_custom_command(TARGET brosoundml_test_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brosoundml_test_api>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_LINKER_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brosoundml_test_api>
+        )
+    endif()
+    add_test(NAME brosoundml_test_api COMMAND brosoundml_test_api)
+    if(WIN32)
+        set_tests_properties(brosoundml_test_api PROPERTIES
+            ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api>;$ENV{PATH}")
+    endif()
+endif()
