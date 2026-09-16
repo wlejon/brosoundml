@@ -1,4 +1,4 @@
-#include "host_soundml_internal.h"
+#include "soundml_legacy_compat.h"
 
 #include <brosoundml/sensor_hub.h>
 #include <brosoundml/gesture_spotter.h>

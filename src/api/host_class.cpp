@@ -4,10 +4,12 @@
 namespace brosoundml::api {
 
 void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
-                        const std::function<void(ObjectBuilder&)>& decorate) {
+                        const std::function<void(ObjectBuilder&)>& decorate,
+                        bool global) {
     ev::NativeFn ctorBody = body;
     if (!ctorBody) {
-        std::string msg = std::string("TypeError: ") + name + " is not a constructor";
+        std::string msg = std::string(name) +
+            " is not constructible: instances come from the loader that returns one";
         ctorBody = [msg](Value, std::span<const Value>) { return ev::throwTypeError(msg); };
     }
 
@@ -21,6 +23,7 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
         proto_ = new ev::Persistent(proto.get());
     }
 
+    if (!global) return;
     ev::registerGlobal(name, ctor_->get());
     ev::GlobalValue gt = ev::globalValue("globalThis");
     if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
@@ -46,6 +49,21 @@ void HostClass::inherit(const HostClass& base) const {
     if (!ev::isFunction(setProto.get())) return;
     const Value args[2] = {proto_->get(), base.proto_->get()};
     ev::call(setProto.get(), ev::undefined(), std::span<const Value>(args, 2));
+}
+
+bool HostClass::isInstance(Value val) const {
+    if (!proto_ || !ev::isObject(val)) return false;
+    ev::Persistent target(val);
+    ev::GlobalValue objectCtor = ev::globalValue("Object");
+    if (!objectCtor.found || !ev::isObject(objectCtor.value)) return false;
+    ev::Persistent objectNs(objectCtor.value);
+    ev::Persistent objectProto(ev::getProperty(objectNs.get(), "prototype"));
+    ev::Persistent isProtoOf(ev::getProperty(objectProto.get(), "isPrototypeOf"));
+    if (!ev::isFunction(isProtoOf.get())) return false;
+    const Value args[1] = {target.get()};
+    ev::CallResult r = ev::call(isProtoOf.get(), proto_->get(), std::span<const Value>(args, 1));
+    if (r.thrown) return false;
+    return ev::isBool(r.value) && ev::toBool(r.value);
 }
 
 Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) const {

@@ -1,4 +1,4 @@
-#include "host_soundml_internal.h"
+#include "soundml_legacy_compat.h"
 
 #include <brosoundml/rave.h>
 #include <brotensor/runtime.h>

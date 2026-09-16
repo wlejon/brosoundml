@@ -3,7 +3,11 @@ cmake_minimum_required(VERSION 3.24)
 set(BROSOUNDML_API_SOURCES
     host_class.cpp
     api.cpp
+    soundml_async.cpp
     native_soundml_stt.cpp
+    native_soundml_stt_whisper.cpp
+    native_soundml_stt_parakeet.cpp
+    native_soundml_stt_qwen.cpp
     native_soundml_tts.cpp
     native_soundml_diar.cpp
     native_soundml_rave.cpp
