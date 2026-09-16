@@ -144,9 +144,4 @@ struct SttJobBase {
 
 inline constexpr size_t kSttTokenSlots = 1u << 16;
 
-// Build the model TranscribeOptions' cancel check from the job's flag.
-inline brosoundml::CancelCheck cancelCheckOf(const std::atomic<bool>& cancel) {
-    return [&cancel] { return cancel.load(std::memory_order_acquire); };
-}
-
 } // namespace brosoundml::api

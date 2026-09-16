@@ -448,6 +448,33 @@ inline void callCallback2(Value cb, Value a0, Value a1) {
     callCallback(cb, std::span<const Value>(args, 2));
 }
 
+// Object.keys(obj) as strings (own enumerable string keys), for the few
+// option bags keyed by user-chosen names (a logit-bias map).
+inline std::vector<std::string> objectKeys(Value obj) {
+    std::vector<std::string> out;
+    if (!ev::isObject(obj)) return out;
+    ev::Persistent root(obj);
+    auto objectCtor = ev::globalValue("Object");
+    if (!objectCtor.found || !ev::isObject(objectCtor.value)) return out;
+    ev::Persistent keysFn(ev::getProperty(objectCtor.value, "keys"));
+    if (!ev::isFunction(keysFn.get())) return out;
+    const Value args[1] = {root.get()};
+    ev::CallResult r = ev::call(keysFn.get(), ev::undefined(), std::span<const Value>(args, 1));
+    if (r.thrown || !ev::isObject(r.value)) return out;
+    ev::Persistent arr(r.value);
+    const uint32_t n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(arr.get(), "length")));
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) out.push_back(ev::toUtf8(ev::getElement(arr.get(), i)));
+    return out;
+}
+
+// A model's CancelCheck from the async job's cancel flag. The check runs
+// synchronously inside the model call on the work thread, so capturing the
+// flag by reference is safe.
+inline brosoundml::CancelCheck cancelCheckOf(const std::atomic<bool>& cancel) {
+    return [&cancel] { return cancel.load(std::memory_order_acquire); };
+}
+
 // { cancelled, error? } — the second argument of every onDone.
 inline Value makeDoneInfo(bool cancelled, const std::string& error) {
     ObjectBuilder info;
