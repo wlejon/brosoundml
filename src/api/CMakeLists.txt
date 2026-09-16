@@ -15,7 +15,11 @@ set(BROSOUNDML_API_SOURCES
     native_soundml_tts_supertonic.cpp
     native_soundml_diar.cpp
     native_soundml_rave.cpp
+    soundml_listen_host.cpp
     native_soundml_wake.cpp
+    native_soundml_kws.cpp
+    native_soundml_sense.cpp
+    native_soundml_gesture.cpp
     native_soundml_listen.cpp
 )
 

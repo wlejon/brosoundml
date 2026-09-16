@@ -15,6 +15,7 @@
 //   - A heavy call with an onDone / onReady callback runs on a background
 //   thread through soundml_async.h; the same call without one blocks.
 
+#include "api.h"
 #include "embed/embed.h"
 #include "host_class.h"
 #include "object_builder.h"
@@ -426,6 +427,11 @@ std::string resolvePath(const std::string& path);
 // Log line on the host's [INFO] channel (stderr when no host hook).
 void logInfo(const std::string& line);
 
+// The host's broaudio engine and inference scheduler (api.h setters); null /
+// empty until the host provides them.
+broaudio::Engine* audioEngine();
+const InferenceScheduler& inferenceScheduler();
+
 // ---------------------------------------------------------------------------
 // Callbacks
 // ---------------------------------------------------------------------------
@@ -534,13 +540,11 @@ void installStt(ObjectBuilder& bro);
 void installTts(ObjectBuilder& bro);
 void installDiar(ObjectBuilder& bro);
 void installRave(ObjectBuilder& bro);
-void installWakeAndKws(ObjectBuilder& bro);
-void installListenSenseGesture(ObjectBuilder& bro);
-
-// Views shared between wake/kws and listen
-Value createWakeStreamViewHandle();
-Value createKwsStreamViewHandle();
-Value createSenseStreamViewHandle();
-Value createGestureStreamViewHandle();
+// The listen-host tenants (soundml_listen_internal.h has their seams).
+void installWake(ObjectBuilder& bro);
+void installKws(ObjectBuilder& bro);
+void installSense(ObjectBuilder& bro);
+void installGesture(ObjectBuilder& bro);
+void installListen(ObjectBuilder& bro);
 
 } // namespace brosoundml::api

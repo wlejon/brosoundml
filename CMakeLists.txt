@@ -92,6 +92,26 @@ if(NOT TARGET brolm)
     endif()
 endif()
 
+# broaudio probes for an SDL3 and prefers bro's pre-built SDL3-static, which
+# bro compiles against the DLL CRT (/MD). This standalone tree is static-CRT
+# (/MT, above), and a /MD static library does not link into a /MT executable
+# (unresolved __imp_* CRT imports the moment the api's listen host pulls in
+# broaudio::Engine). So standalone on MSVC, build SDL3 from a source checkout
+# under this tree's own runtime setting; inside bro SDL3::SDL3-static already
+# exists and this is skipped.
+if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+   AND NOT TARGET SDL3::SDL3 AND NOT TARGET SDL3::SDL3-static)
+    foreach(_sdl_src "${CMAKE_SOURCE_DIR}/../bro/third_party/SDL" "${CMAKE_SOURCE_DIR}/../SDL")
+        if(EXISTS "${_sdl_src}/CMakeLists.txt")
+            set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+            set(SDL_STATIC ON CACHE BOOL "" FORCE)
+            set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+            add_subdirectory("${_sdl_src}" "${CMAKE_BINARY_DIR}/SDL" EXCLUDE_FROM_ALL)
+            break()
+        endif()
+    endforeach()
+endif()
+
 # broaudio — sibling audio engine library
 set(BROAUDIO_DIR "${CMAKE_SOURCE_DIR}/../broaudio" CACHE PATH
     "Path to standalone broaudio repo (set to a missing path to force submodule fallback)")

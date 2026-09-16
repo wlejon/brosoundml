@@ -1,7 +1,12 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
+
+namespace broaudio {
+class Engine;
+}
 
 namespace brosoundml::api {
 
@@ -32,6 +37,32 @@ void setPathResolver(std::function<std::string(const std::string&)> resolver);
 /// Route the bindings' [INFO] lines ("Whisper loaded on CUDA") to the host's
 /// logger. stderr when unset.
 void setLogHook(std::function<void(const std::string&)> hook);
+
+/// The host's broaudio engine, for the listen host's live sources: a mic
+/// stream installs a raw 16 kHz tap on it, and stats() reads that tap. Null
+/// (the default) leaves scripted feed() working and makes listen()/start()
+/// on a live source throw "audio engine not available". The pointer must
+/// outlive every open stream — call shutdownSoundML() before the engine
+/// dies.
+void setAudioEngine(broaudio::Engine* engine);
+
+/// Where the listen host's per-stream feed runs. A host with an audio-
+/// inference worker supplies it here: `addPump` registers a closure the
+/// worker calls on every drain cycle (bro's AudioInference: every ~5 ms
+/// threaded, or once per headless advanceTime step inline) and returns an
+/// id; `removePump` unregisters it and, when threaded, returns only after
+/// no call of that closure can still be running (a barrier — the caller
+/// mutates the stream's models right after); `threaded` says which mode the
+/// worker is in, deciding whether a JS feed() writes the live ring (threaded:
+/// events surface later through callbacks) or runs the bus inline on the
+/// calling thread (headless: deterministic, the result comes back). Unset,
+/// every feed runs inline.
+struct InferenceScheduler {
+    std::function<std::uint32_t(std::function<void()> pump)> addPump;
+    std::function<void(std::uint32_t id)>                    removePump;
+    std::function<bool()>                                    threaded;
+};
+void setInferenceScheduler(InferenceScheduler scheduler);
 
 } // namespace brosoundml::api
 

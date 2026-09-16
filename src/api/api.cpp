@@ -1,5 +1,6 @@
 #include "api.h"
 #include "host_soundml_internal.h"
+#include "soundml_listen_internal.h"
 
 #include <cstdio>
 #include <utility>
@@ -18,7 +19,27 @@ std::function<void(const std::string&)>& logHook() {
     return h;
 }
 
+broaudio::Engine*& audioEngineSlot() {
+    static broaudio::Engine* e = nullptr;
+    return e;
+}
+
+InferenceScheduler& schedulerSlot() {
+    static InferenceScheduler s;
+    return s;
+}
+
 }  // namespace
+
+broaudio::Engine* audioEngine() { return audioEngineSlot(); }
+
+const InferenceScheduler& inferenceScheduler() { return schedulerSlot(); }
+
+void setAudioEngine(broaudio::Engine* engine) { audioEngineSlot() = engine; }
+
+void setInferenceScheduler(InferenceScheduler scheduler) {
+    schedulerSlot() = std::move(scheduler);
+}
 
 std::string resolvePath(const std::string& path) {
     auto& r = pathResolver();
@@ -44,10 +65,21 @@ void setLogHook(std::function<void(const std::string&)> hook) {
 
 void tickSoundML() {
     tickAsyncJobs();
+    tickWake();
+    tickKws();
+    tickGesture();
 }
 
 void shutdownSoundML() {
     shutdownAsyncJobs();
+    // Tenants first (they detach from their streams — a scheduler barrier —
+    // and release their rooted callbacks), then the streams and their
+    // sources, while the audio engine and the scheduler are still alive.
+    cleanupWake();
+    cleanupKws();
+    cleanupSense();
+    cleanupGesture();
+    shutdownListenHost();
 }
 
 void installSoundML() {
@@ -84,8 +116,11 @@ void installSoundML() {
     installTts(bro);
     installDiar(bro);
     installRave(bro);
-    installWakeAndKws(bro);
-    installListenSenseGesture(bro);
+    installWake(bro);
+    installKws(bro);
+    installSense(bro);
+    installGesture(bro);
+    installListen(bro);
 
     // Keep updated bro global
     ev::registerGlobal("bro", bro.get());
