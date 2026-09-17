@@ -54,6 +54,10 @@ jobs:
           repository: wlejon/broimage
           path: broimage
 
+      # bronze (and through it brass) for the api. Pre-built with the other
+      # siblings below, ahead of the trace.
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 
@@ -77,7 +81,7 @@ jobs:
       - name: Pre-build sibling code (outside the traced build)
         run: |
           cmake --build build --parallel 4 \
-            --target stb_image broimage brolm brotensor_core brotensor_cpu
+            --target stb_image broimage brolm brotensor_core brotensor_cpu bronze_runtime_shared
 
       # The query set lives in the config file, which also documents why
       # cpp/path-injection is excluded.

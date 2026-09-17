@@ -19,6 +19,15 @@ concurrency:
 #       brotensor/
 #       brolm/
 #       broimage/
+#       bronze/       <- the JavaScript runtime brosoundml_api binds
+#       brass/        <- bronze's code generator
+#
+# bronze and brass are laid out by bronze's checkout-toolchain action and
+# compiled inside this build tree (bronze add_subdirectory()s brass), with the
+# job's own compiler and CRT — the api is bound across bronze's C++ embed
+# boundary, so a prebuilt bronze would be an unverifiable ABI hazard. That is
+# what makes brosoundml_test_api the check that the library works the way bro
+# uses it.
 #
 # Hence `path:` on every checkout and `cmake -S brosoundml`. A default checkout
 # puts ../bromath outside the workspace and the configure dies on the FATAL_ERROR
@@ -82,6 +91,8 @@ jobs:
         with:
           repository: wlejon/broimage
           path: broimage
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -153,6 +164,8 @@ jobs:
         with:
           repository: wlejon/broimage
           path: broimage
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr ninja-build
