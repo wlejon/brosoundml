@@ -54,6 +54,22 @@ jobs:
           repository: wlejon/broimage
           path: broimage
 
+      # broaudio (the listen host's audio engine) and the SDL3 it needs, as
+      # in ci.yml; pre-built ahead of the trace with the other siblings.
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broaudio
+          path: broaudio
+          submodules: recursive
+
+      - name: Provision SDL3
+        uses: libsdl-org/setup-sdl@v1
+        with:
+          version: 3.4.12
+          build-type: Release
+          add-to-environment: true
+          install-linux-dependencies: true
+
       # bronze (and through it brass) for the api. Pre-built with the other
       # siblings below, ahead of the trace.
       - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
@@ -81,7 +97,7 @@ jobs:
       - name: Pre-build sibling code (outside the traced build)
         run: |
           cmake --build build --parallel 4 \
-            --target stb_image broimage brolm brotensor_core brotensor_cpu bronze_runtime_shared
+            --target stb_image broimage brolm brotensor_core brotensor_cpu broaudio bronze_runtime_shared
 
       # The query set lives in the config file, which also documents why
       # cpp/path-injection is excluded.

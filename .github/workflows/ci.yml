@@ -19,6 +19,7 @@ concurrency:
 #       brotensor/
 #       brolm/
 #       broimage/
+#       broaudio/     <- with submodules; the listen host's audio engine
 #       bronze/       <- the JavaScript runtime brosoundml_api binds
 #       brass/        <- bronze's code generator
 #
@@ -63,10 +64,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
-          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
-          - { name: windows-msvc, os: windows-2022 }
-          - { name: macos-arm64,  os: macos-14 }
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++,     sdl_args: "" }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++, sdl_args: "" }
+          - { name: windows-msvc, os: windows-2022, sdl_args: "-DSDL_SHARED=OFF -DSDL_STATIC=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" }
+          - { name: macos-arm64,  os: macos-14,     sdl_args: "" }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -91,6 +92,25 @@ jobs:
         with:
           repository: wlejon/broimage
           path: broimage
+
+      # broaudio backs the listen host (bro.wake / kws / sense / gesture /
+      # listen), with its libremidi submodule; it needs SDL3, provisioned the
+      # way broaudio's own CI does (static MSVC runtime on Windows to match
+      # this tree's /MT). Tests run with SDL_AUDIODRIVER=dummy.
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broaudio
+          path: broaudio
+          submodules: recursive
+
+      - name: Provision SDL3
+        uses: libsdl-org/setup-sdl@v1
+        with:
+          version: 3.4.12
+          build-type: Release
+          add-to-environment: true
+          install-linux-dependencies: true
+          cmake-arguments: ${{ matrix.sdl_args }}
 
       - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
@@ -127,6 +147,8 @@ jobs:
         run: cmake --build build --config Release --parallel 4
 
       - name: Test
+        env:
+          SDL_AUDIODRIVER: dummy
         run: ctest --test-dir build -C Release --output-on-failure
 
   # ── Coverage ──────────────────────────────────────────────────────────────
@@ -165,6 +187,20 @@ jobs:
           repository: wlejon/broimage
           path: broimage
 
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broaudio
+          path: broaudio
+          submodules: recursive
+
+      - name: Provision SDL3
+        uses: libsdl-org/setup-sdl@v1
+        with:
+          version: 3.4.12
+          build-type: Release
+          add-to-environment: true
+          install-linux-dependencies: true
+
       - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
@@ -180,6 +216,8 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
+        env:
+          SDL_AUDIODRIVER: dummy
         run: ctest --test-dir build --output-on-failure
 
       # pipefail: piping gcovr into tee otherwise hands the step tee's exit
