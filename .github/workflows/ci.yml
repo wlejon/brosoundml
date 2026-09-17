@@ -222,15 +222,19 @@ jobs:
 
       # pipefail: piping gcovr into tee otherwise hands the step tee's exit
       # status, so a gcovr crash produces no report and the job still goes green.
+      #
+      # Run from the workspace root, where build/ is, with the filters spelled
+      # brosoundml/...: gcovr only looks for .gcda files under its root, and
+      # run from inside brosoundml/ with the build tree beside it, it found
+      # none and reported "0.0% (0 out of 0)" as a green job.
       - name: Report
         shell: bash
-        working-directory: brosoundml
         run: |
           set -o pipefail
           mkdir -p coverage-html
           gcovr --root . \
-            --filter 'src/' --filter 'include/brosoundml/' \
-            --exclude 'tests/' --exclude 'tools/' \
+            --filter 'brosoundml/src/' --filter 'brosoundml/include/brosoundml/' \
+            --exclude 'brosoundml/tests/' --exclude 'brosoundml/tools/' \
             --exclude-unreachable-branches \
             --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
             --print-summary \
@@ -240,7 +244,6 @@ jobs:
 
       - name: Job summary
         if: always()
-        working-directory: brosoundml
         run: |
           {
             echo '## Coverage — `src/` + `include/brosoundml/`'
@@ -261,5 +264,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: coverage-html
-          path: brosoundml/coverage-html/
+          path: coverage-html/
           retention-days: 14
