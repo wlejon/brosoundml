@@ -20,11 +20,26 @@ namespace brosoundml::api {
 ///     N-stream listen bus)
 void installSoundML();
 
+/// The compute half of installSoundML for a realm on a thread that is NOT
+/// the host's main thread (a Worker): bro.stt, bro.tts, bro.diar and
+/// bro.rave — models that read files and run inference on the calling
+/// thread's own async jobs — and nothing that taps the audio engine or the
+/// inference scheduler (wake / kws / sense / gesture / listen stay main-
+/// thread only). The class objects are process-global but what they hold is
+/// per thread (host_class.h), so a Worker realm installs its own. Pair with
+/// tickSoundMLAsync() from that thread's loop.
+void installSoundMLCompute();
+
 /// Pump the async jobs (background loads / transcriptions / syntheses):
 /// drains streamed tokens and steps to their JS callbacks and fires onDone /
 /// onReady for finished jobs. The host calls this once per frame on the
 /// thread that owns the realm; a headless advanceTime() counts as a frame.
 void tickSoundML();
+
+/// tickSoundML minus the listen tenants: only the calling thread's async
+/// jobs, which is all a Worker realm has. Per thread — a job's callbacks are
+/// Persistents of the realm that launched it and are delivered there.
+void tickSoundMLAsync();
 
 /// Cancel + join every in-flight job and release its rooted callbacks. Call
 /// at realm teardown, before the runtime and brotensor go away.

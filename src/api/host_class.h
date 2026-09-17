@@ -53,14 +53,27 @@ public:
     // handle from a Parakeet handle before it casts the payload.
     bool isInstance(Value val) const;
 
-    bool installed() const { return proto_ != nullptr; }
+    // Whether install() has run on the CALLING thread.
+    bool installed() const;
 
     Value prototype() const;
     Value constructor() const;
 
+    // The class objects are process-global (`HostClass g_whisperModelClass`),
+    // but what they hold is PER THREAD: bronze's runtime is per-thread, and
+    // a Persistent is a slot in its creating thread's registry, so a
+    // constructor made on the main thread means nothing to a Worker's realm.
+    // Every accessor reads the CALLING thread's slots and install() fills
+    // the calling thread's; a realm installs each class once, and
+    // installed() answers for the calling thread.
+    struct Slots {
+        ev::Persistent* proto = nullptr;
+        ev::Persistent* ctor = nullptr;
+    };
+
 private:
-    ev::Persistent* proto_ = nullptr;
-    ev::Persistent* ctor_ = nullptr;
+    Slots& slots() const;
+    const Slots* slotsIfAny() const;
 };
 
 Value hostArrayOf(size_t count, const std::function<Value(size_t)>& make);

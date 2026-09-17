@@ -70,6 +70,10 @@ void tickSoundML() {
     tickGesture();
 }
 
+void tickSoundMLAsync() {
+    tickAsyncJobs();
+}
+
 void shutdownSoundML() {
     shutdownAsyncJobs();
     // Tenants first (they detach from their streams — a scheduler barrier —
@@ -82,7 +86,12 @@ void shutdownSoundML() {
     shutdownListenHost();
 }
 
-void installSoundML() {
+namespace {
+
+// The `bro` root of the calling thread's realm, created and registered when
+// the host has not published one, then the installers over it. `compute`
+// leaves out the listen tenants (api.h: installSoundMLCompute).
+void installSoundMLOnto(bool compute) {
     Value globalThisVal = ev::undefined();
     auto gt = ev::globalValue("globalThis");
     if (gt.found && ev::isObject(gt.value)) {
@@ -111,22 +120,34 @@ void installSoundML() {
 
     installAsyncHandleClass();
 
-    // Mount the 9 audio/voice AI subsystems onto bro
+    // Mount the audio/voice AI subsystems onto bro
     installStt(bro);
     installTts(bro);
     installDiar(bro);
     installRave(bro);
-    installWake(bro);
-    installKws(bro);
-    installSense(bro);
-    installGesture(bro);
-    installListen(bro);
+    if (!compute) {
+        installWake(bro);
+        installKws(bro);
+        installSense(bro);
+        installGesture(bro);
+        installListen(bro);
+    }
 
     // Keep updated bro global
     ev::registerGlobal("bro", bro.get());
     if (!ev::isUndefined(globalRoot.get())) {
         ev::setProperty(globalRoot.get(), "bro", bro.get());
     }
+}
+
+}  // namespace
+
+void installSoundML() {
+    installSoundMLOnto(/*compute=*/false);
+}
+
+void installSoundMLCompute() {
+    installSoundMLOnto(/*compute=*/true);
 }
 
 } // namespace brosoundml::api
