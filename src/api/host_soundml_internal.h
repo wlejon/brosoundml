@@ -546,5 +546,9 @@ void installKws(ObjectBuilder& bro);
 void installSense(ObjectBuilder& bro);
 void installGesture(ObjectBuilder& bro);
 void installListen(ObjectBuilder& bro);
+void installVoiceAgent(ObjectBuilder& bro);
+
+extern HostClass g_voiceAgentClass;
+extern HostClass g_bcResnet2dClass;
 
 } // namespace brosoundml::api

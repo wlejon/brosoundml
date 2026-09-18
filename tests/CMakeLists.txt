@@ -165,4 +165,37 @@ if(BROSOUNDML_ENABLE_API)
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api>;$ENV{PATH}")
         endif()
     endif()
+
+    add_executable(test_voice_agent_api test_voice_agent_api.cpp)
+    target_include_directories(test_voice_agent_api PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
+    )
+    target_link_libraries(test_voice_agent_api PRIVATE
+        brosoundml_api
+        bronze_runtime_shared
+    )
+    if(MSVC)
+        target_compile_options(test_voice_agent_api PRIVATE /W4)
+    else()
+        target_compile_options(test_voice_agent_api PRIVATE -Wall -Wextra)
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET test_voice_agent_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:test_voice_agent_api>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_LINKER_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:test_voice_agent_api>
+        )
+    endif()
+    if(NOT BRASS_HOST_BACKEND)
+        message(STATUS "brosoundml: test_voice_agent_api not registered (brass has no code generator for this target)")
+    else()
+        add_test(NAME test_voice_agent_api COMMAND test_voice_agent_api)
+        if(WIN32)
+            set_tests_properties(test_voice_agent_api PROPERTIES
+                ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:test_voice_agent_api>;$ENV{PATH}")
+        endif()
+    endif()
 endif()

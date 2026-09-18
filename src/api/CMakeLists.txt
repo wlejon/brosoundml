@@ -21,6 +21,7 @@ set(BROSOUNDML_API_SOURCES
     native_soundml_sense.cpp
     native_soundml_gesture.cpp
     native_soundml_listen.cpp
+    native_soundml_voice_agent.cpp
 )
 
 add_library(brosoundml_api STATIC
