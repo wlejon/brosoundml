@@ -31,6 +31,8 @@ struct HostVoiceAgent {
     ev::Persistent textHandlerCb;
     ev::Persistent sttHandlerCb;
     ev::Persistent ttsHandlerCb;
+    ev::Persistent tokenizerCb;
+    ev::Persistent phonemizerCb;
 };
 
 namespace {
@@ -178,6 +180,62 @@ void attachTtsHandler(HostVoiceAgent* h, Value fn) {
     }
 }
 
+void attachTokenizer(HostVoiceAgent* h, Value fn) {
+    if (ev::isUndefined(fn) || ev::isNull(fn)) {
+        h->tokenizerCb = ev::Persistent();
+        h->agent->set_stt_tokenizer(nullptr);
+    } else if (g_whisperTokenizerClass.isInstance(fn)) {
+        h->tokenizerCb = ev::Persistent(fn);
+        auto* wt = static_cast<HostWhisperTokenizer*>(g_whisperTokenizerClass.unwrap(fn));
+        if (wt && wt->tok) {
+            auto* tok = wt->tok.get();
+            h->agent->set_stt_tokenizer([tok](const std::vector<int32_t>& ids) {
+                return tok->decode(ids, /*skip_special=*/true);
+            });
+        }
+    } else if (g_parakeetTokenizerClass.isInstance(fn)) {
+        h->tokenizerCb = ev::Persistent(fn);
+        auto* pt = static_cast<HostParakeetTokenizer*>(g_parakeetTokenizerClass.unwrap(fn));
+        if (pt && pt->tok) {
+            auto* tok = pt->tok.get();
+            h->agent->set_stt_tokenizer([tok](const std::vector<int32_t>& ids) {
+                return tok->decode(ids);
+            });
+        }
+    } else if (ev::isFunction(fn)) {
+        h->tokenizerCb = ev::Persistent(fn);
+        h->agent->set_stt_tokenizer([h](const std::vector<int32_t>& ids) -> std::string {
+            if (!ev::isFunction(h->tokenizerCb.get())) return "";
+            Value a0 = makeInt32Array(ids);
+            ev::CallResult r = ev::call(h->tokenizerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+            if (!r.thrown && ev::isString(r.value)) {
+                return ev::toUtf8(r.value);
+            }
+            return "";
+        });
+    }
+}
+
+void attachPhonemizer(HostVoiceAgent* h, Value fn) {
+    if (ev::isUndefined(fn) || ev::isNull(fn)) {
+        h->phonemizerCb = ev::Persistent();
+        h->agent->set_phonemizer(VoiceAgent::PhonemeHandler{});
+        h->agent->set_phonemizer(std::shared_ptr<g2p::Phonemizer>{});
+    } else if (ev::isFunction(fn)) {
+        h->phonemizerCb = ev::Persistent(fn);
+        h->agent->set_phonemizer([h](const std::string& text) -> std::vector<int32_t> {
+            if (!ev::isFunction(h->phonemizerCb.get())) return {};
+            Value a0 = ev::fromUtf8(text);
+            ev::CallResult r = ev::call(h->phonemizerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+            if (!r.thrown && ev::isTypedArray(r.value)) {
+                bool ok = false;
+                return readInt32Array(r.value, &ok);
+            }
+            return {};
+        });
+    }
+}
+
 Value createVoiceAgentInstance(std::span<const Value> a) {
     VoiceAgentConfig cfg;
     if (!a.empty() && ev::isObject(a[0])) {
@@ -228,6 +286,9 @@ Value createVoiceAgentInstance(std::span<const Value> a) {
         if (hasProperty(opts, "sttHandler")) attachSttHandler(rawHost, ev::getProperty(opts, "sttHandler"));
         if (hasProperty(opts, "textHandler")) attachTextHandler(rawHost, ev::getProperty(opts, "textHandler"));
         if (hasProperty(opts, "ttsHandler")) attachTtsHandler(rawHost, ev::getProperty(opts, "ttsHandler"));
+        if (hasProperty(opts, "tokenizer")) attachTokenizer(rawHost, ev::getProperty(opts, "tokenizer"));
+        if (hasProperty(opts, "sttTokenizer")) attachTokenizer(rawHost, ev::getProperty(opts, "sttTokenizer"));
+        if (hasProperty(opts, "phonemizer")) attachPhonemizer(rawHost, ev::getProperty(opts, "phonemizer"));
     }
 
     return g_voiceAgentClass.createInstance(std::move(host));
@@ -393,7 +454,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         return ev::throwTypeError("setVad(vadModel): valid BcResnet2d model required");
     });
 
-    b.def("setWhisper", 1, [](Value self, std::span<const Value> a) -> Value {
+    b.def("setWhisper", 2, [](Value self, std::span<const Value> a) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("setWhisper: not a VoiceAgent");
         if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
@@ -401,32 +462,63 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             return self;
         }
         Value wVal = a[0];
+        std::shared_ptr<Whisper> whisper;
         if (g_whisperModelClass.isInstance(wVal)) {
             auto* wm = static_cast<HostWhisperModel*>(g_whisperModelClass.unwrap(wVal));
-            if (wm && wm->model) {
-                h->agent->set_whisper(wm->model);
-                return self;
-            }
-        }
-        if (g_whisperSessionClass.isInstance(wVal)) {
+            if (wm && wm->model) whisper = wm->model;
+        } else if (g_whisperSessionClass.isInstance(wVal)) {
             auto* ws = static_cast<HostWhisperSession*>(g_whisperSessionClass.unwrap(wVal));
-            if (ws && ws->model) {
-                h->agent->set_whisper(ws->model);
-                return self;
+            if (ws && ws->model) whisper = ws->model;
+        } else {
+            void* ptr = ev::handleData(wVal);
+            if (ptr) {
+                auto* wm = static_cast<HostWhisperModel*>(ptr);
+                if (wm && wm->model) whisper = wm->model;
             }
         }
-        void* ptr = ev::handleData(wVal);
-        if (ptr) {
-            auto* wm = static_cast<HostWhisperModel*>(ptr);
-            if (wm && wm->model) {
-                h->agent->set_whisper(wm->model);
-                return self;
-            }
+        if (!whisper) {
+            return ev::throwTypeError("setWhisper(whisperModel): valid WhisperModel required");
         }
-        return ev::throwTypeError("setWhisper(whisperModel): valid WhisperModel required");
+        h->agent->set_whisper(std::move(whisper));
+        if (a.size() > 1 && !ev::isUndefined(a[1]) && !ev::isNull(a[1])) {
+            attachTokenizer(h, a[1]);
+        }
+        return self;
     });
 
-    b.def("setKokoro", 2, [](Value self, std::span<const Value> a) -> Value {
+    b.def("setParakeet", 2, [](Value self, std::span<const Value> a) -> Value {
+        auto* h = agentSelf(self);
+        if (!h || !h->agent) return ev::throwTypeError("setParakeet: not a VoiceAgent");
+        if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
+            h->agent->set_parakeet(nullptr);
+            return self;
+        }
+        Value pVal = a[0];
+        std::shared_ptr<Parakeet> parakeet;
+        if (g_parakeetModelClass.isInstance(pVal)) {
+            auto* pm = static_cast<HostParakeetModel*>(g_parakeetModelClass.unwrap(pVal));
+            if (pm && pm->model) parakeet = pm->model;
+        } else if (g_parakeetSessionClass.isInstance(pVal)) {
+            auto* ps = static_cast<HostParakeetSession*>(g_parakeetSessionClass.unwrap(pVal));
+            if (ps && ps->model) parakeet = ps->model;
+        } else {
+            void* ptr = ev::handleData(pVal);
+            if (ptr) {
+                auto* pm = static_cast<HostParakeetModel*>(ptr);
+                if (pm && pm->model) parakeet = pm->model;
+            }
+        }
+        if (!parakeet) {
+            return ev::throwTypeError("setParakeet(parakeetModel): valid ParakeetModel required");
+        }
+        h->agent->set_parakeet(std::move(parakeet));
+        if (a.size() > 1 && !ev::isUndefined(a[1]) && !ev::isNull(a[1])) {
+            attachTokenizer(h, a[1]);
+        }
+        return self;
+    });
+
+    b.def("setKokoro", 3, [](Value self, std::span<const Value> a) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("setKokoro: not a VoiceAgent");
         if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
@@ -466,6 +558,42 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             }
         }
         h->agent->set_kokoro(std::move(kokoro), std::move(voice));
+        if (a.size() > 2 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
+            attachPhonemizer(h, a[2]);
+        }
+        return self;
+    });
+
+    b.def("setTokenizer", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* h = agentSelf(self);
+        if (!h || !h->agent) return ev::throwTypeError("setTokenizer: not a VoiceAgent");
+        if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
+            attachTokenizer(h, ev::undefined());
+        } else {
+            attachTokenizer(h, a[0]);
+        }
+        return self;
+    });
+
+    b.def("setSttTokenizer", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* h = agentSelf(self);
+        if (!h || !h->agent) return ev::throwTypeError("setSttTokenizer: not a VoiceAgent");
+        if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
+            attachTokenizer(h, ev::undefined());
+        } else {
+            attachTokenizer(h, a[0]);
+        }
+        return self;
+    });
+
+    b.def("setPhonemizer", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* h = agentSelf(self);
+        if (!h || !h->agent) return ev::throwTypeError("setPhonemizer: not a VoiceAgent");
+        if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
+            attachPhonemizer(h, ev::undefined());
+        } else {
+            attachPhonemizer(h, a[0]);
+        }
         return self;
     });
 

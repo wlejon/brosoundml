@@ -16,6 +16,10 @@
 
 namespace brosoundml {
 
+namespace g2p {
+class Phonemizer;
+}
+
 // ─── VoiceAgentState ───────────────────────────────────────────────────────
 enum class VoiceAgentState {
     Idle,       // Waiting for user speech
@@ -81,6 +85,18 @@ public:
     void set_whisper(std::shared_ptr<Whisper> whisper);
     void set_parakeet(std::shared_ptr<Parakeet> parakeet);
     void set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice);
+
+    // Real token decoding and phonemizer handler types
+    using SttTokenizer = std::function<std::string(const std::vector<int32_t>& token_ids)>;
+    using PhonemeHandler = std::function<std::vector<int32_t>(const std::string& text)>;
+
+    void set_stt_tokenizer(SttTokenizer tokenizer);
+    void set_whisper(std::shared_ptr<Whisper> whisper, SttTokenizer tokenizer);
+    void set_parakeet(std::shared_ptr<Parakeet> parakeet, SttTokenizer tokenizer);
+    void set_phonemizer(PhonemeHandler phonemizer);
+    void set_phonemizer(std::shared_ptr<g2p::Phonemizer> phonemizer);
+    void set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice, PhonemeHandler phonemizer);
+    void set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice, std::shared_ptr<g2p::Phonemizer> phonemizer);
 
     // Custom injectable handlers (for mocking, custom LLM backends, or custom STT/TTS)
     using SttHandler = std::function<std::string(const AudioBuffer& utterance)>;

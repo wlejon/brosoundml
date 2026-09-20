@@ -1,5 +1,6 @@
 #include "brosoundml/voice_agent.h"
 #include "brosoundml/mel.h"
+#include "brosoundml/g2p/phonemizer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +32,11 @@ struct VoiceAgent::Impl {
     std::shared_ptr<Parakeet> parakeet;
     std::shared_ptr<Kokoro> kokoro;
     std::optional<Voice> voice;
+
+    // Attached Tokenizer and Phonemizer
+    SttTokenizer stt_tokenizer;
+    PhonemeHandler phoneme_handler;
+    std::shared_ptr<g2p::Phonemizer> phonemizer;
 
     // Custom Handlers
     SttHandler stt_handler;
@@ -89,14 +95,22 @@ struct VoiceAgent::Impl {
         if (stt_handler) {
             transcript = stt_handler(utterance);
         } else if (whisper) {
-            std::vector<int32_t> prompt = {whisper->config().decoder_start_token_id};
-            Whisper::Transcription res = whisper->transcribe(utterance, prompt);
-            transcript = "transcript_" + std::to_string(res.token_ids.size()) + "_tokens";
+            if (stt_tokenizer) {
+                std::vector<int32_t> prompt = {whisper->config().decoder_start_token_id};
+                Whisper::Transcription res = whisper->transcribe(utterance, prompt);
+                transcript = stt_tokenizer(res.token_ids);
+            } else {
+                transcript.clear();
+            }
         } else if (parakeet) {
-            Parakeet::Transcription res = parakeet->transcribe(utterance);
-            transcript = "transcript_" + std::to_string(res.token_ids.size()) + "_tokens";
+            if (stt_tokenizer) {
+                Parakeet::Transcription res = parakeet->transcribe(utterance);
+                transcript = stt_tokenizer(res.token_ids);
+            } else {
+                transcript.clear();
+            }
         } else {
-            transcript = "user utterance (" + std::to_string(utterance.samples.size()) + " samples)";
+            transcript.clear();
         }
 
         if (transcript.empty()) {
@@ -138,18 +152,25 @@ struct VoiceAgent::Impl {
                     on_audio_output_cb(chunk);
                 }
             });
-        } else if (kokoro && voice.has_value()) {
-            std::vector<int32_t> phoneme_tokens = {1, 2, 3};
-            AudioBuffer audio = kokoro->synthesize(phoneme_tokens, *voice);
-            if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
-                on_audio_output_cb(audio);
-            }
         } else {
-            AudioBuffer dummy;
-            dummy.sample_rate = config.tts_sample_rate;
-            dummy.samples.assign(4800, 0.05f);
-            if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
-                on_audio_output_cb(dummy);
+            std::vector<int32_t> phoneme_tokens;
+            if (phoneme_handler) {
+                phoneme_tokens = phoneme_handler(text);
+            } else if (phonemizer) {
+                phoneme_tokens = phonemizer->phonemize(text);
+            }
+
+            if (kokoro && voice.has_value() && !phoneme_tokens.empty()) {
+                AudioBuffer audio = kokoro->synthesize(phoneme_tokens, *voice);
+                if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
+                    on_audio_output_cb(audio);
+                }
+            } else {
+                AudioBuffer empty;
+                empty.sample_rate = config.tts_sample_rate;
+                if (state == VoiceAgentState::Speaking && on_audio_output_cb) {
+                    on_audio_output_cb(empty);
+                }
             }
         }
 
@@ -175,17 +196,51 @@ void VoiceAgent::set_vad_model(std::shared_ptr<const BcResnet2d> vad_model) {
     }
 }
 
+void VoiceAgent::set_stt_tokenizer(SttTokenizer tokenizer) {
+    impl_->stt_tokenizer = std::move(tokenizer);
+}
+
 void VoiceAgent::set_whisper(std::shared_ptr<Whisper> whisper) {
     impl_->whisper = std::move(whisper);
+}
+
+void VoiceAgent::set_whisper(std::shared_ptr<Whisper> whisper, SttTokenizer tokenizer) {
+    impl_->whisper = std::move(whisper);
+    impl_->stt_tokenizer = std::move(tokenizer);
 }
 
 void VoiceAgent::set_parakeet(std::shared_ptr<Parakeet> parakeet) {
     impl_->parakeet = std::move(parakeet);
 }
 
+void VoiceAgent::set_parakeet(std::shared_ptr<Parakeet> parakeet, SttTokenizer tokenizer) {
+    impl_->parakeet = std::move(parakeet);
+    impl_->stt_tokenizer = std::move(tokenizer);
+}
+
+void VoiceAgent::set_phonemizer(PhonemeHandler phonemizer) {
+    impl_->phoneme_handler = std::move(phonemizer);
+}
+
+void VoiceAgent::set_phonemizer(std::shared_ptr<g2p::Phonemizer> phonemizer) {
+    impl_->phonemizer = std::move(phonemizer);
+}
+
 void VoiceAgent::set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice) {
     impl_->kokoro = std::move(kokoro);
     impl_->voice = std::move(voice);
+}
+
+void VoiceAgent::set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice, PhonemeHandler phonemizer) {
+    impl_->kokoro = std::move(kokoro);
+    impl_->voice = std::move(voice);
+    impl_->phoneme_handler = std::move(phonemizer);
+}
+
+void VoiceAgent::set_kokoro(std::shared_ptr<Kokoro> kokoro, Voice voice, std::shared_ptr<g2p::Phonemizer> phonemizer) {
+    impl_->kokoro = std::move(kokoro);
+    impl_->voice = std::move(voice);
+    impl_->phonemizer = std::move(phonemizer);
 }
 
 void VoiceAgent::set_stt_handler(SttHandler handler) {

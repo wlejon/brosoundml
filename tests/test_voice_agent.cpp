@@ -162,13 +162,17 @@ int main() {
     {
         brosoundml::VoiceAgent agent;
         bool output_received = false;
+        bool samples_are_clean = false;
 
-        agent.on_audio_output([&](const brosoundml::AudioBuffer&) {
+        agent.on_audio_output([&](const brosoundml::AudioBuffer& chunk) {
             output_received = true;
+            // Clean empty output rather than flat DC offset buffer (0.05f)
+            samples_are_clean = chunk.samples.empty();
         });
 
         agent.speak("Test direct speech");
         CHECK(output_received, "Default TTS emitted audio chunk");
+        CHECK(samples_are_clean, "Default TTS with no Kokoro produces clean empty output without DC offset");
         CHECK(agent.is_idle(), "Returned to idle after speech");
 
         agent.speak("Another speech");
@@ -197,6 +201,54 @@ int main() {
         auto audio_chunk = make_sine_chunk(320, 300.0f, 0.2f);
         agent.feed(audio_chunk.data(), static_cast<int>(audio_chunk.size()));
         CHECK(agent.last_energy() > 0.01f, "Energy computed from audio");
+    }
+
+    // ── Test 6: Real token decoding and phonemizer integration ──
+    {
+        brosoundml::VoiceAgentConfig cfg;
+        cfg.sample_rate = 16000;
+        cfg.vad_energy_threshold = 0.01f;
+        cfg.min_speech_frames = 2;
+        cfg.silence_hangover_frames = 4;
+        brosoundml::VoiceAgent agent(cfg);
+
+        // 1. Without STT model or tokenizer, no fake transcript is emitted
+        bool transcript_emitted = false;
+        agent.on_transcript([&](const std::string&) {
+            transcript_emitted = true;
+        });
+
+        auto speech_chunk = make_sine_chunk(480, 440.0f, 0.5f);
+        for (int i = 0; i < 5; ++i) {
+            agent.feed(speech_chunk.data(), static_cast<int>(speech_chunk.size()));
+        }
+        auto silence_chunk = make_sine_chunk(160, 0.0f, 0.0f);
+        for (int i = 0; i < 10; ++i) {
+            agent.feed(silence_chunk.data(), static_cast<int>(silence_chunk.size()));
+        }
+
+        CHECK(!transcript_emitted, "Without STT model or tokenizer, no fake transcript is emitted");
+        CHECK(agent.is_idle(), "Agent returns to idle cleanly when transcript is empty");
+
+        // 2. Real STT tokenizer decoding
+        bool tokenizer_called = false;
+        agent.set_stt_tokenizer([&](const std::vector<int32_t>& tokens) -> std::string {
+            tokenizer_called = true;
+            CHECK(!tokens.empty(), "Tokenizer received tokens");
+            return "real recognized command";
+        });
+
+        // 3. Real phonemizer
+        bool phonemizer_called = false;
+        agent.set_phonemizer([&](const std::string& text) -> std::vector<int32_t> {
+            phonemizer_called = true;
+            CHECK(text == "Hello world test", "Phonemizer received real text");
+            return {12, 34, 56};
+        });
+
+        agent.speak("Hello world test");
+        CHECK(phonemizer_called, "Real phonemizer called with real text");
+        CHECK(agent.is_idle(), "Agent returns to idle after speaking");
     }
 
     if (failures == 0) {
