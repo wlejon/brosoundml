@@ -8,6 +8,7 @@
 #include "brosoundml/bc_resnet2d.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,7 +34,7 @@ struct VoiceAgentEvent {
         AudioOutput,
         BargeIn
     };
-    Type type = Type::StateChanged;
+    Type type;
     VoiceAgentState oldState = VoiceAgentState::Idle;
     VoiceAgentState newState = VoiceAgentState::Idle;
     std::vector<float> samples;
@@ -61,7 +62,7 @@ struct VoiceAgentEventQueue {
 
 struct HostVoiceAgent {
     std::unique_ptr<VoiceAgent> agent;
-    std::thread::id mainThreadId;
+    std::atomic<std::thread::id> ownerThreadId;
     VoiceAgentEventQueue eventQueue;
 
     ev::Persistent onStateChangedCb;
@@ -114,7 +115,7 @@ inline const char* voiceAgentStateToJs(VoiceAgentState s) {
 
 }  // namespace
 
-HostVoiceAgent::HostVoiceAgent() : mainThreadId(std::this_thread::get_id()) {
+HostVoiceAgent::HostVoiceAgent() : ownerThreadId(std::this_thread::get_id()) {
     registerVoiceAgent(this);
 }
 
@@ -124,13 +125,15 @@ HostVoiceAgent::~HostVoiceAgent() {
 
 void HostVoiceAgent::queueEvent(VoiceAgentEvent ev) {
     eventQueue.push(std::move(ev));
-    if (std::this_thread::get_id() == mainThreadId) {
+    if (std::this_thread::get_id() == ownerThreadId.load(std::memory_order_relaxed)) {
         drainEvents();
     }
 }
 
 void HostVoiceAgent::drainEvents() {
-    if (std::this_thread::get_id() != mainThreadId) return;
+    auto cur = std::this_thread::get_id();
+    auto expected = ownerThreadId.load(std::memory_order_relaxed);
+    if (expected != std::thread::id{} && cur != expected) return;
     std::vector<VoiceAgentEvent> batch;
     eventQueue.drain(batch);
     for (auto& ev : batch) {
@@ -186,8 +189,11 @@ void tickVoiceAgent() {
         std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
         agents = g_activeVoiceAgents;
     }
+    const auto curThread = std::this_thread::get_id();
     for (auto* a : agents) {
-        a->drainEvents();
+        if (a->ownerThreadId.load(std::memory_order_relaxed) == curThread) {
+            a->drainEvents();
+        }
     }
 }
 
@@ -517,6 +523,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
     b.def("pump", 0, [](Value self, std::span<const Value>) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("pump: not a VoiceAgent");
+        h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
         h->drainEvents();
         return ev::undefined();
     });
@@ -525,6 +532,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("feed: not a VoiceAgent");
         if (a.empty()) return ev::throwTypeError("feed(samples): samples required");
+        h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
         if (ev::isTypedArray(a[0])) {
             auto info = ev::typedArrayInfo(a[0]);
             if (info.data && info.elementKind == ev::elements::Float32) {
@@ -555,6 +563,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("speak: not a VoiceAgent");
         if (!isStringArg(a, 0)) return ev::throwTypeError("speak(text): text required");
+        h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
         h->agent->speak(strAt(a, 0));
         h->drainEvents();
         return ev::undefined();
@@ -563,6 +572,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
     b.def("interrupt", 0, [](Value self, std::span<const Value>) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("interrupt: not a VoiceAgent");
+        h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
         h->agent->interrupt();
         h->drainEvents();
         return ev::undefined();
@@ -571,6 +581,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
     b.def("reset", 0, [](Value self, std::span<const Value>) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("reset: not a VoiceAgent");
+        h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
         h->agent->reset();
         h->drainEvents();
         return ev::undefined();
