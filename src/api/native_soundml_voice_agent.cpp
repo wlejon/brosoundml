@@ -1,13 +1,17 @@
 #include "host_soundml_internal.h"
 #include "soundml_stt_internal.h"
 #include "soundml_tts_internal.h"
+#include "soundml_listen_internal.h"
 #include "brosoundml/voice_agent.h"
 #include "brosoundml/whisper.h"
 #include "brosoundml/kokoro.h"
 #include "brosoundml/bc_resnet2d.h"
 
+#include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace brosoundml::api {
@@ -19,8 +23,47 @@ struct HostBcResnet2d {
     std::shared_ptr<const BcResnet2d> model;
 };
 
+struct VoiceAgentEvent {
+    enum class Type {
+        StateChanged,
+        SpeechStart,
+        SpeechEnd,
+        Transcript,
+        ResponseText,
+        AudioOutput,
+        BargeIn
+    };
+    Type type = Type::StateChanged;
+    VoiceAgentState oldState = VoiceAgentState::Idle;
+    VoiceAgentState newState = VoiceAgentState::Idle;
+    std::vector<float> samples;
+    std::string text;
+};
+
+struct VoiceAgentEventQueue {
+    static constexpr size_t kCapacity = 512;
+    std::mutex mtx;
+    std::vector<VoiceAgentEvent> events;
+
+    void push(VoiceAgentEvent ev) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (events.size() < kCapacity) {
+            events.push_back(std::move(ev));
+        }
+    }
+
+    void drain(std::vector<VoiceAgentEvent>& out) {
+        std::lock_guard<std::mutex> lock(mtx);
+        out.swap(events);
+        events.clear();
+    }
+};
+
 struct HostVoiceAgent {
     std::unique_ptr<VoiceAgent> agent;
+    std::thread::id mainThreadId;
+    VoiceAgentEventQueue eventQueue;
+
     ev::Persistent onStateChangedCb;
     ev::Persistent onSpeechStartCb;
     ev::Persistent onSpeechEndCb;
@@ -33,13 +76,30 @@ struct HostVoiceAgent {
     ev::Persistent ttsHandlerCb;
     ev::Persistent tokenizerCb;
     ev::Persistent phonemizerCb;
+
+    HostVoiceAgent();
+    ~HostVoiceAgent();
+
+    void queueEvent(VoiceAgentEvent ev);
+    void drainEvents();
 };
 
 namespace {
 
-HostVoiceAgent* agentSelf(Value self) {
-    if (!g_voiceAgentClass.isInstance(self)) return nullptr;
-    return static_cast<HostVoiceAgent*>(g_voiceAgentClass.unwrap(self));
+std::mutex g_voiceAgentRegMtx;
+std::vector<HostVoiceAgent*> g_activeVoiceAgents;
+
+void registerVoiceAgent(HostVoiceAgent* h) {
+    std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
+    g_activeVoiceAgents.push_back(h);
+}
+
+void unregisterVoiceAgent(HostVoiceAgent* h) {
+    std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
+    auto it = std::find(g_activeVoiceAgents.begin(), g_activeVoiceAgents.end(), h);
+    if (it != g_activeVoiceAgents.end()) {
+        g_activeVoiceAgents.erase(it);
+    }
 }
 
 inline const char* voiceAgentStateToJs(VoiceAgentState s) {
@@ -52,53 +112,139 @@ inline const char* voiceAgentStateToJs(VoiceAgentState s) {
     return "unknown";
 }
 
+}  // namespace
+
+HostVoiceAgent::HostVoiceAgent() : mainThreadId(std::this_thread::get_id()) {
+    registerVoiceAgent(this);
+}
+
+HostVoiceAgent::~HostVoiceAgent() {
+    unregisterVoiceAgent(this);
+}
+
+void HostVoiceAgent::queueEvent(VoiceAgentEvent ev) {
+    eventQueue.push(std::move(ev));
+    if (std::this_thread::get_id() == mainThreadId) {
+        drainEvents();
+    }
+}
+
+void HostVoiceAgent::drainEvents() {
+    if (std::this_thread::get_id() != mainThreadId) return;
+    std::vector<VoiceAgentEvent> batch;
+    eventQueue.drain(batch);
+    for (auto& ev : batch) {
+        switch (ev.type) {
+            case VoiceAgentEvent::Type::StateChanged:
+                if (ev::isFunction(onStateChangedCb.get())) {
+                    Value a0 = ev::fromUtf8(voiceAgentStateToJs(ev.oldState));
+                    Value a1 = ev::fromUtf8(voiceAgentStateToJs(ev.newState));
+                    callCallback2(onStateChangedCb.get(), a0, a1);
+                }
+                break;
+            case VoiceAgentEvent::Type::SpeechStart:
+                if (ev::isFunction(onSpeechStartCb.get())) {
+                    callCallback(onSpeechStartCb.get(), {});
+                }
+                break;
+            case VoiceAgentEvent::Type::SpeechEnd:
+                if (ev::isFunction(onSpeechEndCb.get())) {
+                    Value a0 = makeFloat32Array(ev.samples);
+                    callCallback1(onSpeechEndCb.get(), a0);
+                }
+                break;
+            case VoiceAgentEvent::Type::Transcript:
+                if (ev::isFunction(onTranscriptCb.get())) {
+                    Value a0 = ev::fromUtf8(ev.text);
+                    callCallback1(onTranscriptCb.get(), a0);
+                }
+                break;
+            case VoiceAgentEvent::Type::ResponseText:
+                if (ev::isFunction(onResponseTextCb.get())) {
+                    Value a0 = ev::fromUtf8(ev.text);
+                    callCallback1(onResponseTextCb.get(), a0);
+                }
+                break;
+            case VoiceAgentEvent::Type::AudioOutput:
+                if (ev::isFunction(onAudioOutputCb.get())) {
+                    Value a0 = makeFloat32Array(ev.samples);
+                    callCallback1(onAudioOutputCb.get(), a0);
+                }
+                break;
+            case VoiceAgentEvent::Type::BargeIn:
+                if (ev::isFunction(onBargeInCb.get())) {
+                    callCallback(onBargeInCb.get(), {});
+                }
+                break;
+        }
+    }
+}
+
+void tickVoiceAgent() {
+    std::vector<HostVoiceAgent*> agents;
+    {
+        std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
+        agents = g_activeVoiceAgents;
+    }
+    for (auto* a : agents) {
+        a->drainEvents();
+    }
+}
+
+namespace {
+
+HostVoiceAgent* agentSelf(Value self) {
+    if (!g_voiceAgentClass.isInstance(self)) return nullptr;
+    return static_cast<HostVoiceAgent*>(g_voiceAgentClass.unwrap(self));
+}
+
 void wireAgentCallbacks(HostVoiceAgent* host) {
     host->agent->on_state_changed([host](VoiceAgentState old_s, VoiceAgentState new_s) {
-        if (ev::isFunction(host->onStateChangedCb.get())) {
-            Value a0 = ev::fromUtf8(voiceAgentStateToJs(old_s));
-            Value a1 = ev::fromUtf8(voiceAgentStateToJs(new_s));
-            callCallback2(host->onStateChangedCb.get(), a0, a1);
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::StateChanged;
+        ev.oldState = old_s;
+        ev.newState = new_s;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_speech_start([host]() {
-        if (ev::isFunction(host->onSpeechStartCb.get())) {
-            callCallback(host->onSpeechStartCb.get(), {});
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::SpeechStart;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_speech_end([host](const AudioBuffer& utterance) {
-        if (ev::isFunction(host->onSpeechEndCb.get())) {
-            Value a0 = makeFloat32Array(utterance.samples);
-            callCallback1(host->onSpeechEndCb.get(), a0);
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::SpeechEnd;
+        ev.samples = utterance.samples;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_transcript([host](const std::string& transcript) {
-        if (ev::isFunction(host->onTranscriptCb.get())) {
-            Value a0 = ev::fromUtf8(transcript);
-            callCallback1(host->onTranscriptCb.get(), a0);
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::Transcript;
+        ev.text = transcript;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_response_text([host](const std::string& responseText) {
-        if (ev::isFunction(host->onResponseTextCb.get())) {
-            Value a0 = ev::fromUtf8(responseText);
-            callCallback1(host->onResponseTextCb.get(), a0);
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::ResponseText;
+        ev.text = responseText;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_audio_output([host](const AudioBuffer& audio) {
-        if (ev::isFunction(host->onAudioOutputCb.get())) {
-            Value a0 = makeFloat32Array(audio.samples);
-            callCallback1(host->onAudioOutputCb.get(), a0);
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::AudioOutput;
+        ev.samples = audio.samples;
+        host->queueEvent(std::move(ev));
     });
 
     host->agent->on_barge_in([host]() {
-        if (ev::isFunction(host->onBargeInCb.get())) {
-            callCallback(host->onBargeInCb.get(), {});
-        }
+        VoiceAgentEvent ev;
+        ev.type = VoiceAgentEvent::Type::BargeIn;
+        host->queueEvent(std::move(ev));
     });
 }
 
@@ -368,6 +514,13 @@ void decorateVoiceAgent(ObjectBuilder& b) {
     });
 
     // ── Methods ──
+    b.def("pump", 0, [](Value self, std::span<const Value>) -> Value {
+        auto* h = agentSelf(self);
+        if (!h || !h->agent) return ev::throwTypeError("pump: not a VoiceAgent");
+        h->drainEvents();
+        return ev::undefined();
+    });
+
     b.def("feed", 1, [](Value self, std::span<const Value> a) -> Value {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("feed: not a VoiceAgent");
@@ -376,6 +529,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             auto info = ev::typedArrayInfo(a[0]);
             if (info.data && info.elementKind == ev::elements::Float32) {
                 h->agent->feed(reinterpret_cast<const float*>(info.data), static_cast<int>(info.elementCount));
+                h->drainEvents();
                 return ev::undefined();
             }
         }
@@ -385,6 +539,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             auto vec = readFloat32Array(samplesProp, &ok);
             if (ok) {
                 h->agent->feed(vec.data(), static_cast<int>(vec.size()));
+                h->drainEvents();
                 return ev::undefined();
             }
         }
@@ -392,6 +547,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         auto vec = readFloat32Array(a[0], &ok);
         if (!ok) return ev::throwTypeError("feed(samples): samples must be a Float32Array or number[]");
         h->agent->feed(vec.data(), static_cast<int>(vec.size()));
+        h->drainEvents();
         return ev::undefined();
     });
 
@@ -400,6 +556,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         if (!h || !h->agent) return ev::throwTypeError("speak: not a VoiceAgent");
         if (!isStringArg(a, 0)) return ev::throwTypeError("speak(text): text required");
         h->agent->speak(strAt(a, 0));
+        h->drainEvents();
         return ev::undefined();
     });
 
@@ -407,6 +564,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("interrupt: not a VoiceAgent");
         h->agent->interrupt();
+        h->drainEvents();
         return ev::undefined();
     });
 
@@ -414,6 +572,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         auto* h = agentSelf(self);
         if (!h || !h->agent) return ev::throwTypeError("reset: not a VoiceAgent");
         h->agent->reset();
+        h->drainEvents();
         return ev::undefined();
     });
 

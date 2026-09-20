@@ -68,6 +68,7 @@ void tickSoundML() {
     tickWake();
     tickKws();
     tickGesture();
+    tickVoiceAgent();
 }
 
 void tickSoundMLAsync() {

@@ -92,7 +92,7 @@ bool listenHostMicCapturing();
 // (audio flows / can be retained without any model attached). Returns
 // kInvalidStream if the source is unavailable (e.g. loopback unsupported, or
 // the target process is gone). Main thread only.
-StreamId listenHostOpen(const ListenSource& src);
+StreamId listenHostOpen(const ListenSource& src, std::string* outError = nullptr);
 
 // Close a stream: detach its members, stop its source, free its infra. Safe on
 // an unknown id. Main thread only.

@@ -189,6 +189,8 @@ target_sources(brosoundml PRIVATE
     src/audio.cpp
     src/modules.cpp
     src/kokoro_modules.cpp
+    src/kokoro_predictor.cpp
+    src/kokoro_generator.cpp
     src/kokoro.cpp
     src/decoder_lora.cpp
     src/kokoro_decoder_backward.cpp

@@ -35,6 +35,7 @@ Value makeGestureView(StreamId id);
 void tickWake();
 void tickKws();
 void tickGesture();
+void tickVoiceAgent();
 
 // Stop every tenant, release its rooted callbacks and drop its models. Runs
 // before the listen host itself shuts down.

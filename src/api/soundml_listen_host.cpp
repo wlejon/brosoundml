@@ -16,8 +16,16 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <signal.h>
+#endif
 
 namespace brosoundml::api {
 
@@ -146,6 +154,143 @@ struct Retention {
     }
 };
 
+#if defined(__linux__)
+class LinuxSystemLoopbackCapture {
+public:
+    ~LinuxSystemLoopbackCapture() { stop(); }
+
+    bool start(int targetRate, std::function<void(const float*, int)> cb, std::string& err) {
+        stop();
+        if (targetRate <= 0) targetRate = 16000;
+
+        int out_pipe[2] = {-1, -1};
+        int err_pipe[2] = {-1, -1};
+        if (::pipe(out_pipe) < 0 || ::pipe(err_pipe) < 0) {
+            err = "system loopback capture failed to create IPC pipes";
+            if (out_pipe[0] >= 0) { ::close(out_pipe[0]); ::close(out_pipe[1]); }
+            if (err_pipe[0] >= 0) { ::close(err_pipe[0]); ::close(err_pipe[1]); }
+            return false;
+        }
+
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            err = "system loopback capture failed to fork capture process";
+            ::close(out_pipe[0]); ::close(out_pipe[1]);
+            ::close(err_pipe[0]); ::close(err_pipe[1]);
+            return false;
+        }
+
+        if (pid == 0) {
+            ::close(out_pipe[0]);
+            ::close(err_pipe[0]);
+            ::dup2(out_pipe[1], STDOUT_FILENO);
+            ::dup2(err_pipe[1], STDERR_FILENO);
+            ::close(out_pipe[1]);
+            ::close(err_pipe[1]);
+
+            std::string rateStr = std::to_string(targetRate);
+            char* argv[] = {
+                const_cast<char*>("parec"),
+                const_cast<char*>("-d"),
+                const_cast<char*>("@DEFAULT_MONITOR@"),
+                const_cast<char*>("--rate"),
+                const_cast<char*>(rateStr.c_str()),
+                const_cast<char*>("--channels=1"),
+                const_cast<char*>("--format=float32le"),
+                const_cast<char*>("--raw"),
+                nullptr
+            };
+            ::execvp("parec", argv);
+
+            // If parec is not found, try pw-record
+            char* pwArgv[] = {
+                const_cast<char*>("pw-record"),
+                const_cast<char*>("--target"),
+                const_cast<char*>("@DEFAULT_MONITOR@"),
+                const_cast<char*>("--rate"),
+                const_cast<char*>(rateStr.c_str()),
+                const_cast<char*>("--channels=1"),
+                const_cast<char*>("--format=f32"),
+                const_cast<char*>("-a"),
+                const_cast<char*>("-"),
+                nullptr
+            };
+            ::execvp("pw-record", pwArgv);
+            ::_exit(127);
+        }
+
+        ::close(out_pipe[1]);
+        ::close(err_pipe[1]);
+
+        // Give the spawned process a brief moment to connect or fail fast
+        ::usleep(50000);
+        int status = 0;
+        pid_t res = ::waitpid(pid, &status, WNOHANG);
+        if (res == pid) {
+            char errBuf[512] = {0};
+            int n = static_cast<int>(::read(err_pipe[0], errBuf, sizeof(errBuf) - 1));
+            ::close(out_pipe[0]);
+            ::close(err_pipe[0]);
+
+            std::string msg = (n > 0) ? std::string(errBuf, n) : "";
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' ')) {
+                msg.pop_back();
+            }
+
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+                err = "audio capture tools ('parec' or 'pw-record') not found on system; install pulseaudio-utils or pipewire";
+            } else {
+                err = "connection to PulseAudio/PipeWire sound server failed: " +
+                      (msg.empty() ? "server not running or connection refused" : msg);
+            }
+            return false;
+        }
+
+        ::close(err_pipe[0]);
+        childPid = pid;
+        audioFd = out_pipe[0];
+        running.store(true, std::memory_order_release);
+
+        readerThread = std::thread([this, cb = std::move(cb)]() {
+            std::vector<float> buffer(512);
+            while (running.load(std::memory_order_relaxed)) {
+                ssize_t nBytes = ::read(audioFd, buffer.data(), buffer.size() * sizeof(float));
+                if (nBytes <= 0) break;
+                size_t numSamples = static_cast<size_t>(nBytes) / sizeof(float);
+                if (numSamples > 0) {
+                    cb(buffer.data(), static_cast<int>(numSamples));
+                }
+            }
+        });
+
+        return true;
+    }
+
+    void stop() {
+        if (!running.exchange(false, std::memory_order_acq_rel)) return;
+        if (childPid > 0) {
+            ::kill(childPid, SIGTERM);
+            int status = 0;
+            ::waitpid(childPid, &status, 0);
+            childPid = -1;
+        }
+        if (audioFd >= 0) {
+            ::close(audioFd);
+            audioFd = -1;
+        }
+        if (readerThread.joinable()) {
+            readerThread.join();
+        }
+    }
+
+private:
+    std::atomic<bool> running{false};
+    pid_t childPid = -1;
+    int audioFd = -1;
+    std::thread readerThread;
+};
+#endif
+
 constexpr std::uint32_t kInvalidPump = 0;
 
 // ── One independent listening pipeline ────────────────────────────────────────
@@ -162,6 +307,9 @@ struct ListenStream {
     std::uint32_t                              pumpId = kInvalidPump;
     broaudio::MicTapId     tapId  = broaudio::kInvalidMicTapId;          // mic source
     std::unique_ptr<broaudio::LoopbackCapture> loopback;                 // loopback source
+#if defined(__linux__)
+    std::unique_ptr<LinuxSystemLoopbackCapture> linuxLoopback;
+#endif
 
     // Members (main-thread copies used to build each generation's closure).
     std::shared_ptr<brosoundml::SensorHub>      hub;
@@ -219,24 +367,47 @@ struct ListenStream {
             if (!audio->isMicCapturing()) audio->startMicCapture();
             tapId = tap;
         } else {
-            // Render-side loopback. The capture runs its own thread and writes
-            // the same ring the mic tap would, downmixed + resampled to `rate`.
-            broaudio::LoopbackConfig cfg;
-            cfg.mode = (source.kind == ListenSource::Kind::SystemLoopback)
-                           ? broaudio::LoopbackMode::SystemOutput
-                       : source.exclude
-                           ? broaudio::LoopbackMode::ProcessExclude
-                           : broaudio::LoopbackMode::ProcessInclude;
-            cfg.pid        = source.pid;
-            cfg.targetRate = rate;
-            cfg.mono       = true;   // channel-select reserved (source.channel)
-            auto cap = std::make_unique<broaudio::LoopbackCapture>();
-            const bool ok = cap->start(
-                cfg, [ringRef](const float* s, int n) { ringRef->write(s, n); });
-            if (!ok) {
-                throw std::runtime_error("listen host: loopback start failed");
+            // Render-side loopback.
+#if defined(__linux__)
+            if (source.kind == ListenSource::Kind::ProcessLoopback) {
+                throw std::runtime_error("listen host: process-scoped loopback capture is not supported on Linux; use system loopback");
             }
-            loopback = std::move(cap);
+#endif
+            bool started = false;
+            if (broaudio::LoopbackCapture::isSupported()) {
+                broaudio::LoopbackConfig cfg;
+                cfg.mode = (source.kind == ListenSource::Kind::SystemLoopback)
+                               ? broaudio::LoopbackMode::SystemOutput
+                           : source.exclude
+                               ? broaudio::LoopbackMode::ProcessExclude
+                               : broaudio::LoopbackMode::ProcessInclude;
+                cfg.pid        = source.pid;
+                cfg.targetRate = rate;
+                cfg.mono       = true;   // channel-select reserved (source.channel)
+                auto cap = std::make_unique<broaudio::LoopbackCapture>();
+                if (cap->start(cfg, [ringRef](const float* s, int n) { ringRef->write(s, n); })) {
+                    loopback = std::move(cap);
+                    started = true;
+                }
+            }
+            if (!started) {
+#if defined(__linux__)
+                if (source.kind == ListenSource::Kind::SystemLoopback) {
+                    auto cap = std::make_unique<LinuxSystemLoopbackCapture>();
+                    std::string err;
+                    if (!cap->start(rate, [ringRef](const float* s, int n) { ringRef->write(s, n); }, err)) {
+                        throw std::runtime_error("listen host: system loopback capture failed on Linux: " +
+                                                 (err.empty() ? "audio server connection failed" : err));
+                    }
+                    linuxLoopback = std::move(cap);
+                    started = true;
+                } else {
+                    throw std::runtime_error("listen host: process-scoped loopback capture is not supported on Linux; use system loopback");
+                }
+#else
+                throw std::runtime_error("listen host: loopback capture start failed (unsupported on this platform)");
+#endif
+            }
         }
 
         bus  = std::move(newBus);
@@ -256,6 +427,9 @@ struct ListenStream {
         }
         tapId = broaudio::kInvalidMicTapId;
         if (loopback) { loopback->stop(); loopback.reset(); }
+#if defined(__linux__)
+        if (linuxLoopback) { linuxLoopback->stop(); linuxLoopback.reset(); }
+#endif
         removePumpIfAny();
         ring.reset();
         bus.reset();
@@ -412,10 +586,14 @@ bool listenHostMicCapturing() {
 
 // ─── Streams ───────────────────────────────────────────────────────────────
 
-StreamId listenHostOpen(const ListenSource& src) {
-    if (!audioEngine()) return kInvalidStream;
+StreamId listenHostOpen(const ListenSource& src, std::string* outError) {
+    if (!audioEngine()) {
+        if (outError) *outError = "audio engine not available";
+        return kInvalidStream;
+    }
     if (src.kind != ListenSource::Kind::Mic &&
-        !broaudio::LoopbackCapture::isSupported()) {
+        !listenHostLoopbackSupported()) {
+        if (outError) *outError = "loopback capture not supported on this platform";
         return kInvalidStream;
     }
     ListenStream* s = g_mgr.create(src, /*keepInfra*/ true);
@@ -424,6 +602,7 @@ StreamId listenHostOpen(const ListenSource& src) {
         s->rebuildPump();   // run the (member-less) feed so audio flows + retains
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[ERROR] [listen] open: %s\n", e.what());
+        if (outError) *outError = e.what();
         g_mgr.erase(s->id);
         return kInvalidStream;
     }
@@ -440,7 +619,11 @@ bool listenHostValid(StreamId id) { return g_mgr.find(id) != nullptr; }
 StreamId listenHostDefaultMicId() { return g_mgr.ensureDefaultMic()->id; }
 
 bool listenHostLoopbackSupported() {
+#if defined(__linux__)
+    return true;
+#else
     return broaudio::LoopbackCapture::isSupported();
+#endif
 }
 
 std::vector<broaudio::AudioProcess> listenHostEnumerateApps() {

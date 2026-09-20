@@ -298,6 +298,16 @@ int main() {
         if (!threw) throw new Error("speak with number should throw TypeError");
     )JS", "Model attachment and TypeError validations");
 
+    // ── Test 5: VoiceAgent pump() method and thread-safe dispatch ──
+    std::cout << "\n--- Test 5: VoiceAgent pump() Method ---" << std::endl;
+    runEval(R"JS(
+        const agent5 = new bro.soundml.VoiceAgent();
+        if (typeof agent5.pump !== 'function') {
+            throw new Error("VoiceAgent.prototype.pump must be a function");
+        }
+        agent5.pump();
+    )JS", "VoiceAgent pump() verification");
+
     brosoundml::api::shutdownSoundML();
 
     if (g_failures > 0) {

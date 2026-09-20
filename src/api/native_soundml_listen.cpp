@@ -211,11 +211,16 @@ Value jsOpen(Value, std::span<const Value> a) {
     if (!listenHostAudioAvailable())
         return ev::throwError("bro.listen.open: audio engine not available");
 
-    const StreamId id = listenHostOpen(src);
-    if (id == kInvalidStream)
+    std::string openErr;
+    const StreamId id = listenHostOpen(src, &openErr);
+    if (id == kInvalidStream) {
+        if (!openErr.empty()) {
+            return ev::throwError("bro.listen.open: " + openErr);
+        }
         return ev::throwError(
             "bro.listen.open: could not open the stream (source unavailable, "
             "or the audio subsystem is not ready)");
+    }
 
     auto* h = new StreamHandle{id, src.kind};
     ObjectBuilder wrapper(g_streamClass.make(

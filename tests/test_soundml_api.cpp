@@ -130,6 +130,22 @@ int main() {
         expectClassNotConstructible(rave, "Rave");
     }
 
+    // ── bro.listen ─────────────────────────────────────────────────────────
+    {
+        ev::Value listen = ns(bro, "listen");
+        ev::Value supFn = ev::getProperty(listen, "supported");
+        check(ev::isFunction(supFn), "bro.listen.supported is a function");
+        if (ev::isFunction(supFn)) {
+            ev::CallResult r = ev::call(supFn, listen, {});
+            check(!r.thrown && ev::isBool(r.value), "bro.listen.supported() returns bool");
+#if defined(__linux__)
+            check(ev::toBool(r.value) == true, "bro.listen.supported() is true on Linux");
+#endif
+        }
+        ev::Value notSource[] = {ev::fromDouble(1234)};
+        expectThrows(listen, "open", notSource, "TypeError", "source must be a string or an object");
+    }
+
     brosoundml::api::shutdownSoundML();
 
     if (g_failures) {
