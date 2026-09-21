@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,13 +34,16 @@ struct VoiceAgentEvent {
         Transcript,
         ResponseText,
         AudioOutput,
-        BargeIn
+        BargeIn,
+        SttRequest,
+        TextRequest
     };
     Type type;
     VoiceAgentState oldState = VoiceAgentState::Idle;
     VoiceAgentState newState = VoiceAgentState::Idle;
     std::vector<float> samples;
     std::string text;
+    std::shared_ptr<std::promise<std::string>> promise;
 };
 
 struct VoiceAgentEventQueue {
@@ -50,6 +55,8 @@ struct VoiceAgentEventQueue {
         std::lock_guard<std::mutex> lock(mtx);
         if (events.size() < kCapacity) {
             events.push_back(std::move(ev));
+        } else if (ev.promise) {
+            try { ev.promise->set_value(""); } catch (...) {}
         }
     }
 
@@ -121,6 +128,13 @@ HostVoiceAgent::HostVoiceAgent() : ownerThreadId(std::this_thread::get_id()) {
 
 HostVoiceAgent::~HostVoiceAgent() {
     unregisterVoiceAgent(this);
+    std::vector<VoiceAgentEvent> batch;
+    eventQueue.drain(batch);
+    for (auto& ev : batch) {
+        if (ev.promise) {
+            try { ev.promise->set_value(""); } catch (...) {}
+        }
+    }
 }
 
 void HostVoiceAgent::queueEvent(VoiceAgentEvent ev) {
@@ -177,6 +191,32 @@ void HostVoiceAgent::drainEvents() {
             case VoiceAgentEvent::Type::BargeIn:
                 if (ev::isFunction(onBargeInCb.get())) {
                     callCallback(onBargeInCb.get(), {});
+                }
+                break;
+            case VoiceAgentEvent::Type::SttRequest:
+                if (ev.promise) {
+                    std::string result;
+                    if (ev::isFunction(sttHandlerCb.get())) {
+                        Value a0 = makeFloat32Array(ev.samples);
+                        ev::CallResult r = ev::call(sttHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                        if (!r.thrown && ev::isString(r.value)) {
+                            result = ev::toUtf8(r.value);
+                        }
+                    }
+                    try { ev.promise->set_value(std::move(result)); } catch (...) {}
+                }
+                break;
+            case VoiceAgentEvent::Type::TextRequest:
+                if (ev.promise) {
+                    std::string result;
+                    if (ev::isFunction(textHandlerCb.get())) {
+                        Value a0 = ev::fromUtf8(ev.text);
+                        ev::CallResult r = ev::call(textHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                        if (!r.thrown && ev::isString(r.value)) {
+                            result = ev::toUtf8(r.value);
+                        }
+                    }
+                    try { ev.promise->set_value(std::move(result)); } catch (...) {}
                 }
                 break;
         }
@@ -261,11 +301,24 @@ void attachSttHandler(HostVoiceAgent* h, Value fn) {
     } else if (ev::isFunction(fn)) {
         h->sttHandlerCb = ev::Persistent(fn);
         h->agent->set_stt_handler([h](const AudioBuffer& utterance) -> std::string {
-            if (!ev::isFunction(h->sttHandlerCb.get())) return "";
-            Value a0 = makeFloat32Array(utterance.samples);
-            ev::CallResult r = ev::call(h->sttHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
-            if (!r.thrown && ev::isString(r.value)) {
-                return ev::toUtf8(r.value);
+            if (std::this_thread::get_id() == h->ownerThreadId.load(std::memory_order_relaxed)) {
+                if (!ev::isFunction(h->sttHandlerCb.get())) return "";
+                Value a0 = makeFloat32Array(utterance.samples);
+                ev::CallResult r = ev::call(h->sttHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                if (!r.thrown && ev::isString(r.value)) {
+                    return ev::toUtf8(r.value);
+                }
+                return "";
+            }
+            auto promise = std::make_shared<std::promise<std::string>>();
+            auto future = promise->get_future();
+            VoiceAgentEvent ev;
+            ev.type = VoiceAgentEvent::Type::SttRequest;
+            ev.samples = utterance.samples;
+            ev.promise = promise;
+            h->queueEvent(std::move(ev));
+            if (future.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+                return future.get();
             }
             return "";
         });
@@ -279,11 +332,24 @@ void attachTextHandler(HostVoiceAgent* h, Value fn) {
     } else if (ev::isFunction(fn)) {
         h->textHandlerCb = ev::Persistent(fn);
         h->agent->set_text_handler([h](const std::string& query) -> std::string {
-            if (!ev::isFunction(h->textHandlerCb.get())) return "";
-            Value a0 = ev::fromUtf8(query);
-            ev::CallResult r = ev::call(h->textHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
-            if (!r.thrown && ev::isString(r.value)) {
-                return ev::toUtf8(r.value);
+            if (std::this_thread::get_id() == h->ownerThreadId.load(std::memory_order_relaxed)) {
+                if (!ev::isFunction(h->textHandlerCb.get())) return "";
+                Value a0 = ev::fromUtf8(query);
+                ev::CallResult r = ev::call(h->textHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                if (!r.thrown && ev::isString(r.value)) {
+                    return ev::toUtf8(r.value);
+                }
+                return "";
+            }
+            auto promise = std::make_shared<std::promise<std::string>>();
+            auto future = promise->get_future();
+            VoiceAgentEvent ev;
+            ev.type = VoiceAgentEvent::Type::TextRequest;
+            ev.text = query;
+            ev.promise = promise;
+            h->queueEvent(std::move(ev));
+            if (future.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+                return future.get();
             }
             return "";
         });
