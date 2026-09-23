@@ -12,7 +12,9 @@
 //   brosoundml_laya_audio_cache --align A.tsv --out C.lac
 //        [--model-dir weights/qwen-asr/0.6B] [--window 3.0]
 //        [--per-utt 4] [--every 1] [--limit 0] [--seed 1]
-//        [--fp32] [--check N]
+//        [--fp32] [--check N] [--start U]
+// --start skips alignment rows before U (window utterance indices stay
+// absolute), so an alignment file still being appended can be cached in parts.
 // The encoder runs FP16 on the GPU unless --fp32; --check N compares the
 // first N windows against an FP32 encoder.
 
@@ -45,7 +47,7 @@ namespace {
 int main(int argc, char** argv) {
     std::string align, out, model_dir = "weights/qwen-asr/0.6B";
     float window_s = 3.0f;
-    int per_utt = 4, every = 1, limit = 0, check = 0;
+    int per_utt = 4, every = 1, limit = 0, check = 0, start = 0;
     bool half = true;
     uint32_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -62,6 +64,7 @@ int main(int argc, char** argv) {
         else if (a == "--every") every = std::max(1, std::atoi(next().c_str()));
         else if (a == "--limit") limit = std::atoi(next().c_str());
         else if (a == "--seed") seed = static_cast<uint32_t>(std::atoi(next().c_str()));
+        else if (a == "--start") start = std::atoi(next().c_str());
         else if (a == "--fp32") half = false;
         else if (a == "--check") check = std::atoi(next().c_str());
         else die("unknown argument " + a);
@@ -91,7 +94,7 @@ int main(int argc, char** argv) {
         int n_enc = 0, kept = 0;
         std::vector<float> host;
         for (std::size_t u = 0; u < utts.size(); ++u) {
-            if (u % static_cast<std::size_t>(every)) continue;
+            if (static_cast<int>(u) < start || u % static_cast<std::size_t>(every)) continue;
             if (limit > 0 && kept >= limit) break;
             ++kept;
             const std::vector<float> pcm = laya_audio::load_audio_16k(utts[u].wav);

@@ -360,12 +360,13 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(brosoundml_cluster_diarize PRIVATE brosoundml)
 
     # laya-audio: the audio front end for Laya (docs/laya-audio.md).
-    add_library(brosoundml_laya_audio_data STATIC tools/laya_audio_data.cpp)
+    add_library(brosoundml_laya_audio_data STATIC tools/laya_audio_data.cpp tools/laya_audio_task.cpp
+                tools/laya_audio_baselines.cpp tools/laya_audio_listener.cpp)
     target_link_libraries(brosoundml_laya_audio_data PUBLIC brosoundml)
-    add_executable(brosoundml_laya_audio_align tools/laya_audio_align.cpp)
-    target_link_libraries(brosoundml_laya_audio_align PRIVATE brosoundml_laya_audio_data)
-    add_executable(brosoundml_laya_audio_cache tools/laya_audio_cache.cpp)
-    target_link_libraries(brosoundml_laya_audio_cache PRIVATE brosoundml_laya_audio_data)
+    foreach(_la align cache train eval listen)
+        add_executable(brosoundml_laya_audio_${_la} tools/laya_audio_${_la}.cpp)
+        target_link_libraries(brosoundml_laya_audio_${_la} PRIVATE brosoundml_laya_audio_data)
+    endforeach()
 endif()
 
 # --- Standalone Bronze JavaScript API ---
