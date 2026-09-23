@@ -13,8 +13,8 @@
 # from test speakers. The random bucket assignment over one eligible pool
 # keeps word frequency from confounding the examples-per-word curve.
 #
-# Only the chosen clips are extracted while the shards stream past (the
-# shards are alphabetical by word, so all of them are read).
+# Only the chosen clips are extracted while the language archive streams
+# past; the archive itself is never stored.
 #
 # Usage: fetch_mswc.sh LANG WORDS_PER_BUCKET "BUCKETS" UNSEEN TEST_PER [DEST=D:/datasets/mswc]
 #   e.g. fetch_mswc.sh en 150 "1 2 4 8 16 32 64 128 256" 150 8
@@ -25,22 +25,24 @@ BUCKETS=$3
 UNSEEN=$4
 TEST_PER=$5
 DEST=${6:-D:/datasets/mswc}
-HF=https://huggingface.co/datasets/MLCommons/ml_spoken_words/resolve/main/data
+# The original release (MLCommons' bucket): audio/<lang>.tar.gz holds
+# <lang>/clips/<word>/<clip>.opus; splits/<lang>.tar.gz the split CSVs.
+GCS=https://storage.googleapis.com/public-datasets-mswc
 D=$DEST/$LANG_
 mkdir -p "$D/clips" "$D/_tmp"
 cd "$D"
 if [ ! -f _tmp/train.csv ]; then
-    curl -sL "$HF/splits/$LANG_/splits.tar.gz" | tar -xzf - -C _tmp train.csv 2>/dev/null ||
-        curl -sL "$HF/splits/$LANG_/splits.tar.gz" | tar -xzf - -C _tmp /train.csv
+    curl -s "$GCS/splits/$LANG_.tar.gz" | tar -xzf - -C _tmp "${LANG_}_train.csv" version.txt
+    mv "_tmp/${LANG_}_train.csv" _tmp/train.csv
+    mv _tmp/version.txt version.txt
 fi
-curl -sL -o version.txt "$HF/splits/$LANG_/version.txt" 2>/dev/null || true
 
 # LINK,WORD,VALID,SPEAKER,GENDER -> selection.tsv: file word speaker split bucket
 awk -F, -v per="$PER" -v buckets="$BUCKETS" -v unseen="$UNSEEN" -v test_per="$TEST_PER" '
 BEGIN { srand(7); nb = split(buckets, B, " ") }
 NR > 1 && $3 == "True" && length($2) >= 3 {
     w = $2; t = (substr($4, 1, 1) == "0" || substr($4, 1, 1) == "1")
-    f = $1; gsub("/", "_", f)
+    f = $1
     s = substr($4, 1, 16)
     if (t) { nt[w]++; tf[w, nt[w]] = f; ts[w, nt[w]] = s }
     else   { nr[w]++; rf[w, nr[w]] = f; rs[w, nr[w]] = s }
@@ -63,19 +65,17 @@ END {
         for (c = 1; c <= test_per; ++c) printf "%s\t%s\t%s\ttest\t%d\n", tf[w, c], w, ts[w, c], budget[w]
     }
 }' _tmp/train.csv > selection.tsv
-cut -f1 selection.tsv > _tmp/wanted.txt
+awk -F'\t' -v L="$LANG_" '{print L "/clips/" $1}' selection.tsv > _tmp/wanted.txt
 echo "selected $(wc -l < selection.tsv) clips"
 
-N=$(curl -sL "$HF/opus/$LANG_/train/n_files.txt")
-for ((i = 0; i < N; ++i)); do
-    curl -sL "$HF/opus/$LANG_/train/audio/$i.tar.gz" | tar -xzf - -C clips -T _tmp/wanted.txt 2>/dev/null || true
-done
+# One pass over the language archive; members not in the list are skipped.
+curl -s "$GCS/audio/$LANG_.tar.gz" | tar -xzf - -C clips --strip-components=2 -T _tmp/wanted.txt 2>/dev/null || true
 
 # Manifest: id \t audio \t speaker \t subset \t text (the word).
 awk -F'\t' -v D="$D" -v L="$LANG_" '{
     f = D "/clips/" $1
     if ((getline line < f) < 0) next; close(f)
-    id = $1; sub(/\.opus$/, "", id)
+    id = $1; sub(/\.opus$/, "", id); gsub("/", "_", id)
     printf "%s\t%s\t%s\tmswc-%s-%s\t%s\n", id, f, $3, L, $4, $2
 }' selection.tsv > manifest.tsv
 rm -rf _tmp

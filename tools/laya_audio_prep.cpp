@@ -22,6 +22,8 @@
 //   brosoundml_laya_audio_prep clips --manifest M.tsv --out A.tsv
 //   brosoundml_laya_audio_prep nonspeech --list files.txt --subset musan-music --out-prefix P
 //       [--chunk 12] [--test-frac 0.15]  -> P_train.tsv P_test.tsv
+//   brosoundml_laya_audio_prep pcmselect --list ranges.txt < pcm > pcm
+//       (16 kHz mono s16le filter keeping "start end" second ranges)
 
 #include "laya_audio_data.h"
 
@@ -37,6 +39,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 using namespace laya_audio;
 namespace fs = std::filesystem;
@@ -272,6 +279,50 @@ int prep_nonspeech(const std::string& list, const std::string& subset, const std
     return 0;
 }
 
+// ---------------------------------------------------------------- pcmselect
+
+// stdin: 16 kHz mono s16le; stdout: only the samples inside the listed
+// [start, end) second ranges (one "start end" pair per line, ascending,
+// non-overlapping), back to back. A streaming cut for long recordings
+// (VoxPopuli sessions) so only the kept speech gets encoded.
+int pcm_select(const std::string& list) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    std::ifstream f(list);
+    if (!f) die("cannot open " + list);
+    std::vector<std::pair<long long, long long>> r;
+    std::string line;
+    while (std::getline(f, line)) {  // "start end [anything...]"
+        std::istringstream is(line);
+        double s = 0, e = 0;
+        if (!(is >> s >> e)) continue;
+        const long long a = static_cast<long long>(s * 16000.0 + 0.5), b = static_cast<long long>(e * 16000.0 + 0.5);
+        if (b > a) r.push_back({a, b});
+    }
+    std::vector<int16_t> buf(1 << 16);
+    long long pos = 0;
+    std::size_t k = 0;
+    while (k < r.size()) {
+        const std::size_t n = std::fread(buf.data(), sizeof(int16_t), buf.size(), stdin);
+        if (n == 0) break;
+        const long long end = pos + static_cast<long long>(n);
+        while (k < r.size() && r[k].first < end) {
+            const long long a = std::max(pos, r[k].first), b = std::min(end, r[k].second);
+            if (b > a) std::fwrite(buf.data() + (a - pos), sizeof(int16_t), static_cast<std::size_t>(b - a), stdout);
+            if (r[k].second <= end) ++k;
+            else break;
+        }
+        pos = end;
+    }
+    // Drain the rest so the decoder upstream does not see a broken pipe.
+    while (std::fread(buf.data(), sizeof(int16_t), buf.size(), stdin) > 0) {
+    }
+    std::fflush(stdout);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -303,6 +354,10 @@ int main(int argc, char** argv) {
         if (mode == "clips") {
             if (manifest.empty() || out.empty()) die("clips needs --manifest and --out");
             return prep_clips(manifest, out);
+        }
+        if (mode == "pcmselect") {
+            if (list.empty()) die("pcmselect needs --list");
+            return pcm_select(list);
         }
         if (mode == "nonspeech") {
             if (list.empty() || subset.empty() || out_prefix.empty()) die("nonspeech needs --list --subset --out-prefix");

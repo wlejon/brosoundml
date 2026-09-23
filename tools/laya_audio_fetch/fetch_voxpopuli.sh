@@ -19,6 +19,7 @@ YEARS=$2
 CAP_H=$3
 DEST=${4:-D:/datasets/voxpopuli}
 BASE=https://dl.fbaipublicfiles.com/voxpopuli
+PREP=${PREP:-D:/projects/brosoundml/build-cuda/Release/brosoundml_laya_audio_prep.exe}
 D=$DEST/$LANG_
 mkdir -p "$D/_segs"
 cd "$D"
@@ -49,13 +50,25 @@ awk -F'|' '{
 cut_session() {  # stdin: the session .ogg
     local sess=$1 list=$D/_segs/$1.txt tmp=$D/_cut_$1
     if [ ! -f "$list" ]; then cat > /dev/null; return 0; fi
+    # Already cut (a resumed run)?
+    if awk -v D="$D" '{ f = D "/" $4 "/" $3 ".opus"; if ((getline x < f) < 0) exit 1; close(f) }' "$list"; then
+        cat > /dev/null
+        return 0
+    fi
     rm -rf "$tmp" && mkdir -p "$tmp"
+    # Decode once, keep only the segments' samples (laya_audio_prep
+    # pcmselect), encode those back to back and split at the exact
+    # cumulative segment boundaries: only the kept speech is encoded.
     local times
-    times=$(awk '{printf "%s%s,%s", (NR>1?",":""), $1, $2}' "$list")
-    ffmpeg -nostdin -hide_banner -loglevel error -i pipe:0 -ac 1 -ar 16000 -c:a libopus -b:a 32k \
-        -f segment -segment_times "$times" -segment_format ogg "$tmp/p%05d.opus"
-    # Piece 2k+1 is segment k (piece 0 is the audio before the first one).
-    awk '{printf "%05d %s %s\n", 2*(NR-1)+1, $3, $4}' "$list" | while read -r p id split; do
+    times=$(awk '{ n += int($2 * 16000 + 0.5) - int($1 * 16000 + 0.5); if (NR > 1) printf ","; printf "%.4f", n / 16000 }' "$list" |
+        sed 's/,[^,]*$//')
+    [ -n "$times" ] || times=1000000
+    ffmpeg -nostdin -hide_banner -loglevel error -i pipe:0 -f s16le -ac 1 -ar 16000 - |
+        "$PREP" pcmselect --list "$list" |
+        ffmpeg -hide_banner -loglevel error -f s16le -ar 16000 -ac 1 -i pipe:0 -c:a libopus -b:a 32k \
+            -f segment -segment_times "$times" -reset_timestamps 1 -segment_format ogg "$tmp/p%05d.opus"
+    # Piece k is segment k.
+    awk '{printf "%05d %s %s\n", NR-1, $3, $4}' "$list" | while read -r p id split; do
         mkdir -p "$D/$split"
         [ -f "$tmp/p$p.opus" ] && mv "$tmp/p$p.opus" "$D/$split/$id.opus"
     done
@@ -63,7 +76,7 @@ cut_session() {  # stdin: the session .ogg
     echo "$sess: $(wc -l < "$list") segments"
 }
 export -f cut_session
-export D
+export D PREP
 for y in $YEARS; do
     curl -s $BASE/audios/${LANG_}_$y.tar | tar -xf - --to-command='
         case "$TAR_FILENAME" in
