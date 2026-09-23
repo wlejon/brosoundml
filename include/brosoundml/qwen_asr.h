@@ -138,8 +138,11 @@ public:
     // Load config.json + the AuT encoder / projector weights only (no text
     // decoder): encode() works, transcribe() / make_session() throw. For a
     // consumer of the latents alone (an adapter into another model).
+    // `half` (GPU only) runs the encoder in FP16 on tensor cores: several
+    // times faster, latents within FP16 rounding of the FP32 path.
     void load_encoder(const std::string& model_dir,
-                      brotensor::Device device = brotensor::Device::CPU);
+                      brotensor::Device device = brotensor::Device::CPU,
+                      bool half = false);
 
     // Result of a transcribe() call. `token_ids` is the GENERATED id stream
     // only (the chat-template prompt and the audio placeholder tokens are

@@ -12,6 +12,9 @@
 //   brosoundml_laya_audio_cache --align A.tsv --out C.lac
 //        [--model-dir weights/qwen-asr/0.6B] [--window 3.0]
 //        [--per-utt 4] [--every 1] [--limit 0] [--seed 1]
+//        [--fp32] [--check N]
+// The encoder runs FP16 on the GPU unless --fp32; --check N compares the
+// first N windows against an FP32 encoder.
 
 #include "laya_audio_data.h"
 
@@ -21,7 +24,9 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -40,7 +45,8 @@ namespace {
 int main(int argc, char** argv) {
     std::string align, out, model_dir = "weights/qwen-asr/0.6B";
     float window_s = 3.0f;
-    int per_utt = 4, every = 1, limit = 0;
+    int per_utt = 4, every = 1, limit = 0, check = 0;
+    bool half = true;
     uint32_t seed = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -56,6 +62,8 @@ int main(int argc, char** argv) {
         else if (a == "--every") every = std::max(1, std::atoi(next().c_str()));
         else if (a == "--limit") limit = std::atoi(next().c_str());
         else if (a == "--seed") seed = static_cast<uint32_t>(std::atoi(next().c_str()));
+        else if (a == "--fp32") half = false;
+        else if (a == "--check") check = std::atoi(next().c_str());
         else die("unknown argument " + a);
     }
     if (align.empty() || out.empty()) die("need --align and --out");
@@ -66,8 +74,16 @@ int main(int argc, char** argv) {
             brotensor::is_available(brotensor::Device::CUDA) ? brotensor::Device::CUDA : brotensor::Device::CPU;
         const std::vector<laya_audio::AlignedUtterance> utts = laya_audio::read_alignments(align);
         brosoundml::QwenAsr asr;
-        asr.load_encoder(model_dir, dev);
+        asr.load_encoder(model_dir, dev, half);
         const int dim = asr.config().latent_dim;
+        // --check N: the first N windows also run through an FP32 encoder;
+        // report how far the FP16 latents sit from it (per-row cosine, and
+        // the error norm relative to the latent norm).
+        brosoundml::QwenAsr ref;
+        if (check > 0) ref.load_encoder(model_dir, dev, false);
+        double worst_rel = 0, sum_rel = 0, worst_cos = 1;
+        int n_checked = 0;
+        std::vector<float> host_ref;
         laya_audio::CacheWriter writer(out, window_s, dim);
 
         std::mt19937 rng(seed);
@@ -87,6 +103,30 @@ int main(int argc, char** argv) {
                 const int frames = asr.encode_to_host(win, host);
                 enc_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 ++n_enc;
+                if (n_checked < check) {
+                    ref.encode_to_host(win, host_ref);
+                    double en = 0, rn = 0;
+                    for (int r = 0; r < frames; ++r) {
+                        double dot = 0, a2 = 0, b2 = 0;
+                        for (int c = 0; c < dim; ++c) {
+                            const std::size_t i = static_cast<std::size_t>(r) * dim + c;
+                            const double a = host[i], b = host_ref[i];
+                            dot += a * b;
+                            a2 += a * a;
+                            b2 += b * b;
+                            en += (a - b) * (a - b);
+                        }
+                        rn += b2;
+                        worst_cos = std::min(worst_cos, dot / std::sqrt(a2 * b2 + 1e-30));
+                    }
+                    const double rel = std::sqrt(en / (rn + 1e-30));
+                    worst_rel = std::max(worst_rel, rel);
+                    sum_rel += rel;
+                    if (++n_checked == check) {
+                        std::fprintf(stderr, "check vs FP32 over %d windows: |d|/|x| mean %.4f worst %.4f, worst row cosine %.5f\n",
+                                     n_checked, sum_rel / n_checked, worst_rel, worst_cos);
+                    }
+                }
                 laya_audio::CachedWindow w;
                 w.utt = static_cast<int>(u);
                 w.t_end = t_end;

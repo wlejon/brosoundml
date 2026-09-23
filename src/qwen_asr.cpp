@@ -186,8 +186,12 @@ void QwenAsr::load(const std::string& model_dir, bt::Device device) {
     load_impl_(model_dir, device, /*with_decoder=*/true);
 }
 
-void QwenAsr::load_encoder(const std::string& model_dir, bt::Device device) {
+void QwenAsr::load_encoder(const std::string& model_dir, bt::Device device, bool half) {
     load_impl_(model_dir, device, /*with_decoder=*/false);
+    if (half && device != bt::Device::CPU) {
+        bt::DeviceScope scope(device);
+        impl_->encoder.use_half(bt::Dtype::FP16);
+    }
 }
 
 void QwenAsr::load_impl_(const std::string& model_dir, bt::Device device, bool with_decoder) {

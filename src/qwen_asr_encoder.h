@@ -70,6 +70,12 @@ struct QwenAsrEncoder {
     void load(const brotensor::safetensors::File& f, const QwenAsrConfig& cfg,
               brotensor::Device device = brotensor::Device::CPU);
 
+    // Narrow every learned weight to `dt` (FP16 or BF16; GPU only) so the
+    // forward runs on tensor cores: implicit-GEMM conv stem, fused-epilogue
+    // linears (bias + GELU, residual accumulate), 16-bit attention. forward()
+    // still returns FP32. Not for transcribe parity — for latency consumers.
+    void use_half(brotensor::Dtype dt);
+
     // 16 kHz mono PCM -> (frames, num_mel_bins) host log-mel features,
     // frames = sample_count / 160 (no 30 s padding). Throws on a sample-rate
     // mismatch or audio shorter than one hop.

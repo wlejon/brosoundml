@@ -158,6 +158,24 @@ void QwenAsrEncoder::load(const sf::File& f, const QwenAsrConfig& cfg,
     }
 }
 
+void QwenAsrEncoder::use_half(bt::Dtype dt) {
+    if (dt != bt::Dtype::FP16 && dt != bt::Dtype::BF16) fail("use_half: dtype must be FP16 or BF16");
+    if (proj2_w.device == bt::Device::CPU) fail("use_half: the CPU backend is FP32-only");
+    auto narrow = [dt](bt::Tensor& t) {
+        bt::Tensor n;
+        bt::cast(t, n, dt);
+        t = std::move(n);
+    };
+    for (bt::Tensor* t : {&conv1_w, &conv1_b, &conv2_w, &conv2_b, &conv3_w, &conv3_b, &conv_out_w, &ln_post_w,
+                          &ln_post_b, &proj1_w, &proj1_b, &proj2_w, &proj2_b, &pos_table})
+        narrow(*t);
+    for (QwenAsrEncoderLayer& el : layers) {
+        for (bt::Tensor* t : {&el.ln1_w, &el.ln1_b, &el.qw, &el.qb, &el.kw, &el.kb, &el.vw, &el.vb, &el.ow, &el.ob,
+                              &el.ln2_w, &el.ln2_b, &el.fc1_w, &el.fc1_b, &el.fc2_w, &el.fc2_b})
+            narrow(*t);
+    }
+}
+
 std::vector<float> QwenAsrEncoder::log_mel(const AudioBuffer& audio,
                                            int& frames_out) const {
     if (mel_filters.rows == 0) fail("load() not called");
@@ -269,6 +287,13 @@ void QwenAsrEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
         x = bt::Tensor::from_host_on(dev, slab.data(), n_chunks,
                                      num_mel_bins * chunk_w);
     }
+    const bt::Dtype dt = proj2_w.dtype;   // FP32, or 16-bit after use_half()
+    const bool half = dt != bt::Dtype::FP32;
+    if (half) {
+        bt::Tensor xh;
+        bt::cast(x, xh, dt);
+        x = std::move(xh);
+    }
 
     // 3x (3x3, stride 2, pad 1) + exact GELU. H: n_mels -> n_mels/8 (rounded
     // up per layer); W: chunk_w -> t_out.
@@ -307,8 +332,7 @@ void QwenAsrEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
 
     // Drop the tail chunk's dead (zero-pad-born) tokens: the valid rows are a
     // contiguous prefix, so a view re-lengths the token stream in place.
-    bt::Tensor valid = bt::Tensor::view(dev, hs.data, n_valid, d_model,
-                                        bt::Dtype::FP32);
+    bt::Tensor valid = bt::Tensor::view(dev, hs.data, n_valid, d_model, dt);
 
     // ── block-diagonal attention windows ──
     // n_window_infer mel frames per window => t_out * (n_window_infer /
@@ -326,6 +350,27 @@ void QwenAsrEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
     const auto* cu_ptr = static_cast<const std::int32_t*>(cu_dev.data);
 
     // ── transformer stack (pre-LN, bidirectional windowed MHA, GELU FFN) ──
+    // FP32: plain linears + separate GELU / residual passes (the transcribe
+    // parity path). 16-bit: the same math with bias + GELU and the residual
+    // add fused into the tensor-core GEMM's epilogue.
+    auto lin = [&](const bt::Tensor& W, const bt::Tensor& b, const bt::Tensor& X, bool gelu, bt::Tensor& Y) {
+        if (half) {
+            bt::linear_forward_batched_ex(W, &b, X, gelu ? bt::kLinearActGeluExact : bt::kLinearActNone,
+                                          bt::kLinearEpiStore, nullptr, Y);
+            return;
+        }
+        qtd::linear(W, &b, X, Y);
+        if (gelu) bt::gelu_exact_forward(Y, Y);
+    };
+    auto lin_residual = [&](const bt::Tensor& W, const bt::Tensor& b, const bt::Tensor& X, bt::Tensor& resid) {
+        if (half) {
+            bt::linear_forward_batched_ex(W, &b, X, bt::kLinearActNone, bt::kLinearEpiAccumulate, nullptr, resid);
+            return;
+        }
+        bt::Tensor y;
+        qtd::linear(W, &b, X, y);
+        bt::add_inplace_batched(resid, y);
+    };
     const int head_dim = d_model / num_heads;
     constexpr float kLnEps = 1e-5f;   // nn.LayerNorm default
     for (const QwenAsrEncoderLayer& el : layers) {
@@ -333,26 +378,21 @@ void QwenAsrEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
         bt::layernorm_forward_inference_batched(valid, el.ln1_w, el.ln1_b,
                                                 normed, kLnEps);
         bt::Tensor q, k, v;
-        qtd::linear(el.qw, &el.qb, normed, q);
-        qtd::linear(el.kw, &el.kb, normed, k);
-        qtd::linear(el.vw, &el.vb, normed, v);
+        lin(el.qw, el.qb, normed, false, q);
+        lin(el.kw, el.kb, normed, false, k);
+        lin(el.vw, el.vb, normed, false, v);
         bt::Tensor ctx;
         bt::flash_attention_varlen_forward(q, k, v, cu_ptr, cu_ptr, n_windows,
                                            max_seqlen, max_seqlen, num_heads,
                                            head_dim, /*causal=*/false, ctx);
-        bt::Tensor attn;
-        qtd::linear(el.ow, &el.ob, ctx, attn);
-        bt::add_inplace_batched(valid, attn);
+        lin_residual(el.ow, el.ob, ctx, valid);
 
         bt::Tensor n2;
         bt::layernorm_forward_inference_batched(valid, el.ln2_w, el.ln2_b,
                                                 n2, kLnEps);
         bt::Tensor h1;
-        qtd::linear(el.fc1_w, &el.fc1_b, n2, h1);
-        bt::gelu_exact_forward(h1, h1);
-        bt::Tensor h2;
-        qtd::linear(el.fc2_w, &el.fc2_b, h1, h2);
-        bt::add_inplace_batched(valid, h2);
+        lin(el.fc1_w, el.fc1_b, n2, true, h1);
+        lin_residual(el.fc2_w, el.fc2_b, h1, valid);
     }
 
     // ── final norm + projector into the decoder width ──
@@ -360,9 +400,14 @@ void QwenAsrEncoder::forward(const AudioBuffer& audio, bt::Tensor& out) const {
     bt::layernorm_forward_inference_batched(valid, ln_post_w, ln_post_b,
                                             post, kLnEps);
     bt::Tensor p1;
-    qtd::linear(proj1_w, &proj1_b, post, p1);
-    bt::gelu_exact_forward(p1, p1);
-    qtd::linear(proj2_w, &proj2_b, p1, out);   // (n_valid, output_dim)
+    lin(proj1_w, proj1_b, post, true, p1);
+    if (!half) {
+        lin(proj2_w, proj2_b, p1, false, out);   // (n_valid, output_dim)
+        return;
+    }
+    bt::Tensor o16;
+    lin(proj2_w, proj2_b, p1, false, o16);
+    bt::cast(o16, out, bt::Dtype::FP32);
 }
 
 }  // namespace brosoundml
