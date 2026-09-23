@@ -32,7 +32,9 @@ awk -F'|' '$13=="train"' cand.tsv | shuf --random-source=<(yes) > train_shuf.tsv
 {
     awk -F'|' '$13!="train"' cand.tsv
     awk -F'|' -v cap="$CAP_H" '{ h += ($9-$8)/3600; if (h <= cap) print }' train_shuf.tsv
-} | sort -t'|' -k3,3 -k8,8g > selected.tsv
+} | awk -F'|' '!seen[$1]++' | sort -t'|' -k3,3 -k8,8g > selected.tsv
+# (A segment id can occur in two sessions' annotations, the same speech in
+# two recordings; it is kept once.)
 rm cand.tsv train_shuf.tsv
 awk -F'|' '{n[$13]++; h[$13]+=($9-$8)/3600} END {for (s in n) printf "selected %s: %d segments, %.1f h\n", s, n[s], h[s]}' selected.tsv
 

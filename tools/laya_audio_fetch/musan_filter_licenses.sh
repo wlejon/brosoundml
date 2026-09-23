@@ -49,3 +49,19 @@ for d in */; do
     rm -f "$d/.verdict"
 done
 echo "kept $(wc -l < ../music_kept.tsv) music tracks ($(awk -F'\t' '$3=="N"' ../music_kept.tsv | wc -l) without vocals); $(find . -name '*.opus' | wc -l) opus files remain"
+
+# noise/sound-bible: every block names one file and its licence line
+# ("Attribution 3.0" or "Public Domain"). Files the LICENSE never names, or
+# names with any other licence, are deleted.
+cd "$DEST/noise/sound-bible"
+awk '
+    { sub(/[ \t\r]+$/, "") }
+    /^noise-sound-bible-[0-9]+$/ { id = $0; next }
+    /^License:/ && id != "" { if (!(id in lic)) lic[id] = $0 }
+    END { for (i in lic) if (lic[i] ~ /Attribution 3\.0|Public Domain/ && lic[i] !~ /NonCommercial|NoDeriv|ShareAlike/) print i }
+' LICENSE | sort > .keep
+for f in *.opus; do
+    grep -qx "$(basename "$f" .opus)" .keep || { echo "sound-bible: no usable licence for $f, deleted"; rm -f "$f"; }
+done
+rm -f .keep
+echo "kept $(ls *.opus | wc -l) sound-bible noises"
