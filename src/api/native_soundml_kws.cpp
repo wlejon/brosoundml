@@ -781,6 +781,11 @@ void installKws(ObjectBuilder& bro) {
                 KwsTenant* t = findTenant(streamOf(self));
                 return ev::fromBool(t && t->listening);
             });
+            // The pre-bronze spelling of `active`, which apps were written against.
+            b.accessor("listening", [](Value self, std::span<const Value>) -> Value {
+                KwsTenant* t = findTenant(streamOf(self));
+                return ev::fromBool(t && t->listening);
+            });
             defineKwsOps(b);
         },
         /*global=*/false);
