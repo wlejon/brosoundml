@@ -13,6 +13,7 @@ set(BROSOUNDML_API_SOURCES
     native_soundml_tts_qwen.cpp
     native_soundml_tts_omnivoice.cpp
     native_soundml_tts_supertonic.cpp
+    native_soundml_tts_higgs.cpp
     native_soundml_diar.cpp
     native_soundml_rave.cpp
     soundml_listen_host.cpp

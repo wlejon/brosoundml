@@ -8,6 +8,7 @@
 // is asked for by name: its LM is a full Qwen3-0.6B forward per diffusion
 // step, and a silent CPU fallback would turn a ~1 s synthesis into minutes.
 #include "soundml_tts_internal.h"
+#include "soundml_loader.h"
 
 #include <brosoundml/g2p/lexicon.h>
 #include <brosoundml/g2p/pos_tagger.h>
@@ -35,64 +36,18 @@ HostClass g_speakerEncoderClass;
 
 namespace {
 
-// Run a build on the JS thread (sync) or on a work thread (opts.onReady is a
-// function), wrapping the result in `cls`. The build touches no JS state.
+// The loaders share soundml_loader.h's prologue (modelLoaderArgs: path +
+// device + whether opts.device was explicit, opts rooted) and runner
+// (runModelLoader: sync or onReady/onError).
 template <typename W>
 Value runLoader(const char* fn, Value opts, const HostClass& cls,
                 std::function<std::unique_ptr<W>()> build) {
-    struct State {
-        std::string fn;
-        const HostClass* cls = nullptr;
-        std::function<std::unique_ptr<W>()> build;
-        std::unique_ptr<W> w;
-        ev::Persistent onReady, onError;
-    };
-    auto st = std::make_shared<State>();
-    st->fn = fn;
-    st->cls = &cls;
-    st->build = std::move(build);
-    st->onReady = getFunctionOpt(opts, "onReady");
-    st->onError = getFunctionOpt(opts, "onError");
-    if (!ev::isFunction(st->onReady.get())) {
-        try {
-            return cls.createInstance(st->build());
-        } catch (const std::exception& e) {
-            return ev::throwError(st->fn + ": " + e.what());
-        }
-    }
-    auto work = [st](const std::atomic<bool>&) { st->w = st->build(); };
-    auto done = [st](bool, const std::string& error) {
-        if (!error.empty() || !st->w) {
-            if (ev::isFunction(st->onError.get())) {
-                ev::Persistent msg(ev::fromUtf8(error.empty() ? st->fn + " failed" : error));
-                callCallback1(st->onError.get(), msg.get());
-            }
-            return;
-        }
-        ev::Persistent inst(st->cls->createInstance(std::move(st->w)));
-        callCallback1(st->onReady.get(), inst.get());
-    };
-    return launchAsyncJob(std::move(work), nullptr, std::move(done));
+    return runModelLoader<W>(fn, opts, cls, std::move(build));
 }
 
-// Shared prologue of the model loaders: path + device (+ whether opts.device
-// was given explicitly).
 bool loaderArgs(const char* fn, std::span<const Value> args, std::string& dir, brotensor::Device& dev,
-                Value& opts, bool* explicitDevice = nullptr) {
-    if (!isStringArg(args, 0)) {
-        ev::throwTypeError(std::string(fn) + "(modelDir, opts?): path required");
-        return false;
-    }
-    dir = resolvePath(strAt(args, 0));
-    brotensor::init();
-    dev = autoDevice();
-    opts = isObjectArg(args, 1) ? args[1] : ev::undefined();
-    std::string err;
-    if (!parseDeviceOpt(opts, dev, err, explicitDevice)) {
-        ev::throwTypeError(std::string(fn) + ": " + err);
-        return false;
-    }
-    return true;
+                ev::Persistent& opts, bool* explicitDevice = nullptr) {
+    return modelLoaderArgs(fn, args, dir, dev, opts, explicitDevice);
 }
 
 Value ttsInit(Value, std::span<const Value>) {
@@ -108,9 +63,9 @@ Value ttsInit(Value, std::span<const Value>) {
 Value loadKokoro(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadKokoro", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostKokoro>("loadKokoro", opts, g_kokoroClass, [dir, dev] {
+    return runLoader<HostKokoro>("loadKokoro", opts.get(), g_kokoroClass, [dir, dev] {
         auto w = std::make_unique<HostKokoro>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::Kokoro>();
@@ -127,9 +82,9 @@ Value loadKokoro(Value, std::span<const Value> args) {
 Value loadQwen(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadQwen", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostQwenTts>("loadQwen", opts, g_qwenTtsClass, [dir, dev] {
+    return runLoader<HostQwenTts>("loadQwen", opts.get(), g_qwenTtsClass, [dir, dev] {
         auto w = std::make_unique<HostQwenTts>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::QwenTts>();
@@ -149,7 +104,7 @@ Value loadQwen(Value, std::span<const Value> args) {
 Value loadOmniVoice(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     bool explicitDevice = false;
     if (!loaderArgs("loadOmniVoice", args, dir, dev, opts, &explicitDevice)) return ev::undefined();
     if (dev.type == brotensor::DeviceType::CPU && !explicitDevice)
@@ -159,17 +114,17 @@ Value loadOmniVoice(Value, std::span<const Value> args) {
     auto precision = dev.type == brotensor::DeviceType::CUDA ? brosoundml::OmniVoicePrecision::BF16
                                                               : brosoundml::OmniVoicePrecision::FP32;
     bool decoderOnly = false;
-    if (ev::isObject(opts)) {
-        Value pv = ev::getProperty(opts, "precision");
+    if (ev::isObject(opts.get())) {
+        Value pv = ev::getProperty(opts.get(), "precision");
         if (!ev::isUndefined(pv) && !ev::isNull(pv)) {
             const std::string prec = ev::isString(pv) ? ev::toUtf8(pv) : "";
             if (prec == "bf16") precision = brosoundml::OmniVoicePrecision::BF16;
             else if (prec == "fp32") precision = brosoundml::OmniVoicePrecision::FP32;
             else return ev::throwTypeError("loadOmniVoice: opts.precision must be 'fp32' or 'bf16'");
         }
-        decoderOnly = getPropertyBool(opts, "decoderOnly");
+        decoderOnly = getPropertyBool(opts.get(), "decoderOnly");
     }
-    return runLoader<HostOmniVoice>("loadOmniVoice", opts, g_omniVoiceClass, [dir, dev, precision, decoderOnly] {
+    return runLoader<HostOmniVoice>("loadOmniVoice", opts.get(), g_omniVoiceClass, [dir, dev, precision, decoderOnly] {
         auto w = std::make_unique<HostOmniVoice>();
         w->device = dev;
         w->precision = precision;
@@ -190,9 +145,9 @@ Value loadOmniVoice(Value, std::span<const Value> args) {
 Value loadSupertonic(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadSupertonic", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostSupertonic>("loadSupertonic", opts, g_supertonicClass, [dir, dev] {
+    return runLoader<HostSupertonic>("loadSupertonic", opts.get(), g_supertonicClass, [dir, dev] {
         auto w = std::make_unique<HostSupertonic>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::Supertonic>();
@@ -211,9 +166,9 @@ Value loadSupertonic(Value, std::span<const Value> args) {
 Value loadSpeakerEncoder(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadSpeakerEncoder", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostSpeakerEncoder>("loadSpeakerEncoder", opts, g_speakerEncoderClass, [dir, dev] {
+    return runLoader<HostSpeakerEncoder>("loadSpeakerEncoder", opts.get(), g_speakerEncoderClass, [dir, dev] {
         auto w = std::make_unique<HostSpeakerEncoder>();
         w->enc = std::make_shared<brosoundml::SpeakerEncoder>();
         {
@@ -386,6 +341,7 @@ void installTts(ObjectBuilder& bro) {
     installTtsQwenClasses();
     installTtsOmniVoiceClasses();
     installTtsSupertonicClasses();
+    installTtsHiggsClasses();
 
     ObjectBuilder tts;
     tts.def("init", 0, ttsInit);
@@ -394,6 +350,7 @@ void installTts(ObjectBuilder& bro) {
     tts.def("loadOmniVoice", 2, loadOmniVoice);
     tts.def("loadSupertonic", 2, loadSupertonic);
     tts.def("loadSpeakerEncoder", 2, loadSpeakerEncoder);
+    tts.def("loadHiggsCodec", 2, loadHiggsCodec);
     tts.def("phonemize", 2, phonemize);
     tts.def("setAssetRoot", 1, setAssetRoot);
     tts.def("setAssets", 1, setAssets);
@@ -412,6 +369,7 @@ void installTts(ObjectBuilder& bro) {
     tts.set("SupertonicModel", g_supertonicClass.constructor());
     tts.set("SupertonicVoice", g_supertonicVoiceClass.constructor());
     tts.set("SpeakerEncoder", g_speakerEncoderClass.constructor());
+    tts.set("HiggsCodec", g_higgsCodecClass.constructor());
 
     bro.set("tts", tts.get());
 }

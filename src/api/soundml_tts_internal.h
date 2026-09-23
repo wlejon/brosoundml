@@ -102,6 +102,11 @@ void installTtsKokoroClasses();
 void installTtsQwenClasses();
 void installTtsOmniVoiceClasses();
 void installTtsSupertonicClasses();
+void installTtsHiggsClasses();
+
+// bro.tts.loadHiggsCodec (native_soundml_tts_higgs.cpp) and its class handle.
+Value loadHiggsCodec(Value, std::span<const Value> args);
+extern HostClass g_higgsCodecClass;
 
 // ---- dispatch entry points (bro.tts.synthesize / synthesizeStream / decodeFrom)
 //
@@ -165,11 +170,12 @@ inline bool readAudioArgs(std::span<const Value> args, size_t at, brosoundml::Au
     return !out.samples.empty() && out.sample_rate > 0;
 }
 
-// Read an optional uint64 seed.
+// Read an optional uint64 seed: a number, or a BigInt for the full 64 bits.
 inline void getSeedOpt(Value opts, std::uint64_t& dst) {
     if (!ev::isObject(opts)) return;
     Value v = ev::getProperty(opts, "seed");
     if (ev::isNumber(v)) dst = static_cast<std::uint64_t>(static_cast<int64_t>(ev::toDouble(v)));
+    else if (ev::isBigInt(v)) dst = ev::toUint64(v);
 }
 
 } // namespace brosoundml::api
