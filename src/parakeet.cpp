@@ -396,6 +396,7 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
 
             out.token_ids.push_back(token);
             out.token_frames.push_back(time);
+            out.token_durations.push_back(duration);
             if (opts.on_token) opts.on_token(token);
             prediction.step(token, st, dec_proj);          // advance predictor
             ++symbols;

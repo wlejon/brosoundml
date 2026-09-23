@@ -139,6 +139,7 @@ struct QwenAsr::Impl {
     QwenAsrDecoder decoder;
     bt::Device     device = bt::Device::CPU;
     bool           loaded = false;
+    bool           decoder_loaded = false;  // false after load_encoder()
 
     // Shared transcribe body over a caller-supplied decode cache: the legacy
     // single-call path hands it a stack-local cache, the session path hands it
@@ -182,6 +183,14 @@ int QwenAsr::encode_to_host(const AudioBuffer& audio,
 }
 
 void QwenAsr::load(const std::string& model_dir, bt::Device device) {
+    load_impl_(model_dir, device, /*with_decoder=*/true);
+}
+
+void QwenAsr::load_encoder(const std::string& model_dir, bt::Device device) {
+    load_impl_(model_dir, device, /*with_decoder=*/false);
+}
+
+void QwenAsr::load_impl_(const std::string& model_dir, bt::Device device, bool with_decoder) {
     const std::string where = "QwenAsr::load";
     const fs::path dir(model_dir);
     const fs::path config_path  = dir / "config.json";
@@ -198,7 +207,8 @@ void QwenAsr::load(const std::string& model_dir, bt::Device device) {
     auto f = bt::safetensors::File::open(weights_path.string());
 
     impl_->encoder.load(f, impl_->config, device);
-    impl_->decoder.load(f, impl_->config, device);
+    if (with_decoder) impl_->decoder.load(f, impl_->config, device);
+    impl_->decoder_loaded = with_decoder;
     impl_->loaded = true;
 }
 
@@ -208,7 +218,7 @@ QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio) const {
 
 QwenAsr::Transcription QwenAsr::transcribe(const AudioBuffer& audio,
                                            const TranscribeOptions& opts) const {
-    if (!impl_->loaded) fail("QwenAsr::transcribe", "load() not called");
+    if (!impl_->loaded || !impl_->decoder_loaded) fail("QwenAsr::transcribe", "load() not called (or encoder only)");
     QwenAsrDecoderCache cache;
     return impl_->run_transcribe(cache, audio, opts);
 }
@@ -308,7 +318,7 @@ QwenAsrSession::QwenAsrSession(QwenAsrSession&&) noexcept = default;
 QwenAsrSession& QwenAsrSession::operator=(QwenAsrSession&&) noexcept = default;
 
 QwenAsrSession QwenAsr::make_session() const {
-    if (!impl_->loaded) fail("QwenAsr::make_session", "load() not called");
+    if (!impl_->loaded || !impl_->decoder_loaded) fail("QwenAsr::make_session", "load() not called (or encoder only)");
     QwenAsrSession s;
     s.state_->cache.reset(impl_->decoder.num_layers);
     return s;
@@ -326,7 +336,7 @@ QwenAsr::Transcription QwenAsr::transcribe(QwenAsrSession& session,
 QwenAsr::Transcription QwenAsr::transcribe(QwenAsrSession& session,
                                            const AudioBuffer& audio,
                                            const TranscribeOptions& opts) const {
-    if (!impl_->loaded) fail("QwenAsr::transcribe", "load() not called");
+    if (!impl_->loaded || !impl_->decoder_loaded) fail("QwenAsr::transcribe", "load() not called (or encoder only)");
     return impl_->run_transcribe(session.state_->cache, audio, opts);
 }
 

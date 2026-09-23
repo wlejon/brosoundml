@@ -135,6 +135,12 @@ public:
     void load(const std::string& model_dir,
               brotensor::Device device = brotensor::Device::CPU);
 
+    // Load config.json + the AuT encoder / projector weights only (no text
+    // decoder): encode() works, transcribe() / make_session() throw. For a
+    // consumer of the latents alone (an adapter into another model).
+    void load_encoder(const std::string& model_dir,
+                      brotensor::Device device = brotensor::Device::CPU);
+
     // Result of a transcribe() call. `token_ids` is the GENERATED id stream
     // only (the chat-template prompt and the audio placeholder tokens are
     // not echoed; the trailing EOS is stripped). The stream is the model's
@@ -223,6 +229,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    void load_impl_(const std::string& model_dir, brotensor::Device device, bool with_decoder);
 };
 
 // One stream's decode scratch over a shared QwenAsr (CONCURRENT tier). Build one

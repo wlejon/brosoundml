@@ -115,9 +115,12 @@ public:
     // stream (SentencePiece piece ids, no blank/pad — the caller detokenizes).
     // `token_frames[i]` is the encoder-frame index at which token_ids[i] was
     // emitted; multiply by config().frame_seconds() for a start timestamp.
+    // `token_durations[i]` is the TDT duration (encoder frames) predicted with
+    // token_ids[i]: token i spans roughly [frame, frame + duration).
     struct Transcription {
         std::vector<int32_t> token_ids;
         std::vector<int32_t> token_frames;
+        std::vector<int32_t> token_durations;
     };
 
     // Streaming sink: invoked once per emitted token, in decode order. Empty
