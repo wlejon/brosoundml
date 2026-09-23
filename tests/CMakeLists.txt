@@ -160,9 +160,20 @@ if(BROSOUNDML_ENABLE_API)
         message(STATUS "brosoundml: brosoundml_test_api not registered (brass has no code generator for this target)")
     else()
         add_test(NAME brosoundml_test_api COMMAND brosoundml_test_api)
+        # The same binding test under bronze's GC stress oracle: a collection
+        # on every allocation, from-space poisoned afterwards, so a Value held
+        # across an allocating embed call crashes or reads garbage here
+        # instead of passing by luck. `ctest -LE gcstress` skips it.
+        add_test(NAME brosoundml_test_api_gcstress COMMAND brosoundml_test_api)
+        set_tests_properties(brosoundml_test_api_gcstress PROPERTIES LABELS gcstress)
         if(WIN32)
             set_tests_properties(brosoundml_test_api PROPERTIES
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api>;$ENV{PATH}")
+            set_tests_properties(brosoundml_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api>;$ENV{PATH}")
+        else()
+            set_tests_properties(brosoundml_test_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
         endif()
     endif()
 
@@ -193,9 +204,58 @@ if(BROSOUNDML_ENABLE_API)
         message(STATUS "brosoundml: test_voice_agent_api not registered (brass has no code generator for this target)")
     else()
         add_test(NAME test_voice_agent_api COMMAND test_voice_agent_api)
+        add_test(NAME test_voice_agent_api_gcstress COMMAND test_voice_agent_api)
+        set_tests_properties(test_voice_agent_api_gcstress PROPERTIES LABELS gcstress)
         if(WIN32)
             set_tests_properties(test_voice_agent_api PROPERTIES
                 ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:test_voice_agent_api>;$ENV{PATH}")
+            set_tests_properties(test_voice_agent_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:test_voice_agent_api>;$ENV{PATH}")
+        else()
+            set_tests_properties(test_voice_agent_api_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
+        endif()
+    endif()
+
+    # Real model loads + the async (onReady / onDone) paths from JavaScript.
+    # Each section skips when its weights are absent under <repo>/weights.
+    add_executable(brosoundml_test_api_weights test_soundml_api_weights.cpp)
+    target_include_directories(brosoundml_test_api_weights PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
+    )
+    target_link_libraries(brosoundml_test_api_weights PRIVATE
+        brosoundml_api
+        bronze_runtime_shared
+    )
+    target_compile_definitions(brosoundml_test_api_weights PRIVATE
+        BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
+    if(MSVC)
+        target_compile_options(brosoundml_test_api_weights PRIVATE /W4)
+    else()
+        target_compile_options(brosoundml_test_api_weights PRIVATE -Wall -Wextra)
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET brosoundml_test_api_weights POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brosoundml_test_api_weights>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_LINKER_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brosoundml_test_api_weights>
+        )
+    endif()
+    if(BRASS_HOST_BACKEND)
+        add_test(NAME brosoundml_test_api_weights COMMAND brosoundml_test_api_weights)
+        add_test(NAME brosoundml_test_api_weights_gcstress COMMAND brosoundml_test_api_weights)
+        set_tests_properties(brosoundml_test_api_weights_gcstress PROPERTIES LABELS gcstress)
+        if(WIN32)
+            set_tests_properties(brosoundml_test_api_weights PROPERTIES
+                ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api_weights>;$ENV{PATH}")
+            set_tests_properties(brosoundml_test_api_weights_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brosoundml_test_api_weights>;$ENV{PATH}")
+        else()
+            set_tests_properties(brosoundml_test_api_weights_gcstress PROPERTIES
+                ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1")
         endif()
     endif()
 endif()

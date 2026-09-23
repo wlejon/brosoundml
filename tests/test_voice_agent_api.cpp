@@ -27,9 +27,10 @@ static void runEval(std::string_view code, const std::string& desc) {
     if (r.thrown) {
         std::string errStr = "unknown error";
         if (ev::isObject(r.value)) {
-            ev::Value msgVal = ev::getProperty(r.value, "message");
+            ev::Persistent err(r.value);  // getProperty allocates
+            ev::Value msgVal = ev::getProperty(err.get(), "message");
             if (ev::isString(msgVal)) errStr = ev::toUtf8(msgVal);
-            else errStr = ev::toUtf8(r.value);
+            else errStr = ev::toUtf8(err.get());
         } else if (ev::isString(r.value)) {
             errStr = ev::toUtf8(r.value);
         }
