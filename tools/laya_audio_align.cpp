@@ -2,10 +2,10 @@
 //
 // Runs Parakeet-TDT over every utterance of a LibriTTS-R manifest subset,
 // turns its token stream (emission frame + TDT duration per token) into timed
-// hypothesis words, and transfers those times onto the REFERENCE transcript's
-// words by a Levenshtein word alignment (laya_audio::align_reference). The
-// word identities therefore come from the human transcript; only the times
-// come from the ASR model (80 ms encoder frames).
+// hypothesis words (AsrBaseline::transcribe_timed), and transfers those times
+// onto the REFERENCE transcript's words by a Levenshtein word alignment
+// (laya_audio::align_reference). The word identities therefore come from the
+// human transcript; only the times come from the ASR model (80 ms frames).
 //
 // Usage:
 //   brosoundml_laya_audio_align --manifest M.json --subset dev-clean --out A.tsv
@@ -15,12 +15,9 @@
 // --every K keeps every K-th utterance of the subset (a deterministic subsample).
 // --resume skips utterance ids already present in --out and appends.
 
+#include "laya_audio_baselines.h"
 #include "laya_audio_data.h"
 
-#include "brosoundml/audio.h"
-#include "brosoundml/parakeet.h"
-
-#include <brolm/tokenizer_t5.h>
 #include <brotensor/runtime.h>
 
 #include <chrono>
@@ -36,46 +33,6 @@ namespace {
 [[noreturn]] void die(const std::string& msg) {
     std::fprintf(stderr, "laya_audio_align: %s\n", msg.c_str());
     std::exit(2);
-}
-
-// Timed hypothesis words from Parakeet's token stream: a token whose
-// incremental detokenisation starts with a space begins a new word.
-std::vector<laya_audio::TimedWord> hyp_words(const brolm::t5::Tokenizer& tok,
-                                             const brosoundml::Parakeet::Transcription& tr,
-                                             double frame_s) {
-    std::vector<laya_audio::TimedWord> words;
-    std::vector<int32_t> prefix;
-    std::string prev_text;
-    std::string cur;
-    float t0 = 0, t1 = 0;
-    auto flush = [&] {
-        for (const std::string& w : laya_audio::normalize_words(cur)) {
-            laya_audio::TimedWord tw;
-            tw.word = w;
-            tw.t0 = t0;
-            tw.t1 = t1;
-            words.push_back(std::move(tw));
-        }
-        cur.clear();
-    };
-    for (std::size_t i = 0; i < tr.token_ids.size(); ++i) {
-        prefix.push_back(tr.token_ids[i]);
-        const std::string text = tok.decode(prefix);
-        const std::string piece = text.size() > prev_text.size() ? text.substr(prev_text.size()) : std::string();
-        prev_text = text;
-        const float s = static_cast<float>(tr.token_frames[i] * frame_s);
-        const int dur = i < tr.token_durations.size() ? tr.token_durations[i] : 1;
-        const float e = static_cast<float>((tr.token_frames[i] + std::max(1, dur)) * frame_s);
-        const bool starts_word = i == 0 || (!piece.empty() && piece[0] == ' ');
-        if (starts_word) {
-            flush();
-            t0 = s;
-        }
-        cur += piece;
-        t1 = e;
-    }
-    flush();
-    return words;
 }
 
 }  // namespace
@@ -103,9 +60,6 @@ int main(int argc, char** argv) {
 
     try {
         brotensor::init();
-        const brotensor::Device dev =
-            brotensor::is_available(brotensor::Device::CUDA) ? brotensor::Device::CUDA : brotensor::Device::CPU;
-
         std::vector<laya_audio::Utterance> utts;
         {
             int k = 0;
@@ -124,26 +78,24 @@ int main(int argc, char** argv) {
             laya_audio::write_alignments(out_path, {}, false);
         }
 
-        brosoundml::Parakeet model;
-        model.load(model_dir, dev);
-        const auto tok = brolm::t5::Tokenizer::load((std::filesystem::path(model_dir) / "tokenizer.json").string());
-        const double frame_s = model.config().frame_seconds();
+        laya_audio::AsrBaseline asr;
+        asr.load(model_dir);
 
         std::vector<laya_audio::AlignedUtterance> batch;
         std::size_t n_words = 0, n_match = 0, n_timed = 0, n_done = 0;
         const auto t_start = std::chrono::steady_clock::now();
         for (const laya_audio::Utterance& u : utts) {
             if (done.count(u.id)) continue;
-            brosoundml::AudioBuffer audio(laya_audio::load_audio_16k(u.wav), 16000);
-            if (audio.samples.size() < 1600) continue;
-            const auto tr = model.transcribe(audio);
+            const std::vector<float> pcm = laya_audio::load_audio_16k(u.wav);
+            if (pcm.size() < 1600) continue;
             laya_audio::AlignedUtterance a;
             a.id = u.id;
             a.wav = u.wav;
             a.speaker = u.speaker;
             a.subset = u.subset;
-            a.duration_s = static_cast<float>(audio.duration_seconds());
-            a.words = laya_audio::align_reference(laya_audio::normalize_words(u.text), hyp_words(tok, tr, frame_s));
+            a.duration_s = static_cast<float>(pcm.size()) / 16000.0f;
+            a.words = laya_audio::align_reference(laya_audio::normalize_words(u.text),
+                                                  asr.transcribe_timed(pcm, /*pad=*/false));
             for (const auto& w : a.words) {
                 ++n_words;
                 n_match += w.asr_match ? 1 : 0;

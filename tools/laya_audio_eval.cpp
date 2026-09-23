@@ -6,8 +6,11 @@
 // dev set (same seed). Methods, each scored per probe:
 //
 //   laya_audio   projected AuT latents in Laya's state span (the adapter)
-//   asr_match    Parakeet transcript of the window contains the keyword (0/1)
-//   asr_laya     text Laya, same question, state = Parakeet transcript
+//   asr_win      Parakeet transcript of the 3 s window contains the keyword (0/1)
+//   asr_stream   Parakeet over the whole stream up to t_end (a streaming
+//                recognizer's view with full left context); keyword among the
+//                words whose midpoint is in the window
+//   asr_laya     text Laya, same question, state = the asr_stream words
 //   oracle_laya  text Laya, same question, state = the true words in the window
 //   phoneme      open-vocabulary phoneme spotter, g2p-enrolled keyword
 //   probe        dedicated MLP head on the last two latent frames (speaking /
@@ -125,8 +128,8 @@ void report(const std::vector<Probe>& probes, const std::vector<Method>& methods
 int main(int argc, char** argv) {
     std::string align_train, align_dev, cache_dev, proj_path, probe_path, laya = "D:/projects/laya";
     std::string parakeet_dir = "weights/parakeet/0.6b-v3", phoneme_w = "weights/phoneme/english.bpm";
-    std::string data_dir = "D:/projects/brosoundml-data", kokoro_dir = "weights/kokoro";
-    int eval_windows = 1500;
+    std::string data_dir = "D:/projects/brosoundml-data", kokoro_dir = "weights/kokoro", debug_utt;
+    int eval_windows = 1500, show_misses = 0;
     uint32_t seed = 1;
     bool asr = true, phoneme = true;
     for (int i = 1; i < argc; ++i) {
@@ -145,6 +148,8 @@ int main(int argc, char** argv) {
         else if (k == "--seed") seed = static_cast<uint32_t>(std::atoi(next().c_str()));
         else if (k == "--no-asr") asr = false;
         else if (k == "--no-phoneme") phoneme = false;
+        else if (k == "--show-misses") show_misses = std::atoi(next().c_str());
+        else if (k == "--debug-utt") debug_utt = next();
         else if (k == "--parakeet-dir") parakeet_dir = next();
         else if (k == "--phoneme-weights") phoneme_w = next();
         else if (k == "--data-dir") data_dir = next();
@@ -176,6 +181,31 @@ int main(int argc, char** argv) {
         std::sort(wins.begin(), wins.end());
         const std::vector<Probe> probes = make_probes(dv, dv_utts, wins, all_vocab, &seen, 2, rng);
         std::fprintf(stderr, "%zu dev windows, %zu probes\n", wins.size(), probes.size());
+
+        // --debug-utt ID: Parakeet on the whole utterance and on growing
+        // prefixes of it, with word times (a check of the ASR baselines).
+        if (!debug_utt.empty()) {
+            AsrBaseline dbg;
+            dbg.load(parakeet_dir);
+            for (const AlignedUtterance& u : dv_utts) {
+                if (u.id != debug_utt) continue;
+                const std::vector<float> pcm = load_audio_16k(u.wav);
+                std::printf("%s: %.2f s\n", u.id.c_str(), pcm.size() / 16000.0);
+                for (float t : {1.0f, 1.82f, 2.5f})
+                    std::printf("  stream window at %.2f: %s\n", t,
+                                dbg.transcribe_stream_window(pcm, t, 3.0f).c_str());
+                for (float t = 1.0f; t < u.duration_s + 0.5f; t += 0.5f) {
+                    std::vector<float> pre(pcm.begin(), pcm.begin() + std::min<std::size_t>(pcm.size(), t * 16000));
+                    for (bool pad : {false, true}) {
+                        std::printf("  prefix %.1f s pad %d:", t, pad ? 1 : 0);
+                        for (const TimedWord& w : dbg.transcribe_timed(pre, pad))
+                            std::printf(" %s[%.2f-%.2f]", w.word.c_str(), w.t0, w.t1);
+                        std::printf("\n");
+                    }
+                }
+            }
+            return 0;
+        }
 
         brolm::laya::DecisionModel model;
         model.load_model(laya);
@@ -238,9 +268,13 @@ int main(int argc, char** argv) {
             PhonemeBaseline ph_m;
             if (asr) asr_m.load(parakeet_dir);
             if (phoneme) ph_m.load(phoneme_w, data_dir, kokoro_dir);
-            std::vector<std::string> hyp(dv.windows.size());
+            // hyp: Parakeet on the 3 s window alone; hyp_s: Parakeet on the
+            // whole stream so far (a streaming recognizer's view), words in
+            // the window.
+            std::vector<std::string> hyp(dv.windows.size()), hyp_s(dv.windows.size());
             std::vector<float> ph(probes.size(), kNaN), energy(probes.size(), kNaN);
-            double asr_ms = 0, ph_ms = 0;
+            double asr_ms = 0, asr_s_ms = 0, ph_ms = 0;
+            int empty_win = 0;
             int cur_utt = -1;
             std::vector<float> pcm;
             std::size_t p = 0;
@@ -254,7 +288,13 @@ int main(int argc, char** argv) {
                 if (asr) {
                     const double a0 = now_ms();
                     hyp[static_cast<std::size_t>(w)] = asr_m.transcribe(win);
-                    asr_ms += now_ms() - a0;
+                    const double a1 = now_ms();
+                    hyp_s[static_cast<std::size_t>(w)] = asr_m.transcribe_stream_window(pcm, cw.t_end, dv.window_s);
+                    asr_ms += a1 - a0;
+                    asr_s_ms += now_ms() - a1;
+                    const WindowFacts f =
+                        window_facts(dv_utts[static_cast<std::size_t>(cw.utt)], cw.t_end, dv.window_s);
+                    if (hyp[static_cast<std::size_t>(w)].empty() && f.inside.size() >= 3) ++empty_win;
                 }
                 if (phoneme) {
                     const double a0 = now_ms();
@@ -270,18 +310,38 @@ int main(int argc, char** argv) {
                     if (phoneme && probes[p].q == Question::Keyword) ph[p] = ph_m.score(probes[p].keyword);
                 }
             }
-            std::fprintf(stderr, "per window: parakeet %.1f ms, phoneme net %.1f ms\n", asr_ms / wins.size(),
-                         ph_ms / wins.size());
+            std::printf("per window: parakeet on the window %.1f ms, on the stream prefix %.1f ms, phoneme net %.1f ms; "
+                        "%d windows holding >= 3 words got an empty window transcript\n",
+                        asr_ms / wins.size(), asr_s_ms / wins.size(), ph_ms / wins.size(), empty_win);
             if (asr) {
-                std::vector<float> match(probes.size(), kNaN);
-                for (std::size_t i = 0; i < probes.size(); ++i) {
-                    if (probes[i].q != Question::Keyword) continue;
-                    const std::vector<std::string> ws =
-                        normalize_words(hyp[static_cast<std::size_t>(probes[i].window)]);
-                    match[i] = std::find(ws.begin(), ws.end(), probes[i].keyword) != ws.end() ? 1.0f : 0.0f;
+                auto match_of = [&](const std::vector<std::string>& h) {
+                    std::vector<float> m(probes.size(), kNaN);
+                    for (std::size_t i = 0; i < probes.size(); ++i) {
+                        if (probes[i].q != Question::Keyword) continue;
+                        const std::vector<std::string> ws = normalize_words(h[static_cast<std::size_t>(probes[i].window)]);
+                        m[i] = std::find(ws.begin(), ws.end(), probes[i].keyword) != ws.end() ? 1.0f : 0.0f;
+                    }
+                    return m;
+                };
+                const std::vector<float> match = match_of(hyp);
+                const std::vector<float> match_s = match_of(hyp_s);
+                // --show-misses N: positives the transcript missed, with context.
+                for (std::size_t i = 0, shown = 0; i < probes.size() && static_cast<int>(shown) < show_misses; ++i) {
+                    if (probes[i].q != Question::Keyword || probes[i].label != 1 || match_s[i] != 0.0f) continue;
+                    const CachedWindow& cw = dv.windows[static_cast<std::size_t>(probes[i].window)];
+                    const WindowFacts f =
+                        window_facts(dv_utts[static_cast<std::size_t>(cw.utt)], cw.t_end, dv.window_s);
+                    std::string truth;
+                    for (const std::string& x : f.inside) truth += x + " ";
+                    std::printf("miss \"%s\"  t_end %.2f\n  true:   %s\n  window: %s\n  stream: %s\n",
+                                probes[i].keyword.c_str(), cw.t_end, truth.c_str(),
+                                hyp[static_cast<std::size_t>(probes[i].window)].c_str(),
+                                hyp_s[static_cast<std::size_t>(probes[i].window)].c_str());
+                    ++shown;
                 }
-                methods.push_back({"asr_match", match});
-                methods.push_back({"asr_laya", text_laya(hyp)});
+                methods.push_back({"asr_win", match});
+                methods.push_back({"asr_stream", match_s});
+                methods.push_back({"asr_laya", text_laya(hyp_s)});
             }
             if (phoneme) methods.push_back({"phoneme", ph});
             methods.push_back({"energy", energy});

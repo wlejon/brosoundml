@@ -31,6 +31,18 @@ namespace bt = brotensor;
 namespace bsm = brosoundml;
 namespace g = brosoundml::g2p;
 
+namespace {
+std::vector<float> dithered_silence(std::size_t n, uint32_t seed) {
+    std::vector<float> v(n);
+    uint32_t s = seed * 2654435761u + 12345u;
+    for (float& x : v) {
+        s = s * 1664525u + 1013904223u;
+        x = (static_cast<float>(s >> 8) / 16777216.0f - 0.5f) * 2e-4f;
+    }
+    return v;
+}
+}  // namespace
+
 struct AsrBaseline::Impl {
     bsm::Parakeet model;
     std::optional<brolm::t5::Tokenizer> tok;
@@ -45,11 +57,72 @@ void AsrBaseline::load(const std::string& dir) {
 }
 
 std::string AsrBaseline::transcribe(const std::vector<float>& pcm) {
-    const auto tr = impl_->model.transcribe(bsm::AudioBuffer(pcm, 16000));
     std::string out;
-    for (const std::string& w : normalize_words(impl_->tok->decode(tr.token_ids))) {
+    for (const TimedWord& w : transcribe_timed(pcm, false)) {
         if (!out.empty()) out += ' ';
-        out += w;
+        out += w.word;
+    }
+    return out;
+}
+
+std::vector<TimedWord> AsrBaseline::transcribe_timed(const std::vector<float>& pcm, bool pad) {
+    // Parakeet (this port: no NeMo preprocessor dither) returns an empty
+    // transcript for many short clips that end in exact digital silence, so
+    // the padding carries the same +-1e-4 dither window_audio adds.
+    const int lead = pad ? 8000 : 0;
+    std::vector<float> in = dithered_silence(pcm.size() + 2 * static_cast<std::size_t>(lead), 99u);
+    std::copy(pcm.begin(), pcm.end(), in.begin() + lead);
+    const auto tr = impl_->model.transcribe(bsm::AudioBuffer(std::move(in), 16000));
+    const double frame_s = impl_->model.config().frame_seconds();
+    const float shift = static_cast<float>(lead) / 16000.0f;
+    const brolm::t5::Tokenizer& tok = *impl_->tok;
+
+    std::vector<TimedWord> words;
+    std::vector<int32_t> prefix;
+    std::string prev_text, cur;
+    float t0 = 0, t1 = 0;
+    auto flush = [&] {
+        for (const std::string& w : normalize_words(cur)) {
+            TimedWord tw;
+            tw.word = w;
+            tw.t0 = t0 - shift;
+            tw.t1 = t1 - shift;
+            words.push_back(std::move(tw));
+        }
+        cur.clear();
+    };
+    for (std::size_t i = 0; i < tr.token_ids.size(); ++i) {
+        prefix.push_back(tr.token_ids[i]);
+        const std::string text = tok.decode(prefix);
+        const std::string piece = text.size() > prev_text.size() ? text.substr(prev_text.size()) : std::string();
+        prev_text = text;
+        const float s = static_cast<float>(tr.token_frames[i] * frame_s);
+        const int dur = i < tr.token_durations.size() ? tr.token_durations[i] : 1;
+        const float e = static_cast<float>((tr.token_frames[i] + std::max(1, dur)) * frame_s);
+        if (i == 0 || (!piece.empty() && piece[0] == ' ')) {
+            flush();
+            t0 = s;
+        }
+        cur += piece;
+        t1 = e;
+    }
+    flush();
+    return words;
+}
+
+std::string AsrBaseline::transcribe_stream_window(const std::vector<float>& utt, float t_end, float window_s) {
+    const std::size_t end = std::min(utt.size(), static_cast<std::size_t>(std::max(0.0f, t_end) * 16000.0f));
+    // No trailing silence: appended silence (even dithered) makes Parakeet
+    // return nothing for many short prefixes (its per-feature normalization
+    // runs over the whole clip), so the prefix goes in as it is.
+    const std::vector<float> prefix(utt.begin(), utt.begin() + static_cast<std::ptrdiff_t>(end));
+    if (prefix.size() < 1600) return {};
+    std::string out;
+    for (const TimedWord& w : transcribe_timed(prefix, false)) {
+        const float mid = 0.5f * (w.t0 + w.t1);
+        if (mid < t_end - window_s || mid > t_end) continue;
+        if (!out.empty()) out += ' ';
+        out += w.word;
     }
     return out;
 }

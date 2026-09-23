@@ -16,6 +16,9 @@
 //   speaking        onset delay after the first word starts, release delay
 //                   after the last word ends.
 //
+// Keyword metrics are reported per operating point: a threshold and the
+// number of consecutive hops p must hold above it before a fire counts.
+//
 // Then a timing pass: hops with 1 and with 10 keyword questions.
 //
 // Usage:
@@ -103,7 +106,9 @@ int main(int argc, char** argv) {
         std::iota(order.begin(), order.end(), 0);
         std::shuffle(order.begin(), order.end(), rng);
 
-        const std::vector<float> thrs = {0.5f, 0.7f, 0.9f};
+        // Operating points: threshold, and hops it must hold for (30 ms each).
+        const std::vector<float> thrs = {0.5f, 0.7f, 0.9f, 0.7f, 0.9f, 0.9f};
+        const std::vector<int> consec = {1, 1, 1, 5, 5, 10};
         std::vector<std::vector<double>> delays(thrs.size());
         std::vector<int> misses(thrs.size(), 0), fa(thrs.size(), 0), early(thrs.size(), 0);
         std::vector<double> sp_on, sp_off, hop_ms, enc_ms, laya_ms;
@@ -167,20 +172,26 @@ int main(int argc, char** argv) {
                 if (!t.positive) neg_hours += audio_h;
                 else ++n_pos;
                 for (std::size_t k = 0; k < thrs.size(); ++k) {
+                    // Gate: p >= thr on `consec[k]` consecutive hops.
+                    std::vector<char> g(t.p.size(), 0);
+                    for (std::size_t j = 0, run = 0; j < t.p.size(); ++j) {
+                        run = t.p[j] >= thrs[k] ? run + 1 : 0;
+                        g[j] = run >= static_cast<std::size_t>(consec[k]);
+                    }
                     if (!t.positive) {
                         bool on = false;
-                        for (float v : t.p) {
-                            if (v >= thrs[k] && !on) ++fa[k];
-                            on = v >= thrs[k];
+                        for (char v : g) {
+                            if (v && !on) ++fa[k];
+                            on = v != 0;
                         }
                         continue;
                     }
                     bool fired = false, before = false;
                     for (std::size_t j = 0; j < hops.size(); ++j) {
                         const double te = hops[j].t_end;
-                        if (t.p[j] >= thrs[k] && te < t.t0) before = true;
+                        if (g[j] && te < t.t0) before = true;
                         if (te < t.t0 || te > t.t1 + 1.5) continue;
-                        if (t.p[j] >= thrs[k]) {
+                        if (g[j]) {
                             delays[k].push_back(te - t.t1);
                             fired = true;
                             break;
@@ -213,9 +224,9 @@ int main(int argc, char** argv) {
         std::printf("per hop (%d-%d questions): total p50 %.1f p95 %.1f ms | encode+project p50 %.1f | laya p50 %.1f\n",
                     n_neg + 3, n_neg + 5, pct(hop_ms, 0.5), pct(hop_ms, 0.95), pct(enc_ms, 0.5), pct(laya_ms, 0.5));
         for (std::size_t k = 0; k < thrs.size(); ++k) {
-            std::printf("thr %.1f: recall %.3f, delay after word end p10 %+.2f p50 %+.2f p90 %+.2f s, "
+            std::printf("thr %.1f x %2d hops: recall %.3f, delay after word end p10 %+.2f p50 %+.2f p90 %+.2f s, "
                         "fired before onset %d, false alarms %.1f / keyword-hour\n",
-                        thrs[k], 1.0 - static_cast<double>(misses[k]) / std::max(1, n_pos), pct(delays[k], 0.1),
+                        thrs[k], consec[k], 1.0 -static_cast<double>(misses[k]) / std::max(1, n_pos), pct(delays[k], 0.1),
                         pct(delays[k], 0.5), pct(delays[k], 0.9), early[k], fa[k] / std::max(1e-9, neg_hours));
         }
         std::printf("speaking (p >= 0.5): onset delay p50 %.2f p90 %.2f s, release after last word p50 %.2f p90 %.2f s\n",
