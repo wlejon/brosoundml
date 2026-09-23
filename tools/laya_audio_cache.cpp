@@ -12,12 +12,18 @@
 //   brosoundml_laya_audio_cache --align A.tsv --out C.lac
 //        [--model-dir weights/qwen-asr/0.6B] [--window 3.0]
 //        [--per-utt 4] [--every 1] [--limit 0] [--seed 1]
-//        [--fp32] [--check N] [--start U]
+//        [--fp32] [--check N] [--start U] [--after-word S]
+//        [--aug-rirs L] [--aug-noises L] [--aug-music L] [--p-rir P] [--p-noise P] [--p-music P]
+// --after-word S puts every window end in [last word end, + S] instead (a
+// word just finished: the single-word clip test sets).
+// --aug-* augment each utterance before windowing (laya_audio_augment.h);
+// L is a list of audio files, one per line.
 // --start skips alignment rows before U (window utterance indices stay
 // absolute), so an alignment file still being appended can be cached in parts.
 // The encoder runs FP16 on the GPU unless --fp32; --check N compares the
 // first N windows against an FP32 encoder.
 
+#include "laya_audio_augment.h"
 #include "laya_audio_data.h"
 
 #include "brosoundml/audio.h"
@@ -48,6 +54,10 @@ int main(int argc, char** argv) {
     std::string align, out, model_dir = "weights/qwen-asr/0.6B";
     float window_s = 3.0f;
     int per_utt = 4, every = 1, limit = 0, check = 0, start = 0;
+    float after_word = 0;
+    std::string dump_dir;  // --dump DIR N: write the first N augmented utterances as WAVs (a listening check)
+    int dump = 0;
+    laya_audio::AugmentConfig aug_cfg;
     bool half = true;
     uint32_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -67,6 +77,17 @@ int main(int argc, char** argv) {
         else if (a == "--start") start = std::atoi(next().c_str());
         else if (a == "--fp32") half = false;
         else if (a == "--check") check = std::atoi(next().c_str());
+        else if (a == "--after-word") after_word = std::stof(next());
+        else if (a == "--dump") {
+            dump_dir = next();
+            dump = std::atoi(next().c_str());
+        }
+        else if (a == "--aug-rirs") aug_cfg.rir_list = next();
+        else if (a == "--aug-noises") aug_cfg.noise_list = next();
+        else if (a == "--aug-music") aug_cfg.music_list = next();
+        else if (a == "--p-rir") aug_cfg.p_rir = std::stof(next());
+        else if (a == "--p-noise") aug_cfg.p_noise = std::stof(next());
+        else if (a == "--p-music") aug_cfg.p_music = std::stof(next());
         else die("unknown argument " + a);
     }
     if (align.empty() || out.empty()) die("need --align and --out");
@@ -89,7 +110,10 @@ int main(int argc, char** argv) {
         std::vector<float> host_ref;
         laya_audio::CacheWriter writer(out, window_s, dim);
 
-        std::mt19937 rng(seed);
+        std::mt19937 rng(seed), aug_rng(seed * 7919u + 17u);
+        laya_audio::Augmenter aug;
+        aug.load(aug_cfg);
+        int n_rir = 0, n_noise = 0, n_music = 0;
         double enc_ms = 0;
         int n_enc = 0, kept = 0;
         std::vector<float> host;
@@ -97,10 +121,24 @@ int main(int argc, char** argv) {
             if (static_cast<int>(u) < start || u % static_cast<std::size_t>(every)) continue;
             if (limit > 0 && kept >= limit) break;
             ++kept;
-            const std::vector<float> pcm = laya_audio::load_audio_16k(utts[u].wav);
+            std::vector<float> pcm = laya_audio::load_audio_16k(utts[u].wav);
+            if (aug.enabled()) {
+                const laya_audio::AugmentApplied ap = aug.apply(pcm, aug_rng);
+                n_rir += ap.rir;
+                n_noise += ap.noise;
+                n_music += ap.music;
+                if (kept <= dump && !dump_dir.empty()) {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "/aug_%03d_r%d_n%d_m%d.wav", kept, ap.rir, ap.noise, ap.music);
+                    brosoundml::AudioBuffer(pcm, 16000).write_wav(dump_dir + name);
+                }
+            }
+            float last_end = 0;
+            for (const laya_audio::TimedWord& w : utts[u].words) last_end = std::max(last_end, w.t1);
             std::uniform_real_distribution<float> t_dist(0.4f, utts[u].duration_s + 0.8f);
+            std::uniform_real_distribution<float> t_after(last_end, last_end + after_word);
             for (int k = 0; k < per_utt; ++k) {
-                const float t_end = t_dist(rng);
+                const float t_end = after_word > 0 && last_end > 0 ? t_after(rng) : t_dist(rng);
                 brosoundml::AudioBuffer win(laya_audio::window_audio(pcm, t_end, window_s, rng()), 16000);
                 const auto t0 = std::chrono::steady_clock::now();
                 const int frames = asr.encode_to_host(win, host);
@@ -145,6 +183,9 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "done: %d windows from %d utterances, encode %.2f ms/window (%.1f s windows)\n",
                      writer.count(), kept, enc_ms / std::max(1, n_enc), window_s);
+        if (aug.enabled())
+            std::fprintf(stderr, "augmented utterances: reverb %d, noise %d, music %d of %d\n", n_rir, n_noise,
+                         n_music, kept);
         return 0;
     } catch (const std::exception& e) {
         die(e.what());

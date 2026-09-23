@@ -1,5 +1,7 @@
 #include "laya_audio_task.h"
 
+#include "laya_audio_corpus.h"
+
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
@@ -40,13 +42,20 @@ bool held_out_keyword(const std::string& w) {
 
 WindowFacts window_facts(const AlignedUtterance& u, float t_end, float window_s) {
     WindowFacts f;
+    // The stream is silent outside [0, duration] (window_audio), so only
+    // [lo, hi] of the window is heard. A word cut by the utterance edge
+    // (AMI chunks cut inside overlapping speech) is partial, not inside.
     const float ts = t_end - window_s;
+    const float lo = std::max(ts, 0.0f);
+    // (+0.1 s: ASR-derived word ends may overrun the audio by up to a frame.)
+    const float hi = u.duration_s > 0 ? std::min(t_end, u.duration_s + 0.1f) : t_end;
     for (const TimedWord& w : u.words) {
-        if (w.t0 < 0 || w.t1 <= w.t0) continue;
-        if (w.t1 > t_end - kTailS && w.t0 < t_end) f.speaking = true;
-        if (w.t1 > t_end - kTailS && w.t1 <= t_end) f.word_end = true;
-        if (w.t0 >= ts && w.t1 <= t_end) f.inside.push_back(w.word);
-        else if (w.t1 > ts && w.t0 < t_end) f.partial.insert(w.word);
+        if (w.t1 <= 0 || w.t1 <= w.t0) continue;  // unknown time (-1|-1) or empty
+        const bool heard_tail = w.t1 > std::max(t_end - kTailS, lo) && w.t0 < hi;
+        if (heard_tail) f.speaking = true;
+        if (heard_tail && w.t1 <= hi && w.t1 > t_end - kTailS) f.word_end = true;
+        if (w.t0 >= lo && w.t1 <= hi) f.inside.push_back(w.word);
+        else if (w.t1 > lo && w.t0 < hi) f.partial.insert(w.word);
     }
     return f;
 }
@@ -146,13 +155,14 @@ brolm::laya::LayaItem ItemBuilder::item(const std::string& instructions, int n_s
 }
 
 std::vector<Probe> make_probes(const WindowCache& cache, const std::vector<AlignedUtterance>& utts,
-                               const std::vector<int>& windows, Vocab& neg_vocab, const Vocab* seen, int kw_pos,
+                               const std::vector<int>& windows, VocabSet& vocabs, const Vocab* seen, int kw_pos,
                                std::mt19937& rng) {
     const bool training = seen == nullptr;
     std::vector<Probe> out;
     for (int wi : windows) {
         const CachedWindow& w = cache.windows[static_cast<std::size_t>(wi)];
         const AlignedUtterance& u = utts[static_cast<std::size_t>(w.utt)];
+        Vocab& neg_vocab = vocabs.for_utterance(u, rng);
         const WindowFacts f = window_facts(u, w.t_end, cache.window_s);
         auto unseen = [&](const std::string& k) { return training ? false : (held_out_keyword(k) || !seen->contains(k)); };
 

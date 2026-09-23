@@ -104,9 +104,11 @@ struct Probe {
 // (training vocab, held-out words excluded), speaking and word_end. Eval:
 // up to `kw_pos` positives and the same number each of hard and random
 // negatives drawn from `neg_vocab` (all words, held-out included), with
-// `unseen` marked against the training vocabulary `seen`.
+// `unseen` marked against the training vocabulary `seen`. Negatives come
+// from the vocabulary of the window's language (laya_audio_corpus.h).
+class VocabSet;
 std::vector<Probe> make_probes(const WindowCache& cache, const std::vector<AlignedUtterance>& utts,
-                               const std::vector<int>& windows, Vocab& neg_vocab, const Vocab* seen, int kw_pos,
+                               const std::vector<int>& windows, VocabSet& neg_vocab, const Vocab* seen, int kw_pos,
                                std::mt19937& rng);
 
 // Rank AUC of scores against 0/1 labels (ties count half). NaN if a class is empty.

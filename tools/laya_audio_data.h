@@ -22,19 +22,27 @@ struct Utterance {
     double duration_s = 0;
 };
 
-// Read the LibriTTS-R manifest.json (an array of {id, wav, speaker, subset,
-// text, sample_rate, duration_s}). Throws on a malformed file.
+// Read a manifest: the LibriTTS-R manifest.json (an array of {id, wav,
+// speaker, subset, text, sample_rate, duration_s}), or a .tsv with
+// id \t audio \t speaker \t subset \t text per line (duration unknown).
 std::vector<Utterance> load_manifest(const std::string& path);
 
-// Windowed-sinc (Hann, 16 zero crossings) band-limited resample. Host FP32.
+// Windowed-sinc (Hann, 16 zero crossings) band-limited resample, polyphase
+// with precomputed kernels. Host FP32. (laya_audio_decode.cpp)
 std::vector<float> resample_sinc(const std::vector<float>& in, int in_rate, int out_rate);
 
-// A WAV at 16 kHz mono (resampled when it is not).
-std::vector<float> load_audio_16k(const std::string& wav_path);
+// Audio at 16 kHz mono: .wav, .flac, .opus/.ogg (Ogg Opus), or
+// "path@t0:t1" for a time range of one of those. (laya_audio_decode.cpp)
+std::vector<float> load_audio_16k(const std::string& spec);
 
-// Lower-case ASCII words of a transcript: letters, digits and inner
-// apostrophes; everything else separates words.
+// Lower-case words of a transcript: letters (UTF-8 included; Latin-1 and
+// Latin Extended-A capitals are lowered), digits and inner apostrophes
+// (' or U+2019); ASCII and Latin-1 / general punctuation separate words.
 std::vector<std::string> normalize_words(const std::string& text);
+
+// Language of a subset name: "voxpopuli-de-train" / "mswc-fr-test" -> "de" /
+// "fr"; everything else (LibriTTS, AMI, non-speech) -> "en".
+std::string language_of(const std::string& subset);
 
 struct TimedWord {
     std::string word;

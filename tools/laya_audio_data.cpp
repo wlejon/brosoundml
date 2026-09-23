@@ -20,6 +20,31 @@ namespace json = brolm::detail::json;
 std::vector<Utterance> load_manifest(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("laya_audio: cannot open manifest " + path);
+    if (path.size() > 4 && path.compare(path.size() - 4, 4, ".tsv") == 0) {
+        // id \t audio \t speaker \t subset \t text
+        std::vector<Utterance> out;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            std::vector<std::string> c;
+            std::size_t s = 0;
+            for (int k = 0; k < 4; ++k) {
+                const std::size_t t = line.find('\t', s);
+                if (t == std::string::npos) throw std::runtime_error("laya_audio: bad manifest line in " + path);
+                c.push_back(line.substr(s, t - s));
+                s = t + 1;
+            }
+            Utterance u;
+            u.id = c[0];
+            u.wav = c[1];
+            u.speaker = c[2];
+            u.subset = c[3];
+            u.text = line.substr(s);
+            out.push_back(std::move(u));
+        }
+        return out;
+    }
     std::stringstream ss;
     ss << f.rdbuf();
     const json::Value root = json::parse(ss.str());
@@ -37,39 +62,6 @@ std::vector<Utterance> load_manifest(const std::string& path) {
     return out;
 }
 
-std::vector<float> resample_sinc(const std::vector<float>& in, int in_rate, int out_rate) {
-    if (in_rate == out_rate) return in;
-    const double ratio = static_cast<double>(out_rate) / in_rate;
-    const double cutoff = std::min(1.0, ratio) * 0.95;  // of the input Nyquist
-    constexpr int kZeros = 16;
-    const double half_width = kZeros / cutoff;  // input samples each side
-    const std::size_t n_out = static_cast<std::size_t>(std::floor(in.size() * ratio));
-    std::vector<float> out(n_out);
-    const double pi = 3.14159265358979323846;
-    for (std::size_t n = 0; n < n_out; ++n) {
-        const double t = n / ratio;
-        const long lo = static_cast<long>(std::ceil(t - half_width));
-        const long hi = static_cast<long>(std::floor(t + half_width));
-        double acc = 0, wsum = 0;
-        for (long j = lo; j <= hi; ++j) {
-            const double x = (t - j) * cutoff;
-            const double sinc = std::abs(x) < 1e-9 ? 1.0 : std::sin(pi * x) / (pi * x);
-            const double w = 0.5 + 0.5 * std::cos(pi * (t - j) / half_width);
-            const double k = sinc * w * cutoff;
-            wsum += k;
-            if (j >= 0 && j < static_cast<long>(in.size())) acc += k * in[static_cast<std::size_t>(j)];
-        }
-        out[n] = static_cast<float>(wsum > 0 ? acc / wsum : 0.0);
-    }
-    return out;
-}
-
-std::vector<float> load_audio_16k(const std::string& wav_path) {
-    brosoundml::AudioBuffer a = brosoundml::read_wav(wav_path);
-    if (a.sample_rate == 16000) return std::move(a.samples);
-    return resample_sinc(a.samples, a.sample_rate, 16000);
-}
-
 std::vector<std::string> normalize_words(const std::string& text) {
     std::vector<std::string> words;
     std::string cur;
@@ -80,17 +72,60 @@ std::vector<std::string> normalize_words(const std::string& text) {
         if (s < cur.size()) words.push_back(cur.substr(s));
         cur.clear();
     };
-    for (unsigned char c : text) {
-        if (std::isalnum(c)) {
-            cur.push_back(static_cast<char>(std::tolower(c)));
-        } else if (c == '\'' && !cur.empty()) {
-            cur.push_back('\'');
-        } else {
-            flush();
+    const std::size_t n = text.size();
+    for (std::size_t i = 0; i < n;) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c < 0x80) {
+            if (std::isalnum(c)) cur.push_back(static_cast<char>(std::tolower(c)));
+            else if (c == '\'' && !cur.empty()) cur.push_back('\'');
+            else flush();
+            ++i;
+            continue;
         }
+        // UTF-8 sequence.
+        const std::size_t len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        const std::size_t e = std::min(n, i + len);
+        const unsigned char c1 = e > i + 1 ? static_cast<unsigned char>(text[i + 1]) : 0;
+        if (c == 0xC2) {
+            flush();  // U+0080..U+00BF: Latin-1 punctuation and symbols
+        } else if (c == 0xC3 && c1 >= 0x80 && c1 <= 0x9E && c1 != 0x97) {
+            cur.push_back(static_cast<char>(c));  // U+00C0..U+00DE capitals -> lower case
+            cur.push_back(static_cast<char>(c1 + 0x20));
+        } else if (c == 0xC3 && c1 == 0x97) {
+            flush();  // multiplication sign
+        } else if (c == 0xE2 && c1 == 0x80) {
+            // General punctuation: the right single quote is an apostrophe.
+            const unsigned char c2 = e > i + 2 ? static_cast<unsigned char>(text[i + 2]) : 0;
+            if (c2 == 0x99 && !cur.empty()) cur.push_back('\'');
+            else flush();
+        } else if (c >= 0xC4 && c <= 0xC5 && c1 >= 0x80 && c1 <= 0xBF) {
+            // Latin Extended-A (U+0100..U+017F): upper case sits on even code
+            // points for most of the block; lower it by setting bit 0.
+            const unsigned cp = ((c & 0x1Fu) << 6) | (c1 & 0x3Fu);
+            const bool odd_upper = (cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E);
+            unsigned lc = cp;
+            if (cp != 0x130 && cp != 0x131 && cp != 0x138 && cp != 0x149 && cp != 0x17F) {
+                if (odd_upper) lc = (cp & 1u) ? cp + 1 : cp;
+                else lc = (cp & 1u) ? cp : cp + 1;
+            }
+            cur.push_back(static_cast<char>(0xC0 | (lc >> 6)));
+            cur.push_back(static_cast<char>(0x80 | (lc & 0x3F)));
+        } else {
+            cur.append(text, i, e - i);  // other letters pass through
+        }
+        i = e;
     }
     flush();
     return words;
+}
+
+std::string language_of(const std::string& subset) {
+    // "voxpopuli-de-train", "mswc-fr-test": the language is the second field.
+    for (const char* corpus : {"voxpopuli-", "mswc-"}) {
+        const std::size_t n = std::strlen(corpus);
+        if (subset.compare(0, n, corpus) == 0 && subset.size() >= n + 2) return subset.substr(n, 2);
+    }
+    return "en";
 }
 
 std::vector<TimedWord> align_reference(const std::vector<std::string>& ref, const std::vector<TimedWord>& hyp) {
