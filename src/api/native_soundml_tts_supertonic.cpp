@@ -28,13 +28,14 @@ struct SupertonicOpts {
 
 void readSupertonicOpts(Value opts, SupertonicOpts& o) {
     if (!ev::isObject(opts)) return;
-    getStrOpt(opts, "language", o.language);
-    getIntOpt(opts, "steps", o.steps);
-    getFloatOpt(opts, "speed", o.speed);
-    getFloatOpt(opts, "gapSeconds", o.gapSeconds);
-    getFloatOpt(opts, "guidance", o.guidance);
-    getSeedOpt(opts, o.seed);
-    getBoolOpt(opts, "longForm", o.longForm);
+    ev::Persistent root(opts);  // every read below allocates
+    getStrOpt(root.get(), "language", o.language);
+    getIntOpt(root.get(), "steps", o.steps);
+    getFloatOpt(root.get(), "speed", o.speed);
+    getFloatOpt(root.get(), "gapSeconds", o.gapSeconds);
+    getFloatOpt(root.get(), "guidance", o.guidance);
+    getSeedOpt(root.get(), o.seed);
+    getBoolOpt(root.get(), "longForm", o.longForm);
     if (o.steps < 1) o.steps = 1;
 }
 
@@ -152,6 +153,7 @@ void decorateSupertonic(ObjectBuilder& b) {
 //   gapSeconds, guidance, onDone(result, info). Supertonic has no per-step
 //   cancel hook (the flow loop is short), so cancel is not polled.
 Value supertonicSynthesizeAsync(Value modelVal, HostSupertonic* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     if (!isStringArg(args, 1)) return ev::throwTypeError("synthesize(supertonic, text, opts): text string required");
     if (!w->model || !w->model->loaded()) return ev::throwError("synthesize: model is not loaded");
     struct Job {
@@ -181,7 +183,7 @@ Value supertonicSynthesizeAsync(Value modelVal, HostSupertonic* w, std::span<con
     job->gate = w->busy;
     job->device = w->device;
     job->model = w->model;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     auto work = [job](const std::atomic<bool>&) {
         brotensor::DeviceScope scope(job->device);
         auto buf = runSupertonic(*job->model, job->text, job->o, job->style);

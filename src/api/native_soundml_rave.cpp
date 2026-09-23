@@ -148,9 +148,9 @@ Value raveInit(Value, std::span<const Value>) {
 Value loadRave(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!modelLoaderArgs("loadRave", args, dir, dev, opts)) return ev::undefined();
-    return runModelLoader<HostRave>("loadRave", opts, g_raveClass, [dir, dev] {
+    return runModelLoader<HostRave>("loadRave", opts.get(), g_raveClass, [dir, dev] {
         auto w = std::make_unique<HostRave>();
         w->device = dev;
         w->rave = std::make_shared<brosoundml::Rave>();

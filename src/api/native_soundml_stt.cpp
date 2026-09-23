@@ -6,6 +6,7 @@
 // picks explicitly and must be a string. Every loader resolves its path the
 // way the host's fs module does (setPathResolver).
 #include "soundml_stt_internal.h"
+#include "soundml_loader.h"
 
 namespace brosoundml::api {
 
@@ -21,66 +22,17 @@ HostClass g_qwenAsrStreamClass;
 
 namespace {
 
-// Run a build on the JS thread (sync) or on a work thread (opts.onReady is a
-// function), wrapping the result in `cls`. The build touches no JS state.
+// The loaders share soundml_loader.h's prologue (modelLoaderArgs: path +
+// device, opts rooted) and runner (runModelLoader: sync or onReady/onError).
 template <typename W>
 Value runLoader(const char* fn, Value opts, const HostClass& cls,
                 std::function<std::unique_ptr<W>()> build) {
-    struct State {
-        std::string fn;
-        const HostClass* cls = nullptr;
-        std::function<std::unique_ptr<W>()> build;
-        std::unique_ptr<W> w;
-        ev::Persistent onReady;
-        ev::Persistent onError;
-    };
-    auto st = std::make_shared<State>();
-    st->fn = fn;
-    st->cls = &cls;
-    st->build = std::move(build);
-    st->onReady = getFunctionOpt(opts, "onReady");
-    st->onError = getFunctionOpt(opts, "onError");
-
-    if (!ev::isFunction(st->onReady.get())) {
-        try {
-            return cls.createInstance(st->build());
-        } catch (const std::exception& e) {
-            return ev::throwError(st->fn + ": " + e.what());
-        }
-    }
-
-    auto work = [st](const std::atomic<bool>&) { st->w = st->build(); };
-    auto done = [st](bool, const std::string& error) {
-        if (!error.empty() || !st->w) {
-            if (ev::isFunction(st->onError.get())) {
-                ev::Persistent msg(ev::fromUtf8(error.empty() ? st->fn + " failed" : error));
-                callCallback1(st->onError.get(), msg.get());
-            }
-            return;
-        }
-        ev::Persistent inst(st->cls->createInstance(std::move(st->w)));
-        callCallback1(st->onReady.get(), inst.get());
-    };
-    return launchAsyncJob(std::move(work), nullptr, std::move(done));
+    return runModelLoader<W>(fn, opts, cls, std::move(build));
 }
 
-// Shared prologue of the model loaders: path + device.
 bool loaderArgs(const char* fn, std::span<const Value> args, std::string& dir,
-                brotensor::Device& dev, Value& opts) {
-    if (!isStringArg(args, 0)) {
-        ev::throwTypeError(std::string(fn) + "(modelDir, opts?): path required");
-        return false;
-    }
-    dir = resolvePath(strAt(args, 0));
-    brotensor::init();
-    dev = autoDevice();
-    opts = isObjectArg(args, 1) ? args[1] : ev::undefined();
-    std::string err;
-    if (!parseDeviceOpt(opts, dev, err)) {
-        ev::throwTypeError(std::string(fn) + ": " + err);
-        return false;
-    }
-    return true;
+                brotensor::Device& dev, ev::Persistent& opts) {
+    return modelLoaderArgs(fn, args, dir, dev, opts);
 }
 
 Value sttInit(Value, std::span<const Value>) {
@@ -96,9 +48,9 @@ Value sttInit(Value, std::span<const Value>) {
 Value loadWhisper(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadWhisper", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostWhisperModel>("loadWhisper", opts, g_whisperModelClass, [dir, dev] {
+    return runLoader<HostWhisperModel>("loadWhisper", opts.get(), g_whisperModelClass, [dir, dev] {
         auto w = std::make_unique<HostWhisperModel>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::Whisper>();
@@ -136,9 +88,9 @@ Value loadTokenizer(Value, std::span<const Value> args) {
 Value loadParakeet(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadParakeet", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostParakeetModel>("loadParakeet", opts, g_parakeetModelClass, [dir, dev] {
+    return runLoader<HostParakeetModel>("loadParakeet", opts.get(), g_parakeetModelClass, [dir, dev] {
         auto w = std::make_unique<HostParakeetModel>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::Parakeet>();
@@ -156,8 +108,8 @@ Value loadParakeetTokenizer(Value, std::span<const Value> args) {
     if (!isStringArg(args, 0))
         return ev::throwTypeError("loadParakeetTokenizer(tokenizerJsonPath, opts?): path required");
     const std::string path = resolvePath(strAt(args, 0));
-    Value opts = isObjectArg(args, 1) ? args[1] : ev::undefined();
-    return runLoader<HostParakeetTokenizer>("loadParakeetTokenizer", opts, g_parakeetTokenizerClass,
+    ev::Persistent opts(isObjectArg(args, 1) ? args[1] : ev::undefined());
+    return runLoader<HostParakeetTokenizer>("loadParakeetTokenizer", opts.get(), g_parakeetTokenizerClass,
         [path] {
             auto t = std::make_unique<HostParakeetTokenizer>();
             t->tok = std::make_unique<brolm::t5::Tokenizer>(brolm::t5::Tokenizer::load(path));
@@ -169,9 +121,9 @@ Value loadParakeetTokenizer(Value, std::span<const Value> args) {
 Value loadQwenAsr(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadQwenAsr", args, dir, dev, opts)) return ev::undefined();
-    return runLoader<HostQwenAsrModel>("loadQwenAsr", opts, g_qwenAsrModelClass, [dir, dev] {
+    return runLoader<HostQwenAsrModel>("loadQwenAsr", opts.get(), g_qwenAsrModelClass, [dir, dev] {
         auto w = std::make_unique<HostQwenAsrModel>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::QwenAsr>();
@@ -189,11 +141,11 @@ Value loadQwenAsr(Value, std::span<const Value> args) {
 Value loadQwenAsrStream(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderArgs("loadQwenAsrStream", args, dir, dev, opts)) return ev::undefined();
     int blockChunks = 1;
-    getIntOpt(opts, "blockChunks", blockChunks);
-    return runLoader<HostQwenAsrStream>("loadQwenAsrStream", opts, g_qwenAsrStreamClass,
+    getIntOpt(opts.get(), "blockChunks", blockChunks);
+    return runLoader<HostQwenAsrStream>("loadQwenAsrStream", opts.get(), g_qwenAsrStreamClass,
         [dir, dev, blockChunks] {
             auto w = std::make_unique<HostQwenAsrStream>();
             w->device = dev;

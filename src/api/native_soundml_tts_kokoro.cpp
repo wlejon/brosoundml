@@ -64,6 +64,7 @@ Value makeKokoroResult(const std::vector<float>& samples, int rate, const std::v
 
 // loadVoice(path, opts?) -> Voice (sync) | AsyncHandle (opts.onReady)
 Value kokoroLoadVoice(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);  // `this` is a plain copy; the reads below allocate
     auto* w = kokoroSelf(self);
     if (!w) return ev::throwTypeError("loadVoice: not a Kokoro");
     if (!isStringArg(a, 0)) return ev::throwTypeError("loadVoice(path, opts?): path string required");
@@ -90,7 +91,7 @@ Value kokoroLoadVoice(Value self, std::span<const Value> a) {
     st->model = w->model;
     st->device = w->device;
     st->path = path;
-    st->modelRef = ev::Persistent(self);
+    st->modelRef = ev::Persistent(selfRoot.get());
     st->onReady = onReady;
     st->onError = getFunctionOpt(opts.get(), "onError");
     auto work = [st](const std::atomic<bool>&) {
@@ -265,6 +266,7 @@ Value launchKokoroJob(std::shared_ptr<KokoroJob> job, std::function<void(KokoroJ
 
 // session.synthesize(phonemeIds, voice?, opts?) -> AsyncHandle
 Value kokoroSessionSynthesize(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);  // `this` is a plain copy; the reads below allocate
     auto* sw = sessionSelf(self);
     if (!sw) return ev::throwTypeError("synthesize: not a KokoroSession");
     if (!hasArg(a, 0)) return ev::throwTypeError("synthesize(phonemeIds, voice?, opts?): phonemeIds required");
@@ -293,7 +295,7 @@ Value kokoroSessionSynthesize(Value self, std::span<const Value> a) {
     }
     job->gate = sw->busy;
     job->device = sw->device;
-    job->modelRef = ev::Persistent(self);
+    job->modelRef = ev::Persistent(selfRoot.get());
     brosoundml::KokoroSession* session = sw->session.get();
     return launchKokoroJob(job, [session](KokoroJob& j, const std::atomic<bool>& cancel) {
         brotensor::DeviceScope scope(j.device);
@@ -320,6 +322,7 @@ Value kokoroSessionSetVoice(Value self, std::span<const Value> a) {
 
 // bro.tts.synthesize(kokoro, phonemeIds, voice, opts?) -> AsyncHandle
 Value kokoroSynthesizeAsync(Value modelVal, HostKokoro* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     if (args.size() < 3)
         return ev::throwTypeError("synthesize(kokoro, phonemeIds, voice, opts?): kokoro, phonemeIds and voice required");
     auto job = std::make_shared<KokoroJob>();
@@ -335,7 +338,7 @@ Value kokoroSynthesizeAsync(Value modelVal, HostKokoro* w, std::span<const Value
     job->gate = w->busy;
     job->device = w->device;
     job->voice = vw->voice;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     job->voiceRef = ev::Persistent(args[2]);
     auto model = w->model;
     return launchKokoroJob(job, [model](KokoroJob& j, const std::atomic<bool>& cancel) {
@@ -349,6 +352,7 @@ Value kokoroSynthesizeAsync(Value modelVal, HostKokoro* w, std::span<const Value
 
 // bro.tts.decodeFrom(kokoro, voice, asr, F0, N, nPhonemes, opts?) -> AsyncHandle
 Value kokoroDecodeFromAsync(Value modelVal, HostKokoro* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     if (args.size() < 6)
         return ev::throwTypeError("decodeFrom(kokoro, voice, asr, F0, N, nPhonemes, opts?): voice, asr, F0, N and nPhonemes required");
     auto* vw = voiceOf(args[1]);
@@ -383,7 +387,7 @@ Value kokoroDecodeFromAsync(Value modelVal, HostKokoro* w, std::span<const Value
     job->device = w->device;
     job->model = w->model;
     job->voice = vw->voice;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     job->voiceRef = ev::Persistent(args[1]);
     auto work = [job](const std::atomic<bool>& cancel) {
         brotensor::DeviceScope scope(job->device);
@@ -411,6 +415,7 @@ Value kokoroDecodeFromAsync(Value modelVal, HostKokoro* w, std::span<const Value
 //   flat id array treated as a single chunk. opts.onChunk(samples, durations)
 //   fires per chunk; onDone gets the concatenation.
 Value kokoroSynthesizeStream(Value modelVal, HostKokoro* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     if (args.size() < 3)
         return ev::throwTypeError("synthesizeStream(kokoro, phonemeChunks, voice, opts?): kokoro, phonemeChunks and voice required");
     struct StreamJob {
@@ -461,7 +466,7 @@ Value kokoroSynthesizeStream(Value modelVal, HostKokoro* w, std::span<const Valu
     job->device = w->device;
     job->model = w->model;
     job->voice = vw->voice;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     job->voiceRef = ev::Persistent(args[2]);
 
     auto work = [job](const std::atomic<bool>& cancel) {

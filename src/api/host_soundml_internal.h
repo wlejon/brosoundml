@@ -215,10 +215,10 @@ inline std::vector<float> readFloat32Array(Value v, bool* ok = nullptr) {
         return {};
     }
     if (ev::isObject(v) && !ev::isFunction(v)) {
-        Value lenVal = ev::getProperty(v, "length");
+        ev::Persistent root(v);  // rooted before the length read allocates
+        Value lenVal = ev::getProperty(root.get(), "length");
         if (!ev::isNumber(lenVal)) return {};
         if (ok) *ok = true;
-        ev::Persistent root(v);
         uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
         std::vector<float> out;
         out.reserve(len);
@@ -265,10 +265,10 @@ inline std::vector<int32_t> readInt32Array(Value v, bool* ok = nullptr) {
         return out;
     }
     if (ev::isObject(v) && !ev::isFunction(v)) {
-        Value lenVal = ev::getProperty(v, "length");
+        ev::Persistent root(v);  // rooted before the length read allocates
+        Value lenVal = ev::getProperty(root.get(), "length");
         if (!ev::isNumber(lenVal)) return {};
         if (ok) *ok = true;
-        ev::Persistent root(v);
         uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
         std::vector<int32_t> out;
         out.reserve(len);
@@ -296,9 +296,9 @@ inline std::vector<uint8_t> readByteArray(Value v) {
         return out;
     }
     if (ev::isObject(v) && !ev::isFunction(v)) {
-        Value lenVal = ev::getProperty(v, "length");
+        ev::Persistent root(v);  // rooted before the length read allocates
+        Value lenVal = ev::getProperty(root.get(), "length");
         if (!ev::isNumber(lenVal)) return out;
-        ev::Persistent root(v);
         uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
         out.reserve(len);
         for (uint32_t i = 0; i < len; ++i) {

@@ -35,6 +35,7 @@ brosoundml::QwenAsr::Transcription runQwen(QwenJob& job,
 
 Value qwenAsrTranscribe(Value modelVal, HostQwenAsrModel* model, HostQwenAsrSession* session,
                         std::span<const Value> args, const char* fn) {
+    ev::Persistent modelRoot(modelVal);  // the reads below allocate
     const std::string pre = std::string(fn) + ": ";
     auto job = std::make_shared<QwenJob>();
     if (session) {
@@ -85,7 +86,7 @@ Value qwenAsrTranscribe(Value modelVal, HostQwenAsrModel* model, HostQwenAsrSess
 
     if (!job->gate.tryClaim())
         return ev::throwError(pre + "an operation is already in flight on this model");
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     if (job->hasOnToken) job->tokens.reserve(kSttTokenSlots);
 
     auto work = [job](const std::atomic<bool>& cancel) {

@@ -93,31 +93,33 @@ namespace {
 // the host has not published one, then the installers over it. `compute`
 // leaves out the listen tenants (api.h: installSoundMLCompute).
 void installSoundMLOnto(bool compute) {
-    Value globalThisVal = ev::undefined();
-    auto gt = ev::globalValue("globalThis");
-    if (gt.found && ev::isObject(gt.value)) {
-        globalThisVal = gt.value;
-    }
-    ev::Persistent globalRoot(globalThisVal);
-
-    Value broVal = ev::globalValue("bro").found ? ev::globalValue("bro").value : ev::undefined();
-    if (!ev::isObject(broVal)) {
-        if (!ev::isUndefined(globalRoot.get())) {
-            Value candidate = ev::getProperty(globalRoot.get(), "bro");
-            if (ev::isObject(candidate)) {
-                broVal = candidate;
-            }
-        }
-    }
-    if (!ev::isObject(broVal)) {
-        broVal = ev::createObject();
-        ev::registerGlobal("bro", broVal);
-        if (!ev::isUndefined(globalRoot.get())) {
-            ev::setProperty(globalRoot.get(), "bro", broVal);
-        }
+    // Every Value below that outlives an allocating call rides in a
+    // Persistent (embed.h GC contract): getProperty, createObject,
+    // registerGlobal and setProperty may each move everything.
+    ev::Persistent globalRoot;
+    {
+        auto gt = ev::globalValue("globalThis");
+        if (gt.found && ev::isObject(gt.value)) globalRoot.set(gt.value);
     }
 
-    ObjectBuilder bro(broVal);
+    ev::Persistent broRoot;
+    {
+        auto bg = ev::globalValue("bro");
+        if (bg.found && ev::isObject(bg.value)) broRoot.set(bg.value);
+    }
+    if (!ev::isObject(broRoot.get()) && ev::isObject(globalRoot.get())) {
+        Value candidate = ev::getProperty(globalRoot.get(), "bro");
+        if (ev::isObject(candidate)) broRoot.set(candidate);
+    }
+    if (!ev::isObject(broRoot.get())) {
+        broRoot.set(ev::createObject());
+        ev::registerGlobal("bro", broRoot.get());
+        if (ev::isObject(globalRoot.get())) {
+            ev::setProperty(globalRoot.get(), "bro", broRoot.get());
+        }
+    }
+
+    ObjectBuilder bro(broRoot.get());
 
     installAsyncHandleClass();
 

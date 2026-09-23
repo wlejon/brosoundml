@@ -46,11 +46,13 @@ public:
 
     void setStatic(const char* name, Value v) const;
 
-    void* unwrap(Value val) const { return ev::handleData(val); }
+    // The payload of a handle THIS class made; nullptr for anything else,
+    // including a handle of another class (host_class.cpp, brands).
+    void* unwrap(Value val) const;
 
-    // True when `val` is an instance of THIS class (its prototype chain
-    // reaches this class's prototype), so a method body can tell a Whisper
-    // handle from a Parakeet handle before it casts the payload.
+    // True when `val` is a handle THIS class made, so a method body can tell
+    // a Whisper handle from a Parakeet handle before it casts the payload.
+    // Allocates nothing.
     bool isInstance(Value val) const;
 
     // Whether install() has run on the CALLING thread.

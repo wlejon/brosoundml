@@ -21,27 +21,29 @@ const char* precisionName(brosoundml::OmniVoicePrecision p) {
 }
 
 // opts -> OmniVoiceParams. Omitted keys keep the upstream defaults.
-void readOmniParams(Value opts, brosoundml::OmniVoiceParams& p) {
-    if (!ev::isObject(opts)) return;
-    getIntOpt(opts, "numSteps", p.num_steps);
-    getFloatOpt(opts, "tShift", p.t_shift);
-    getFloatOpt(opts, "guidanceScale", p.guidance_scale);
-    getFloatOpt(opts, "layerPenalty", p.layer_penalty);
-    getFloatOpt(opts, "positionTemperature", p.position_temperature);
-    getFloatOpt(opts, "classTemperature", p.class_temperature);
-    getBoolOpt(opts, "gumbelNoise", p.gumbel_noise);
-    getSeedOpt(opts, p.seed);
-    getFloatOpt(opts, "speed", p.speed);
-    getFloatOpt(opts, "duration", p.duration);
-    getStrOpt(opts, "language", p.language);
-    getStrOpt(opts, "instruct", p.instruct);
-    getBoolOpt(opts, "denoise", p.denoise);
-    getBoolOpt(opts, "preprocessPrompt", p.preprocess_prompt);
-    getBoolOpt(opts, "postprocess", p.postprocess_output);
-    getFloatOpt(opts, "chunkDuration", p.audio_chunk_duration);
-    getFloatOpt(opts, "chunkThreshold", p.audio_chunk_threshold);
-    getFloatOpt(opts, "padDuration", p.pad_duration);
-    getFloatOpt(opts, "fadeDuration", p.fade_duration);
+void readOmniParams(Value optsIn, brosoundml::OmniVoiceParams& p) {
+    if (!ev::isObject(optsIn)) return;
+    ev::Persistent root(optsIn);  // every read below allocates
+    const auto opts = [&root] { return root.get(); };
+    getIntOpt(opts(), "numSteps", p.num_steps);
+    getFloatOpt(opts(), "tShift", p.t_shift);
+    getFloatOpt(opts(), "guidanceScale", p.guidance_scale);
+    getFloatOpt(opts(), "layerPenalty", p.layer_penalty);
+    getFloatOpt(opts(), "positionTemperature", p.position_temperature);
+    getFloatOpt(opts(), "classTemperature", p.class_temperature);
+    getBoolOpt(opts(), "gumbelNoise", p.gumbel_noise);
+    getSeedOpt(opts(), p.seed);
+    getFloatOpt(opts(), "speed", p.speed);
+    getFloatOpt(opts(), "duration", p.duration);
+    getStrOpt(opts(), "language", p.language);
+    getStrOpt(opts(), "instruct", p.instruct);
+    getBoolOpt(opts(), "denoise", p.denoise);
+    getBoolOpt(opts(), "preprocessPrompt", p.preprocess_prompt);
+    getBoolOpt(opts(), "postprocess", p.postprocess_output);
+    getFloatOpt(opts(), "chunkDuration", p.audio_chunk_duration);
+    getFloatOpt(opts(), "chunkThreshold", p.audio_chunk_threshold);
+    getFloatOpt(opts(), "padDuration", p.pad_duration);
+    getFloatOpt(opts(), "fadeDuration", p.fade_duration);
 }
 
 // { codes: Int32Array|number[], numFrames?, text?, rms? } -> OmniVoicePrompt.
@@ -233,6 +235,7 @@ struct OmniPromptJob {
 //   opts.sampleRate (default 24000), opts.refText, opts.preprocess (default
 //   true). The async path claims the gate: the encoder shares the device.
 Value omniCreatePrompt(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);  // `this` is a plain copy; the reads below allocate
     auto* w = omniSelf(self);
     if (!w) return ev::throwTypeError("createPrompt: not an OmniVoice");
     brosoundml::AudioBuffer ref;
@@ -266,7 +269,7 @@ Value omniCreatePrompt(Value self, std::span<const Value> a) {
     job->refText = std::move(refText);
     job->preprocess = preprocess;
     job->gate = w->busy;
-    job->modelRef = ev::Persistent(self);
+    job->modelRef = ev::Persistent(selfRoot.get());
     job->onDone = onDone;
     job->onError = getFunctionOpt(opts.get(), "onError");
 

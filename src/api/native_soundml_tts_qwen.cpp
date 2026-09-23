@@ -23,8 +23,10 @@ HostSpeakerEncoder* encSelf(Value self) {
 const char* variantName(brosoundml::QwenTtsVariant v) {
     switch (v) {
         case brosoundml::QwenTtsVariant::Base: return "base";
-        case brosoundml::QwenTtsVariant::CustomVoice: return "custom_voice";
-        case brosoundml::QwenTtsVariant::VoiceDesign: return "voice_design";
+        // The names the QuickJS binding published and the weights layout /
+        // download script use ("0.6B-customvoice", --variant voicedesign).
+        case brosoundml::QwenTtsVariant::CustomVoice: return "customvoice";
+        case brosoundml::QwenTtsVariant::VoiceDesign: return "voicedesign";
     }
     return "base";
 }
@@ -289,6 +291,7 @@ std::shared_ptr<QwenJob> makeQwenJob(std::span<const Value> a, size_t textAt, co
 
 // session.synthesize(text, opts?) -> AsyncHandle
 Value qwenSessionSynthesize(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);  // `this` is a plain copy; the reads below allocate
     auto* sw = sessionSelf(self);
     if (!sw) return ev::throwTypeError("synthesize: not a QwenTtsSession");
     auto job = makeQwenJob(a, 0, "synthesize");
@@ -298,7 +301,7 @@ Value qwenSessionSynthesize(Value self, std::span<const Value> a) {
     job->device = sw->device;
     job->model = sw->model;
     job->session = &sw->session;
-    job->modelRef = ev::Persistent(self);
+    job->modelRef = ev::Persistent(selfRoot.get());
     return launchQwenJob(std::move(job));
 }
 
@@ -306,13 +309,14 @@ Value qwenSessionSynthesize(Value self, std::span<const Value> a) {
 
 // bro.tts.synthesize(qwen, text, opts?) -> AsyncHandle
 Value qwenTtsSynthesizeAsync(Value modelVal, HostQwenTts* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     auto job = makeQwenJob(args, 1, "synthesize");
     if (!job) return ev::undefined();
     if (!w->busy.tryClaim()) return ev::throwError("synthesize: an operation is already in flight on this model");
     job->gate = w->busy;
     job->device = w->device;
     job->model = w->model;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     return launchQwenJob(std::move(job));
 }
 
@@ -320,6 +324,7 @@ Value qwenTtsSynthesizeAsync(Value modelVal, HostQwenTts* w, std::span<const Val
 //   opts.onChunk(Float32Array) per decoded codec chunk (opts.chunkFrames,
 //   default 25 = ~2 s), then onDone with the whole buffer.
 Value qwenTtsSynthesizeStream(Value modelVal, HostQwenTts* w, std::span<const Value> args) {
+    ev::Persistent modelRoot(modelVal);  // rooted: the reads below allocate
     if (!isStringArg(args, 1)) return ev::throwTypeError("synthesizeStream(qwen, text, opts?): text string required");
     struct StreamJob {
         std::string text;
@@ -353,7 +358,7 @@ Value qwenTtsSynthesizeStream(Value modelVal, HostQwenTts* w, std::span<const Va
     job->gate = w->busy;
     job->device = w->device;
     job->model = w->model;
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
 
     auto work = [job](const std::atomic<bool>& cancel) {
         brotensor::DeviceScope scope(job->device);
@@ -482,6 +487,7 @@ void decorateQwenTtsSession(ObjectBuilder& b) {
 
 // enc.embedSpeaker(audio, opts?) -> Float32Array (sync) | AsyncHandle (opts.onDone)
 Value speakerEmbed(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);  // `this` is a plain copy; the reads below allocate
     auto* w = encSelf(self);
     if (!w) return ev::throwTypeError("embedSpeaker: not a SpeakerEncoder");
     if (!w->enc || !w->enc->loaded()) return ev::throwError("embedSpeaker: encoder is not loaded");
@@ -505,7 +511,7 @@ Value speakerEmbed(Value self, std::span<const Value> a) {
     auto st = std::make_shared<State>();
     st->enc = w->enc;
     st->ref = std::move(ref);
-    st->self = ev::Persistent(self);
+    st->self = ev::Persistent(selfRoot.get());
     st->onDone = onDone;
     st->onError = getFunctionOpt(opts.get(), "onError");
     auto work = [st](const std::atomic<bool>&) { st->out = st->enc->embed(st->ref); };

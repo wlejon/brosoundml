@@ -108,6 +108,7 @@ struct WhisperJob : SttJobBase {
     // onWindow BEFORE the tokens of that window.
     struct WindowSlot { double start = 0.0; size_t at = 0; };
     SpscSlots<WindowSlot> windows;
+    std::vector<brosoundml::Whisper::Transcription::WindowMark> windowMarks;  // the full list, for onDone
     bool hasOnWindow = false;
     ev::Persistent onWindow;
 
@@ -151,6 +152,7 @@ brosoundml::Whisper::Transcription runWhisper(WhisperJob& job,
 
 Value whisperTranscribe(Value modelVal, HostWhisperModel* model, HostWhisperSession* session,
                         std::span<const Value> args, const char* fn) {
+    ev::Persistent modelRoot(modelVal);  // the reads below allocate
     const std::string pre = std::string(fn) + ": ";
     auto job = std::make_shared<WhisperJob>();
     if (session) {
@@ -181,7 +183,7 @@ Value whisperTranscribe(Value modelVal, HostWhisperModel* model, HostWhisperSess
         if (promptIsArray) {
             job->prompt = readInt32Array(argAt(args, 1));
             if (isObjectArg(args, 2)) optsRoot.set(args[2]);
-        } else if (ev::isObject(promptVal)) {
+        } else if (isObjectArg(args, 1)) {  // promptVal is stale after the length read
             optsRoot.set(args[1]);
             job->prompt = readInt32Array(ev::getProperty(optsRoot.get(), "prompt"));
         } else if (isObjectArg(args, 2)) {
@@ -224,7 +226,7 @@ Value whisperTranscribe(Value modelVal, HostWhisperModel* model, HostWhisperSess
     // ── Async path.
     if (!job->gate.tryClaim())
         return ev::throwError(pre + "an operation is already in flight on this model");
-    job->modelRef = ev::Persistent(modelVal);
+    job->modelRef = ev::Persistent(modelRoot.get());
     if (job->hasOnToken) job->tokens.reserve(kSttTokenSlots);
     if (job->hasOnWindow) job->windows.reserve(4096);
 
@@ -242,12 +244,27 @@ Value whisperTranscribe(Value modelVal, HostWhisperModel* model, HostWhisperSess
         }
         auto out = runWhisper(*job, o);
         job->tokenIds = std::move(out.token_ids);
+        job->windowMarks = std::move(out.windows);
     };
     auto poll = [job] { job->drainAll(); };
     auto done = [job](bool cancelled, const std::string& error) {
         job->gate.release();   // before the callbacks: onDone may start the next op
         ev::Persistent ids(makeInt32Array(job->tokenIds));
         ev::Persistent info(makeDoneInfo(cancelled, error));
+        // info.windows: [{ start, at }] — where each long-form window began,
+        // `at` indexing the id array. Without it a caller that did not stream
+        // cannot read the (per-window, restarting) timestamps as absolute
+        // times. Absent for a short-form decode.
+        if (!job->windowMarks.empty()) {
+            const auto& marks = job->windowMarks;
+            ev::Persistent ws(hostArrayOf(marks.size(), [&marks](size_t i) {
+                ObjectBuilder o;
+                o.set("start", marks[i].start_seconds);
+                o.set("at", static_cast<double>(marks[i].first_token));
+                return o.get();
+            }));
+            info.set(ev::setProperty(info.get(), "windows", ws.get()));
+        }
         callCallback2(job->onDone.get(), ids.get(), info.get());
     };
     return launchAsyncJob(std::move(work), std::move(poll), std::move(done));

@@ -76,13 +76,14 @@ Value makeDiarization(const brosoundml::ClusterDiarizer::Diarization& d) {
 // library default.
 void parseClusterConfig(Value opts, brosoundml::ClusterDiarizer::Config& cfg) {
     if (!ev::isObject(opts)) return;
-    getFloatOpt(opts, "vadThreshold", cfg.vad_threshold);
-    getFloatOpt(opts, "windowSeconds", cfg.window_seconds);
-    getFloatOpt(opts, "hopSeconds", cfg.hop_seconds);
-    getFloatOpt(opts, "minWindowSeconds", cfg.min_window_seconds);
-    getFloatOpt(opts, "clusterThreshold", cfg.cluster_threshold);
-    getFloatOpt(opts, "minSpeakerSeconds", cfg.min_speaker_seconds);
-    getIntOpt(opts, "maxSpeakers", cfg.max_speakers);
+    ev::Persistent root(opts);  // every read below allocates
+    getFloatOpt(root.get(), "vadThreshold", cfg.vad_threshold);
+    getFloatOpt(root.get(), "windowSeconds", cfg.window_seconds);
+    getFloatOpt(root.get(), "hopSeconds", cfg.hop_seconds);
+    getFloatOpt(root.get(), "minWindowSeconds", cfg.min_window_seconds);
+    getFloatOpt(root.get(), "clusterThreshold", cfg.cluster_threshold);
+    getFloatOpt(root.get(), "minSpeakerSeconds", cfg.min_speaker_seconds);
+    getIntOpt(root.get(), "maxSpeakers", cfg.max_speakers);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,9 +289,9 @@ Value diarInit(Value, std::span<const Value>) {
 Value loadSortformer(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!modelLoaderArgs("loadSortformer", args, dir, dev, opts)) return ev::undefined();
-    return runModelLoader<HostSortformer>("loadSortformer", opts, g_sortformerClass, [dir, dev] {
+    return runModelLoader<HostSortformer>("loadSortformer", opts.get(), g_sortformerClass, [dir, dev] {
         auto w = std::make_unique<HostSortformer>();
         w->device = dev;
         w->model = std::make_shared<brosoundml::Sortformer>();
@@ -311,9 +312,9 @@ Value loadClusterDiarizer(Value, std::span<const Value> args) {
     const std::string sortformerDir = resolvePath(strAt(args, 0));
     const std::string encoderDir = resolvePath(strAt(args, 1));
     brotensor::Device dev = brotensor::Device::CPU;
-    Value opts = ev::undefined();
+    ev::Persistent opts;
     if (!loaderDevice("loadClusterDiarizer", args, 2, dev, opts)) return ev::undefined();
-    return runModelLoader<HostClusterDiarizer>("loadClusterDiarizer", opts, g_clusterDiarizerClass,
+    return runModelLoader<HostClusterDiarizer>("loadClusterDiarizer", opts.get(), g_clusterDiarizerClass,
                                                [sortformerDir, encoderDir, dev] {
         auto w = std::make_unique<HostClusterDiarizer>();
         w->device = dev;
@@ -343,8 +344,8 @@ Value launchDiarJob(Value modelVal, ModelGate gate, brotensor::Device device, Va
     job->run = std::move(run);
     job->gate = gate;
     job->device = device;
+    job->modelRef = ev::Persistent(modelVal);  // keep the model alive; rooted before any allocation
     job->onDone = getFunctionOpt(opts, "onDone");
-    job->modelRef = ev::Persistent(modelVal);  // keep the model alive
     auto work = [job](const std::atomic<bool>&) {
         brotensor::DeviceScope scope(job->device);
         job->result = job->run();
@@ -384,12 +385,12 @@ Value diarClusterDiarize(Value, std::span<const Value> a) {
     auto audio = std::make_shared<brosoundml::AudioBuffer>();
     std::string err;
     if (!readAudioBuffer(a[1], *audio, err)) return ev::throwTypeError("clusterDiarize: " + err);
-    Value opts = isObjectArg(a, 2) ? a[2] : ev::undefined();
+    ev::Persistent opts(isObjectArg(a, 2) ? a[2] : ev::undefined());
     brosoundml::ClusterDiarizer::Config cfg;
-    parseClusterConfig(opts, cfg);
+    parseClusterConfig(opts.get(), cfg);
     if (!w->busy.tryClaim()) return ev::throwError("clusterDiarize: an operation is already in flight on this model");
     std::shared_ptr<brosoundml::ClusterDiarizer> model = w->model;
-    return launchDiarJob<brosoundml::ClusterDiarizer::Diarization>(a[0], w->busy, w->device, opts,
+    return launchDiarJob<brosoundml::ClusterDiarizer::Diarization>(a[0], w->busy, w->device, opts.get(),
         [model, audio, cfg] { return model->diarize(*audio, cfg); });
 }
 

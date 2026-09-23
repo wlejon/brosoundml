@@ -9,6 +9,8 @@ namespace brosoundml::api {
 
 // Run a build on the JS thread (sync) or on a work thread (opts.onReady is a
 // function), wrapping the result in `cls`. The build touches no JS state.
+// `opts` must be fresh (read since the caller's last allocation); it is
+// rooted here before the first property read.
 template <typename W>
 Value runModelLoader(const char* fn, Value opts, const HostClass& cls,
                      std::function<std::unique_ptr<W>()> build) {
@@ -19,12 +21,13 @@ Value runModelLoader(const char* fn, Value opts, const HostClass& cls,
         std::unique_ptr<W> w;
         ev::Persistent onReady, onError;
     };
+    ev::Persistent optsRoot(opts);
     auto st = std::make_shared<State>();
     st->fn = fn;
     st->cls = &cls;
     st->build = std::move(build);
-    st->onReady = getFunctionOpt(opts, "onReady");
-    st->onError = getFunctionOpt(opts, "onError");
+    st->onReady = getFunctionOpt(optsRoot.get(), "onReady");
+    st->onError = getFunctionOpt(optsRoot.get(), "onError");
     if (!ev::isFunction(st->onReady.get())) {
         try {
             return cls.createInstance(st->build());
@@ -49,14 +52,15 @@ Value runModelLoader(const char* fn, Value opts, const HostClass& cls,
 
 // Device + opts prologue shared by every loader once its path arguments are
 // checked: brotensor init, GPU-first auto device, strict opts.device parse.
-// False with a pending TypeError on a bad device option.
+// False with a pending TypeError on a bad device option. `opts` comes back
+// rooted (the device parse allocates; a raw Value would be stale).
 inline bool loaderDevice(const char* fn, std::span<const Value> args, std::size_t optsIndex,
-                         brotensor::Device& dev, Value& opts, bool* explicitDevice = nullptr) {
+                         brotensor::Device& dev, ev::Persistent& opts, bool* explicitDevice = nullptr) {
     brotensor::init();
     dev = autoDevice();
-    opts = isObjectArg(args, optsIndex) ? args[optsIndex] : ev::undefined();
+    opts.set(isObjectArg(args, optsIndex) ? args[optsIndex] : ev::undefined());
     std::string err;
-    if (!parseDeviceOpt(opts, dev, err, explicitDevice)) {
+    if (!parseDeviceOpt(opts.get(), dev, err, explicitDevice)) {
         ev::throwTypeError(std::string(fn) + ": " + err);
         return false;
     }
@@ -65,7 +69,7 @@ inline bool loaderDevice(const char* fn, std::span<const Value> args, std::size_
 
 // The one-path form: `fn(modelDir, opts?)`.
 inline bool modelLoaderArgs(const char* fn, std::span<const Value> args, std::string& dir,
-                            brotensor::Device& dev, Value& opts, bool* explicitDevice = nullptr) {
+                            brotensor::Device& dev, ev::Persistent& opts, bool* explicitDevice = nullptr) {
     if (!isStringArg(args, 0)) {
         ev::throwTypeError(std::string(fn) + "(modelDir, opts?): path required");
         return false;

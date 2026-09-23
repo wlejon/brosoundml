@@ -154,9 +154,9 @@ void HostVoiceAgent::drainEvents() {
         switch (ev.type) {
             case VoiceAgentEvent::Type::StateChanged:
                 if (ev::isFunction(onStateChangedCb.get())) {
-                    Value a0 = ev::fromUtf8(voiceAgentStateToJs(ev.oldState));
+                    ev::Persistent a0(ev::fromUtf8(voiceAgentStateToJs(ev.oldState)));
                     Value a1 = ev::fromUtf8(voiceAgentStateToJs(ev.newState));
-                    callCallback2(onStateChangedCb.get(), a0, a1);
+                    callCallback2(onStateChangedCb.get(), a0.get(), a1);
                 }
                 break;
             case VoiceAgentEvent::Type::SpeechStart:
@@ -364,8 +364,12 @@ void attachTtsHandler(HostVoiceAgent* h, Value fn) {
         h->ttsHandlerCb = ev::Persistent(fn);
         h->agent->set_tts_handler([h](const std::string& text, VoiceAgent::TtsChunkCallback chunk_cb) {
             if (!ev::isFunction(h->ttsHandlerCb.get())) return;
-            Value emitCb = ev::makeFunction([&chunk_cb, h](Value, std::span<const Value> cArgs) -> Value {
-                if (cArgs.empty()) return ev::undefined();
+            // emitChunk reaches chunk_cb only while this handler call is on
+            // the stack: a script that keeps emitChunk and calls it later
+            // gets a no-op, not a dangling reference.
+            auto live = std::make_shared<const VoiceAgent::TtsChunkCallback*>(&chunk_cb);
+            ev::Persistent emitCb(ev::makeFunction([live, h](Value, std::span<const Value> cArgs) -> Value {
+                if (cArgs.empty() || !*live) return ev::undefined();
                 AudioBuffer buf;
                 buf.sample_rate = h->agent->config().tts_sample_rate;
                 bool ok = false;
@@ -376,14 +380,15 @@ void attachTtsHandler(HostVoiceAgent* h, Value fn) {
                     buf.samples = readFloat32Array(cArgs[0], &ok);
                 }
                 if (ok && !buf.samples.empty()) {
-                    chunk_cb(buf);
+                    (**live)(buf);
                 }
                 return ev::undefined();
-            }, 1);
+            }, 1));
 
             Value a0 = ev::fromUtf8(text);
-            const Value callArgs[2] = {a0, emitCb};
+            const Value callArgs[2] = {a0, emitCb.get()};
             ev::CallResult r = ev::call(h->ttsHandlerCb.get(), ev::undefined(), std::span<const Value>(callArgs, 2));
+            *live = nullptr;
             if (!r.thrown && !ev::isUndefined(r.value) && !ev::isNull(r.value)) {
                 bool ok = false;
                 auto samples = readFloat32Array(r.value, &ok);
@@ -456,8 +461,10 @@ void attachPhonemizer(HostVoiceAgent* h, Value fn) {
 
 Value createVoiceAgentInstance(std::span<const Value> a) {
     VoiceAgentConfig cfg;
+    // `opts` names the rooted argument slot (updated in place by the GC), so
+    // it stays valid across the allocating reads below.
     if (!a.empty() && ev::isObject(a[0])) {
-        Value opts = a[0];
+        const Value& opts = a[0];
         getIntOpt(opts, "sampleRate", cfg.sample_rate);
         getIntOpt(opts, "sample_rate", cfg.sample_rate);
         getIntOpt(opts, "ttsSampleRate", cfg.tts_sample_rate);
@@ -493,7 +500,7 @@ Value createVoiceAgentInstance(std::span<const Value> a) {
     wireAgentCallbacks(rawHost);
 
     if (!a.empty() && ev::isObject(a[0])) {
-        Value opts = a[0];
+        const Value& opts = a[0];
         if (hasProperty(opts, "onStateChanged")) rawHost->onStateChangedCb = getFunctionOpt(opts, "onStateChanged");
         if (hasProperty(opts, "onSpeechStart")) rawHost->onSpeechStartCb = getFunctionOpt(opts, "onSpeechStart");
         if (hasProperty(opts, "onSpeechEnd")) rawHost->onSpeechEndCb = getFunctionOpt(opts, "onSpeechEnd");
@@ -599,14 +606,8 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         if (!h || !h->agent) return ev::throwTypeError("feed: not a VoiceAgent");
         if (a.empty()) return ev::throwTypeError("feed(samples): samples required");
         h->ownerThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
-        if (ev::isTypedArray(a[0])) {
-            auto info = ev::typedArrayInfo(a[0]);
-            if (info.data && info.elementKind == ev::elements::Float32) {
-                h->agent->feed(reinterpret_cast<const float*>(info.data), static_cast<int>(info.elementCount));
-                h->drainEvents();
-                return ev::undefined();
-            }
-        }
+        // Always a copy: feed() fires the agent's callbacks synchronously on
+        // this thread, which run JS and may move the typed array's store.
         if (ev::isObject(a[0]) && !ev::isTypedArray(a[0]) && hasProperty(a[0], "samples")) {
             Value samplesProp = ev::getProperty(a[0], "samples");
             bool ok = false;
@@ -661,18 +662,10 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             h->agent->set_vad_model(nullptr);
             return self;
         }
-        Value vadVal = a[0];
-        if (g_bcResnet2dClass.isInstance(vadVal)) {
-            auto* w = static_cast<HostBcResnet2d*>(g_bcResnet2dClass.unwrap(vadVal));
-            if (w && w->model) {
-                h->agent->set_vad_model(w->model);
-                return self;
-            }
-        }
-        void* ptr = ev::handleData(vadVal);
-        if (ptr) {
-            auto* w = static_cast<HostBcResnet2d*>(ptr);
-            if (w && w->model) {
+        // Brand-checked only: a handle of another class is refused, never
+        // reinterpreted.
+        if (auto* w = static_cast<HostBcResnet2d*>(g_bcResnet2dClass.unwrap(a[0]))) {
+            if (w->model) {
                 h->agent->set_vad_model(w->model);
                 return self;
             }
@@ -697,20 +690,11 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             h->agent->set_whisper(nullptr);
             return self;
         }
-        Value wVal = a[0];
         std::shared_ptr<Whisper> whisper;
-        if (g_whisperModelClass.isInstance(wVal)) {
-            auto* wm = static_cast<HostWhisperModel*>(g_whisperModelClass.unwrap(wVal));
-            if (wm && wm->model) whisper = wm->model;
-        } else if (g_whisperSessionClass.isInstance(wVal)) {
-            auto* ws = static_cast<HostWhisperSession*>(g_whisperSessionClass.unwrap(wVal));
-            if (ws && ws->model) whisper = ws->model;
-        } else {
-            void* ptr = ev::handleData(wVal);
-            if (ptr) {
-                auto* wm = static_cast<HostWhisperModel*>(ptr);
-                if (wm && wm->model) whisper = wm->model;
-            }
+        if (auto* wm = static_cast<HostWhisperModel*>(g_whisperModelClass.unwrap(a[0]))) {
+            whisper = wm->model;
+        } else if (auto* ws = static_cast<HostWhisperSession*>(g_whisperSessionClass.unwrap(a[0]))) {
+            whisper = ws->model;
         }
         if (!whisper) {
             return ev::throwTypeError("setWhisper(whisperModel): valid WhisperModel required");
@@ -729,20 +713,11 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             h->agent->set_parakeet(nullptr);
             return self;
         }
-        Value pVal = a[0];
         std::shared_ptr<Parakeet> parakeet;
-        if (g_parakeetModelClass.isInstance(pVal)) {
-            auto* pm = static_cast<HostParakeetModel*>(g_parakeetModelClass.unwrap(pVal));
-            if (pm && pm->model) parakeet = pm->model;
-        } else if (g_parakeetSessionClass.isInstance(pVal)) {
-            auto* ps = static_cast<HostParakeetSession*>(g_parakeetSessionClass.unwrap(pVal));
-            if (ps && ps->model) parakeet = ps->model;
-        } else {
-            void* ptr = ev::handleData(pVal);
-            if (ptr) {
-                auto* pm = static_cast<HostParakeetModel*>(ptr);
-                if (pm && pm->model) parakeet = pm->model;
-            }
+        if (auto* pm = static_cast<HostParakeetModel*>(g_parakeetModelClass.unwrap(a[0]))) {
+            parakeet = pm->model;
+        } else if (auto* ps = static_cast<HostParakeetSession*>(g_parakeetSessionClass.unwrap(a[0]))) {
+            parakeet = ps->model;
         }
         if (!parakeet) {
             return ev::throwTypeError("setParakeet(parakeetModel): valid ParakeetModel required");
@@ -761,18 +736,8 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             h->agent->set_kokoro(nullptr, {});
             return self;
         }
-        Value kVal = a[0];
         std::shared_ptr<Kokoro> kokoro;
-        if (g_kokoroClass.isInstance(kVal)) {
-            auto* km = static_cast<HostKokoro*>(g_kokoroClass.unwrap(kVal));
-            if (km) kokoro = km->model;
-        } else {
-            void* ptr = ev::handleData(kVal);
-            if (ptr) {
-                auto* km = static_cast<HostKokoro*>(ptr);
-                if (km) kokoro = km->model;
-            }
-        }
+        if (auto* km = static_cast<HostKokoro*>(g_kokoroClass.unwrap(a[0]))) kokoro = km->model;
         if (!kokoro) {
             return ev::throwTypeError("setKokoro(kokoroModel, voice): valid KokoroModel required");
         }
@@ -907,14 +872,14 @@ Value ctorBcResnet(Value, std::span<const Value> a) {
             brotensor::Device dev = brotensor::Device::CPU;
             if (a.size() > 1 && ev::isObject(a[1])) {
                 std::string err;
-                parseDeviceOpt(a[1], dev, err);
+                if (!parseDeviceOpt(a[1], dev, err)) return ev::throwTypeError("BcResnet2d: " + err);
             }
             net = std::make_shared<const BcResnet2d>(BcResnet2d::load(path, dev));
         } else if (isObjectArg(a, 0)) {
-            Value opts = a[0];
+            const Value& opts = a[0];  // the rooted argument slot
             brotensor::Device dev = brotensor::Device::CPU;
             std::string err;
-            parseDeviceOpt(opts, dev, err);
+            if (!parseDeviceOpt(opts, dev, err)) return ev::throwTypeError("BcResnet2d: " + err);
             if (hasProperty(opts, "weights")) {
                 std::string path = resolvePath(getPropertyString(opts, "weights"));
                 net = std::make_shared<const BcResnet2d>(BcResnet2d::load(path, dev));
@@ -952,12 +917,12 @@ void installVoiceAgent(ObjectBuilder& bro) {
         g_bcResnet2dClass.install("BcResnet2d", 1, ctorBcResnet, decorateBcResnet, /*global=*/true);
     }
 
-    Value soundmlVal = ev::getProperty(bro.get(), "soundml");
-    if (!ev::isObject(soundmlVal)) {
-        soundmlVal = ev::createObject();
-        bro.set("soundml", soundmlVal);
+    // Rooted: bro.set allocates, and a raw Value would be stale after it.
+    ObjectBuilder soundml(ev::getProperty(bro.get(), "soundml"));
+    if (!ev::isObject(soundml.get())) {
+        soundml.obj.set(ev::createObject());
+        bro.set("soundml", soundml.get());
     }
-    ObjectBuilder soundml(soundmlVal);
     soundml.set("VoiceAgent", g_voiceAgentClass.constructor());
     soundml.set("BcResnet2d", g_bcResnet2dClass.constructor());
 
