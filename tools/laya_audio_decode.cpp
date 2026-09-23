@@ -24,6 +24,17 @@
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #if LAYA_AUDIO_HAVE_FLAC
 #define DR_FLAC_IMPLEMENTATION
@@ -46,8 +57,22 @@ bool ends_with(const std::string& s, const char* suf) {
     return true;
 }
 
+// Paths are UTF-8 (MSWC word folders such as "aktivitäten"); on Windows the
+// narrow fopen would read them in the ANSI code page, so open wide there.
+std::FILE* fopen_utf8(const std::string& path) {
+#ifdef _WIN32
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (n <= 0) return nullptr;
+    std::wstring w(static_cast<std::size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), n);
+    return _wfopen(w.c_str(), L"rb");
+#else
+    return std::fopen(path.c_str(), "rb");
+#endif
+}
+
 std::vector<unsigned char> read_file(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fopen_utf8(path);
     if (!f) throw std::runtime_error("laya_audio: cannot open " + path);
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -140,7 +165,8 @@ std::vector<float> decode_file_16k(const std::string& path) {
 #if LAYA_AUDIO_HAVE_FLAC
         unsigned int ch = 0, rate = 0;
         drflac_uint64 frames = 0;
-        float* p = drflac_open_file_and_read_pcm_frames_f32(path.c_str(), &ch, &rate, &frames, nullptr);
+        const std::vector<unsigned char> data = read_file(path);
+        float* p = drflac_open_memory_and_read_pcm_frames_f32(data.data(), data.size(), &ch, &rate, &frames, nullptr);
         if (!p) throw std::runtime_error("laya_audio: cannot decode " + path);
         std::vector<float> mono(static_cast<std::size_t>(frames));
         for (std::size_t i = 0; i < mono.size(); ++i) {
