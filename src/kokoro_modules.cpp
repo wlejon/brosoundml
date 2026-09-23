@@ -399,6 +399,7 @@ void load_lstm_cell(const stf::File& f, const std::string& prefix,
     upload(f, prefix + "weight_ih_l0" + sfx, four_h, input_size, cell.W_ih, where);
     upload(f, prefix + "weight_hh_l0" + sfx, four_h, hidden,     cell.W_hh, where);
     upload(f, prefix + "bias_ih_l0"   + sfx, four_h, 1,          cell.b_ih, where);
+    upload(f, prefix + "bias_hh_l0"   + sfx, four_h, 1,          cell.b_hh, where);
 }
 
 void TextEncoder::load_from(const stf::File& f, const KokoroConfig& cfg) {
