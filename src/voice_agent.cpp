@@ -190,6 +190,12 @@ VoiceAgent& VoiceAgent::operator=(VoiceAgent&&) noexcept = default;
 void VoiceAgent::set_vad_model(std::shared_ptr<const BcResnet2d> vad_model) {
     impl_->vad_model = std::move(vad_model);
     if (impl_->vad_model) {
+        // The mel frames feed the VAD net directly, so the front end lives on
+        // the net's device (a GPU net takes GPU frames).
+        const brotensor::Device dev = impl_->vad_model->device();
+        if (impl_->mel_fe->device() != dev) {
+            impl_->mel_fe = std::make_unique<MelFrontend>(impl_->mel_fe->config(), dev);
+        }
         impl_->vad_session = std::make_unique<BcResnet2dSession>(impl_->vad_model->make_session());
     } else {
         impl_->vad_session.reset();
@@ -294,7 +300,11 @@ void VoiceAgent::feed(const float* samples, int num_samples) {
     float chunk_energy = std::sqrt(sum_sq / static_cast<float>(num_samples));
     impl_->last_energy = chunk_energy;
 
-    // Extract Mel frames
+    // Extract this chunk's mel frames. consume() APPENDS to a non-empty
+    // tensor, so start empty: the streaming VAD takes only the new frames
+    // (its session carries the history), and vad_scores[f] below is frame f
+    // of this chunk.
+    impl_->mel_buffer = brotensor::Tensor{};
     int new_frames = impl_->mel_fe->consume(samples, num_samples, impl_->mel_buffer);
 
     std::vector<float> vad_scores;

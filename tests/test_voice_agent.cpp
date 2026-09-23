@@ -1,5 +1,9 @@
 #include "brosoundml/voice_agent.h"
 #include "brosoundml/bc_resnet2d.h"
+#include "brosoundml/mel.h"
+
+#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
 
 #include <cmath>
 #include <cstdio>
@@ -181,16 +185,24 @@ int main() {
     }
 
     // ── Test 5: BcResnet2d VAD Model Integration ──
+    // The net lives on the GPU when there is one; the agent's mel front end
+    // must follow it there. Chunked feeding must score each frame exactly as
+    // one streaming pass over the whole signal does: each feed() hands the
+    // net only that chunk's new frames.
     {
+        brotensor::init();
+        const brotensor::Device dev = brotensor::is_available(brotensor::Device::CUDA)
+                                          ? brotensor::Device::CUDA
+                                          : brotensor::Device::CPU;
         brosoundml::BcResnet2dConfig vad_cfg;
         vad_cfg.n_mels = 40;
         auto vad_model = std::make_shared<brosoundml::BcResnet2d>(
-            brosoundml::BcResnet2d::make(vad_cfg, brotensor::Device::CPU)
+            brosoundml::BcResnet2d::make(vad_cfg, dev)
         );
 
         brosoundml::VoiceAgentConfig cfg;
         cfg.sample_rate = 16000;
-        cfg.vad_threshold = 0.0f; // always active for test
+        cfg.vad_threshold = 2.0f;  // never speech: the scores are under test, not the state machine
         cfg.vad_energy_threshold = 0.001f;
         cfg.min_speech_frames = 2;
         cfg.silence_hangover_frames = 4;
@@ -198,9 +210,51 @@ int main() {
         brosoundml::VoiceAgent agent(cfg);
         agent.set_vad_model(vad_model);
 
-        auto audio_chunk = make_sine_chunk(320, 300.0f, 0.2f);
-        agent.feed(audio_chunk.data(), static_cast<int>(audio_chunk.size()));
+        // Uneven chunks so frame boundaries straddle feeds.
+        const std::vector<int> chunks = {400, 1000, 160, 2345, 800, 3000};
+        std::vector<float> all;
+        std::vector<float> agent_scores;
+        for (int n : chunks) {
+            auto c = make_sine_chunk(n, 300.0f, 0.2f);
+            for (int i = 0; i < n; ++i)
+                c[i] *= 0.5f + 0.5f * std::sin(0.001f * static_cast<float>(all.size() + i));
+            all.insert(all.end(), c.begin(), c.end());
+            agent.feed(c.data(), n);
+            agent_scores.push_back(agent.last_vad_score());
+        }
         CHECK(agent.last_energy() > 0.01f, "Energy computed from audio");
+
+        // Reference: the same frames in one streaming pass.
+        brosoundml::MelConfig mc;
+        mc.sample_rate = cfg.sample_rate;
+        mc.win_length  = cfg.win_length;
+        mc.hop_length  = cfg.hop_length;
+        mc.n_mels      = cfg.n_mels;
+        mc.compression = brosoundml::MelCompression::PCEN;
+        brosoundml::MelFrontend fe(mc, dev);
+        brotensor::Tensor mel;
+        std::size_t off = 0;
+        std::vector<float> ref_scores;
+        auto sess = vad_model->make_session();
+        for (int n : chunks) {
+            brotensor::Tensor frames;
+            const int nf = fe.consume(all.data() + off, n, frames);
+            off += static_cast<std::size_t>(n);
+            if (nf <= 0) { ref_scores.push_back(ref_scores.empty() ? 0.0f : ref_scores.back()); continue; }
+            brotensor::Tensor logits;
+            vad_model->forward_streaming(sess, frames, logits);
+            const std::vector<float> l = logits.to_host_vector();
+            ref_scores.push_back(1.0f / (1.0f + std::exp(-l.back())));
+        }
+        bool match = ref_scores.size() == agent_scores.size();
+        for (std::size_t i = 0; match && i < ref_scores.size(); ++i) {
+            if (std::fabs(ref_scores[i] - agent_scores[i]) > 1e-4f) {
+                std::fprintf(stderr, "  chunk %zu: agent %.6f ref %.6f\n",
+                             i, agent_scores[i], ref_scores[i]);
+                match = false;
+            }
+        }
+        CHECK(match, "VAD scores per chunk match one streaming pass over the signal");
     }
 
     // ── Test 6: Real token decoding and phonemizer integration ──

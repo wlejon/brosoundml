@@ -2,6 +2,8 @@
 #include "embed/embed.h"
 #include "eval/eval.h"
 
+#include <brotensor/runtime.h>
+
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -308,6 +310,32 @@ int main() {
         }
         agent5.pump();
     )JS", "VoiceAgent pump() verification");
+
+    // ── Test 6: the BcResnet2d VAD lands on the GPU unless told otherwise ──
+    std::cout << "\n--- Test 6: BcResnet2d default device ---" << std::endl;
+    {
+        brotensor::init();
+        const std::string expect =
+            brotensor::is_available(brotensor::Device::CUDA)  ? "CUDA" :
+            brotensor::is_available(brotensor::Device::Metal) ? "Metal" : "CPU";
+        const std::string code =
+            "const expect = '" + expect + "';\n" + R"JS(
+            const vad = new bro.soundml.BcResnet2d({ nMels: 40 });
+            if (!vad.loaded) throw new Error("BcResnet2d not loaded");
+            if (vad.device !== expect)
+                throw new Error("BcResnet2d default device " + vad.device + ", expected " + expect);
+            const cpu = new bro.soundml.BcResnet2d({ nMels: 40, device: 'cpu' });
+            if (cpu.device !== 'CPU') throw new Error("explicit device:'cpu' ignored");
+            // A GPU VAD drives the agent: its mel front end follows the net.
+            const agent6 = new bro.soundml.VoiceAgent();
+            agent6.setVad(vad);
+            const pcm = new Float32Array(3200);
+            for (let i = 0; i < pcm.length; i++) pcm[i] = 0.2 * Math.sin(i * 0.1);
+            agent6.feed(pcm);
+            agent6.feed(pcm);
+        )JS";
+        runEval(code, "BcResnet2d defaults to the GPU and feeds the agent there");
+    }
 
     brosoundml::api::shutdownSoundML();
 

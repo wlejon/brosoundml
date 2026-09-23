@@ -673,7 +673,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
         if (isStringArg(a, 0)) {
             try {
                 auto net = std::make_shared<const BcResnet2d>(
-                    BcResnet2d::load(resolvePath(strAt(a, 0)), brotensor::Device::CPU));
+                    BcResnet2d::load(resolvePath(strAt(a, 0)), autoDevice()));
                 h->agent->set_vad_model(net);
                 return self;
             } catch (const std::exception& e) {
@@ -869,7 +869,7 @@ Value ctorBcResnet(Value, std::span<const Value> a) {
         std::shared_ptr<const BcResnet2d> net;
         if (isStringArg(a, 0)) {
             std::string path = resolvePath(strAt(a, 0));
-            brotensor::Device dev = brotensor::Device::CPU;
+            brotensor::Device dev = autoDevice();
             if (a.size() > 1 && ev::isObject(a[1])) {
                 std::string err;
                 if (!parseDeviceOpt(a[1], dev, err)) return ev::throwTypeError("BcResnet2d: " + err);
@@ -877,7 +877,7 @@ Value ctorBcResnet(Value, std::span<const Value> a) {
             net = std::make_shared<const BcResnet2d>(BcResnet2d::load(path, dev));
         } else if (isObjectArg(a, 0)) {
             const Value& opts = a[0];  // the rooted argument slot
-            brotensor::Device dev = brotensor::Device::CPU;
+            brotensor::Device dev = autoDevice();
             std::string err;
             if (!parseDeviceOpt(opts, dev, err)) return ev::throwTypeError("BcResnet2d: " + err);
             if (hasProperty(opts, "weights")) {
@@ -904,6 +904,10 @@ void decorateBcResnet(ObjectBuilder& b) {
     b.accessor("loaded", [](Value self, std::span<const Value>) -> Value {
         auto* w = static_cast<HostBcResnet2d*>(g_bcResnet2dClass.unwrap(self));
         return ev::fromBool(w && w->model != nullptr);
+    });
+    b.accessor("device", [](Value self, std::span<const Value>) -> Value {
+        auto* w = static_cast<HostBcResnet2d*>(g_bcResnet2dClass.unwrap(self));
+        return ev::fromUtf8(w && w->model ? deviceName(w->model->device()) : "CPU");
     });
 }
 
