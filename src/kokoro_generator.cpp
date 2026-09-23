@@ -577,15 +577,38 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
         return static_cast<float>(rng & 0x00FFFFFFu) / static_cast<float>(0x01000000u);
     };
 
-    // Initial phases for harmonics: fundamental at 0, higher harmonics distributed in [0, 2pi)
+    // Standard normal draws (Box-Muller over the same deterministic stream):
+    // upstream adds torch.randn noise, and a uniform draw of the same bound
+    // carries a different spectrum and ~0.6x the power.
+    float spare = 0.0f;
+    bool have_spare = false;
+    auto next_normal = [&]() -> float {
+        if (have_spare) { have_spare = false; return spare; }
+        float u1 = next_u01();
+        while (u1 <= 0.0f) u1 = next_u01();
+        const float u2 = next_u01();
+        const float r = std::sqrt(-2.0f * std::log(u1));
+        const float a = 6.28318530717958647692f * u2;
+        spare = r * std::sin(a);
+        have_spare = true;
+        return r * std::cos(a);
+    };
+
+    // Initial phases for harmonics: fundamental at 0, higher harmonics
+    // distributed in [0, 2pi) (SineGen's rand_ini, with rand_ini[:, 0] = 0).
     std::vector<float> phases(dim, 0.0f);
     for (int h = 1; h < dim; ++h) {
         phases[h] = next_u01() * 6.28318530717958647692f;
     }
 
+    // SineGen: sine_waves = sin(phase) * sine_amp * uv + noise, where
+    // noise = (uv * noise_std + (1 - uv) * sine_amp / 3) * randn. noise_std is
+    // SourceModuleHnNSF's add_noise_std = 0.003, an absolute level (not scaled
+    // by sine_amp). Unvoiced samples carry only the noise, which is what
+    // excites the unvoiced consonants.
     std::vector<float> sine_waves(static_cast<std::size_t>(signal_len) * dim, 0.0f);
-    const float noise_std = 0.003f * sine_amp;
-    const float uv_amp = sine_amp / 3.0f;
+    const float noise_std = 0.003f;
+    const float uv_std = sine_amp / 3.0f;
 
     for (int t = 0; t < signal_len; ++t) {
         const int frame = t / upsample_scale;
@@ -601,10 +624,9 @@ void HarmonicSource::forward(const bt::Tensor& F0_pred, int frame_count,
                 if (phases[h] > 6.28318530717958647692f) {
                     phases[h] -= 6.28318530717958647692f;
                 }
-                const float n_val = (next_u01() * 2.0f - 1.0f) * noise_std;
-                sample_val = std::sin(phases[h]) * sine_amp + n_val;
+                sample_val = std::sin(phases[h]) * sine_amp + next_normal() * noise_std;
             } else {
-                sample_val = (next_u01() * 2.0f - 1.0f) * uv_amp;
+                sample_val = next_normal() * uv_std;
             }
             sine_waves[static_cast<std::size_t>(t) * dim + h] = sample_val;
         }
