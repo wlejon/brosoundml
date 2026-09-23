@@ -258,7 +258,8 @@ int main(int argc, char** argv) try {
     });
     const std::string checkpoint = first_existing({
         a.weights, env_or_empty("BROSOUNDML_PHONEME_WEIGHTS"),
-        "D:/projects/brosoundml/build-cuda/english.bpm",
+        data + "/phoneme/english.bpm",
+        "weights/phoneme/english.bpm",
     });
     const std::string out = !a.out.empty() ? a.out
         : "D:/projects/brosoundml/build-cuda/esd_real.bpds";

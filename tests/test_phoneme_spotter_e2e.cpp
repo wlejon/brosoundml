@@ -15,8 +15,14 @@
 // Resolution order for the phoneme checkpoint:
 //   1. argv[1]
 //   2. $BROSOUNDML_PHONEME_WEIGHTS
-//   3. <repo>/build-cuda/english.bpm  (the chunk-7 real model)
-//   4. <repo>/build-cuda/smoke.bpm    (the chunk-4 smoke model)
+//   3. <data>/phoneme/english.bpm          (the published model,
+//                                            scripts/download-brosoundml-data.sh)
+//   4. <repo>/weights/phoneme/english.bpm  (phoneme_train's default output)
+// Never a build-dir training artifact: the early chunk-7 english.bpm was
+// trained only on Kokoro renders from the old deterministic sine source (no
+// unvoiced excitation, zero harmonic phases). It cleared this test at 0.319
+// against a 0.30 threshold, then stopped firing once Kokoro's source followed
+// upstream SineGen. The published model also saw real speech; it scores ~0.45.
 // Kokoro dir:  $BROSOUNDML_KOKORO_DIR, then <repo>/weights/kokoro, then
 //              <data>/kokoro, then weights/kokoro (cwd-relative).
 // g2p data:    $BROSOUNDML_DATA_DIR, then <repo>/../brosoundml-data.
@@ -100,8 +106,8 @@ int main(int argc, char** argv) {
     const std::string checkpoint = first_existing({
         argc > 1 ? std::string(argv[1]) : std::string(),
         env_or_empty("BROSOUNDML_PHONEME_WEIGHTS"),
-        repo + "/build-cuda/english.bpm",
-        repo + "/build-cuda/smoke.bpm",
+        data + "/phoneme/english.bpm",
+        repo + "/weights/phoneme/english.bpm",
     });
 
     // Locate a voice pack inside the Kokoro dir.
