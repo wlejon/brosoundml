@@ -81,6 +81,15 @@ std::vector<float> score_text(brolm::laya::DecisionModel& model, const std::vect
                               const std::vector<std::string>& questions,
                               const std::vector<std::pair<int, int>>& pairs, int batch_items = 256);
 
+// score_text over transcripts (words, not states): an empty transcript
+// answers every content question "no" (logit -kNoWords) instead of asking
+// Laya about "(no speech)", which the text checkpoints answer erratically
+// (English Laya says yes to nine bank questions for it).
+constexpr float kNoWords = 12.0f;
+std::vector<float> score_transcripts(brolm::laya::DecisionModel& model, const std::vector<std::string>& words,
+                                     const std::vector<std::string>& questions,
+                                     const std::vector<std::pair<int, int>>& pairs);
+
 // The adapter's logit for each (cache window, question) pair: the window's
 // latents through `proj` into the state span. Pairs should be grouped by
 // window (consecutive pairs of one window share its soft rows).

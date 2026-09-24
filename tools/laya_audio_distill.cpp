@@ -40,7 +40,7 @@ std::vector<DistillItem> Distiller::sample(const Corpus& c, const std::vector<in
     for (std::size_t k = 0; k < wins.size(); ++k) {
         const CachedWindow& w = c.cache.windows[static_cast<std::size_t>(wins[k])];
         const AlignedUtterance& u = c.utts[static_cast<std::size_t>(w.utt)];
-        states.push_back(transcript_state(window_words(u, w.t_end, c.cache.window_s)));
+        states.push_back(window_words(u, w.t_end, c.cache.window_s));
         std::vector<std::size_t> fs;
         for (int tries = 0; static_cast<int>(fs.size()) < cand_ && tries < 20 * cand_; ++tries) {
             const std::size_t f = fam(rng);
@@ -51,7 +51,7 @@ std::vector<DistillItem> Distiller::sample(const Corpus& c, const std::vector<in
             pairs.push_back({static_cast<int>(k), qs[std::uniform_int_distribution<std::size_t>(0, qs.size() - 1)(rng)]});
         }
     }
-    const std::vector<float> z = score_text(*teacher_, states, qtext_, pairs);
+    const std::vector<float> z = score_transcripts(*teacher_, states, qtext_, pairs);
     std::vector<DistillItem> out;
     for (std::size_t k = 0, p = 0; k < wins.size(); ++k) {
         std::vector<DistillItem> cands;
@@ -79,14 +79,14 @@ Distiller::Dev Distiller::make_dev(const Corpus& c, int domain, int n_windows, s
     std::vector<std::pair<int, int>> tpairs;
     for (std::size_t k = 0; k < wins.size(); ++k) {
         const CachedWindow& w = c.cache.windows[static_cast<std::size_t>(wins[k])];
-        states.push_back(transcript_state(window_words(c.utts[static_cast<std::size_t>(w.utt)], w.t_end, c.cache.window_s)));
+        states.push_back(window_words(c.utts[static_cast<std::size_t>(w.utt)], w.t_end, c.cache.window_s));
         for (std::size_t q = 0; q < bank_.size(); ++q) {
             if (bank_[q].family_split == "para") continue;
             d.pairs.push_back({wins[k], static_cast<int>(q)});
             tpairs.push_back({static_cast<int>(k), static_cast<int>(q)});
         }
     }
-    const std::vector<float> z = score_text(*teacher_, states, qtext_, tpairs);
+    const std::vector<float> z = score_transcripts(*teacher_, states, qtext_, tpairs);
     for (float v : z) d.teacher_p.push_back(sigmoid_t(v, t_teacher_));
     return d;
 }

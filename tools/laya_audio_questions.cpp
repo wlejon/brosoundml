@@ -181,6 +181,24 @@ std::vector<float> score_text(brolm::laya::DecisionModel& model, const std::vect
     return out;
 }
 
+std::vector<float> score_transcripts(brolm::laya::DecisionModel& model, const std::vector<std::string>& words,
+                                     const std::vector<std::string>& questions,
+                                     const std::vector<std::pair<int, int>>& pairs) {
+    std::vector<std::string> states;
+    for (const std::string& w : words) states.push_back(transcript_state(w));
+    std::vector<std::pair<int, int>> ask;
+    std::vector<std::size_t> idx;
+    for (std::size_t i = 0; i < pairs.size(); ++i)
+        if (!words[static_cast<std::size_t>(pairs[i].first)].empty()) {
+            ask.push_back(pairs[i]);
+            idx.push_back(i);
+        }
+    const std::vector<float> z = score_text(model, states, questions, ask);
+    std::vector<float> out(pairs.size(), -kNoWords);
+    for (std::size_t k = 0; k < idx.size(); ++k) out[idx[k]] = z[k];
+    return out;
+}
+
 std::vector<float> score_audio(brolm::laya::DecisionModel& model, ItemBuilder& builder, Mlp& proj,
                                const WindowCache& cache, const std::vector<std::string>& questions,
                                const std::vector<std::pair<int, int>>& pairs, int batch_windows) {

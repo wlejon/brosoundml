@@ -37,6 +37,12 @@ Multilingual Spoken Words Corpus: M. Mazumder et al., "Multilingual Spoken
   https://mlcommons.org/datasets/multilingual-spoken-words/
   Derived from Mozilla Common Voice (CC0).
 
+Timers and Such v1.0: L. Lugosch, P. Papreja, M. Ravanelli, A. Heba,
+  T. Parcollet, "Timers and Such: A Practical Benchmark for Spoken Language
+  Understanding with Numbers", NeurIPS 2021 Datasets and Benchmarks.
+  CC0 1.0 (credited, not required). Only the real recordings were used.
+  https://zenodo.org/records/4623772
+
 OpenSLR 28 (RIRS_NOISES): T. Ko et al., "A Study on Data Augmentation of
   Reverberant Speech for Robust Speech Recognition", ICASSP 2017.
   Simulated room impulse responses, Apache License 2.0; point-source noises,

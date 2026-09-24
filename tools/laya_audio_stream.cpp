@@ -135,18 +135,17 @@ int run_meeting(const Opts& o) {
     const std::vector<HopResult> hops = stream(L, pcm);
 
     // Ceiling every text_every hops.
-    std::vector<std::string> states, words;
+    std::vector<std::string> words;
     std::vector<std::pair<int, int>> pairs;
     std::vector<int> text_hop;
     for (std::size_t h = 0; h < hops.size(); h += static_cast<std::size_t>(o.text_every)) {
         const std::string w = window_words(m, static_cast<float>(hops[h].t_end), o.cfg.window_s);
         text_hop.push_back(static_cast<int>(h));
         words.push_back(w);
-        states.push_back(transcript_state(w));
         for (std::size_t q = 0; q < panel.size(); ++q)
-            pairs.push_back({static_cast<int>(states.size()) - 1, static_cast<int>(q)});
+            pairs.push_back({static_cast<int>(words.size()) - 1, static_cast<int>(q)});
     }
-    const std::vector<float> zg = score_text(L.model(), states, panel, pairs);
+    const std::vector<float> zg = score_transcripts(L.model(), words, panel, pairs);
 
     std::FILE* f = std::fopen(o.trace.c_str(), "wb");
     if (!f) die("cannot write " + o.trace);
@@ -287,7 +286,7 @@ int run_utts(const Opts& o) {
         for (const HopResult& h : hops) hop_ms.push_back(h.total_ms);
         const float t_label = s_end + 0.3f;
         // Text baselines: gold words, ASR at the end and on prefixes.
-        std::vector<std::string> states = {transcript_state(window_words(u, t_label, o.cfg.window_s))};
+        std::vector<std::string> states = {window_words(u, t_label, o.cfg.window_s)};
         if (o.asr) {
             for (float dt : kPrefix) {
                 const float te = std::max(0.3f, s_end + dt);
@@ -296,14 +295,14 @@ int run_utts(const Opts& o) {
                 std::string hyp;
                 for (const std::string& w : normalize_words(asr_m.transcribe(pre))) hyp += (hyp.empty() ? "" : " ") + w;
                 asr_ms.push_back(now_ms() - t0);
-                states.push_back(transcript_state(hyp));
+                states.push_back(hyp);
             }
         }
         std::vector<std::pair<int, int>> pairs;
         for (std::size_t s = 0; s < states.size(); ++s)
             for (std::size_t q = 0; q < qs.size(); ++q) pairs.push_back({static_cast<int>(s), static_cast<int>(q)});
         const double t1 = now_ms();
-        const std::vector<float> z = score_text(L.model(), states, qtext, pairs);
+        const std::vector<float> z = score_transcripts(L.model(), states, qtext, pairs);
         text_ms.push_back((now_ms() - t1) / states.size());
         for (std::size_t q = 0; q < qs.size(); ++q) {
             Rec r;

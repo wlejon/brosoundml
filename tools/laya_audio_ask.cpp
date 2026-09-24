@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
             std::sort(wins.begin(), wins.end());
             const LabelSet* lab = labels[d].empty() ? nullptr : &labels[d];
 
-            std::vector<std::string> gold_states, asr_states;
+            std::vector<std::string> gold_words, asr_words;
             std::vector<std::pair<int, int>> apairs, tpairs;
             std::vector<Rec> recs;
             int cur_utt = -1;
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
                 const CachedWindow& cw = ev.cache.windows[static_cast<std::size_t>(wins[k])];
                 const AlignedUtterance& u = ev.utts[static_cast<std::size_t>(cw.utt)];
                 const std::string gold = window_words(u, cw.t_end, ev.cache.window_s);
-                gold_states.push_back(transcript_state(gold));
+                gold_words.push_back(gold);
                 std::string hyp;
                 if (asr) {
                     if (cw.utt != cur_utt) {
@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
                     const std::vector<std::string> ws =
                         normalize_words(asr_m.transcribe_stream_window(pcm, cw.t_end, ev.cache.window_s));
                     for (const std::string& w : ws) hyp += (hyp.empty() ? "" : " ") + w;
-                    asr_states.push_back(transcript_state(hyp));
+                    asr_words.push_back(hyp);
                 }
                 if (dw)
                     std::fprintf(dw, "%s\t%d\t%s\t%.2f\t%s\t%s\n", names[d].c_str(), wins[k], u.id.c_str(), cw.t_end,
@@ -310,10 +310,10 @@ int main(int argc, char** argv) {
             const double t0 = now_ms();
             const std::vector<float> za = score_audio(model, builder, proj, ev.cache, qtext, apairs);
             const double t1 = now_ms();
-            const std::vector<float> zg = score_text(*tm, gold_states, qtext, tpairs);
+            const std::vector<float> zg = score_transcripts(*tm, gold_words, qtext, tpairs);
             const double t2 = now_ms();
             std::vector<float> zr(recs.size(), std::nanf(""));
-            if (asr) zr = score_text(*tm, asr_states, qtext, tpairs);
+            if (asr) zr = score_transcripts(*tm, asr_words, qtext, tpairs);
             // Records hold calibrated logits (each checkpoint's temperature
             // applied), so the metrics below use T = 1.
             for (std::size_t i = 0; i < recs.size(); ++i) {
