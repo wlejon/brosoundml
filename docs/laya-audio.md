@@ -41,7 +41,7 @@ neighbours as negatives ("their" vs "there" class) it is 0.990. A hop costs
 | keyword X spoken | Laya adapter is competitive, with a different profile from ASR | AUC 0.993 vs 0.975 for streaming ASR plus string match. At ≤ 1 % FPR, ASR still recalls more: 0.95 vs 0.86, and 0.90 vs 0.48 on unseen words. |
 | someone speaking | **not Laya.** A tiny head or a VAD. | Energy gate: AUC 0.986. 2-layer probe on the latents: 0.995. Laya: 0.990. |
 | a word just ended | **not Laya.** A small head on the latents. | Probe 0.904, Laya 0.909. The label timing (80 ms ASR frames) is the ceiling, not the model. |
-| any other question about the audio | **Laya's actual value** | The only structure here that answers arbitrary noul questions about audio with no new training per question. |
+| any other question about the audio | **Only with in-domain audio; otherwise ASR → text Laya** | Measured in [laya-audio-questions.md](laya-audio-questions.md). With in-domain training audio, intents, numbers and times reach real-label AUC 0.92–0.97, level with or above ASR → text Laya, and fire ~2 s before the utterance ends. On new question families it gets 0.58–0.85 against 0.83–0.99 for ASR → text. Tone of voice is at chance. |
 
 In short, the adapter is sound and fast, and it reads audio well enough to
 beat a text Laya fed the *true* transcript (AUC 0.927). But keyword spotting
@@ -65,6 +65,35 @@ Clean English holds (0.993 → 0.992–0.993) and so does latency. What did not
 improve is precision on words never asked in training. Recall at 1 % FPR on
 a fixed held-out word set stays at 0.35–0.51 for English. More vocabulary
 alone does not fix that.
+
+**Update: free-form questions about speech** (full write-up with numbers:
+[laya-audio-questions.md](laya-audio-questions.md)). The hypothesis was that
+the adapter's distinctive strength is answering arbitrary questions about
+live speech: intent, addressee, topic, sentiment, speech acts, entity
+mentions and tone. It was tested with a 131-question bank that holds out
+whole families and phrasings, three real-label sets and transcript
+distillation from text Laya:
+
+- **Zero-shot**, the keyword-trained projector barely understands such
+  questions. Its AUC against the gold-transcript ceiling is 0.53–0.76, where
+  ASR → text Laya gets 0.85–0.99.
+- **Distillation** raises the adapter to 0.82–0.93 on trained questions,
+  0.73–0.81 on new phrasings and 0.69–0.82 on new families, with no keyword,
+  speaking or word-end regression. ASR → text is still ahead everywhere
+  except far-field AMI, where they tie.
+- **Real labels:**
+  - Where training included in-domain audio (Timers and Such: timer, alarm,
+    arithmetic, numbers, times), the adapter scores AUC 0.89–0.97, matching
+    or beating ASR → text. It crosses 0.5 at a median 1.6–2.4 s *before* the
+    speaker finishes.
+  - Elsewhere it trails by 0.1–0.3.
+- **Tone** questions are at chance for every method.
+- **Latency:** 18 questions cost 15.5 ms p50 per 30 ms hop, against 73–150 ms
+  per Parakeet call.
+
+Positioning: an always-on pre-filter and early trigger for a known set of
+intents trained with in-domain audio. It is not a general replacement for
+ASR → text Laya.
 
 ## What was built
 
