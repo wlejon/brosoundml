@@ -158,7 +158,9 @@ int main(int argc, char** argv) {
         std::vector<std::vector<double>> delays(thrs.size());
         std::vector<int> misses(thrs.size(), 0), fa(thrs.size(), 0);
         // Boop sweep.
-        const std::vector<float> boop = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 0.95f};
+        // Thresholds up to 0.995: a checkpoint calibrated sharper (the
+        // multilingual one, T = 1) reaches the low false-boop rates only there.
+        const std::vector<float> boop = {0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f, 0.99f, 0.995f};
         constexpr int kHold = 5;
         std::vector<int> b_hit(boop.size(), 0), b_fb(boop.size(), 0), b_fb_retracted(boop.size(), 0);
         std::vector<int> b_tb(boop.size(), 0), b_tb_retracted(boop.size(), 0);
@@ -330,7 +332,7 @@ int main(int argc, char** argv) {
         std::printf("%6s %8s %12s %14s %14s %14s %14s\n", "thr", "recall", "fire p50 (s)", "false boops/kh",
                     "false retract", "true retract", "confirm p50 (s)");
         for (std::size_t k = 0; k < boop.size(); ++k) {
-            std::printf("%6.2f %8.3f %+12.2f %14.1f %14.3f %14.3f %+14.2f\n", boop[k],
+            std::printf("%6.3f %8.3f %+12.2f %14.1f %14.3f %14.3f %+14.2f\n", boop[k],
                         double(b_hit[k]) / std::max(1, n_pos), pct(b_fire[k], 0.5),
                         b_fb[k] / std::max(1e-9, neg_hours), double(b_fb_retracted[k]) / std::max(1, b_fb[k]),
                         double(b_tb_retracted[k]) / std::max(1, b_tb[k]), pct(b_confirm[k], 0.5));
