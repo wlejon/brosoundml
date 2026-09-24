@@ -1,0 +1,150 @@
+# Free-form noul questions about live speech (docs/laya-audio.md, "Free-form questions").
+#
+# family  family_split  phrasing_split  text  real_label_rule
+#
+# family_split: train   = asked in distillation training;
+#               heldout = never asked in training (generalisation to new question families);
+#               para    = paralinguistic, never trained (tone, not words: a transcript teacher cannot teach it).
+# phrasing_split: in train families, one phrasing per family is held out (never asked in training).
+# real_label_rule (optional): where a real label exists.
+#   tag:A|B|C     a labelled span with any of these tags lies (mostly) in the window; a trailing * matches a prefix.
+#                 Only evaluated on sets whose label file uses that tag namespace (the part before '=').
+#   subset:A|B    the utterance's corpus subset starts with A or B (a domain proxy, pooled across sets).
+#
+# ---------------------------------------------------------------- assistant intents
+intent.alarm	train	train	Someone is asking to set an alarm.	tag:scenario=alarm|intent=SetAlarm
+intent.alarm	train	train	The speaker wants an alarm to wake them up at a certain time.	tag:scenario=alarm|intent=SetAlarm
+intent.alarm	train	heldout	The request is about an alarm clock.	tag:scenario=alarm|intent=SetAlarm
+intent.timer	train	train	Someone is asking to set a timer.	tag:intent=SetTimer
+intent.timer	train	train	The speaker wants a countdown started for some minutes.	tag:intent=SetTimer
+intent.timer	train	heldout	A timer is being requested.	tag:intent=SetTimer
+intent.math	train	train	Someone is asking for the result of a calculation.	tag:intent=SimpleMath|intent=qa_maths
+intent.math	train	train	The speaker wants a math problem solved.	tag:intent=SimpleMath|intent=qa_maths
+intent.math	train	heldout	Numbers are being added, subtracted, multiplied or divided on request.	tag:intent=SimpleMath|intent=qa_maths
+intent.convert	train	train	Someone is asking to convert between units.	tag:intent=UnitConversion
+intent.convert	train	train	The speaker wants to know how many of one unit make another.	tag:intent=UnitConversion
+intent.convert	train	heldout	A unit conversion is requested.	tag:intent=UnitConversion
+intent.music	train	train	Someone is asking to play music.	tag:intent=play_music
+intent.music	train	train	The speaker wants a song, an artist or a playlist played.	tag:intent=play_music
+intent.music	train	heldout	The request is to put some music on.	tag:intent=play_music
+intent.calendar	train	train	Someone is asking to add or check an event in their calendar.	tag:scenario=calendar
+intent.calendar	train	train	The speaker wants to be reminded about a meeting or an appointment.	tag:scenario=calendar
+intent.calendar	train	heldout	The request concerns their schedule.	tag:scenario=calendar
+intent.email	train	train	Someone is asking to send or read an email.	tag:scenario=email
+intent.email	train	train	The speaker wants to check their inbox.	tag:scenario=email
+intent.email	train	heldout	The request is about email.	tag:scenario=email
+intent.volume	train	train	Someone is asking to change the volume.	tag:intent=audio_volume_*
+intent.volume	train	train	The speaker wants the sound louder, quieter or muted.	tag:intent=audio_volume_*
+intent.volume	train	heldout	The request is about how loud something is playing.	tag:intent=audio_volume_*
+intent.pause	train	train	Someone is asking to pause the game.
+intent.pause	train	train	The speaker wants to stop or pause what is playing.
+intent.pause	train	heldout	The speaker asks for a break in the game.
+intent.transport	train	train	Someone is asking about trains, taxis, flights or traffic.	tag:scenario=transport
+intent.transport	train	train	The speaker wants to book a ticket or a ride.	tag:scenario=transport
+intent.transport	train	heldout	The request is about getting somewhere.	tag:scenario=transport
+intent.weather	heldout	heldout	Someone is asking about the weather.	tag:scenario=weather
+intent.weather	heldout	heldout	The speaker wants to know if it will rain or how warm it will be.	tag:scenario=weather
+intent.weather	heldout	heldout	The request is for a weather forecast.	tag:scenario=weather
+intent.lights	heldout	heldout	Someone is asking to turn the lights on or off.	tag:intent=iot_hue_*
+intent.lights	heldout	heldout	The speaker wants the lights dimmed, brightened or their colour changed.	tag:intent=iot_hue_*
+intent.lights	heldout	heldout	The request is about the lighting in the room.	tag:intent=iot_hue_*
+intent.cooking	heldout	heldout	Someone is asking for a recipe or cooking instructions.	tag:scenario=cooking
+intent.cooking	heldout	heldout	The speaker wants to know how to cook something.	tag:scenario=cooking
+intent.news	heldout	heldout	Someone is asking for the news.	tag:scenario=news
+intent.news	heldout	heldout	The speaker wants to hear the latest headlines.	tag:scenario=news
+# ---------------------------------------------------------------- speech acts and addressee
+act.command	train	train	Someone is giving a command or an instruction.	subset:slurp|timers
+act.command	train	train	The speaker tells someone or something to do a task.	subset:slurp|timers
+act.command	train	heldout	An order or a request for action is being made.	subset:slurp|timers
+act.assistant	train	train	Someone is talking to a voice assistant or a device.	subset:slurp|timers
+act.assistant	train	train	The speaker is addressing a computer or a smart speaker rather than a person.	subset:slurp|timers
+act.assistant	train	heldout	These words are directed at a machine.	subset:slurp|timers
+act.question	train	train	Someone is asking a question.	tag:daclass=elicit
+act.question	train	train	The speaker wants to know something and is asking for it.	tag:daclass=elicit
+act.question	train	heldout	A question is being asked.	tag:daclass=elicit
+act.suggest	train	train	Someone is making a suggestion.	tag:da=sug
+act.suggest	train	train	The speaker proposes an idea or a plan.	tag:da=sug
+act.suggest	train	heldout	An idea is being put forward for the group to consider.	tag:da=sug
+act.opinion	train	train	Someone gives their opinion about something.	tag:da=ass
+act.opinion	train	train	The speaker judges whether something is good or bad.	tag:da=ass
+act.opinion	train	heldout	An evaluation or assessment is being expressed.	tag:da=ass
+act.agree	train	train	Someone agrees with what was said.
+act.agree	train	train	The speaker says that is right or expresses agreement.
+act.agree	train	heldout	There is agreement with the previous point.
+act.greeting	train	train	Someone is greeting someone, like hello or good morning.
+act.greeting	train	train	The speaker says hello or goodbye.
+act.greeting	train	heldout	A greeting is being exchanged.
+act.backchannel	train	train	Someone only says a short acknowledgement like yeah, okay or mm-hmm.
+act.backchannel	train	heldout	The speaker just signals they are listening.
+act.help	heldout	heldout	Someone is asking for help.
+act.help	heldout	heldout	The speaker needs assistance with something.
+act.help	heldout	heldout	A request for help is being made.
+act.refuse	heldout	heldout	Someone refuses or says no to a request.
+act.refuse	heldout	heldout	The speaker disagrees or rejects an idea.
+act.thanks	heldout	heldout	Someone thanks someone.
+act.thanks	heldout	heldout	The speaker expresses gratitude.
+# ---------------------------------------------------------------- sentiment in the words
+sent.positive	train	train	The speaker says something positive or happy.	tag:da=be.pos
+sent.positive	train	train	The words express approval, pleasure or enthusiasm.	tag:da=be.pos
+sent.positive	train	heldout	Something nice is being said.	tag:da=be.pos
+sent.negative	train	train	The speaker says something negative, critical or unhappy.	tag:da=be.neg
+sent.negative	train	train	The words express a complaint or displeasure.	tag:da=be.neg
+sent.negative	train	heldout	Something unpleasant is being said.	tag:da=be.neg
+sent.unsure	train	train	The speaker says they are unsure or do not know.
+sent.unsure	train	heldout	The speaker is guessing rather than certain.
+# ---------------------------------------------------------------- topics
+topic.money	train	train	They are talking about money, prices or costs.	tag:topic=project budget
+topic.money	train	train	The conversation is about a budget or spending.	tag:topic=project budget
+topic.money	train	heldout	The topic is financial.	tag:topic=project budget
+topic.design	train	train	They are discussing the design of a product.	tag:topic=look and usability|topic=components, materials and energy sources|topic=evaluation of prototype(s)
+topic.design	train	heldout	The topic is how a device should look or be built.	tag:topic=look and usability|topic=components, materials and energy sources|topic=evaluation of prototype(s)
+topic.politics	train	train	The topic is politics, laws or government.	subset:voxpopuli
+topic.politics	train	train	They are talking about a political decision or policy.	subset:voxpopuli
+topic.politics	train	heldout	The subject is how a country or union is governed.	subset:voxpopuli
+topic.food	train	train	The topic is food or eating.
+topic.food	train	heldout	They are talking about a meal.
+topic.family	train	train	They are talking about family members or relationships.
+topic.family	train	heldout	The subject is someone's parents, children or partner.
+topic.travel	train	train	The topic is travel or a journey.
+topic.travel	train	heldout	They are talking about going on a trip.
+topic.nature	train	train	The topic is nature, animals or the countryside.
+topic.nature	train	heldout	They are talking about plants, animals or the weather outside.
+topic.war	train	train	The topic is war, fighting or weapons.
+topic.war	train	heldout	They are talking about soldiers or a battle.
+topic.religion	train	train	The topic is religion or God.
+topic.religion	train	heldout	They are talking about faith or the church.
+topic.sport	heldout	heldout	The topic is sport or games.
+topic.sport	heldout	heldout	They are talking about a match, a team or a player.
+topic.health	heldout	heldout	The topic is health, illness or medicine.
+topic.health	heldout	heldout	They are talking about a doctor or feeling sick.
+topic.tech	heldout	heldout	The topic is technology, computers or electronics.
+topic.tech	heldout	heldout	They are talking about a gadget or software.
+# ---------------------------------------------------------------- mentions
+ent.number	train	train	A number is mentioned.	tag:ne=NUMEX
+ent.number	train	train	The speaker says a number or a quantity.	tag:ne=NUMEX
+ent.number	train	heldout	Some amount is stated.	tag:ne=NUMEX
+ent.price	train	train	A price or an amount of money is mentioned.	tag:ne=MONEY|entity=currency_name
+ent.price	train	train	The speaker says how much something costs.	tag:ne=MONEY|entity=currency_name
+ent.price	train	heldout	A sum in euros, dollars or pounds comes up.	tag:ne=MONEY|entity=currency_name
+ent.time	train	train	A time or a date is mentioned.	tag:ne=TIMEX|entity=date|entity=time
+ent.time	train	train	The speaker says when something happens, like a day or a time.	tag:ne=TIMEX|entity=date|entity=time
+ent.time	train	heldout	A moment in time is specified.	tag:ne=TIMEX|entity=date|entity=time
+ent.person	train	train	A person's name is mentioned.	tag:entity=person
+ent.person	train	train	The speaker refers to somebody by their name.	tag:entity=person
+ent.person	train	heldout	Somebody is named.	tag:entity=person
+ent.place	heldout	heldout	A place, a city or a country is mentioned.	tag:entity=place_name|ne=LOCATION
+ent.place	heldout	heldout	The speaker names a location.	tag:entity=place_name|ne=LOCATION
+ent.color	heldout	heldout	A colour is mentioned.	tag:ne=COLOUR|entity=color_type
+ent.color	heldout	heldout	The speaker names a colour like red or blue.	tag:ne=COLOUR|entity=color_type
+# ---------------------------------------------------------------- tone of voice (never trained)
+para.angry	para	heldout	The speaker sounds angry.	tag:emotion=ANG
+para.angry	para	heldout	The voice sounds irritated or annoyed.	tag:emotion=ANG
+para.happy	para	heldout	The speaker sounds happy or cheerful.	tag:emotion=HAP
+para.happy	para	heldout	The voice sounds joyful.	tag:emotion=HAP
+para.sad	para	heldout	The speaker sounds sad.	tag:emotion=SAD
+para.sad	para	heldout	The voice sounds unhappy or depressed.	tag:emotion=SAD
+para.afraid	para	heldout	The speaker sounds scared or afraid.	tag:emotion=FEA
+para.disgust	para	heldout	The speaker sounds disgusted.	tag:emotion=DIS
+para.calm	para	heldout	The speaker sounds calm and neutral.	tag:emotion=NEU
+para.excited	para	heldout	The speaker sounds excited.
+para.hesitant	para	heldout	The speaker sounds hesitant.

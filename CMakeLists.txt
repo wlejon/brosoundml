@@ -362,7 +362,8 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # laya-audio: the audio front end for Laya (docs/laya-audio.md).
     add_library(brosoundml_laya_audio_data STATIC tools/laya_audio_data.cpp tools/laya_audio_decode.cpp
                 tools/laya_audio_augment.cpp tools/laya_audio_task.cpp tools/laya_audio_corpus.cpp
-                tools/laya_audio_metrics.cpp tools/laya_audio_baselines.cpp tools/laya_audio_listener.cpp)
+                tools/laya_audio_metrics.cpp tools/laya_audio_baselines.cpp tools/laya_audio_listener.cpp
+                tools/laya_audio_questions.cpp tools/laya_audio_distill.cpp)
     target_link_libraries(brosoundml_laya_audio_data PUBLIC brosoundml)
     # Compressed dataset audio (tools only): Ogg Opus via libopus + libogg,
     # FLAC via the header-only dr_flac. Found in a vcpkg tree or the system.
@@ -389,7 +390,7 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     else()
         message(STATUS "laya-audio tools: dr_flac.h not found, .flac input disabled")
     endif()
-    foreach(_la align prep cache train eval listen)
+    foreach(_la align prep cache train eval listen labels ask stream)
         add_executable(brosoundml_laya_audio_${_la} tools/laya_audio_${_la}.cpp)
         target_link_libraries(brosoundml_laya_audio_${_la} PRIVATE brosoundml_laya_audio_data)
     endforeach()

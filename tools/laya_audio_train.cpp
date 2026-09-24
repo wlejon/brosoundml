@@ -20,11 +20,18 @@
 //   brosoundml_laya_audio_train --train NAME,WEIGHT,ALIGN,CACHE[+CACHE] ...
 //        --dev NAME,ALIGN,CACHE ... --out proj.mlp
 //        [--laya D:/projects/laya] [--steps 6000] [--batch 16] [--lr 3e-4]
-//        [--eval-every 500] [--eval-windows 600] [--probe] [--seed 1]
+//        [--eval-every 500] [--eval-windows 600] [--probe] [--seed 1] [--init proj.mlp]
+//        [--bank questions.tsv [--teacher LAYA_DIR] [--teacher-temperature T] [--student-temperature T]
+//         [--free-cand 12] [--free-keep 4] [--free-weight 1] [--free-dev-windows 80]]
+//   --bank adds free-form question distillation (laya_audio_distill.h): the
+//   teacher is text Laya on each window's gold transcript; per window
+//   --free-keep of --free-cand sampled trained questions are learned as soft
+//   targets next to the keyword / speaking / word-end tasks.
 //   (--align-train A --cache-train C[,C] --align-dev A --cache-dev C is the
 //    single-domain form of the first adapter.)
 
 #include "laya_audio_corpus.h"
+#include "laya_audio_distill.h"
 #include "laya_audio_task.h"
 
 #include "brolm/laya.h"
@@ -65,6 +72,10 @@ struct Args {
     float lr = 3e-4f;
     bool probe = false;
     uint32_t seed = 1;
+    // Free-form distillation (laya_audio_distill.h).
+    std::string bank, teacher, init;
+    float teacher_temperature = 1.0f, student_temperature = 1.0f, free_weight = 1.0f;
+    int free_cand = 12, free_keep = 4, free_dev_windows = 80;
 };
 
 // AUC report over dev probes, by question and keyword category.
@@ -183,6 +194,15 @@ int main(int argc, char** argv) {
         else if (k == "--hidden") a.hidden = std::atoi(next().c_str());
         else if (k == "--probe") a.probe = true;
         else if (k == "--seed") a.seed = static_cast<uint32_t>(std::atoi(next().c_str()));
+        else if (k == "--bank") a.bank = next();
+        else if (k == "--teacher") a.teacher = next();
+        else if (k == "--teacher-temperature") a.teacher_temperature = std::stof(next());
+        else if (k == "--student-temperature") a.student_temperature = std::stof(next());
+        else if (k == "--free-weight") a.free_weight = std::stof(next());
+        else if (k == "--free-cand") a.free_cand = std::atoi(next().c_str());
+        else if (k == "--free-keep") a.free_keep = std::atoi(next().c_str());
+        else if (k == "--free-dev-windows") a.free_dev_windows = std::atoi(next().c_str());
+        else if (k == "--init") a.init = next();
         else die("unknown argument " + k);
     }
     if (!a.align_train.empty()) {
@@ -235,12 +255,33 @@ int main(int argc, char** argv) {
             dev_probes[d] = make_probes(dv.cache, dv.utts, wins, all_vocab, &seen, 2, rng);
         }
 
+        // Free-form distillation: teacher = text Laya (--teacher, default
+        // the student's own checkpoint) on the window's gold transcript.
+        Distiller distill;
+        brolm::laya::DecisionModel teacher_own;
+        std::vector<Distiller::Dev> free_dev;
+        if (!a.bank.empty()) {
+            brolm::laya::DecisionModel* teacher = &model;
+            if (!a.teacher.empty() && a.teacher != a.laya) {
+                teacher_own.load_model(a.teacher);
+                teacher = &teacher_own;
+            }
+            distill.init(a.bank, teacher, a.teacher_temperature, a.free_cand, a.free_keep);
+            for (std::size_t d = 0; d < dv.domains.size(); ++d)
+                free_dev.push_back(distill.make_dev(dv, static_cast<int>(d), a.free_dev_windows, rng));
+        }
+
         Mlp proj;
-        proj.init(tr.cache.dim, a.hidden, D, a.seed);
+        if (!a.init.empty()) {
+            proj.load(a.init);
+            if (proj.d_in() != tr.cache.dim || proj.d_out() != D) die("--init projector does not fit this Laya");
+        } else {
+            proj.init(tr.cache.dim, a.hidden, D, a.seed);
+        }
 
         float scale = 1024.0f;
         int good_run = 0, skipped = 0;
-        double loss_acc = 0, ms_acc = 0, fwd_acc = 0, bwd_acc = 0;
+        double loss_acc = 0, free_acc = 0, teacher_acc = 0, ms_acc = 0, fwd_acc = 0, bwd_acc = 0;
         int n_acc = 0;
         for (int step = 1; step <= a.steps; ++step) {
             const double t0 = now_ms();
@@ -250,6 +291,9 @@ int main(int argc, char** argv) {
             wins.erase(std::unique(wins.begin(), wins.end()), wins.end());
             const std::vector<Probe> probes = make_probes(tr.cache, tr.utts, wins, train_vocab, nullptr, 1, rng);
             const int F = tr.cache.windows[static_cast<std::size_t>(wins.front())].frames;
+            // Teacher before the student's forward (it may share the model).
+            const std::vector<DistillItem> free =
+                a.bank.empty() ? std::vector<DistillItem>{} : distill.sample(tr, wins, rng);
 
             const bt::Tensor lat = gather_latents(tr.cache, wins);
             bt::Tensor y, soft;
@@ -260,10 +304,11 @@ int main(int argc, char** argv) {
                 if (probes[i].window != wins[k]) ++k;
                 items.push_back(builder.item(question_text(probes[i].q, probes[i].keyword), F, static_cast<int>(k) * F));
             }
+            for (const DistillItem& d : free) items.push_back(builder.item(distill.text(d.q), F, d.k * F));
             const std::vector<float> logits = grad.forward(items, &soft);
             std::vector<float> dlog(logits.size(), 0.0f);
-            double loss = 0;
-            const float inv_n = 1.0f / static_cast<float>(probes.size());
+            double loss = 0, free_loss = 0;
+            const float inv_n = 1.0f / static_cast<float>(items.size());
             for (std::size_t i = 0; i < probes.size(); ++i) {
                 const float z = logits[2 * i + 1] - logits[2 * i];
                 const float yv = static_cast<float>(probes[i].label);
@@ -271,6 +316,17 @@ int main(int argc, char** argv) {
                 loss += -(yv * std::log(std::max(p, 1e-7f)) + (1 - yv) * std::log(std::max(1 - p, 1e-7f)));
                 dlog[2 * i + 1] = (p - yv) * inv_n;
                 dlog[2 * i] = -(p - yv) * inv_n;
+            }
+            // Free-form: soft-target BCE on the student's calibrated probability.
+            const float Ts = a.student_temperature;
+            for (std::size_t j = 0; j < free.size(); ++j) {
+                const std::size_t i = probes.size() + j;
+                const float z = (logits[2 * i + 1] - logits[2 * i]) / Ts;
+                const float yv = free[j].target, p = sigmoid(z);
+                free_loss += -(yv * std::log(std::max(p, 1e-7f)) + (1 - yv) * std::log(std::max(1 - p, 1e-7f)));
+                const float g = a.free_weight * (p - yv) / Ts * inv_n;
+                dlog[2 * i + 1] = g;
+                dlog[2 * i] = -g;
             }
             bt::Tensor d_soft;
             if (!grad.backward(dlog, d_soft, scale)) {
@@ -291,16 +347,19 @@ int main(int argc, char** argv) {
             proj.adam(lr);
             bt::sync(bt::default_device());
             loss_acc += loss / probes.size();
+            free_acc += free.empty() ? 0.0 : free_loss / free.size();
+            teacher_acc += free.empty() ? 0.0 : distill.last_teacher_ms();
             ms_acc += now_ms() - t0;
             fwd_acc += grad.last_forward_ms();
             bwd_acc += grad.last_backward_ms();
             ++n_acc;
             if (step % 50 == 0) {
-                std::printf("step %d loss %.4f  %.0f ms/step (laya fwd %.0f bwd %.0f, %zu items)  scale %.0f skipped %d\n",
-                            step, loss_acc / n_acc, ms_acc / n_acc, fwd_acc / n_acc, bwd_acc / n_acc, probes.size(),
-                            scale, skipped);
+                std::printf("step %d loss %.4f free %.4f  %.0f ms/step (teacher %.0f laya fwd %.0f bwd %.0f, %zu items)  "
+                            "scale %.0f skipped %d\n",
+                            step, loss_acc / n_acc, free_acc / n_acc, ms_acc / n_acc, teacher_acc / n_acc,
+                            fwd_acc / n_acc, bwd_acc / n_acc, items.size(), scale, skipped);
                 std::fflush(stdout);
-                loss_acc = ms_acc = fwd_acc = bwd_acc = 0;
+                loss_acc = free_acc = teacher_acc = ms_acc = fwd_acc = bwd_acc = 0;
                 n_acc = 0;
             }
             if (step % a.eval_every == 0 || step == a.steps) {
@@ -308,6 +367,8 @@ int main(int argc, char** argv) {
                     const std::vector<float> s = score_laya(model, builder, proj, dv.cache, dev_probes[d]);
                     report(dev_probes[d], s, "step " + std::to_string(step) + " " + dv.domains[d].name);
                 }
+                for (const Distiller::Dev& fd : free_dev)
+                    distill.report(model, builder, proj, dv.cache, fd, Ts, "step " + std::to_string(step));
                 if (!a.out.empty()) proj.save(a.out);
             }
         }

@@ -1,0 +1,19 @@
+# The streaming demo's question panel (brosoundml_laya_audio_stream meeting): one noul question per line.
+Someone is speaking at the end of this audio.
+Someone is asking a question.
+Someone is making a suggestion.
+Someone agrees with what was said.
+The speaker disagrees or rejects an idea.
+Someone is asking for help.
+Someone is giving a command or an instruction.
+Someone is talking to a voice assistant or a device.
+Someone is asking to pause the game.
+A price or an amount of money is mentioned.
+A number is mentioned.
+A colour is mentioned.
+They are discussing the design of a product.
+The topic is technology, computers or electronics.
+The speaker says something positive or happy.
+The speaker says something negative, critical or unhappy.
+The speaker sounds angry.
+The speaker sounds hesitant.

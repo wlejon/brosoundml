@@ -46,6 +46,9 @@ public:
     void reset();  // new stream
     // Push 16 kHz mono PCM; returns one result per hop completed by this push.
     std::vector<HopResult> feed(const float* pcm, int n);
+    // The frozen Laya (for text questions against the same checkpoint).
+    brolm::laya::DecisionModel& model() { return model_; }
+    const ListenerConfig& config() const { return cfg_; }
 
 private:
     HopResult run_hop_();
