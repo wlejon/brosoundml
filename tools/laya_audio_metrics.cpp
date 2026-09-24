@@ -73,6 +73,41 @@ void report_categories(const std::string& set, const std::vector<Probe>& probes,
                         static_cast<int>(l.size()) - pos);
         }
     }
+
+    // Trained vs never-seen words at ONE operating point: the threshold that
+    // passes 1 % (0.1 %) of ALL keyword negatives, and the recall of each
+    // positive group under it. "held-out" (words hashing to 0 mod 10) is the
+    // same word set for every adapter, never asked in any training run, so
+    // it compares adapters directly; "trained"/"never asked" depend on the
+    // adapter's own training vocabulary.
+    const Method& m0 = methods[0];
+    std::vector<float> neg;
+    for (std::size_t i = 0; i < probes.size(); ++i)
+        if (kw(probes[i]) && probes[i].label == 0 && !std::isnan(m0.score[i])) neg.push_back(m0.score[i]);
+    const float t1 = threshold_at_fpr(neg, 0.01), t01 = threshold_at_fpr(neg, 0.001);
+    struct Group {
+        const char* name;
+        std::function<bool(const Probe&)> in;
+    };
+    const std::vector<Group> groups = {
+        {"trained (asked)", [](const Probe& p) { return !p.unseen; }},
+        {"never asked", [](const Probe& p) { return p.unseen; }},
+        {"held-out (fixed set)", [](const Probe& p) { return held_out_keyword(p.keyword); }},
+    };
+    std::printf("%-16s keyword recall at the all-negatives threshold (%zu negatives):\n", set.c_str(), neg.size());
+    for (const Group& g : groups) {
+        int n = 0, h1 = 0, h01 = 0;
+        for (std::size_t i = 0; i < probes.size(); ++i) {
+            const Probe& p = probes[i];
+            if (!kw(p) || p.label != 1 || std::isnan(m0.score[i]) || !g.in(p)) continue;
+            ++n;
+            h1 += m0.score[i] >= t1;
+            h01 += m0.score[i] >= t01;
+        }
+        if (n > 0)
+            std::printf("%-16s   %-22s pos %5d  recall@1%% %.3f  recall@0.1%% %.3f\n", set.c_str(), g.name, n,
+                        double(h1) / n, double(h01) / n);
+    }
     std::fflush(stdout);
 }
 
