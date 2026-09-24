@@ -1,0 +1,51 @@
+Laya audio adapter
+Copyright 2026 Jonny Brannum
+
+Licensed under the Apache License, Version 2.0. This NOTICE lists the
+third-party works the adapter depends on or was trained with.
+
+Models
+------
+Qwen3-ASR-0.6B, Copyright Alibaba Cloud (Qwen team), Apache License 2.0.
+  The adapter reads the latents of its audio encoder.
+Laya and Laya multilingual, Apache License 2.0. Built on ModernBERT-large
+  (Answer.AI / LightOn, Apache License 2.0) and mmBERT-base (JHU CLSP, MIT).
+NVIDIA parakeet-tdt-0.6b-v3, Copyright NVIDIA, CC BY 4.0
+  (https://creativecommons.org/licenses/by/4.0/). Its transcripts and word
+  timings were used as training labels.
+
+Training data
+-------------
+LibriTTS-R: Y. Koizumi et al., "LibriTTS-R: A Restored Multi-Speaker
+  Text-to-Speech Corpus", 2023. CC BY 4.0. https://www.openslr.org/141/
+  Derived from LibriTTS (H. Zen et al., CC BY 4.0) and LibriVox recordings
+  (public domain).
+
+VoxPopuli: C. Wang et al., "VoxPopuli: A Large-Scale Multilingual Speech
+  Corpus for Representation Learning, Semi-Supervised Learning and
+  Interpretation", ACL 2021. Transcriptions CC0.
+  https://github.com/facebookresearch/voxpopuli
+  Source of the audio: European Parliament, (c) European Union, 2017-2018.
+  Reproduction authorised, provided the source is acknowledged.
+
+AMI Meeting Corpus: J. Carletta et al., "The AMI Meeting Corpus", 2005.
+  Copyright the AMI Consortium (University of Edinburgh and partners).
+  CC BY 4.0. https://groups.inf.ed.ac.uk/ami/corpus/
+
+Multilingual Spoken Words Corpus: M. Mazumder et al., "Multilingual Spoken
+  Words Corpus", NeurIPS 2021 Datasets and Benchmarks. MLCommons, CC BY 4.0.
+  https://mlcommons.org/datasets/multilingual-spoken-words/
+  Derived from Mozilla Common Voice (CC0).
+
+OpenSLR 28 (RIRS_NOISES): T. Ko et al., "A Study on Data Augmentation of
+  Reverberant Speech for Robust Speech Recognition", ICASSP 2017.
+  Simulated room impulse responses, Apache License 2.0; point-source noises,
+  public domain (Freesound). https://www.openslr.org/28/
+
+MUSAN: D. Snyder, G. Chen, D. Povey, "MUSAN: A Music, Speech, and Noise
+  Corpus", 2015. https://www.openslr.org/17/
+  Only recordings licensed CC BY (3.0 or 4.0) or public domain were used.
+  Each one is credited, with title, author, licence and source URL, in
+  ATTRIBUTIONS.tsv, which ships with this NOTICE. Among the authors credited
+  there: Kevin MacLeod (incompetech.com, CC BY 3.0) and the SoundBible.com
+  recorders (CC BY 3.0).
