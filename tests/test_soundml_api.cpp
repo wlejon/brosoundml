@@ -98,6 +98,15 @@ void expectBrandChecked(const ev::Persistent& obj, const char* cls, const char* 
 }  // namespace
 
 int main() {
+    // A host (bro, with broaudio) publishes bro.ear before brosoundml installs;
+    // loadClap must mount onto that object, keeping what is already on it.
+    {
+        ev::Persistent host(ev::createObject());
+        ev::Persistent ear(ev::createObject());
+        ear.set(ev::setProperty(ear.get(), "hostMarker", ev::fromDouble(7)));
+        host.set(ev::setProperty(host.get(), "ear", ear.get()));
+        ev::registerGlobal("bro", host.get());
+    }
     std::cout << "Installing brosoundml API into the Bronze realm..." << std::endl;
     brosoundml::api::installSoundML();
     std::cout << "Installed." << std::endl;
@@ -164,6 +173,32 @@ int main() {
                      [] { return std::vector<ev::Value>{ev::fromDouble(42)}; },
                      "TypeError", "path");
         expectClassNotConstructible(rave, "Rave");
+    }
+
+    // ── bro.ear (CLAP) ─────────────────────────────────────────────────────
+    {
+        ev::Persistent ear = ns(bro, "ear");
+        ev::Persistent marker(ev::getProperty(ear.get(), "hostMarker"));
+        check(ev::isNumber(marker.get()) && ev::toDouble(marker.get()) == 7,
+              "bro.ear is the host's object (its hostMarker survives)");
+        ev::Persistent load(ev::getProperty(ear.get(), "loadClap"));
+        check(ev::isFunction(load.get()), "bro.ear.loadClap is a function");
+        expectThrows(ear, "loadClap",
+                     [] { return std::vector<ev::Value>{ev::fromDouble(42)}; },
+                     "TypeError", "dir");
+        expectThrows(ear, "loadClap",
+                     [] {
+                         ev::Persistent o(ev::createObject());
+                         ev::Persistent s(ev::fromUtf8("tpu"));
+                         return std::vector<ev::Value>{ev::setProperty(o.get(), "device", s.get())};
+                     },
+                     "TypeError", "opts.device");
+        expectThrows(ear, "loadClap",
+                     [] { return std::vector<ev::Value>{ev::fromUtf8("no/such/clap/dir")}; },
+                     "Error", "loadClap");
+        expectClassNotConstructible(ear, "ClapModel");
+        for (const char* m : {"score", "embedAudio", "embedText", "scoreEmbedding", "dispose"})
+            expectBrandChecked(ear, "ClapModel", m);
     }
 
     // ── bro.listen ─────────────────────────────────────────────────────────

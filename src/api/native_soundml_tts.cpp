@@ -336,6 +336,10 @@ Value ttsDecodeFrom(Value, std::span<const Value> args) {
 
 }  // namespace
 
+// The root bro.tts.setAssetRoot() set ("" when unset); bro.ear's CLAP loader
+// looks for weights/clap under it first.
+std::string ttsAssetRootOverride() { return g_assetRoot; }
+
 void installTts(ObjectBuilder& bro) {
     installTtsKokoroClasses();
     installTtsQwenClasses();

@@ -128,6 +128,7 @@ void installSoundMLOnto(bool compute) {
     installTts(bro);
     installDiar(bro);
     installRave(bro);
+    installEar(bro);
     installVoiceAgent(bro);
     if (!compute) {
         installWake(bro);

@@ -195,6 +195,132 @@ int main() {
         std::cout << "  SKIP Kokoro (no " << kokoroDir.string() << " model + voice)" << std::endl;
     }
 
+    // ── CLAP: bro.ear.loadClap from the default location, score / embed ────
+    const fs::path clapDir = weights / "clap";
+    const fs::path humWav = weights / "mhmm.wav";
+    if (fs::exists(clapDir / "model.safetensors") && fs::exists(humWav)) {
+        runEval("globalThis.REPO_DIR = " + jsString(fs::path(BROSOUNDML_REPO_DIR).generic_string()) +
+                "; globalThis.HUM_WAV = " + jsString(humWav.generic_string()) + ";", "clap paths");
+        // No dir: the default is <asset root>/weights/clap.
+        const bool launched = runEval(R"JS(
+            bro.tts.setAssetRoot(REPO_DIR);
+            globalThis.cLoaded = false;
+            bro.ear.loadClap({ onReady: (m) => { globalThis.clap = m; globalThis.cLoaded = true; },
+                               onError: (e) => { globalThis.cError = String(e); globalThis.cLoaded = true; } });
+        )JS", "CLAP background load (default dir)");
+        if (launched && pumpUntil("cLoaded", 600)) {
+            runEval(R"JS(
+                if (globalThis.cError) throw new Error('load failed: ' + cError);
+                if (!(clap instanceof bro.ear.ClapModel)) throw new Error('onReady did not deliver a ClapModel');
+                if (!clap.loaded || clap.sampleRate !== 48000 || clap.embeddingSize !== 512 || clap.windowSeconds !== 10)
+                    throw new Error('config ' + clap.sampleRate + '/' + clap.embeddingSize + '/' + clap.windowSeconds);
+                if (Math.abs(clap.logitScale - 38.6647) > 1e-3) throw new Error('logitScale ' + clap.logitScale);
+                const prompts = ['a dog barking', 'a person humming', 'a whistle', 'xylophone'];
+                const norm = (v) => { let s = 0; for (const x of v) s += x * x; return Math.sqrt(s); };
+                const maxDiff = (a, b) => { let m = 0; for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
+
+                // A file path clip; the reference ranks the hum at 0.958 'a person humming'.
+                const r = clap.score(HUM_WAV, prompts);
+                if (!(r.scores instanceof Float32Array) || r.scores.length !== 4) throw new Error('scores');
+                if (r.similarities.length !== 4 || r.logits.length !== 4) throw new Error('similarities/logits');
+                if (!(r.embedding instanceof Float32Array) || r.embedding.length !== 512) throw new Error('embedding');
+                if (Math.abs(norm(r.embedding) - 1) > 1e-4) throw new Error('embedding not unit: ' + norm(r.embedding));
+                let sum = 0; for (const p of r.scores) sum += p;
+                if (Math.abs(sum - 1) > 1e-5) throw new Error('scores sum ' + sum);
+                if (r.bestIndex !== 1 || r.best !== 'a person humming' || !(r.scores[1] > 0.9))
+                    throw new Error('best ' + r.best + ' ' + r.scores[1]);
+                // scores = softmax(similarities * logitScale), logits = similarities * logitScale.
+                const l = Array.from(r.similarities, (s) => s * clap.logitScale);
+                const mx = Math.max(...l), e = l.map((x) => Math.exp(x - mx)), z = e.reduce((a, b) => a + b);
+                for (let i = 0; i < 4; i++) {
+                    if (Math.abs(r.logits[i] - l[i]) > 1e-3) throw new Error('logit ' + i);
+                    if (Math.abs(r.scores[i] - e[i] / z) > 1e-5) throw new Error('softmax ' + i);
+                }
+
+                // The same clip as a bare Float32Array, { samples, sampleRate } and an AudioBuffer.
+                const n = 44100, pcm = new Float32Array(n);
+                for (let i = 0; i < n; i++) pcm[i] = 0.2 * Math.sin(2 * Math.PI * 440 * i / 44100);
+                const a1 = clap.embedAudio(pcm, { sampleRate: 44100 });
+                const a2 = clap.embedAudio({ samples: pcm, sampleRate: 44100 });
+                const ab = { numberOfChannels: 2, sampleRate: 44100, length: n, getChannelData: (c) => pcm };
+                const a3 = clap.embedAudio(ab);
+                if (maxDiff(a1, a2) !== 0 || maxDiff(a1, a3) > 1e-6) throw new Error('clip forms differ');
+                const a48 = clap.embedAudio(pcm);   // read as 48 kHz: a different pitch
+                if (maxDiff(a1, a48) < 1e-3) throw new Error('sampleRate ignored');
+
+                // Text embeddings, cached prompts and scoreEmbedding.
+                const t = clap.embedText('a person humming');
+                if (!(t instanceof Float32Array) || t.length !== 512) throw new Error('embedText(string)');
+                const ts = clap.embedText(prompts);
+                if (!Array.isArray(ts) || ts.length !== 4 || maxDiff(ts[1], t) !== 0) throw new Error('embedText(array)');
+                const r2 = clap.scoreEmbedding(r.embedding, [ts[0], 'a person humming', ts[2], 'xylophone']);
+                if (maxDiff(r2.scores, r.scores) > 1e-6) throw new Error('scoreEmbedding disagrees with score');
+                if (r2.best !== 'a person humming') throw new Error('best of a text prompt: ' + r2.best);
+                const r3 = clap.score(HUM_WAV, [ts[0], ts[1]]);
+                if (r3.bestIndex !== 1 || r3.best !== null) throw new Error('cached-only best ' + r3.best);
+
+                // Long clips: the window mean by default, one crop on request.
+                const long = new Float32Array(48000 * 13);
+                for (let i = 0; i < long.length; i++) long[i] = 0.2 * Math.sin(2 * Math.PI * (i < 48000 * 6 ? 440 : 880) * i / 48000);
+                const mean = clap.embedAudio(long), head = clap.embedAudio(long, { long: 'crop', cropAt: 0 });
+                const tail = clap.embedAudio(long, { long: 'crop', cropAt: 99 });
+                if (maxDiff(mean, head) < 1e-3 || maxDiff(head, tail) < 1e-3) throw new Error('long modes coincide');
+
+                const expectType = (f, what) => {
+                    let ok = false;
+                    try { f(); } catch (e) { ok = e instanceof TypeError; }
+                    if (!ok) throw new Error(what + ' did not throw a TypeError');
+                };
+                expectType(() => clap.score(pcm), 'score without prompts');
+                expectType(() => clap.score(pcm, []), 'score with no prompts');
+                expectType(() => clap.score(pcm, [42]), 'a numeric prompt');
+                expectType(() => clap.score(pcm, [new Float32Array(3)]), 'a short cached prompt');
+                expectType(() => clap.score(new Float32Array(0), 'x'), 'an empty clip');
+                expectType(() => clap.embedAudio(pcm, { long: 'middle' }), 'long: middle');
+                expectType(() => clap.embedAudio(42), 'a numeric clip');
+                expectType(() => clap.embedText([new Float32Array(512)]), 'embedText of an embedding');
+                expectType(() => clap.scoreEmbedding(new Float32Array(4), 'x'), 'a short audio embedding');
+
+                // Async score + busy guard.
+                globalThis.sDone = false;
+                clap.score(HUM_WAV, prompts, { onDone: (res, info) => { globalThis.sRes = res; globalThis.sInfo = info; globalThis.sDone = true; } });
+                let threw = false;
+                try { clap.embedText('x'); } catch (e) { threw = true; }
+                if (!threw) throw new Error('a sync call while busy did not throw');
+                globalThis.cHum = r;
+            )JS", "CLAP sync surface + async score launch");
+            if (pumpUntil("sDone", 120)) {
+                runEval(R"JS(
+                    if (sInfo.error || sInfo.cancelled) throw new Error('info ' + JSON.stringify(sInfo));
+                    let d = 0;
+                    for (let i = 0; i < 4; i++) d = Math.max(d, Math.abs(sRes.scores[i] - cHum.scores[i]));
+                    if (d !== 0) throw new Error('async score differs from sync by ' + d);
+                    globalThis.eDone = false;
+                    clap.embedText(['a whistle', 'rain'], { onDone: (res) => {
+                        globalThis.eText = res;
+                        clap.embedAudio(HUM_WAV, { onDone: (emb, info) => {
+                            globalThis.eAudio = emb; globalThis.eInfo = info; globalThis.eDone = true;
+                        } });
+                    } });
+                )JS", "CLAP async score result");
+                if (pumpUntil("eDone", 120)) {
+                    runEval(R"JS(
+                        if (!Array.isArray(eText) || eText.length !== 2 || eText[0].length !== 512) throw new Error('async embedText');
+                        if (eInfo.error) throw new Error(eInfo.error);
+                        for (let i = 0; i < 512; i++) if (eAudio[i] !== cHum.embedding[i]) throw new Error('async embedAudio differs');
+                        clap.dispose();
+                        if (clap.loaded) throw new Error('loaded after dispose');
+                        let threw = false;
+                        try { clap.embedText('x'); } catch (e) { threw = true; }
+                        if (!threw) throw new Error('a call after dispose did not throw');
+                    )JS", "CLAP chained async embedText + embedAudio, dispose");
+                }
+            }
+        }
+    } else {
+        std::cout << "  SKIP CLAP (no " << clapDir.string() << " / " << humWav.string() << ")" << std::endl;
+    }
+
     brosoundml::api::shutdownSoundML();
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed" << std::endl;
