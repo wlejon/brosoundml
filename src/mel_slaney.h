@@ -44,14 +44,17 @@ inline double mel_to_hz(double mel) {
 }
 
 // Build the (n_mels, n_fft/2 + 1) Slaney-normalised mel filterbank used by
-// librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_mels, fmin=0,
-// fmax=sample_rate/2, htk=False, norm="slaney"). Returns the buffer flat in
-// row-major order.
+// librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_mels, fmin=band_lo,
+// fmax=band_hi, htk=False, norm="slaney"). The band defaults to [0, sr/2]
+// (Whisper, Parakeet, Qwen3-ASR); CLAP passes [50, 14000]. A negative band_hi
+// means sr/2. Returns the buffer flat in row-major order.
 inline std::vector<float> build_filterbank(int n_mels, int n_fft,
-                                           int sample_rate) {
+                                           int sample_rate,
+                                           double band_lo = 0.0,
+                                           double band_hi = -1.0) {
     const int    n_bins = n_fft / 2 + 1;
-    const double f_max  = sample_rate / 2.0;
-    const double f_min  = 0.0;
+    const double f_max  = band_hi < 0.0 ? sample_rate / 2.0 : band_hi;
+    const double f_min  = band_lo;
 
     // FFT-bin centre frequencies in Hz: 0, sr/n_fft, 2*sr/n_fft, ...
     std::vector<double> fft_freqs(static_cast<std::size_t>(n_bins));

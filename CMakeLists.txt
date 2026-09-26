@@ -230,6 +230,9 @@ target_sources(brosoundml PRIVATE
     src/word_align.cpp
     src/sortformer.cpp
     src/cluster_diarizer.cpp
+    src/clap.cpp
+    src/clap_audio.cpp
+    src/clap_text.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
