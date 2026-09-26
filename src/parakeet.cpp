@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -321,10 +322,12 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
         fail("Parakeet::transcribe", "no model loaded; call Parakeet::load() first");
     if (audio.samples.empty())
         fail("Parakeet::transcribe", "audio buffer is empty");
-    if (audio.sample_rate != config.sample_rate)
-        fail("Parakeet::transcribe",
-             "audio.sample_rate must be 16000 Hz; resampling is the caller's "
-             "responsibility");
+    if (audio.sample_rate <= 0)
+        fail("Parakeet::transcribe", "audio.sample_rate must be positive");
+    if (audio.sample_rate != config.sample_rate) {
+        const AudioBuffer native = resample(audio, config.sample_rate);
+        return run_transcribe(st, native, opts);
+    }
 
     const ParakeetConfig& cfg = config;
     const bt::Device dev = device;
@@ -430,6 +433,155 @@ Parakeet::Transcription Parakeet::Impl::run_transcribe(
                      total > 0.0 ? secs * 1000.0 / total : 0.0);
     }
 
+    return out;
+}
+
+// ── Forced alignment over the TDT lattice ──
+//
+// The joint network is evaluated for every (prefix length u, encoder frame t)
+// pair in row blocks — relu(enc_proj[t] + dec_proj[u]) is assembled on the
+// host, one batched head GEMM runs on the model's device, and each logits row
+// is reduced on the host to the three numbers the lattice needs: the target
+// token's and the blank's log-softmax over the vocabulary, and the duration
+// log-softmax. A Viterbi pass then walks frames in order; a zero-duration
+// token keeps the frame and moves to the next prefix, which the inner loop
+// over u (ascending) reaches in the same sweep.
+Parakeet::Alignment Parakeet::align(const AudioBuffer& audio,
+                                    const std::vector<int32_t>& token_ids) const {
+    const Impl& m = *impl_;
+    const char* where = "Parakeet::align";
+    if (!m.loaded) fail(where, "no model loaded; call Parakeet::load() first");
+    if (audio.samples.empty()) fail(where, "audio buffer is empty");
+    if (audio.sample_rate <= 0) fail(where, "audio.sample_rate must be positive");
+    if (token_ids.empty()) fail(where, "token list is empty");
+    const ParakeetConfig& cfg = m.config;
+    for (int32_t id : token_ids)
+        if (id < 0 || id >= cfg.vocab_size || id == cfg.blank_token_id)
+            fail(where, "token id " + std::to_string(id) + " is outside the vocabulary");
+    if (audio.sample_rate != cfg.sample_rate)
+        return align(resample(audio, cfg.sample_rate), token_ids);
+
+    const bt::Device dev = m.device;
+    bt::DeviceScope scope(dev);
+    const int H  = cfg.decoder_hidden_size;
+    const int V  = cfg.vocab_size;
+    const int nd = static_cast<int>(cfg.durations.size());
+    const int U  = static_cast<int>(token_ids.size());
+
+    bt::Tensor enc;
+    m.encoder.forward(audio, enc);
+    const int T = enc.rows;
+    bt::Tensor enc_proj;
+    bt::linear_forward_batched(m.enc_proj_w, m.enc_proj_b, enc, enc_proj);
+    std::vector<float> enc_host(static_cast<std::size_t>(T) * H);
+    qtd::to_host(enc_proj, enc_host.data());
+
+    std::vector<float> dec_host(static_cast<std::size_t>(U + 1) * H);
+    {
+        ParakeetPrediction::State st = m.prediction.init_state();
+        bt::Tensor dec;
+        m.prediction.step(cfg.blank_token_id, st, dec);
+        qtd::to_host(dec, dec_host.data());
+        for (int u = 0; u < U; ++u) {
+            m.prediction.step(token_ids[static_cast<std::size_t>(u)], st, dec);
+            qtd::to_host(dec, dec_host.data() + static_cast<std::size_t>(u + 1) * H);
+        }
+    }
+
+    const std::size_t R = static_cast<std::size_t>(U + 1) * T;
+    std::vector<float> lp_tok(R), lp_blank(R), lp_dur(R * nd);
+    const int W = V + nd;
+    const std::size_t block = 2048;
+    std::vector<float> hid, logits;
+    for (std::size_t r0 = 0; r0 < R; r0 += block) {
+        const std::size_t n = std::min(block, R - r0);
+        hid.resize(n * H);
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t r = r0 + i;
+            const float* e = enc_host.data() + (r % T) * H;
+            const float* d = dec_host.data() + (r / T) * H;
+            float* h = hid.data() + i * H;
+            for (int k = 0; k < H; ++k) h[k] = std::max(0.0f, e[k] + d[k]);
+        }
+        bt::Tensor x = bt::Tensor::from_host_on(dev, hid.data(), static_cast<int>(n), H);
+        bt::Tensor y;
+        qtd::linear(m.joint.head_w, &m.joint.head_b, x, y);
+        logits.resize(n * W);
+        qtd::to_host(y, logits.data());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t r = r0 + i;
+            const int u = static_cast<int>(r / T);
+            const float* l = logits.data() + i * W;
+            float mx = l[0];
+            for (int v = 1; v < V; ++v) mx = std::max(mx, l[v]);
+            double den = 0.0;
+            for (int v = 0; v < V; ++v) den += std::exp(static_cast<double>(l[v] - mx));
+            const double lse = static_cast<double>(mx) + std::log(den);
+            lp_blank[r] = static_cast<float>(l[cfg.blank_token_id] - lse);
+            lp_tok[r] = u < U ? static_cast<float>(l[token_ids[static_cast<std::size_t>(u)]] - lse)
+                              : -std::numeric_limits<float>::infinity();
+            float dm = l[V];
+            for (int k = 1; k < nd; ++k) dm = std::max(dm, l[V + k]);
+            double dden = 0.0;
+            for (int k = 0; k < nd; ++k) dden += std::exp(static_cast<double>(l[V + k] - dm));
+            const double dlse = static_cast<double>(dm) + std::log(dden);
+            for (int k = 0; k < nd; ++k)
+                lp_dur[r * nd + k] = static_cast<float>(l[V + k] - dlse);
+        }
+    }
+
+    const double kNeg = -std::numeric_limits<double>::infinity();
+    const std::size_t S = static_cast<std::size_t>(T + 1) * (U + 1);
+    std::vector<double> score(S, kNeg);
+    struct Back { int32_t t = -1; int32_t u = -1; int16_t dur = 0; bool token = false; };
+    std::vector<Back> back(S);
+    const auto at = [U](int t, int u) { return static_cast<std::size_t>(t) * (U + 1) + u; };
+    score[at(0, 0)] = 0.0;
+    for (int t = 0; t < T; ++t) {
+        for (int u = 0; u <= U; ++u) {
+            const double s = score[at(t, u)];
+            if (s == kNeg) continue;
+            const std::size_t r = static_cast<std::size_t>(u) * T + t;
+            for (int k = 0; k < nd; ++k) {
+                const int d = cfg.durations[static_cast<std::size_t>(k)];
+                const double pd = lp_dur[r * nd + k];
+                if (d > 0) {
+                    const int nt = std::min(t + d, T);
+                    const double v = s + lp_blank[r] + pd;
+                    if (v > score[at(nt, u)]) {
+                        score[at(nt, u)] = v;
+                        back[at(nt, u)] = Back{t, u, static_cast<int16_t>(d), false};
+                    }
+                }
+                if (u < U) {
+                    const int nt = std::min(t + d, T);
+                    const double v = s + lp_tok[r] + pd;
+                    if (v > score[at(nt, u + 1)]) {
+                        score[at(nt, u + 1)] = v;
+                        back[at(nt, u + 1)] = Back{t, u, static_cast<int16_t>(d), true};
+                    }
+                }
+            }
+        }
+    }
+    if (score[at(T, U)] == kNeg) fail(where, "no alignment path reaches the end of the audio");
+
+    Alignment out;
+    out.num_frames = T;
+    out.log_prob = score[at(T, U)];
+    out.token_frames.assign(static_cast<std::size_t>(U), 0);
+    out.token_durations.assign(static_cast<std::size_t>(U), 0);
+    int t = T, u = U;
+    while (t > 0 || u > 0) {
+        const Back b = back[at(t, u)];
+        if (b.t < 0) fail(where, "broken alignment back-pointer");
+        if (b.token) {
+            out.token_frames[static_cast<std::size_t>(b.u)] = b.t;
+            out.token_durations[static_cast<std::size_t>(b.u)] = b.dur;
+        }
+        t = b.t;
+        u = b.u;
+    }
     return out;
 }
 

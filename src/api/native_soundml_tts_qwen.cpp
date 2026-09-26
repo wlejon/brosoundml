@@ -3,6 +3,7 @@
 // streaming AR tail, plus the standalone ECAPA-TDNN SpeakerEncoder. Loaders
 // live in native_soundml_tts.cpp.
 #include "soundml_tts_internal.h"
+#include "soundml_stt_internal.h"
 
 #include <cstdlib>
 
@@ -39,11 +40,17 @@ struct QwenSynthOpts {
     std::vector<float> xvector;          // Base designer: replaces the preset
     brosoundml::QwenTtsSampling sampling;
     bool wantTrace = false;
+    SpeechAligner aligner;               // opts.align: word timings by forced alignment
+    std::string alignError;
 };
 
 void readQwenOpts(Value opts, QwenSynthOpts& o) {
     if (!ev::isObject(opts)) return;
     ev::Persistent root(opts);
+    {
+        ev::Persistent al(ev::getProperty(root.get(), "align"));
+        if (!readSpeechAligner(al.get(), o.aligner, o.alignError)) o.alignError = "align: " + o.alignError;
+    }
     getStrOpt(root.get(), "speaker", o.speaker);
     getStrOpt(root.get(), "language", o.language);
     getStrOpt(root.get(), "instruct", o.instruct);
@@ -76,13 +83,35 @@ void readQwenOpts(Value opts, QwenSynthOpts& o) {
     readVec("xvector", o.xvector);
 }
 
-Value makeQwenResult(const std::vector<float>& samples, int rate, const brosoundml::QwenTtsTrace* trace) {
+Value makeQwenResult(const std::vector<float>& samples, int rate, const brosoundml::QwenTtsTrace* trace,
+                     const std::vector<brosoundml::WordTiming>* words = nullptr) {
     ev::Persistent out(makeAudioResult(samples, rate));
     if (trace) {
         ev::Persistent st(makeStagesArray(trace->stages));
         ev::setProperty(out.get(), "stages", st.get());
     }
+    if (words) {
+        ev::Persistent w(makeWordsArray(*words));
+        ev::setProperty(out.get(), "words", w.get());
+    }
     return out.get();
+}
+
+// The synchronous paths' guard and alignment: an `align` option naming a
+// model that is busy elsewhere is refused before synthesis starts.
+bool alignerReady(const QwenSynthOpts& o, std::string& err) {
+    if (!o.alignError.empty()) { err = o.alignError; return false; }
+    if (o.aligner.present() && o.aligner.gate.isBusy()) {
+        err = "align: an operation is already in flight on the align model";
+        return false;
+    }
+    return true;
+}
+
+std::vector<brosoundml::WordTiming> alignWords(const QwenSynthOpts& o, const brosoundml::AudioBuffer& buf,
+                                               const std::string& text) {
+    if (!o.aligner.present() || buf.samples.empty()) return {};
+    return runSpeechAligner(o.aligner, buf, text).words;
 }
 
 // qwen.synthesize(text, opts?) -> { samples, sampleRate, stages? }  (sync)
@@ -93,18 +122,25 @@ Value qwenSynthesizeSync(Value self, std::span<const Value> a) {
     if (!w->model || !w->model->loaded()) return ev::throwError("synthesize: model is not loaded");
     QwenSynthOpts o;
     if (isObjectArg(a, 1)) readQwenOpts(a[1], o);
+    std::string err;
+    if (!alignerReady(o, err)) return ev::throwTypeError("synthesize: " + err);
     if (w->busy.isBusy()) return ev::throwError("synthesize: an operation is already in flight on this model");
     try {
-        brotensor::DeviceScope scope(w->device);
+        const std::string text = strAt(a, 0);
         brosoundml::QwenTtsTrace trace;
         brosoundml::AudioBuffer buf;
-        if (!o.xvector.empty())
-            buf = w->model->synthesize_with_xvector(strAt(a, 0), o.xvector, o.language, {}, o.sampling,
-                                                    o.wantTrace ? &trace : nullptr);
-        else
-            buf = w->model->synthesize(strAt(a, 0), o.speaker, o.language, o.instruct, {}, o.sampling,
-                                       o.wantTrace ? &trace : nullptr);
-        return makeQwenResult(buf.samples, buf.sample_rate, o.wantTrace ? &trace : nullptr);
+        {
+            brotensor::DeviceScope scope(w->device);
+            if (!o.xvector.empty())
+                buf = w->model->synthesize_with_xvector(text, o.xvector, o.language, {}, o.sampling,
+                                                        o.wantTrace ? &trace : nullptr);
+            else
+                buf = w->model->synthesize(text, o.speaker, o.language, o.instruct, {}, o.sampling,
+                                           o.wantTrace ? &trace : nullptr);
+        }
+        const auto words = alignWords(o, buf, text);
+        return makeQwenResult(buf.samples, buf.sample_rate, o.wantTrace ? &trace : nullptr,
+                              o.aligner.present() ? &words : nullptr);
     } catch (const std::exception& e) {
         return ev::throwError(std::string("synthesize: ") + e.what());
     }
@@ -120,9 +156,11 @@ Value qwenSynthesizeClone(Value self, std::span<const Value> a) {
     if (!w->model || !w->model->loaded()) return ev::throwError("synthesizeClone: model is not loaded");
     QwenSynthOpts o;
     if (isObjectArg(a, 2)) readQwenOpts(a[2], o);
+    std::string alignErr;
+    if (!alignerReady(o, alignErr)) return ev::throwTypeError("synthesizeClone: " + alignErr);
     if (w->busy.isBusy()) return ev::throwError("synthesizeClone: an operation is already in flight on this model");
     try {
-        brotensor::DeviceScope scope(w->device);
+        const std::string text = strAt(a, 0);
         brosoundml::AudioBuffer ref;
         if (ev::isString(a[1])) {
             ref = brosoundml::read_wav(resolvePath(ev::toUtf8(a[1])));
@@ -131,8 +169,13 @@ Value qwenSynthesizeClone(Value self, std::span<const Value> a) {
             if (!readAudioBuffer(a[1], ref, err, 24000)) return ev::throwTypeError("synthesizeClone: " + err);
             if (isObjectArg(a, 2)) getIntOpt(a[2], "sampleRate", ref.sample_rate);
         }
-        auto buf = w->model->synthesize_clone(strAt(a, 0), ref, o.language, {}, o.sampling);
-        return makeAudioResult(buf.samples, buf.sample_rate);
+        brosoundml::AudioBuffer buf;
+        {
+            brotensor::DeviceScope scope(w->device);
+            buf = w->model->synthesize_clone(text, ref, o.language, {}, o.sampling);
+        }
+        const auto words = alignWords(o, buf, text);
+        return makeQwenResult(buf.samples, buf.sample_rate, nullptr, o.aligner.present() ? &words : nullptr);
     } catch (const std::exception& e) {
         return ev::throwError(std::string("synthesizeClone: ") + e.what());
     }
@@ -148,13 +191,21 @@ Value qwenSynthesizeFromXvector(Value self, std::span<const Value> a) {
     if (!w->model || !w->model->loaded()) return ev::throwError("synthesizeFromXvector: model is not loaded");
     QwenSynthOpts o;
     if (isObjectArg(a, 2)) readQwenOpts(a[2], o);
+    std::string err;
+    if (!alignerReady(o, err)) return ev::throwTypeError("synthesizeFromXvector: " + err);
     if (w->busy.isBusy()) return ev::throwError("synthesizeFromXvector: an operation is already in flight on this model");
     try {
-        brotensor::DeviceScope scope(w->device);
+        const std::string text = strAt(a, 0);
         brosoundml::QwenTtsTrace trace;
-        auto buf = w->model->synthesize_with_xvector(strAt(a, 0), xvec, o.language, {}, o.sampling,
-                                                     o.wantTrace ? &trace : nullptr);
-        return makeQwenResult(buf.samples, buf.sample_rate, o.wantTrace ? &trace : nullptr);
+        brosoundml::AudioBuffer buf;
+        {
+            brotensor::DeviceScope scope(w->device);
+            buf = w->model->synthesize_with_xvector(text, xvec, o.language, {}, o.sampling,
+                                                    o.wantTrace ? &trace : nullptr);
+        }
+        const auto words = alignWords(o, buf, text);
+        return makeQwenResult(buf.samples, buf.sample_rate, o.wantTrace ? &trace : nullptr,
+                              o.aligner.present() ? &words : nullptr);
     } catch (const std::exception& e) {
         return ev::throwError(std::string("synthesizeFromXvector: ") + e.what());
     }
@@ -232,6 +283,7 @@ struct QwenJob {
     QwenSynthOpts o;
     brosoundml::QwenTtsTrace trace;
     std::vector<float> samples;
+    std::vector<brosoundml::WordTiming> words;
     int sampleRate = 24000;
     ModelGate gate;
     brotensor::Device device = brotensor::Device::CPU;
@@ -241,11 +293,19 @@ struct QwenJob {
 };
 
 Value launchQwenJob(std::shared_ptr<QwenJob> job) {
+    if (!job->o.alignError.empty()) {
+        job->gate.release();
+        return ev::throwTypeError("synthesize: " + job->o.alignError);
+    }
+    if (job->o.aligner.present() && !job->o.aligner.gate.tryClaim()) {
+        job->gate.release();
+        return ev::throwError("synthesize: align: an operation is already in flight on the align model");
+    }
     auto work = [job](const std::atomic<bool>& cancel) {
-        brotensor::DeviceScope scope(job->device);
         auto cancelFn = cancelCheckOf(cancel);
         auto* trace = job->o.wantTrace ? &job->trace : nullptr;
         brosoundml::AudioBuffer buf;
+        brotensor::DeviceScope scope(job->device);
         if (job->session) {
             if (!job->o.xvector.empty())
                 buf = job->model->synthesize_with_xvector(*job->session, job->text, job->o.xvector,
@@ -260,14 +320,19 @@ Value launchQwenJob(std::shared_ptr<QwenJob> job) {
             buf = job->model->synthesize(job->text, job->o.speaker, job->o.language, job->o.instruct,
                                          cancelFn, job->o.sampling, trace);
         }
+        if (!cancel.load()) job->words = alignWords(job->o, buf, job->text);
         job->samples = std::move(buf.samples);
         job->sampleRate = buf.sample_rate;
     };
     auto done = [job](bool cancelled, const std::string& error) {
         job->gate.release();
+        if (job->o.aligner.present()) job->o.aligner.gate.release();
         if (!ev::isFunction(job->onDone.get())) return;
-        const bool trace = job->o.wantTrace && !cancelled && error.empty();
-        ev::Persistent result(makeQwenResult(job->samples, job->sampleRate, trace ? &job->trace : nullptr));
+        const bool ok = !cancelled && error.empty();
+        const bool trace = job->o.wantTrace && ok;
+        const bool words = job->o.aligner.present() && ok;
+        ev::Persistent result(makeQwenResult(job->samples, job->sampleRate, trace ? &job->trace : nullptr,
+                                             words ? &job->words : nullptr));
         ev::Persistent info(makeDoneInfo(cancelled, error));
         callCallback2(job->onDone.get(), result.get(), info.get());
     };

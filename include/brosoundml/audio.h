@@ -59,4 +59,18 @@ struct AudioBuffer {
 // file or a header brosoundml does not support (non-PCM, non-16-bit).
 AudioBuffer read_wav(const std::string& path);
 
+// ─── Resampling ─────────────────────────────────────────────────────────────
+//
+// Band-limited resampling of `in` to `rate` Hz, for any pair of positive
+// rates (44.1 kHz, 48 kHz, 22.05 kHz, 8 kHz, ... into a model's native rate
+// and back). A windowed-sinc interpolator — torchaudio's `sinc_interp_hann`
+// recipe: six zero crossings each side, a Hann² window, the cutoff at 0.99 of
+// the lower Nyquist — evaluated per output sample rather than from a polyphase
+// table, so a ratio that reduces to large coprime integers (44 101 : 16 000)
+// costs no more than a clean one. Output length is ceil(n * rate / in_rate);
+// output sample j sits at input time j * in_rate / rate. Deterministic and
+// single-threaded. Equal rates return a copy. Throws std::runtime_error on a
+// non-positive rate.
+AudioBuffer resample(const AudioBuffer& in, int rate);
+
 }

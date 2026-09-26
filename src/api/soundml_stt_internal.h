@@ -18,6 +18,7 @@
 #include <brosoundml/whisper.h>
 #include <brosoundml/parakeet.h>
 #include <brosoundml/qwen_asr.h>
+#include <brosoundml/word_align.h>
 #include <brolm/whisper_tokenizer.h>
 #include <brolm/tokenizer_t5.h>
 
@@ -43,14 +44,37 @@ struct HostWhisperSession {
 };
 
 struct HostParakeetTokenizer {
-    std::unique_ptr<brolm::t5::Tokenizer> tok;
+    std::shared_ptr<brolm::t5::Tokenizer> tok;
 };
 
 struct HostParakeetModel {
     std::shared_ptr<brosoundml::Parakeet> model;
+    std::shared_ptr<brolm::t5::Tokenizer> tokenizer;   // <dir>/tokenizer.json when present
     brotensor::Device device = brotensor::Device::CPU;
     ModelGate busy;
 };
+
+// A Parakeet model and tokenizer lent to another call for forced alignment:
+// ParakeetModel.align, and the `align` option of bro.tts synthesis.
+struct SpeechAligner {
+    std::shared_ptr<brosoundml::Parakeet> model;
+    std::shared_ptr<brolm::t5::Tokenizer> tokenizer;
+    brotensor::Device device = brotensor::Device::CPU;
+    ModelGate gate;
+    bool present() const { return model != nullptr; }
+};
+
+// Read an `align` value: a ParakeetModel (its own tokenizer.json), or
+// { model: ParakeetModel, tokenizer?: ParakeetTokenizer }. undefined / null
+// leaves `out` empty and succeeds; a wrong shape answers false + `err`.
+bool readSpeechAligner(Value v, SpeechAligner& out, std::string& err);
+
+// Align `text` against `audio` (any rate) on the aligner's device.
+brosoundml::WordAlignment runSpeechAligner(const SpeechAligner& a, const brosoundml::AudioBuffer& audio,
+                                           const std::string& text);
+
+// [{ text, start, end }] in seconds.
+Value makeWordsArray(const std::vector<brosoundml::WordTiming>& words);
 
 struct HostParakeetSession {
     std::shared_ptr<brosoundml::Parakeet> model;

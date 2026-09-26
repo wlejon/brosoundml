@@ -123,10 +123,17 @@ struct CpFrameState {
     // The captured graph bakes in the draw policy (argmax vs sample_logits_into)
     // and, when sampling, the sampling params — so a call whose policy/params
     // differ from the capture must re-capture. These record what was baked.
-    bool  cap_sampling = false;
-    float cap_temp = 0.0f;
-    int   cap_top_k = 0;
-    float cap_top_p = 1.0f;
+    // The seed is one of them: sample_logits_into takes it as a kernel
+    // argument, so a graph captured under one seed and replayed for a call
+    // with another drew codebooks 1..15 from the first seed's stream. The
+    // audio for (text, voice, seed) then depended on which seed the process
+    // had synthesized first — repeatable within a process, different in the
+    // next one.
+    bool          cap_sampling = false;
+    float         cap_temp = 0.0f;
+    int           cap_top_k = 0;
+    float         cap_top_p = 1.0f;
+    std::uint64_t cap_key = 0;
 };
 
 namespace {
@@ -430,8 +437,8 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
         // Drop a captured graph whose baked policy/params differ from this call.
         if (st.captured &&
             (st.cap_sampling != sampling ||
-             (sampling && (st.cap_temp != temperature ||
-                           st.cap_top_k != top_k || st.cap_top_p != top_p)))) {
+             (sampling && (st.cap_temp != temperature || st.cap_top_k != top_k ||
+                           st.cap_top_p != top_p || st.cap_key != key)))) {
             st.graph.reset();
             st.captured = false;
         }
@@ -455,6 +462,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
             st.cap_sampling = sampling;
             st.cap_temp = temperature;
             st.cap_top_k = top_k;
+            st.cap_key = key;
             st.cap_top_p = top_p;
         } else {
             st.graph.launch();   // replay: reads st.cond_in, writes st.code_dev

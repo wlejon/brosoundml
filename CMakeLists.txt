@@ -227,6 +227,7 @@ target_sources(brosoundml PRIVATE
     src/whisper_modules.cpp
     src/fastconformer.cpp
     src/parakeet.cpp
+    src/word_align.cpp
     src/sortformer.cpp
     src/cluster_diarizer.cpp
     src/g2p/pos_tagger.cpp

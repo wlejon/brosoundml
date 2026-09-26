@@ -137,9 +137,33 @@ public:
         TokenCallback on_token = {};
     };
 
-    // Run the full pipeline: 16 kHz mono PCM -> token ids + frame positions.
+    // Run the full pipeline: mono PCM -> token ids + frame positions. Audio at
+    // any other rate than config().sample_rate is resampled to it first
+    // (brosoundml::resample), so a 24 kHz TTS take or a 48 kHz file goes in
+    // as it is.
     Transcription transcribe(const AudioBuffer& audio,
                              const TranscribeOptions& opts) const;
+
+    // Forced alignment: where in `audio` each of `token_ids` (a known token
+    // sequence — the caller tokenizes the text it expects to hear) is spoken.
+    // A Viterbi pass over the TDT lattice restricted to that sequence: every
+    // encoder frame t and every prefix length u is scored by the joint
+    // network's own token and duration log-probabilities (blank-and-skip or
+    // emit-the-next-token, each with its predicted frame duration), and the
+    // best path from (0, 0) to (T, U) is traced back. The result is the frame
+    // each token is emitted at and the frames it holds before the decode moves
+    // on; token i spans [token_frames[i], token_frames[i] + max(1,
+    // token_durations[i])) frames of config().frame_seconds() each. The
+    // audio is resampled like transcribe(). `log_prob` is the path score.
+    // Throws on an empty token list, empty audio or an out-of-vocab id.
+    struct Alignment {
+        std::vector<int32_t> token_frames;
+        std::vector<int32_t> token_durations;
+        int                  num_frames = 0;
+        double               log_prob   = 0.0;
+    };
+    Alignment align(const AudioBuffer& audio,
+                    const std::vector<int32_t>& token_ids) const;
 
     // Default-options overload. (A separate overload rather than a defaulted
     // `opts = {}` argument: GCC 12 rejects a brace-init default argument for a

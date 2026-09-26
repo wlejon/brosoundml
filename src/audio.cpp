@@ -171,4 +171,51 @@ AudioBuffer read_wav(const std::string& path) {
     return out;
 }
 
+AudioBuffer resample(const AudioBuffer& in, int rate) {
+    if (rate <= 0 || in.sample_rate <= 0)
+        throw std::runtime_error("brosoundml: resample: rates must be positive");
+    if (rate == in.sample_rate || in.samples.empty()) {
+        AudioBuffer same = in;
+        same.sample_rate = rate;
+        return same;
+    }
+    long long a = in.sample_rate, b = rate;
+    while (b) { const long long t = a % b; a = b; b = t; }
+    const long long orig = in.sample_rate / a;
+    const long long next = rate / a;
+
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kZeroCrossings = 6.0;
+    constexpr double kRolloff = 0.99;
+    const double ratio  = static_cast<double>(next) / static_cast<double>(orig);
+    const double cutoff = 0.5 * std::min(1.0, ratio) * kRolloff;
+    const double span   = kZeroCrossings / (2.0 * cutoff);
+
+    const long long n = static_cast<long long>(in.samples.size());
+    const long long n_out = (n * next + orig - 1) / orig;
+    const float* x = in.samples.data();
+
+    AudioBuffer out;
+    out.sample_rate = rate;
+    out.samples.resize(static_cast<std::size_t>(n_out));
+    for (long long j = 0; j < n_out; ++j) {
+        const long long num = j * orig;
+        const long long base = num / next;
+        const double t = static_cast<double>(base) +
+                         static_cast<double>(num - base * next) / static_cast<double>(next);
+        const long long lo = std::max<long long>(0, static_cast<long long>(std::ceil(t - span)));
+        const long long hi = std::min<long long>(n - 1, static_cast<long long>(std::floor(t + span)));
+        double acc = 0.0;
+        for (long long k = lo; k <= hi; ++k) {
+            const double u = static_cast<double>(k) - t;
+            const double arg = 2.0 * cutoff * u;
+            const double sinc = (arg == 0.0) ? 1.0 : std::sin(kPi * arg) / (kPi * arg);
+            const double w = std::cos(kPi * u / (2.0 * span));
+            acc += static_cast<double>(x[k]) * 2.0 * cutoff * sinc * w * w;
+        }
+        out.samples[static_cast<std::size_t>(j)] = static_cast<float>(acc);
+    }
+    return out;
+}
+
 }

@@ -101,6 +101,126 @@ brosoundml::Parakeet::Transcription runParakeet(ParakeetJob& job,
 
 }  // namespace
 
+bool readSpeechAligner(Value v, SpeechAligner& out, std::string& err) {
+    out = SpeechAligner{};
+    if (ev::isUndefined(v) || ev::isNull(v)) return true;
+    ev::Persistent root(v);
+    Value modelVal = root.get();
+    HostParakeetTokenizer* tok = nullptr;
+    if (!g_parakeetModelClass.isInstance(modelVal)) {
+        if (!ev::isObject(modelVal) || ev::isFunction(modelVal)) {
+            err = "align must be a ParakeetModel or { model, tokenizer? }";
+            return false;
+        }
+        modelVal = ev::getProperty(root.get(), "model");
+        Value tv = ev::getProperty(root.get(), "tokenizer");
+        if (g_parakeetTokenizerClass.isInstance(tv)) tok = tokSelf(tv);
+        else if (!ev::isUndefined(tv) && !ev::isNull(tv)) {
+            err = "align.tokenizer must be a ParakeetTokenizer";
+            return false;
+        }
+    }
+    if (!g_parakeetModelClass.isInstance(modelVal)) {
+        err = "align.model must be a ParakeetModel";
+        return false;
+    }
+    auto* m = modelSelf(modelVal);
+    if (!m || !m->model || !m->model->loaded()) {
+        err = "the align model is not loaded";
+        return false;
+    }
+    out.model = m->model;
+    out.tokenizer = tok && tok->tok ? tok->tok : m->tokenizer;
+    out.device = m->device;
+    out.gate = m->busy;
+    if (!out.tokenizer) {
+        err = "the align model has no tokenizer.json beside it; pass { model, tokenizer }";
+        out = SpeechAligner{};
+        return false;
+    }
+    return true;
+}
+
+brosoundml::WordAlignment runSpeechAligner(const SpeechAligner& a, const brosoundml::AudioBuffer& audio,
+                                           const std::string& text) {
+    brotensor::DeviceScope scope(a.device);
+    return brosoundml::align_words(*a.model, *a.tokenizer, audio, text);
+}
+
+Value makeWordsArray(const std::vector<brosoundml::WordTiming>& words) {
+    return hostArrayOf(words.size(), [&](size_t i) -> Value {
+        ObjectBuilder w;
+        w.set("text", words[i].text);
+        w.set("start", ev::fromDouble(words[i].start));
+        w.set("end", ev::fromDouble(words[i].end));
+        return w.get();
+    });
+}
+
+namespace {
+
+Value makeAlignResult(const brosoundml::WordAlignment& al) {
+    ObjectBuilder res;
+    {
+        ev::Persistent words(makeWordsArray(al.words));
+        res.set("words", words.get());
+    }
+    res.set("logProb", ev::fromDouble(al.log_prob));
+    return res.get();
+}
+
+// model.align(audio, text, opts?) -> { words, logProb } | AsyncHandle (opts.onDone)
+Value parakeetAlign(Value self, std::span<const Value> a) {
+    ev::Persistent selfRoot(self);
+    auto* w = modelSelf(self);
+    if (!w) return ev::throwTypeError("align: not a ParakeetModel");
+    if (!w->model || !w->model->loaded()) return ev::throwError("align: model is not loaded");
+    if (!hasArg(a, 0)) return ev::throwTypeError("align(audio, text, opts?): audio required");
+    if (!isStringArg(a, 1)) return ev::throwTypeError("align(audio, text, opts?): text string required");
+    struct Job {
+        SpeechAligner aligner;
+        brosoundml::AudioBuffer audio;
+        std::string text;
+        brosoundml::WordAlignment out;
+        ev::Persistent onDone, self;
+    };
+    auto job = std::make_shared<Job>();
+    std::string err;
+    if (!readAudioBuffer(a[0], job->audio, err, w->model->config().sample_rate))
+        return ev::throwTypeError("align: " + err);
+    job->text = strAt(a, 1);
+    ev::Persistent optsRoot(isObjectArg(a, 2) ? a[2] : ev::undefined());
+    Value tv = ev::isObject(optsRoot.get()) ? ev::getProperty(optsRoot.get(), "tokenizer") : ev::undefined();
+    ObjectBuilder spec;
+    spec.set("model", selfRoot.get());
+    if (!ev::isUndefined(tv)) spec.set("tokenizer", tv);
+    ev::Persistent specRoot(spec.get());
+    if (!readSpeechAligner(specRoot.get(), job->aligner, err)) return ev::throwTypeError("align: " + err);
+    job->onDone = getFunctionOpt(optsRoot.get(), "onDone");
+    if (!ev::isFunction(job->onDone.get())) {
+        if (w->busy.isBusy()) return ev::throwError("align: an operation is already in flight on this model");
+        try {
+            return makeAlignResult(runSpeechAligner(job->aligner, job->audio, job->text));
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string("align: ") + e.what());
+        }
+    }
+    if (!w->busy.tryClaim()) return ev::throwError("align: an operation is already in flight on this model");
+    job->self = ev::Persistent(selfRoot.get());
+    auto work = [job](const std::atomic<bool>&) {
+        job->out = runSpeechAligner(job->aligner, job->audio, job->text);
+    };
+    auto done = [job](bool cancelled, const std::string& error) {
+        job->aligner.gate.release();
+        ev::Persistent res(makeAlignResult(job->out));
+        ev::Persistent info(makeDoneInfo(cancelled, error));
+        callCallback2(job->onDone.get(), res.get(), info.get());
+    };
+    return launchAsyncJob(std::move(work), nullptr, std::move(done));
+}
+
+}  // namespace
+
 Value parakeetTranscribe(Value modelVal, HostParakeetModel* model, HostParakeetSession* session,
                          std::span<const Value> args, const char* fn) {
     ev::Persistent modelRoot(modelVal);  // the reads below allocate
@@ -201,6 +321,14 @@ void decorateParakeetModel(ObjectBuilder& b) {
         auto* w = modelSelf(self);
         if (!w) return ev::throwTypeError("transcribe: not a ParakeetModel");
         return parakeetTranscribe(self, w, nullptr, a, "transcribe");
+    });
+    b.def("align", 3, parakeetAlign);
+    b.accessor("tokenizer", [](Value self, std::span<const Value>) -> Value {
+        auto* w = modelSelf(self);
+        if (!w || !w->tokenizer) return ev::null();
+        auto t = std::make_unique<HostParakeetTokenizer>();
+        t->tok = w->tokenizer;
+        return g_parakeetTokenizerClass.createInstance(std::move(t));
     });
     b.def("createSession", 0, [](Value self, std::span<const Value>) -> Value {
         auto* w = modelSelf(self);

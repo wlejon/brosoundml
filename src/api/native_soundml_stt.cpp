@@ -8,6 +8,8 @@
 #include "soundml_stt_internal.h"
 #include "soundml_loader.h"
 
+#include <filesystem>
+
 namespace brosoundml::api {
 
 HostClass g_whisperTokenizerClass;
@@ -98,6 +100,9 @@ Value loadParakeet(Value, std::span<const Value> args) {
             brotensor::DeviceScope scope(dev);
             w->model->load(dir, dev);
         }
+        const std::filesystem::path tokPath = std::filesystem::path(dir) / "tokenizer.json";
+        if (std::filesystem::exists(tokPath))
+            w->tokenizer = std::make_shared<brolm::t5::Tokenizer>(brolm::t5::Tokenizer::load(tokPath.string()));
         logInfo(std::string("[stt] Parakeet loaded on ") + deviceName(dev));
         return w;
     });
