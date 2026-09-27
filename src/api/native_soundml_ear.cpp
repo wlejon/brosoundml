@@ -163,7 +163,9 @@ struct ClipOpts {
 };
 
 // opts.sampleRate (for a bare Float32Array), opts.long ('mean' | 'crop'),
-// opts.cropAt (seconds; default: centred). False + err on a bad value.
+// opts.cropAt (seconds; default: centred), opts.pad ('silence' | 'repeat' |
+// 'auto'; default auto: silence under 2 s, repeat from 2 s to 10 s).
+// False + err on a bad value.
 bool readClipOpts(const ev::Persistent& root, ClipOpts& o, std::string& err) {
     if (!ev::isObject(root.get())) return true;
     // Each read may allocate (and move the object): take root.get() afresh.
@@ -180,6 +182,19 @@ bool readClipOpts(const ev::Persistent& root, ClipOpts& o, std::string& err) {
     } else {
         err = "opts.long must be 'mean' or 'crop'";
         return false;
+    }
+    if (hasProperty(root.get(), "pad")) {
+        const std::string pad = getPropertyString(root.get(), "pad", "");
+        if (pad == "silence") {
+            o.audio.pad = brosoundml::ClapPad::Silence;
+        } else if (pad == "repeat") {
+            o.audio.pad = brosoundml::ClapPad::Repeat;
+        } else if (pad == "auto") {
+            o.audio.pad = brosoundml::ClapPad::Auto;
+        } else {
+            err = "opts.pad must be 'silence', 'repeat' or 'auto'";
+            return false;
+        }
     }
     if (hasProperty(root.get(), "cropAt")) {
         const double s = getPropertyDouble(root.get(), "cropAt", 0.0);

@@ -154,25 +154,36 @@ std::vector<float> Clap::to_model_rate(const AudioBuffer& audio) const {
     return resample(audio, impl_->cfg.sample_rate).samples;
 }
 
-std::vector<float> Clap::log_mel(const std::vector<float>& wave48, int crop_offset) const {
-    const ClapConfig& c = impl_->cfg;
+ClapPad Clap::resolve_pad(ClapPad pad, int n) const {
+    if (pad != ClapPad::Auto) return pad;
+    return n < kClapShortClipSeconds * impl_->cfg.sample_rate ? ClapPad::Silence : ClapPad::Repeat;
+}
+
+std::vector<float> Clap::fill_window(const std::vector<float>& wave48, int crop_offset, ClapPad pad) const {
     const int n = static_cast<int>(wave48.size());
-    const int MAX = c.max_samples;
+    const int MAX = impl_->cfg.max_samples;
     if (n == 0) fail("empty clip");
 
     // ClapFeatureExtractor._get_input_mel: crop a longer clip (rand_trunc, at
-    // a chosen offset), repeat-pad a shorter one ("repeatpad": whole tiles,
-    // then zeros).
+    // a chosen offset); pad a shorter one, "repeatpad" (whole tiles, then
+    // zeros) or "pad" (the clip once, then zeros).
     std::vector<float> x(static_cast<std::size_t>(MAX), 0.0f);
     if (n > MAX) {
         const int span = n - MAX;
         const int off = crop_offset < 0 ? span / 2 : std::min(crop_offset, span);
         std::copy(wave48.begin() + off, wave48.begin() + off + MAX, x.begin());
     } else {
-        const int reps = MAX / n;
+        const int reps = resolve_pad(pad, n) == ClapPad::Silence ? 1 : MAX / n;
         for (int r = 0; r < reps; ++r)
             std::copy(wave48.begin(), wave48.end(), x.begin() + static_cast<std::ptrdiff_t>(r) * n);
     }
+    return x;
+}
+
+std::vector<float> Clap::log_mel(const std::vector<float>& wave48, int crop_offset, ClapPad pad) const {
+    const ClapConfig& c = impl_->cfg;
+    const int MAX = c.max_samples;
+    const std::vector<float> x = fill_window(wave48, crop_offset, pad);
 
     // STFT (centred, reflect-padded, periodic Hann) on the host.
     const int n_bins = c.n_fft / 2 + 1;
@@ -248,7 +259,7 @@ std::vector<float> Clap::embed_audio(const AudioBuffer& audio, const ClapAudioOp
     const std::vector<float> wave = to_model_rate(audio);
     const int n = static_cast<int>(wave.size());
     if (n <= impl_->cfg.max_samples || opts.long_mode == ClapLongMode::Crop)
-        return embed_mel(log_mel(wave, opts.crop_offset));
+        return embed_mel(log_mel(wave, opts.crop_offset, opts.pad));
     const int MAX = impl_->cfg.max_samples;
     std::vector<double> acc(static_cast<std::size_t>(impl_->cfg.projection_dim), 0.0);
     for (int s : window_starts(n)) {

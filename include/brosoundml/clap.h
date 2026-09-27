@@ -8,8 +8,8 @@
 // ClapModel, hand-written on brotensor:
 //
 //   front-end   any-rate mono -> 48 kHz (brosoundml::resample) -> a 10 s
-//               window (shorter clips repeat-padded, longer ones cropped or
-//               windowed, see ClapAudioOptions) -> log-mel: 1024-pt periodic
+//               window (shorter clips repeat- or silence-padded, longer ones
+//               cropped or windowed, see ClapAudioOptions) -> log-mel: 1024-pt periodic
 //               Hann STFT, hop 480, centred, power, 64 Slaney mel bins over
 //               50..14000 Hz, 10*log10(max(x, 1e-10)) -> (1001, 64).
 //   audio tower HTSAT (unfused): BatchNorm over mel bins, bicubic time
@@ -72,8 +72,23 @@ struct ClapConfig {
     int frames() const { return max_samples / hop_length + 1; }   // 1001
 };
 
+// How a clip shorter than the 10 s window is filled out to it.
+enum class ClapPad {
+    Auto,      // Silence below kClapShortClipSeconds, Repeat from there on.
+    Repeat,    // transformers' "repeatpad", the reference and the checkpoint's
+               // preprocessor_config: whole tiles of the clip, then zeros. A
+               // 0.3 s one-shot becomes 33 hits in a row, which CLAP hears as
+               // a loop or a rhythm rather than one event.
+    Silence,   // the clip once at the start, then zeros (transformers' "pad").
+};
+
+// Auto's switch-over: a clip shorter than this is a one-shot (a hit, a
+// gunshot, a blip) that tiling would turn into a pattern; a longer one
+// already carries its own texture and keeps the reference's tiling.
+constexpr double kClapShortClipSeconds = 2.0;
+
 // How a clip longer than the 10 s window is reduced to model input. A clip of
-// 10 s or less is always repeat-padded (transformers' "repeatpad").
+// 10 s or less is padded per ClapAudioOptions::pad.
 enum class ClapLongMode {
     Mean,   // embed every 10 s window (ceil(n / 10 s) of them, spread evenly
             // from the start to the end, overlapping as needed) and average
@@ -86,6 +101,8 @@ struct ClapAudioOptions {
     ClapLongMode long_mode   = ClapLongMode::Mean;
     // Crop mode: offset in 48 kHz samples, clamped to the clip. -1 = centre.
     int          crop_offset = -1;
+    // A clip shorter than 10 s: how it is filled out (see ClapPad).
+    ClapPad      pad         = ClapPad::Auto;
 };
 
 struct ClapScore {
@@ -120,8 +137,18 @@ public:
     std::vector<float> to_model_rate(const AudioBuffer& audio) const;
     // 48 kHz samples -> the (frames x num_mel_bins) log-mel of one 10 s
     // window, frame-major. A longer input is cropped at `crop_offset`
-    // (clamped; -1 = centre); a shorter one is repeat-padded.
-    std::vector<float> log_mel(const std::vector<float>& wave48, int crop_offset = -1) const;
+    // (clamped; -1 = centre); a shorter one is padded per `pad` (the
+    // default, Repeat, is the reference's front-end).
+    std::vector<float> log_mel(const std::vector<float>& wave48, int crop_offset = -1,
+                               ClapPad pad = ClapPad::Repeat) const;
+    // The 10 s window of 48 kHz samples log_mel analyses: the crop of a
+    // longer input, or a shorter one padded per `pad` (Auto resolved by
+    // resolve_pad).
+    std::vector<float> fill_window(const std::vector<float>& wave48, int crop_offset = -1,
+                                   ClapPad pad = ClapPad::Repeat) const;
+    // Auto -> Silence for `n` samples under kClapShortClipSeconds at the
+    // model rate, else Repeat; Repeat / Silence pass through.
+    ClapPad resolve_pad(ClapPad pad, int n) const;
     // Start offsets of the 10 s windows Mean mode embeds for `n` samples.
     std::vector<int> window_starts(int n) const;
 

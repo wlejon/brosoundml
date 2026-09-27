@@ -27,6 +27,8 @@ front-end, scoring), `src/clap_audio.cpp` (HTSAT) and `src/clap_text.cpp`
                    a clip shorter than 10 s (480000 samples) is tiled int(480000/n)
                    times, then zero-padded to 10 s; exactly 10 s is used as is; a
                    longer clip is cropped to one 10 s window (see "Long clips").
+                   ClapAudioOptions::pad picks the short-clip fill (see "Short
+                   clips"); only ClapPad::Repeat is the reference's.
                    STFT n_fft 1024, hop 480, centred (reflect pad), periodic Hann,
                    power; Slaney mel 64 bins over 50-14000 Hz (Slaney norm);
                    10*log10(max(x, 1e-10)), no top_db. -> (1001 frames x 64 mels).
@@ -54,6 +56,26 @@ bias. There is one bias per window kind: interior, last row, last column and
 corner. The cyclic roll, the window partition and the patch merge are all row
 permutations, precomputed at load as INT32 index tensors and applied with
 `gather_rows`. There is no host round trip inside the tower.
+
+## Short clips
+
+The reference ("repeatpad") tiles a clip shorter than 10 s as many whole
+times as fit, then zero-pads the rest. That suits a texture, but it turns a
+one-shot into a pattern: a 0.3 s gunshot becomes 33 shots in a row, which
+CLAP scores as a drum loop. `ClapAudioOptions::pad` makes the choice
+explicit:
+
+- `ClapPad::Repeat` is the reference, tiles then zeros.
+- `ClapPad::Silence` places the clip once at the start, then zeros
+  (transformers' `padding="pad"`).
+- `ClapPad::Auto` (the default) is `Silence` below `kClapShortClipSeconds`
+  (2 s, counted in 48 kHz samples after resampling) and `Repeat` from there
+  to 10 s.
+
+`Clap::fill_window` returns the 10 s window a clip becomes, and
+`Clap::log_mel` takes the same `pad` argument, which defaults to `Repeat` so
+that it keeps matching the reference. The parity test pins the end-to-end
+check to `Repeat`, and it checks the fills themselves without weights.
 
 ## Long clips
 

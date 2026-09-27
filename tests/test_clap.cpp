@@ -143,6 +143,7 @@ DeviceResult run_device(const fs::path& dir, bt::Device dev, std::map<std::strin
         brosoundml::ClapAudioOptions o;
         o.long_mode = brosoundml::ClapLongMode::Crop;
         o.crop_offset = crop;
+        o.pad = brosoundml::ClapPad::Repeat;   // the reference's front-end
         const std::vector<float> e2e = clap.embed_audio(buf, o);
         report("audio embedding end to end (max abs)", max_abs(e2e, fx[P + "embed"].f), 2e-4);
         res.audio.push_back(emb);
@@ -204,9 +205,53 @@ DeviceResult run_device(const fs::path& dir, bt::Device dev, std::map<std::strin
     return res;
 }
 
+// The short-clip padding, which needs no weights: an unloaded Clap carries
+// the default config (48 kHz, 480000-sample window).
+void check_padding() {
+    using brosoundml::ClapPad;
+    const brosoundml::Clap clap;
+    const int MAX = clap.config().max_samples, RATE = clap.config().sample_rate;
+    const int two = static_cast<int>(brosoundml::kClapShortClipSeconds * RATE);
+    check(clap.resolve_pad(ClapPad::Auto, 14400) == ClapPad::Silence, "pad: Auto is Silence for 0.3 s");
+    check(clap.resolve_pad(ClapPad::Auto, two - 1) == ClapPad::Silence, "pad: Auto is Silence just under 2 s");
+    check(clap.resolve_pad(ClapPad::Auto, two) == ClapPad::Repeat, "pad: Auto is Repeat from 2 s");
+    check(clap.resolve_pad(ClapPad::Repeat, 10) == ClapPad::Repeat, "pad: Repeat passes through");
+    check(clap.resolve_pad(ClapPad::Silence, MAX) == ClapPad::Silence, "pad: Silence passes through");
+
+    // A 0.3 s clip of 1..n: once then zeros, or 33 whole tiles then zeros.
+    const int n = 14400;
+    std::vector<float> clip(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) clip[i] = static_cast<float>(i + 1);
+    const std::vector<float> s = clap.fill_window(clip, -1, ClapPad::Silence);
+    const std::vector<float> r = clap.fill_window(clip, -1, ClapPad::Repeat);
+    const std::vector<float> a = clap.fill_window(clip, -1, ClapPad::Auto);
+    check(static_cast<int>(s.size()) == MAX && static_cast<int>(r.size()) == MAX, "pad: window length");
+    check(std::equal(clip.begin(), clip.end(), s.begin()), "pad: Silence starts with the clip");
+    check(std::all_of(s.begin() + n, s.end(), [](float v) { return v == 0.0f; }), "pad: Silence is zeros after it");
+    const int reps = MAX / n;
+    bool tiled = true;
+    for (int t = 0; t < reps; ++t) tiled = tiled && std::equal(clip.begin(), clip.end(), r.begin() + t * n);
+    check(tiled, "pad: Repeat holds whole tiles");
+    check(std::all_of(r.begin() + reps * n, r.end(), [](float v) { return v == 0.0f; }), "pad: Repeat tail is zeros");
+    check(a == s, "pad: Auto fills a 0.3 s clip as Silence");
+    // A 3 s clip keeps the reference's tiling under Auto.
+    const std::vector<float> long3(static_cast<std::size_t>(3 * RATE), 0.5f);
+    check(clap.fill_window(long3, -1, ClapPad::Auto) == clap.fill_window(long3, -1, ClapPad::Repeat),
+          "pad: Auto fills a 3 s clip as Repeat");
+    // The log-mel of the silence-padded clip is the log-mel of that window.
+    check(clap.log_mel(clip, -1, ClapPad::Silence) == clap.log_mel(s), "pad: log_mel follows fill_window");
+    std::cout << "  short-clip padding checks done" << std::endl;
+}
+
 }  // namespace
 
 int main() {
+    bt::init();
+    check_padding();
+    if (g_failures) {
+        std::cerr << g_failures << " padding check(s) failed" << std::endl;
+        return 1;
+    }
     const fs::path repo = BROSOUNDML_REPO_DIR;
     const fs::path dir = repo / "weights" / "clap";
     const fs::path fixture = repo / "tests" / "fixtures" / "clap.bin";
@@ -215,7 +260,6 @@ int main() {
                   << " (scripts/download-clap.sh, convert-clap.py, tests/ref/gen_clap_fixture.py)" << std::endl;
         return 0;
     }
-    bt::init();
     auto fx = read_fixture(fixture);
     std::cout << "=== CLAP parity vs transformers ===" << std::endl;
     try {
