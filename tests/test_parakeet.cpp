@@ -241,9 +241,13 @@ static int run_for_device(brotensor::Device dev, const char* dn) {
         AudioBuffer empty; empty.sample_rate = 16000;
         CHECK(throws([&] { p.transcribe(empty); }),
               tag("transcribe rejects empty audio", dn).c_str());
-        AudioBuffer wrong; wrong.sample_rate = 22050; wrong.samples.assign(22050, 0.0f);
+        AudioBuffer wrong; wrong.sample_rate = 0; wrong.samples.assign(100, 0.0f);
         CHECK(throws([&] { p.transcribe(wrong); }),
-              tag("transcribe rejects non-16k audio", dn).c_str());
+              tag("transcribe rejects non-positive sample rate", dn).c_str());
+        // Non-16k audio is resampled transparently (see parakeet.h).
+        AudioBuffer resampled; resampled.sample_rate = 22050; resampled.samples = sine(440.0f, 0.2f).samples;
+        CHECK(!throws([&] { p.transcribe(resampled); }),
+              tag("transcribe accepts non-16k audio via resampling", dn).c_str());
     }
 
     // Happy path: the greedy TDT loop terminates and returns in-range output.
