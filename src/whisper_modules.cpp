@@ -7,7 +7,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/detail/dispatch.h>
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
 #endif
 
@@ -1043,7 +1043,7 @@ struct WhisperDecoderStepState {
     bt::Tensor hidden_n;         // (1, d_model) post-final-LN output
     bt::Tensor logits;           // (1, vocab_size) LM-head output
     WhisperStepScratch sc;
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;
 #endif
     bool captured = false;
@@ -1146,7 +1146,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
         if (dis[0] != '\0' && std::string(dis) != "0") return false;
     }
     const bt::Device dev = layer_norm.gamma.device;
-    if (dev != bt::Device::CUDA) return false;
+    if (dev != bt::Device::CUDA && dev != bt::Device::HIP) return false;
     if (static_cast<int>(cache.layers.size()) != decoder_layers) return false;
     bt::DeviceScope scope(dev);
 
@@ -1181,7 +1181,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
             *t = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         }
         st.cap = cap;
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
 #endif
         st.captured = false;
@@ -1199,7 +1199,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
     std::vector<const void*> keys = whisper_step_keys(*this, cache);
     if (keys != st.keys) {
         st.keys = std::move(keys);
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
 #endif
         st.captured = false;
@@ -1270,7 +1270,7 @@ void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
     std::vector<const void*> keys = whisper_step_keys(*this, cache);
     if (keys != st.keys) {
         st.keys = std::move(keys);
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
 #endif
         st.captured = false;
@@ -1283,7 +1283,7 @@ void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
     bt::copy_d2d(embed_tokens, token_id * d_model, st.in_tok, 0, d_model);
     bt::copy_d2d(embed_positions, pos * d_model, st.in_pos, 0, d_model);
 
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     if (!st.captured) {
         // Warm-up sizes every scratch buffer (capture must not allocate). The
         // step body is idempotent over the staged inputs — the capture re-run

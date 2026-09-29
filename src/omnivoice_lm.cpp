@@ -9,7 +9,7 @@
 #include <brotensor/detail/hash_rng.h>
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
 #endif
 
@@ -111,7 +111,7 @@ struct Session {
     bt::Tensor htar, hnorm;            // (R, H)
     bt::Tensor logits;                 // (R, C*V)
     bt::Tensor vals, idx;              // top-k outputs
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;
 #endif
     bool captured = false;
@@ -415,8 +415,8 @@ struct OmniVoiceLm::Impl {
     }
 
     void run_body(Session& s) const {
-#ifdef BROSOUNDML_HAS_CUDA
-        if (dev.type == bt::DeviceType::CUDA) {
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
+        if (dev.type == bt::DeviceType::CUDA || dev.type == bt::DeviceType::HIP) {
             if (!s.captured) {
                 body(s);            // warm-up (every output already sized; idempotent)
                 bt::sync_all();

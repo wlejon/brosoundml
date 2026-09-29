@@ -41,6 +41,7 @@ endif()
 # if(NOT TARGET ...) guards below reuse it, backend and all.
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
+option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
 
 # --- Siblings: bromath (header-only) + brotensor (tensor + ops) ---
 #
@@ -174,6 +175,9 @@ target_link_libraries(brosoundml PUBLIC
 # keying on it forwards the backend choice without a brosoundml-side option.
 if(TARGET brotensor_cuda)
     target_compile_definitions(brosoundml PRIVATE BROSOUNDML_HAS_CUDA=1)
+endif()
+if(BROTENSOR_WITH_HIP OR BROTENSOR_HAS_HIP OR TARGET brotensor_hip)
+    target_compile_definitions(brosoundml PRIVATE BROSOUNDML_HAS_HIP=1)
 endif()
 
 if(MSVC)

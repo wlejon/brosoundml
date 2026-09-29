@@ -4,7 +4,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
 #endif
 
@@ -81,7 +81,7 @@ struct QwenTtsTalkerStepState {
     bt::Tensor rope_cos, rope_sin;    // (cap, half) generation-phase tables
     bt::Tensor cos_step, sin_step;    // (1, half) the step's RoPE row
     StepScratch sc;
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;
 #endif
     bool captured = false;
@@ -375,7 +375,7 @@ void talker_state_alloc(const QwenTtsTalker& t, QwenTtsTalkerStepState& st,
     st.rope_sin = bt::Tensor::from_host_on(dev, sb.data(), cap, half);
 
     st.cap = cap;
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     st.graph.reset();
 #endif
     st.captured = false;
@@ -384,7 +384,7 @@ void talker_state_alloc(const QwenTtsTalker& t, QwenTtsTalkerStepState& st,
 }  // namespace
 
 bool QwenTtsTalker::decode_begin(QwenTtsTalkerStepPtr& st_ptr, int min_cap) const {
-    if (final_norm.device != bt::Device::CUDA) return false;
+    if (final_norm.device != bt::Device::CUDA && final_norm.device != bt::Device::HIP) return false;
     bt::DeviceScope scope(final_norm.device);
     if (!st_ptr) st_ptr.reset(new QwenTtsTalkerStepState());
     QwenTtsTalkerStepState& st = *st_ptr;
@@ -448,7 +448,7 @@ void QwenTtsTalker::decode_step(QwenTtsTalkerStepState& st, const bt::Tensor& em
     bt::copy_d2d(st.rope_sin, pos * half, st.sin_step, 0, half);
     bt::copy_d2d(embed, 0, st.in, 0, hidden);
 
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     if (!st.captured) {
         // Warm-up sizes every scratch buffer (capture must not allocate). The
         // step body is idempotent over the staged inputs — the capture re-run

@@ -4,7 +4,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
 #endif
 
@@ -116,7 +116,7 @@ struct CpFrameState {
     bt::Tensor code_dev;       // (n_out, 1) INT32 accumulated codes
     bt::Tensor sample_scratch; // (1, 3*vocab) FP32 sampler workspace (sampling)
     DepthCache cache;
-#ifdef BROSOUNDML_HAS_CUDA
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;       // captured whole-frame step (CUDA only)
 #endif
     bool captured = false;
@@ -419,8 +419,8 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     clk::time_point t0;
     if (prof) t0 = clk::now();
 
-#ifdef BROSOUNDML_HAS_CUDA
-    // CUDA: the whole frame is a fixed-shape sequence of device ops with no host
+#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
+    // CUDA/HIP: the whole frame is a fixed-shape sequence of device ops with no host
     // control flow, so capture it once and replay it as a single launch (~700
     // tiny kernel launches/frame -> one cudaGraphLaunch). This now covers
     // sampling too: sample_logits_into reads/advances its Philox counter from a
@@ -431,7 +431,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     // then advances 15 more, matching the CPU eager path frame for frame.
     // BROSOUNDML_QWEN_NO_GRAPH forces the eager path (A/B + escape hatch).
     static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
-    const bool use_graph = (dev == bt::Device::CUDA) && !no_graph;
+    const bool use_graph = (dev == bt::Device::CUDA || dev == bt::Device::HIP) && !no_graph;
     if (use_graph) {
         CpProf::graph() = true;
         // Drop a captured graph whose baked policy/params differ from this call.
@@ -467,7 +467,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
         } else {
             st.graph.launch();   // replay: reads st.cond_in, writes st.code_dev
         }
-        bt::sync(bt::Device::CUDA);
+        bt::sync(dev);
     } else
 #endif
     {
