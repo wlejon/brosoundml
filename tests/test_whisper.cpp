@@ -394,12 +394,12 @@ static int run() {
                 }
             }
 
-            if (dev == bt::Device::CUDA) {
+            if (dev == bt::Device::CUDA || dev == bt::Device::HIP) {
                 CHECK(used_graph,
-                      "step_begin returns true on a CUDA-resident decoder");
+                      "step_begin returns true on a GPU-resident decoder");
             } else {
                 CHECK(!used_graph,
-                      "step_begin returns false off CUDA (eager fallback)");
+                      "step_begin returns false off GPU (eager fallback)");
             }
 
             int mismatched = -1;
@@ -428,6 +428,9 @@ static int run() {
         };
 
         run_case(brotensor::Device::CPU, "CPU");
+        if (brotensor::is_available(brotensor::Device::HIP)) {
+            run_case(brotensor::Device::HIP, "HIP");
+        }
         if (brotensor::is_available(brotensor::Device::CUDA)) {
             run_case(brotensor::Device::CUDA, "CUDA");
         }
@@ -658,9 +661,13 @@ static int run() {
     // CPU enforces the filename-target substring (the deterministic baseline);
     // CUDA only checks that the pipeline runs and produces a well-formed
     // transcript — token argmax may tip on FP noise.
-    RealRun cpu_run, cuda_run;
+    RealRun cpu_run, cuda_run, hip_run;
     run_real_smoke(brotensor::Device::CPU, "CPU",
                    /*enforce_filename_target=*/true, &cpu_run);
+    if (brotensor::is_available(brotensor::Device::HIP)) {
+        run_real_smoke(brotensor::Device::HIP, "HIP",
+                       /*enforce_filename_target=*/false, &hip_run);
+    }
     if (brotensor::is_available(brotensor::Device::CUDA)) {
         run_real_smoke(brotensor::Device::CUDA, "CUDA",
                        /*enforce_filename_target=*/false, &cuda_run);
@@ -670,7 +677,7 @@ static int run() {
                        /*enforce_filename_target=*/false);
     }
 
-    // ─── CPU↔CUDA parity (opt-in: real weights + a CUDA device) ────────────
+    // ─── CPU↔GPU parity (opt-in: real weights + a GPU device) ─────────────
     //
     // Two levels, mirroring how test_qwen_asr pins its cross-device contract:
     //
@@ -681,17 +688,21 @@ static int run() {
     //  2. White-box: encode + prompt prefill on each device and compare the
     //     last-position logits within an FP16-attention tolerance (the same
     //     5e-2 bound test_qwen_asr uses for its upstream-logits check).
-    if (cpu_run.ran && cuda_run.ran) {
-        std::printf("  [parity] CPU %.2f s vs CUDA %.2f s (%.1fx)\n",
-                    cpu_run.seconds, cuda_run.seconds,
-                    cuda_run.seconds > 0.0 ? cpu_run.seconds / cuda_run.seconds
+    const RealRun* gpu_run = hip_run.ran ? &hip_run : (cuda_run.ran ? &cuda_run : nullptr);
+    const char* gpu_dev_name = hip_run.ran ? "HIP" : (cuda_run.ran ? "CUDA" : "GPU");
+    const brotensor::Device gpu_dev = hip_run.ran ? brotensor::Device::HIP : brotensor::Device::CUDA;
+
+    if (cpu_run.ran && gpu_run && gpu_run->ran) {
+        std::printf("  [parity] CPU %.2f s vs %s %.2f s (%.1fx)\n",
+                    cpu_run.seconds, gpu_dev_name, gpu_run->seconds,
+                    gpu_run->seconds > 0.0 ? cpu_run.seconds / gpu_run->seconds
                                            : 0.0);
-        CHECK(cpu_run.transcript == cuda_run.transcript,
-              "CPU and CUDA transcripts match");
+        CHECK(cpu_run.transcript == gpu_run->transcript,
+              "CPU and GPU transcripts match");
         std::printf("  [parity] token streams %s (%zu vs %zu tokens)\n",
-                    cpu_run.generated == cuda_run.generated ? "identical"
+                    cpu_run.generated == gpu_run->generated ? "identical"
                                                             : "differ",
-                    cpu_run.generated.size(), cuda_run.generated.size());
+                    cpu_run.generated.size(), gpu_run->generated.size());
 
         // White-box prefill-logits parity over the real checkpoint.
         const fs::path real_root =
@@ -747,7 +758,7 @@ static int run() {
         };
 
         const std::vector<float> lc = prefill_last_logits(brotensor::Device::CPU);
-        const std::vector<float> lg = prefill_last_logits(brotensor::Device::CUDA);
+        const std::vector<float> lg = prefill_last_logits(gpu_dev);
         CHECK(lc.size() == lg.size(), "parity: logits width matches");
         float max_d = 0.0f;
         double sum_d = 0.0;
@@ -759,7 +770,7 @@ static int run() {
         std::printf("  [parity] prefill logits max|Δ|=%.2e  mean|Δ|=%.2e\n",
                     max_d, lc.empty() ? 0.0 : sum_d / static_cast<double>(lc.size()));
         CHECK(max_d < 5e-2f,
-              "CPU vs CUDA prefill logits within FP16-attention tolerance");
+              "CPU vs GPU prefill logits within FP16-attention tolerance");
     }
 
     if (failures) {
