@@ -16,6 +16,7 @@
 #include "brosoundml/audio.h"
 #include "brosoundml/qwen_asr.h"
 
+#include "safetensors_shard_set.h"
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
@@ -68,6 +69,8 @@ struct QwenAsrEncoder {
     brotensor::Tensor pos_table;
 
     void load(const brotensor::safetensors::File& f, const QwenAsrConfig& cfg,
+              brotensor::Device device = brotensor::Device::CPU);
+    void load(const SafeTensorsShardSet& shards, const QwenAsrConfig& cfg,
               brotensor::Device device = brotensor::Device::CPU);
 
     // Narrow every learned weight to `dt` (FP16 or BF16; GPU only) so the

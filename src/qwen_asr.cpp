@@ -197,21 +197,18 @@ void QwenAsr::load_encoder(const std::string& model_dir, bt::Device device, bool
 void QwenAsr::load_impl_(const std::string& model_dir, bt::Device device, bool with_decoder) {
     const std::string where = "QwenAsr::load";
     const fs::path dir(model_dir);
-    const fs::path config_path  = dir / "config.json";
-    const fs::path weights_path = dir / "model.safetensors";
+    const fs::path config_path = dir / "config.json";
     if (!fs::exists(config_path))
         fail(where, "no config.json under '" + model_dir + "'");
-    if (!fs::exists(weights_path))
-        fail(where, "no model.safetensors under '" + model_dir + "'");
 
     impl_->config = parse_config(config_path.string(),
                                  (dir / "generation_config.json").string());
     impl_->device = device;
 
-    auto f = bt::safetensors::File::open(weights_path.string());
+    SafeTensorsShardSet shards = SafeTensorsShardSet::open(model_dir);
 
-    impl_->encoder.load(f, impl_->config, device);
-    if (with_decoder) impl_->decoder.load(f, impl_->config, device);
+    impl_->encoder.load(shards, impl_->config, device);
+    if (with_decoder) impl_->decoder.load(shards, impl_->config, device);
     impl_->decoder_loaded = with_decoder;
     impl_->loaded = true;
 }

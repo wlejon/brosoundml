@@ -24,7 +24,8 @@ namespace sf = brotensor::safetensors;
     throw std::runtime_error("brosoundml: QwenAsrEncoder: " + msg);
 }
 
-const sf::TensorView& need(const sf::File& f, const std::string& name) {
+template <typename Source>
+const sf::TensorView& need(const Source& f, const std::string& name) {
     const sf::TensorView* v = f.find(name);
     if (!v) fail("missing tensor '" + name + "'");
     return *v;
@@ -33,7 +34,8 @@ const sf::TensorView& need(const sf::File& f, const std::string& name) {
 // Upload a weight to FP32 on `dev`. The checkpoint is BF16 on disk;
 // upload_compute_checked under a CPU scope widens it to host FP32, then it is
 // migrated to the target device (same pattern as the Qwen3-TTS Talker).
-bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols,
+template <typename Source>
+bt::Tensor up(const Source& f, const std::string& name, int rows, int cols,
               bt::Device dev) {
     bt::Tensor t;
     {
@@ -42,7 +44,8 @@ bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols,
     }
     return (dev == bt::Device::CPU) ? t : t.to(dev);
 }
-bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
+template <typename Source>
+bt::Tensor up_vec(const Source& f, const std::string& name, int n,
                   bt::Device dev) {
     return up(f, name, n, 1, dev);
 }
@@ -57,106 +60,118 @@ constexpr int kNFft      = 400;
 constexpr int kHopLength = 160;
 constexpr int kNBins     = kNFft / 2 + 1;   // 201
 
-}  // namespace
+template <typename Source>
+void load_encoder_impl(QwenAsrEncoder& self, const Source& f, const QwenAsrConfig& cfg,
+                       bt::Device dev) {
+    self.num_mel_bins   = cfg.num_mel_bins;
+    self.d_model        = cfg.d_model;
+    self.num_layers     = cfg.encoder_layers;
+    self.num_heads      = cfg.encoder_attention_heads;
+    self.ffn_dim        = cfg.encoder_ffn_dim;
+    self.output_dim     = cfg.output_dim;
+    self.conv_hidden    = cfg.downsample_hidden_size;
+    self.n_window       = cfg.n_window;
+    self.n_window_infer = cfg.n_window_infer;
 
-void QwenAsrEncoder::load(const sf::File& f, const QwenAsrConfig& cfg,
-                          bt::Device dev) {
-    num_mel_bins   = cfg.num_mel_bins;
-    d_model        = cfg.d_model;
-    num_layers     = cfg.encoder_layers;
-    num_heads      = cfg.encoder_attention_heads;
-    ffn_dim        = cfg.encoder_ffn_dim;
-    output_dim     = cfg.output_dim;
-    conv_hidden    = cfg.downsample_hidden_size;
-    n_window       = cfg.n_window;
-    n_window_infer = cfg.n_window_infer;
-
-    if (num_mel_bins <= 0 || d_model <= 0 || num_layers <= 0 || n_window <= 0)
+    if (self.num_mel_bins <= 0 || self.d_model <= 0 || self.num_layers <= 0 || self.n_window <= 0)
         fail("config not parsed (zero dims)");
-    if (d_model % num_heads != 0)
+    if (self.d_model % self.num_heads != 0)
         fail("d_model not divisible by encoder_attention_heads");
-    if (n_window_infer % (n_window * 2) != 0)
+    if (self.n_window_infer % (self.n_window * 2) != 0)
         fail("n_window_infer not a multiple of the conv chunk size");
 
     // ── mel tables (host-resident, closed-form) ──
     {
         std::vector<float> fb =
-            melslaney::build_filterbank(num_mel_bins, kNFft, cfg.sample_rate);
-        mel_filters = bt::Tensor::zeros_on(bt::Device::CPU, num_mel_bins, kNBins,
-                                           bt::Dtype::FP32);
-        std::memcpy(mel_filters.host_f32_mut(), fb.data(),
+            melslaney::build_filterbank(self.num_mel_bins, kNFft, cfg.sample_rate);
+        self.mel_filters = bt::Tensor::zeros_on(bt::Device::CPU, self.num_mel_bins, kNBins,
+                                                bt::Dtype::FP32);
+        std::memcpy(self.mel_filters.host_f32_mut(), fb.data(),
                     fb.size() * sizeof(float));
         std::vector<float> hw = melslaney::build_hann_window(kNFft);
-        hann_window = bt::Tensor::zeros_on(bt::Device::CPU, 1, kNFft,
-                                           bt::Dtype::FP32);
-        std::memcpy(hann_window.host_f32_mut(), hw.data(),
+        self.hann_window = bt::Tensor::zeros_on(bt::Device::CPU, 1, kNFft,
+                                                bt::Dtype::FP32);
+        std::memcpy(self.hann_window.host_f32_mut(), hw.data(),
                     hw.size() * sizeof(float));
     }
 
     // ── conv stem ──
     const std::string P = "thinker.audio_tower.";
-    conv1_w = up(f, P + "conv2d1.weight", conv_hidden, 1 * 3 * 3, dev);
-    conv1_b = up_vec(f, P + "conv2d1.bias", conv_hidden, dev);
-    conv2_w = up(f, P + "conv2d2.weight", conv_hidden, conv_hidden * 3 * 3, dev);
-    conv2_b = up_vec(f, P + "conv2d2.bias", conv_hidden, dev);
-    conv3_w = up(f, P + "conv2d3.weight", conv_hidden, conv_hidden * 3 * 3, dev);
-    conv3_b = up_vec(f, P + "conv2d3.bias", conv_hidden, dev);
+    self.conv1_w = up(f, P + "conv2d1.weight", self.conv_hidden, 1 * 3 * 3, dev);
+    self.conv1_b = up_vec(f, P + "conv2d1.bias", self.conv_hidden, dev);
+    self.conv2_w = up(f, P + "conv2d2.weight", self.conv_hidden, self.conv_hidden * 3 * 3, dev);
+    self.conv2_b = up_vec(f, P + "conv2d2.bias", self.conv_hidden, dev);
+    self.conv3_w = up(f, P + "conv2d3.weight", self.conv_hidden, self.conv_hidden * 3 * 3, dev);
+    self.conv3_b = up_vec(f, P + "conv2d3.bias", self.conv_hidden, dev);
 
     // conv_out is a bias-free Linear(conv_hidden*freq_out -> d_model) over the
     // (t, c*f) flatten of the stem output. Row-major (d_model, c*f) coincides
     // with OIHW (d_model, conv_hidden, freq_out, 1), so the same buffer drives
     // a full-height conv2d and the flatten never leaves the device.
-    const int freq_out = tokens_after_stem(num_mel_bins);   // 128 -> 16
-    conv_out_w = up(f, P + "conv_out.weight", d_model, conv_hidden * freq_out, dev);
+    const int freq_out = tokens_after_stem(self.num_mel_bins);   // 128 -> 16
+    self.conv_out_w = up(f, P + "conv_out.weight", self.d_model, self.conv_hidden * freq_out, dev);
 
     // ── transformer stack ──
-    layers.clear();
-    layers.resize(static_cast<std::size_t>(num_layers));
-    for (int i = 0; i < num_layers; ++i) {
+    self.layers.clear();
+    self.layers.resize(static_cast<std::size_t>(self.num_layers));
+    for (int i = 0; i < self.num_layers; ++i) {
         const std::string L = P + "layers." + std::to_string(i) + ".";
-        QwenAsrEncoderLayer& el = layers[static_cast<std::size_t>(i)];
-        el.ln1_w = up_vec(f, L + "self_attn_layer_norm.weight", d_model, dev);
-        el.ln1_b = up_vec(f, L + "self_attn_layer_norm.bias", d_model, dev);
-        el.qw = up(f, L + "self_attn.q_proj.weight", d_model, d_model, dev);
-        el.qb = up_vec(f, L + "self_attn.q_proj.bias", d_model, dev);
-        el.kw = up(f, L + "self_attn.k_proj.weight", d_model, d_model, dev);
-        el.kb = up_vec(f, L + "self_attn.k_proj.bias", d_model, dev);
-        el.vw = up(f, L + "self_attn.v_proj.weight", d_model, d_model, dev);
-        el.vb = up_vec(f, L + "self_attn.v_proj.bias", d_model, dev);
-        el.ow = up(f, L + "self_attn.out_proj.weight", d_model, d_model, dev);
-        el.ob = up_vec(f, L + "self_attn.out_proj.bias", d_model, dev);
-        el.ln2_w = up_vec(f, L + "final_layer_norm.weight", d_model, dev);
-        el.ln2_b = up_vec(f, L + "final_layer_norm.bias", d_model, dev);
-        el.fc1_w = up(f, L + "fc1.weight", ffn_dim, d_model, dev);
-        el.fc1_b = up_vec(f, L + "fc1.bias", ffn_dim, dev);
-        el.fc2_w = up(f, L + "fc2.weight", d_model, ffn_dim, dev);
-        el.fc2_b = up_vec(f, L + "fc2.bias", d_model, dev);
+        QwenAsrEncoderLayer& el = self.layers[static_cast<std::size_t>(i)];
+        el.ln1_w = up_vec(f, L + "self_attn_layer_norm.weight", self.d_model, dev);
+        el.ln1_b = up_vec(f, L + "self_attn_layer_norm.bias", self.d_model, dev);
+        el.qw = up(f, L + "self_attn.q_proj.weight", self.d_model, self.d_model, dev);
+        el.qb = up_vec(f, L + "self_attn.q_proj.bias", self.d_model, dev);
+        el.kw = up(f, L + "self_attn.k_proj.weight", self.d_model, self.d_model, dev);
+        el.kb = up_vec(f, L + "self_attn.k_proj.bias", self.d_model, dev);
+        el.vw = up(f, L + "self_attn.v_proj.weight", self.d_model, self.d_model, dev);
+        el.vb = up_vec(f, L + "self_attn.v_proj.bias", self.d_model, dev);
+        el.ow = up(f, L + "self_attn.out_proj.weight", self.d_model, self.d_model, dev);
+        el.ob = up_vec(f, L + "self_attn.out_proj.bias", self.d_model, dev);
+        el.ln2_w = up_vec(f, L + "final_layer_norm.weight", self.d_model, dev);
+        el.ln2_b = up_vec(f, L + "final_layer_norm.bias", self.d_model, dev);
+        el.fc1_w = up(f, L + "fc1.weight", self.ffn_dim, self.d_model, dev);
+        el.fc1_b = up_vec(f, L + "fc1.bias", self.ffn_dim, dev);
+        el.fc2_w = up(f, L + "fc2.weight", self.d_model, self.ffn_dim, dev);
+        el.fc2_b = up_vec(f, L + "fc2.bias", self.d_model, dev);
     }
-    ln_post_w = up_vec(f, P + "ln_post.weight", d_model, dev);
-    ln_post_b = up_vec(f, P + "ln_post.bias", d_model, dev);
-    proj1_w = up(f, P + "proj1.weight", d_model, d_model, dev);
-    proj1_b = up_vec(f, P + "proj1.bias", d_model, dev);
-    proj2_w = up(f, P + "proj2.weight", output_dim, d_model, dev);
-    proj2_b = up_vec(f, P + "proj2.bias", output_dim, dev);
+    self.ln_post_w = up_vec(f, P + "ln_post.weight", self.d_model, dev);
+    self.ln_post_b = up_vec(f, P + "ln_post.bias", self.d_model, dev);
+    self.proj1_w = up(f, P + "proj1.weight", self.d_model, self.d_model, dev);
+    self.proj1_b = up_vec(f, P + "proj1.bias", self.d_model, dev);
+    self.proj2_w = up(f, P + "proj2.weight", self.output_dim, self.d_model, dev);
+    self.proj2_b = up_vec(f, P + "proj2.bias", self.output_dim, dev);
 
     // ── per-chunk sinusoidal positions (sin | cos halves, Whisper-style) ──
     {
-        const int max_tokens = tokens_after_stem(n_window * 2);   // 100 -> 13
-        const int half = d_model / 2;
+        const int max_tokens = tokens_after_stem(self.n_window * 2);   // 100 -> 13
+        const int half = self.d_model / 2;
         const double lti = std::log(10000.0) / (half - 1);
-        std::vector<float> pe(static_cast<std::size_t>(max_tokens) * d_model);
+        std::vector<float> pe(static_cast<std::size_t>(max_tokens) * self.d_model);
         for (int t = 0; t < max_tokens; ++t) {
             for (int i = 0; i < half; ++i) {
                 const double ang = t * std::exp(-lti * i);
-                pe[static_cast<std::size_t>(t) * d_model + i] =
+                pe[static_cast<std::size_t>(t) * self.d_model + i] =
                     static_cast<float>(std::sin(ang));
-                pe[static_cast<std::size_t>(t) * d_model + half + i] =
+                pe[static_cast<std::size_t>(t) * self.d_model + half + i] =
                     static_cast<float>(std::cos(ang));
             }
         }
-        pos_table = bt::Tensor::from_host_on(dev, pe.data(), max_tokens, d_model);
+        self.pos_table = bt::Tensor::from_host_on(dev, pe.data(), max_tokens, self.d_model);
     }
 }
+
+}  // namespace
+
+void QwenAsrEncoder::load(const sf::File& f, const QwenAsrConfig& cfg,
+                          bt::Device dev) {
+    load_encoder_impl(*this, f, cfg, dev);
+}
+
+void QwenAsrEncoder::load(const SafeTensorsShardSet& shards, const QwenAsrConfig& cfg,
+                          bt::Device dev) {
+    load_encoder_impl(*this, shards, cfg, dev);
+}
+
 
 void QwenAsrEncoder::use_half(bt::Dtype dt) {
     if (dt != bt::Dtype::FP16 && dt != bt::Dtype::BF16) fail("use_half: dtype must be FP16 or BF16");

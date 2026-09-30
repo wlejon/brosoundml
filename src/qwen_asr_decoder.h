@@ -16,6 +16,7 @@
 
 #include "brosoundml/qwen_asr.h"
 
+#include "safetensors_shard_set.h"
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
@@ -66,6 +67,8 @@ struct QwenAsrDecoder {
     // Build from the thinker.model.* / thinker.lm_head tensors of
     // model.safetensors (BF16 -> FP32 on `device`).
     void load(const brotensor::safetensors::File& f, const QwenAsrConfig& cfg,
+              brotensor::Device device = brotensor::Device::CPU);
+    void load(const SafeTensorsShardSet& shards, const QwenAsrConfig& cfg,
               brotensor::Device device = brotensor::Device::CPU);
 
     // Cached decoder pass over `n` new tokens whose RoPE positions are

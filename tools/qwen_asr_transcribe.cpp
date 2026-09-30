@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
         const auto t1 = std::chrono::steady_clock::now();
         std::fprintf(stderr, "loaded in %.1fs (%s)\n",
                      std::chrono::duration<double>(t1 - t0).count(),
-                     dev == brotensor::Device::CUDA ? "cuda" : "cpu");
+                     brotensor::to_string(dev).c_str());
 
         brosoundml::QwenAsr::TranscribeOptions opts;
         opts.max_new_tokens = max_new_tokens;

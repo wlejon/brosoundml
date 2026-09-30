@@ -22,7 +22,8 @@ namespace sf = brotensor::safetensors;
     throw std::runtime_error("brosoundml: QwenAsrDecoder: " + msg);
 }
 
-const sf::TensorView& need(const sf::File& f, const std::string& name) {
+template <typename Source>
+const sf::TensorView& need(const Source& f, const std::string& name) {
     const sf::TensorView* v = f.find(name);
     if (!v) fail("missing tensor '" + name + "'");
     return *v;
@@ -30,7 +31,8 @@ const sf::TensorView& need(const sf::File& f, const std::string& name) {
 
 // Upload a weight to FP32 on `dev` (BF16 on disk; widened host-side first —
 // same pattern as the Qwen3-TTS Talker).
-bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols,
+template <typename Source>
+bt::Tensor up(const Source& f, const std::string& name, int rows, int cols,
               bt::Device dev) {
     bt::Tensor t;
     {
@@ -39,61 +41,73 @@ bt::Tensor up(const sf::File& f, const std::string& name, int rows, int cols,
     }
     return (dev == bt::Device::CPU) ? t : t.to(dev);
 }
-bt::Tensor up_vec(const sf::File& f, const std::string& name, int n,
+template <typename Source>
+bt::Tensor up_vec(const Source& f, const std::string& name, int n,
                   bt::Device dev) {
     return up(f, name, n, 1, dev);
+}
+
+template <typename Source>
+void load_decoder_impl(QwenAsrDecoder& self, const Source& f, const QwenAsrConfig& cfg,
+                       bt::Device dev) {
+    self.num_layers   = cfg.num_hidden_layers;
+    self.hidden       = cfg.hidden_size;
+    self.intermediate = cfg.intermediate_size;
+    self.n_q_heads    = cfg.num_attention_heads;
+    self.n_kv_heads   = cfg.num_key_value_heads;
+    self.head_dim     = cfg.head_dim;
+    self.vocab        = cfg.vocab_size;
+    self.rms_eps      = cfg.rms_norm_eps;
+    self.rope_theta   = cfg.rope_theta;
+
+    if (self.num_layers <= 0 || self.hidden <= 0 || self.head_dim <= 0 || self.vocab <= 0)
+        fail("config not parsed (zero dims)");
+
+    self.embed_tokens = up(f, "thinker.model.embed_tokens.weight", self.vocab, self.hidden, dev);
+    self.lm_head      = up(f, "thinker.lm_head.weight", self.vocab, self.hidden, dev);
+    self.final_norm   = up_vec(f, "thinker.model.norm.weight", self.hidden, dev);
+
+    // RoPE convention bridge: permute q/k projection rows (and q/k_norm) from
+    // HF rotate-half pairs into brotensor's adjacent-pair layout once at load
+    // (see qwen_tts_talker.cpp for the full rationale).
+    const std::vector<std::int32_t> hd_perm = qtd::rotate_half_perm(self.head_dim);
+    const std::vector<std::int32_t> q_perm =
+        qtd::per_head_perm_rows(hd_perm, self.n_q_heads, self.head_dim);
+    const std::vector<std::int32_t> k_perm =
+        qtd::per_head_perm_rows(hd_perm, self.n_kv_heads, self.head_dim);
+
+    const int qd = self.n_q_heads * self.head_dim;
+    const int kd = self.n_kv_heads * self.head_dim;
+    self.layers.clear();
+    self.layers.resize(static_cast<std::size_t>(self.num_layers));
+    for (int i = 0; i < self.num_layers; ++i) {
+        const std::string L =
+            "thinker.model.layers." + std::to_string(i) + ".";
+        QwenAsrDecoderLayer& dl = self.layers[static_cast<std::size_t>(i)];
+        dl.in_ln   = up_vec(f, L + "input_layernorm.weight", self.hidden, dev);
+        dl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", self.hidden, dev);
+        dl.qw      = qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, self.hidden, dev), q_perm);
+        dl.kw      = qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, self.hidden, dev), k_perm);
+        dl.vw      = up(f, L + "self_attn.v_proj.weight", kd, self.hidden, dev);
+        dl.ow      = up(f, L + "self_attn.o_proj.weight", self.hidden, qd, dev);
+        dl.q_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.q_norm.weight", self.head_dim, dev), hd_perm);
+        dl.k_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.k_norm.weight", self.head_dim, dev), hd_perm);
+        dl.gate    = up(f, L + "mlp.gate_proj.weight", self.intermediate, self.hidden, dev);
+        dl.up      = up(f, L + "mlp.up_proj.weight", self.intermediate, self.hidden, dev);
+        dl.down    = up(f, L + "mlp.down_proj.weight", self.hidden, self.intermediate, dev);
+    }
 }
 
 }  // namespace
 
 void QwenAsrDecoder::load(const sf::File& f, const QwenAsrConfig& cfg,
                           bt::Device dev) {
-    num_layers   = cfg.num_hidden_layers;
-    hidden       = cfg.hidden_size;
-    intermediate = cfg.intermediate_size;
-    n_q_heads    = cfg.num_attention_heads;
-    n_kv_heads   = cfg.num_key_value_heads;
-    head_dim     = cfg.head_dim;
-    vocab        = cfg.vocab_size;
-    rms_eps      = cfg.rms_norm_eps;
-    rope_theta   = cfg.rope_theta;
+    load_decoder_impl(*this, f, cfg, dev);
+}
 
-    if (num_layers <= 0 || hidden <= 0 || head_dim <= 0 || vocab <= 0)
-        fail("config not parsed (zero dims)");
-
-    embed_tokens = up(f, "thinker.model.embed_tokens.weight", vocab, hidden, dev);
-    lm_head      = up(f, "thinker.lm_head.weight", vocab, hidden, dev);
-    final_norm   = up_vec(f, "thinker.model.norm.weight", hidden, dev);
-
-    // RoPE convention bridge: permute q/k projection rows (and q/k_norm) from
-    // HF rotate-half pairs into brotensor's adjacent-pair layout once at load
-    // (see qwen_tts_talker.cpp for the full rationale).
-    const std::vector<std::int32_t> hd_perm = qtd::rotate_half_perm(head_dim);
-    const std::vector<std::int32_t> q_perm =
-        qtd::per_head_perm_rows(hd_perm, n_q_heads, head_dim);
-    const std::vector<std::int32_t> k_perm =
-        qtd::per_head_perm_rows(hd_perm, n_kv_heads, head_dim);
-
-    const int qd = n_q_heads * head_dim;
-    const int kd = n_kv_heads * head_dim;
-    layers.clear();
-    layers.resize(static_cast<std::size_t>(num_layers));
-    for (int i = 0; i < num_layers; ++i) {
-        const std::string L =
-            "thinker.model.layers." + std::to_string(i) + ".";
-        QwenAsrDecoderLayer& dl = layers[static_cast<std::size_t>(i)];
-        dl.in_ln   = up_vec(f, L + "input_layernorm.weight", hidden, dev);
-        dl.post_ln = up_vec(f, L + "post_attention_layernorm.weight", hidden, dev);
-        dl.qw      = qtd::gather_rows(up(f, L + "self_attn.q_proj.weight", qd, hidden, dev), q_perm);
-        dl.kw      = qtd::gather_rows(up(f, L + "self_attn.k_proj.weight", kd, hidden, dev), k_perm);
-        dl.vw      = up(f, L + "self_attn.v_proj.weight", kd, hidden, dev);
-        dl.ow      = up(f, L + "self_attn.o_proj.weight", hidden, qd, dev);
-        dl.q_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.q_norm.weight", head_dim, dev), hd_perm);
-        dl.k_norm  = qtd::gather_rows(up_vec(f, L + "self_attn.k_norm.weight", head_dim, dev), hd_perm);
-        dl.gate    = up(f, L + "mlp.gate_proj.weight", intermediate, hidden, dev);
-        dl.up      = up(f, L + "mlp.up_proj.weight", intermediate, hidden, dev);
-        dl.down    = up(f, L + "mlp.down_proj.weight", hidden, intermediate, dev);
-    }
+void QwenAsrDecoder::load(const SafeTensorsShardSet& shards, const QwenAsrConfig& cfg,
+                          bt::Device dev) {
+    load_decoder_impl(*this, shards, cfg, dev);
 }
 
 void QwenAsrDecoder::run_dev(const bt::Tensor& embeds, int n,
