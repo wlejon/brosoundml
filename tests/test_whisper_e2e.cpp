@@ -402,6 +402,11 @@ static int run_for_device(brotensor::Device dev, const char* dev_name) {
 
 static int run() {
     int f = run_for_device(brotensor::Device::CPU, "CPU");
+    if (brotensor::is_available(brotensor::Device::HIP)) {
+        f += run_for_device(brotensor::Device::HIP, "HIP");
+    } else {
+        std::printf("test_whisper_e2e: HIP not available — HIP path skipped\n");
+    }
     if (brotensor::is_available(brotensor::Device::CUDA)) {
         f += run_for_device(brotensor::Device::CUDA, "CUDA");
     } else {
