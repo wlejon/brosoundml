@@ -96,18 +96,20 @@ int main(int argc, char** argv) {
 
         // Device selection: GPU-first, with explicit override.
         brotensor::Device device = brotensor::Device::CPU;
-        if (device_arg == "cuda") {
+        if (device_arg == "hip" || device_arg == "rocm") {
+            if (!brotensor::is_available(brotensor::Device::HIP))
+                die("--device hip requested but no HIP backend is available");
+            device = brotensor::Device::HIP;
+        } else if (device_arg == "cuda") {
             if (!brotensor::is_available(brotensor::Device::CUDA))
                 die("--device cuda requested but no CUDA backend is available");
             device = brotensor::Device::CUDA;
         } else if (device_arg == "cpu") {
             device = brotensor::Device::CPU;
         } else if (device_arg == "auto") {
-            device = brotensor::is_available(brotensor::Device::CUDA)
-                         ? brotensor::Device::CUDA
-                         : brotensor::Device::CPU;
+            device = brotensor::default_device();
         } else {
-            die("--device must be auto, cpu, or cuda");
+            die("--device must be auto, hip, cuda, or cpu");
         }
 
         // 1. Load model.

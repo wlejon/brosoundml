@@ -85,13 +85,14 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if (device_name == "cuda") {
+        if (device_name == "hip" || device_name == "rocm") {
+            dev = brotensor::Device::HIP;
+        } else if (device_name == "cuda") {
             dev = brotensor::Device::CUDA;
         } else if (device_name == "auto") {
-            if (brotensor::is_available(brotensor::Device::CUDA))
-                dev = brotensor::Device::CUDA;
+            dev = brotensor::default_device();
         } else if (device_name != "cpu") {
-            die("unknown --device '" + device_name + "' (want cpu or cuda)");
+            die("unknown --device '" + device_name + "' (want auto, hip, cuda, or cpu)");
         }
 
         const brosoundml::AudioBuffer audio = brosoundml::read_wav(wav_path);

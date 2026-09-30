@@ -25,9 +25,9 @@ static double ms_since(clk::time_point t0) {
 
 int main(int argc, char** argv) {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available\n");
-        return 1;
+    brotensor::Device dev = brotensor::default_device();
+    if (dev == brotensor::Device::CPU) {
+        std::printf("GPU not available (using CPU)\n");
     }
     const std::string root     = argc > 1 ? argv[1] : "weights/qwen-tts/0.6B-customvoice";
     const std::string text     = argc > 2 ? argv[2]
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
 
     brosoundml::QwenTts q;
     auto t0 = clk::now();
-    q.load(root, brotensor::Device::CUDA, precision);
+    q.load(root, dev, precision);
     std::printf("load: %.0f ms%s\n", ms_since(t0), bf16 ? "  (BF16 weights)" : "");
 
     t0 = clk::now();
