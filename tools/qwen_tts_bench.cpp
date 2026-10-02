@@ -1,4 +1,5 @@
-// Wall-clock benchmark for the Qwen3-TTS pipeline on CUDA. Uses only the public
+// Wall-clock benchmark for the Qwen3-TTS pipeline on the GPU (the best backend
+// brotensor reports: HIP / CUDA / Metal). Uses only the public
 // QwenTts API (load / decode_codes / synthesize) so it builds unchanged against
 // any revision — letting us A/B the on-device codec work against the old
 // host-fallback path by reverting just the implementation files.
@@ -23,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 using brosoundml::QwenTts;
 using clk = std::chrono::steady_clock;
 
@@ -32,8 +35,10 @@ static double ms_since(clk::time_point t0) {
 
 int main(int argc, char** argv) {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping bench\n");
+    const brotensor::Device dev = brosoundml_tool::best_gpu();
+    const char* dn = brosoundml_tool::device_name(dev);
+    if (!dev.is_gpu()) {
+        std::printf("no GPU backend available - skipping bench\n");
         return 0;
     }
     const std::string root = (argc > 1)
@@ -42,15 +47,15 @@ int main(int argc, char** argv) {
     const bool bf16 = std::getenv("BROSOUNDML_QWEN_BF16") != nullptr;
 
     QwenTts q;
-    q.load(root, brotensor::Device::CUDA,
+    q.load(root, dev,
            bf16 ? brosoundml::QwenTtsWeightPrecision::BF16
                 : brosoundml::QwenTtsWeightPrecision::FP32);
     const int K = q.config().codec.num_quantizers;
     const int win = q.config().codec.sliding_window;
-    std::printf("loaded %s on CUDA (K=%d codebooks, window=%d frames, 12.5 Hz%s)\n\n",
-                root.c_str(), K, win, bf16 ? ", BF16 weights" : "");
+    std::printf("loaded %s on %s (K=%d codebooks, window=%d frames, 12.5 Hz%s)\n\n",
+                root.c_str(), dn, K, win, bf16 ? ", BF16 weights" : "");
 
-    std::printf("== codec decode_codes (CUDA) ==\n");
+    std::printf("== codec decode_codes (%s) ==\n", dn);
     std::mt19937 rng(123);
     std::uniform_int_distribution<int> dist(0, 1023);
     for (int T : {72, 144, 300, 600, 1200}) {
@@ -71,7 +76,7 @@ int main(int argc, char** argv) {
                     T > win ? "yes" : "no");
     }
 
-    std::printf("\n== full synthesize() (CUDA) ==\n");
+    std::printf("\n== full synthesize() (%s) ==\n", dn);
     const char* texts[] = {
         "Hello there.",
         "The quick brown fox jumps over the lazy dog near the riverbank at dawn, "

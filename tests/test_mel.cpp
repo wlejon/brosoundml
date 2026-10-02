@@ -2,7 +2,8 @@
 // against itself — the load-bearing check is that consume()-in-chunks of an
 // arbitrary signal produces frames bit-equivalent to compute_offline() on the
 // same buffer (within FP32 STFT noise). The CPU baseline runs unconditionally;
-// CUDA / Metal additionally run when brotensor reports them available, mirroring
+// the GPU (HIP / CUDA / Metal, test_device.h) additionally runs when one is
+// registered, mirroring
 // test_kokoro.cpp's run_real_smoke pattern.
 #include "brosoundml/mel.h"
 
@@ -17,6 +18,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace bt = brotensor;
 using brosoundml::MelConfig;
@@ -230,7 +233,7 @@ static void test_no_nan_on_noise(bt::Device dev, const char* dev_name) {
 }
 
 // ─── Cross-device parity ──────────────────────────────────────────────────
-// The corpus tools (melcache, sound_units) pick CUDA when available while the
+// The corpus tools (melcache, sound_units) pick the GPU when available while the
 // CPU path remains the reference; outputs feed the same checkpoints/centroid
 // files, so the two devices must agree to FP32 STFT noise — not just be
 // individually self-consistent.
@@ -274,13 +277,10 @@ int main() {
     bt::init();
     try {
         run_all(bt::Device::CPU, "CPU");
-        if (bt::is_available(bt::Device::CUDA)) {
-            run_all(bt::Device::CUDA, "CUDA");
-            test_cross_device_parity(bt::Device::CUDA, "CUDA");
-        }
-        if (bt::is_available(bt::Device::Metal)) {
-            run_all(bt::Device::Metal, "Metal");
-            test_cross_device_parity(bt::Device::Metal, "Metal");
+        const bt::Device gpu = brosoundml_test::preferred_gpu();
+        if (gpu.is_gpu()) {
+            run_all(gpu, brosoundml_test::device_name(gpu));
+            test_cross_device_parity(gpu, brosoundml_test::device_name(gpu));
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());

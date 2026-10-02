@@ -55,6 +55,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -136,9 +138,8 @@ int main(int argc, char** argv) {
     }
 
     bt::init();
-    bt::Device device = bt::Device::CPU;
-    if (bt::is_available(bt::Device::CUDA)) device = bt::Device::CUDA;
-    const char* dev_name = (device == bt::Device::CUDA) ? "cuda" : "cpu";
+    const bt::Device device = brosoundml_test::preferred_gpu();
+    const char* dev_name = brosoundml_test::device_name(device);
     std::fprintf(stderr, "test_phoneme_spotter_e2e on %s\n", dev_name);
     std::fprintf(stderr, "  kokoro    = %s\n  voice     = %s\n  checkpoint= %s\n",
                  kokoro_dir.c_str(), voice_path.c_str(), checkpoint.c_str());

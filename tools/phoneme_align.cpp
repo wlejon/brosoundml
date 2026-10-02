@@ -57,6 +57,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -110,7 +112,7 @@ void print_help() {
         "  --cap N              max clips per (speaker x emotion) / per manifest tag,\n"
         "                       0=all (default 200)\n"
         "  --min-score F        drop clips with mean path log-posterior < F (default -3.5)\n"
-        "  --device auto|cuda|cpu\n  -h --help\n");
+        "  --device auto|cpu|gpu|cuda|hip|metal\n  -h --help\n");
 }
 
 Args parse_args(int argc, char** argv) {
@@ -287,10 +289,9 @@ int main(int argc, char** argv) try {
 
     bt::init();
     bt::Device device = bt::Device::CPU;
-    if (a.device == "cuda" || (a.device == "auto" && bt::is_available(bt::Device::CUDA)))
-        device = bt::Device::CUDA;
-    if (a.device == "cpu") device = bt::Device::CPU;
-    const char* dev_name = (device == bt::Device::CUDA) ? "cuda" : "cpu";
+    if (std::string err; !brosoundml_tool::resolve_device(a.device, device, err))
+        fail("phoneme_align", err);
+    const char* dev_name = brosoundml_tool::device_name(device);
 
     // ── Model + class map + framing ──
     bsm::PhonemeNet model = bsm::PhonemeNet::load(checkpoint, device);

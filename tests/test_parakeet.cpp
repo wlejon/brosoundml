@@ -6,7 +6,7 @@
 // terminates, token ids stay in [0, vocab_size), the per-token encoder-frame
 // indices are non-decreasing and in range, max_new_tokens is respected, and a
 // re-run is deterministic. No real weights / tokenizer needed — this is what CI
-// relies on to keep Parakeet green. Runs on CPU and (when present) CUDA.
+// relies on to keep Parakeet green. Runs on CPU and (when present) the GPU.
 
 #include "brosoundml/audio.h"
 #include "brosoundml/parakeet.h"
@@ -24,6 +24,8 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace fs  = std::filesystem;
 namespace stf = brotensor::safetensors;
@@ -301,7 +303,7 @@ static int run_for_device(brotensor::Device dev, const char* dn) {
           tag("uncapped decode terminates", dn).c_str());
 
     // ── Session API (synthetic): make_session + transcribe(session, ...) ─────
-    // Exercises the new session surface on CPU/CUDA in CI regardless of weights.
+    // Exercises the new session surface on CPU/GPU in CI regardless of weights.
     // Two sessions interleaved over one model stay well-formed and in-range, and
     // reset() works. (Bit-exact cross-talk isolation is the real-weights smoke
     // in main(); with these near-tie synthetic logits the argmax tips on FP
@@ -394,11 +396,12 @@ int main() {
     try {
         int f = run_for_device(brotensor::Device::CPU, "CPU");
         f += run_real_session_smoke(brotensor::Device::CPU, "CPU");
-        if (brotensor::is_available(brotensor::Device::CUDA)) {
-            f += run_for_device(brotensor::Device::CUDA, "CUDA");
-            f += run_real_session_smoke(brotensor::Device::CUDA, "CUDA");
+        const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+        if (gpu.is_gpu()) {
+            f += run_for_device(gpu, brosoundml_test::device_name(gpu));
+            f += run_real_session_smoke(gpu, brosoundml_test::device_name(gpu));
         } else
-            std::printf("test_parakeet: CUDA not available — CUDA path skipped\n");
+            std::printf("test_parakeet: no GPU backend available — GPU path skipped\n");
         if (f) {
             std::fprintf(stderr, "test_parakeet: %d failure(s)\n", f);
             return 1;

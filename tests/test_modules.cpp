@@ -3,9 +3,9 @@
 // reference activations from an external framework involved.
 //
 // Each device-dependent test is parameterized over brotensor::Device so the
-// CPU baseline runs unconditionally and the CUDA path runs additionally when
-// `brotensor::is_available(Device::CUDA)` reports true. Module outputs run on
-// CUDA are downloaded via `to_host_vector()` before comparing against the
+// CPU baseline runs unconditionally and the GPU path (HIP / CUDA / Metal, per
+// test_device.h's preferred_gpu()) runs additionally when one is registered.
+// Module outputs run on the GPU are downloaded via `to_host_vector()` before comparing against the
 // from-scratch CPU oracle.
 #include "brosoundml/modules.h"
 
@@ -19,6 +19,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace bt = brotensor;
 
@@ -496,15 +498,11 @@ static void run_all(bt::Device dev, const char* dev_name) {
 int main() {
     bt::init();
     run_all(bt::Device::CPU, "CPU");
-    if (bt::is_available(bt::Device::CUDA)) {
-        run_all(bt::Device::CUDA, "CUDA");
+    const bt::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        run_all(gpu, brosoundml_test::device_name(gpu));
     } else {
-        std::printf("test_modules: CUDA not available — CUDA path skipped\n");
-    }
-    if (bt::is_available(bt::Device::Metal)) {
-        run_all(bt::Device::Metal, "Metal");
-    } else {
-        std::printf("test_modules: Metal not available — Metal path skipped\n");
+        std::printf("test_modules: no GPU backend available — GPU path skipped\n");
     }
 
     if (failures == 0) {

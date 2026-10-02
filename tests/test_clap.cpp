@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs = std::filesystem;
 namespace bt = brotensor;
 
@@ -264,16 +266,17 @@ int main() {
     std::cout << "=== CLAP parity vs transformers ===" << std::endl;
     try {
         const DeviceResult cpu = run_device(dir, bt::Device::CPU, fx);
-        if (bt::is_available(bt::Device::CUDA)) {
-            const DeviceResult cuda = run_device(dir, bt::Device::CUDA, fx);
+        const bt::Device gpu = brosoundml_test::preferred_gpu();
+        if (gpu.is_gpu()) {
+            const DeviceResult g = run_device(dir, gpu, fx);
             double da = 0, dt = 0;
-            for (std::size_t i = 0; i < cpu.audio.size(); ++i) da = std::max(da, max_abs(cpu.audio[i], cuda.audio[i]));
-            for (std::size_t i = 0; i < cpu.text.size(); ++i) dt = std::max(dt, max_abs(cpu.text[i], cuda.text[i]));
-            std::printf("  == CPU vs CUDA ==\n");
+            for (std::size_t i = 0; i < cpu.audio.size(); ++i) da = std::max(da, max_abs(cpu.audio[i], g.audio[i]));
+            for (std::size_t i = 0; i < cpu.text.size(); ++i) dt = std::max(dt, max_abs(cpu.text[i], g.text[i]));
+            std::printf("  == CPU vs %s ==\n", brosoundml_test::device_name(gpu));
             report("audio embeddings (max abs)", da, 2e-5);
             report("text embeddings (max abs)", dt, 2e-5);
         } else {
-            std::cout << "  (CUDA not available: CPU only)" << std::endl;
+            std::cout << "  (no GPU backend available: CPU only)" << std::endl;
         }
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << std::endl;

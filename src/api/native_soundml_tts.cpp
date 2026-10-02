@@ -3,10 +3,11 @@
 // synthesizeStream / decodeFrom dispatch, and the class handles shared by
 // native_soundml_tts_{kokoro,qwen,omnivoice,supertonic}.cpp.
 //
-// Loading is GPU by default (CUDA > Metal > CPU by availability); opts.device
-// picks explicitly and must be a string. OmniVoice refuses the CPU unless it
-// is asked for by name: its LM is a full Qwen3-0.6B forward per diffusion
-// step, and a silent CPU fallback would turn a ~1 s synthesis into minutes.
+// Loading is GPU by default (brotensor's default device: the registered HIP,
+// CUDA or Metal GPU, else the CPU); opts.device picks explicitly and must be
+// a string. OmniVoice refuses the CPU unless it is asked for by name: its LM
+// is a full Qwen3-0.6B forward per diffusion step, and a silent CPU fallback
+// would turn a ~1 s synthesis into minutes.
 #include "soundml_tts_internal.h"
 #include "soundml_loader.h"
 
@@ -99,7 +100,7 @@ Value loadQwen(Value, std::span<const Value> args) {
 
 // bro.tts.loadOmniVoice(modelDir, opts?) -> OmniVoice | AsyncHandle
 //   opts.device: GPU by default; the CPU only when named. opts.precision:
-//   'bf16' (default on CUDA) | 'fp32' (default elsewhere). opts.decoderOnly:
+//   'bf16' (default on CUDA and HIP) | 'fp32' (default elsewhere). opts.decoderOnly:
 //   skip the codec encoder + HuBERT (createPrompt / encodeAudio then throw).
 Value loadOmniVoice(Value, std::span<const Value> args) {
     std::string dir;
@@ -108,11 +109,12 @@ Value loadOmniVoice(Value, std::span<const Value> args) {
     bool explicitDevice = false;
     if (!loaderArgs("loadOmniVoice", args, dir, dev, opts, &explicitDevice)) return ev::undefined();
     if (dev.type == brotensor::DeviceType::CPU && !explicitDevice)
-        return ev::throwError("loadOmniVoice: no GPU backend is available (CUDA/Metal) and OmniVoice's "
+        return ev::throwError("loadOmniVoice: no GPU backend is available (CUDA/HIP/Metal) and OmniVoice's "
                               "language model is not practical on the CPU; pass { device: 'cpu' } "
                               "to run it there anyway");
-    auto precision = dev.type == brotensor::DeviceType::CUDA ? brosoundml::OmniVoicePrecision::BF16
-                                                              : brosoundml::OmniVoicePrecision::FP32;
+    auto precision = dev.type == brotensor::DeviceType::CUDA || dev.type == brotensor::DeviceType::HIP
+                         ? brosoundml::OmniVoicePrecision::BF16
+                         : brosoundml::OmniVoicePrecision::FP32;
     bool decoderOnly = false;
     if (ev::isObject(opts.get())) {
         Value pv = ev::getProperty(opts.get(), "precision");

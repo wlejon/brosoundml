@@ -2,7 +2,7 @@
 //
 // CLI: train_pos_tagger --train <pos_train.bin> --val <pos_val.bin>
 //                      --out <dir> [--epochs N] [--batch N] [--lr F]
-//                      [--warmup N] [--seed N] [--device cpu|cuda]
+//                      [--warmup N] [--seed N] [--device cpu|gpu]
 //                      [--synthetic]
 //
 // Packed-varlen forward+backward: each minibatch's sentences are concatenated
@@ -36,6 +36,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "test_device.h"
 
 namespace bt = brotensor;
 namespace g  = brosoundml::g2p;
@@ -334,7 +336,7 @@ struct PackedBatch {
     bt::Tensor upos_tags;        // (total_words, 1)  INT32
 
     // cu_seqlens: host vector + device tensor. The varlen API takes host
-    // pointers on CPU and device pointers on CUDA/Metal; we keep both around
+    // pointers on CPU and device pointers on a GPU backend; we keep both around
     // and pass the right one per device.
     std::vector<std::int32_t> cu_seqlens_host;   // (B+1)
     bt::Tensor                cu_seqlens_dev;    // (B+1, 1) INT32 — on default device
@@ -955,7 +957,8 @@ void print_help() {
         "  --lr F             (default 5e-4)\n"
         "  --warmup N         (default 1000)\n"
         "  --seed N           (default 42)\n"
-        "  --device cpu|cuda  (default cpu)\n"
+        "  --device cpu|gpu   (default cpu; gpu = the best GPU backend —\n"
+        "                     HIP / CUDA / Metal; cuda/hip are accepted aliases)\n"
         "  --synthetic        ignore --train/--val, build a tiny in-memory set\n"
         "                     and run 2 epochs end-to-end (smoke test).\n"
         "  --byte-noise F     byte-noise probability (default 0.10)\n"
@@ -1138,11 +1141,12 @@ EvalStats evaluate(const g::PosWeights& w, const AuxHead& aux,
 }
 
 int run_training(Args& a) {
-    const bool cuda_avail = bt::is_available(bt::Device::CUDA);
-    std::cout << "cuda available: " << (cuda_avail ? "yes" : "no") << "\n";
-    if (a.device == "cuda") {
-        if (cuda_avail) bt::set_default_device(bt::Device::CUDA);
-        else std::cerr << "warn: cuda requested but unavailable, falling back to cpu\n";
+    const bt::Device gpu = brosoundml_test::preferred_gpu();
+    std::cout << "gpu available: "
+              << (gpu.is_gpu() ? brosoundml_test::device_name(gpu) : "no") << "\n";
+    if (a.device == "gpu" || a.device == "cuda" || a.device == "hip") {
+        if (gpu.is_gpu()) bt::set_default_device(gpu);
+        else std::cerr << "warn: " << a.device << " requested but no GPU is available, falling back to cpu\n";
     } else {
         bt::set_default_device(bt::Device::CPU);
     }

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace ev = bronze::embed;
 
 static int g_failures = 0;
@@ -316,8 +318,7 @@ int main() {
     {
         brotensor::init();
         const std::string expect =
-            brotensor::is_available(brotensor::Device::CUDA)  ? "CUDA" :
-            brotensor::is_available(brotensor::Device::Metal) ? "Metal" : "CPU";
+            brosoundml_test::device_name(brosoundml_test::preferred_gpu());
         const std::string code =
             "const expect = '" + expect + "';\n" + R"JS(
             const vad = new bro.soundml.BcResnet2d({ nMels: 40 });

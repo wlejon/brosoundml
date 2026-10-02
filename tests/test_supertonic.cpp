@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs = std::filesystem;
 
 static std::vector<float> read_bin(const std::string& path) {
@@ -72,12 +74,10 @@ int main() {
         return 1;
     }
 
-    // Run on CUDA when the backend is present (the flow loop is heavy on CPU);
-    // parity tolerances below hold on either backend (device-neutral bit-faithful).
-    const brotensor::Device dev = brotensor::is_available(brotensor::Device::CUDA)
-                                      ? brotensor::Device::CUDA
-                                      : brotensor::Device::CPU;
-    std::printf("device: %s\n", dev == brotensor::Device::CUDA ? "CUDA" : "CPU");
+    // Run on the GPU when a backend is present (the flow loop is heavy on CPU);
+    // parity tolerances below hold on any backend (device-neutral bit-faithful).
+    const brotensor::Device dev = brosoundml_test::preferred_gpu();
+    std::printf("device: %s\n", brosoundml_test::device_name(dev));
 
     brosoundml::Supertonic model;
     try {

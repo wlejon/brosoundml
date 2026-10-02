@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs = std::filesystem;
 
 static int failures = 0;
@@ -75,11 +77,11 @@ static int run() {
 
     // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
     //
-    // CPU and (if available) CUDA. Stage 1 only validates the loader contract;
+    // CPU and (if available) the GPU. Stage 1 only validates the loader contract;
     // synthesize() must still throw the staged stub.
     //
     // Carries the CPU sampled-code stream out of the per-device lambda so the
-    // CUDA run can assert bit-identical sampling parity (device-neutrality for
+    // GPU run can assert bit-identical sampling parity (device-neutrality for
     // the stochastic path, not just greedy).
     std::vector<int32_t> sampled_ref;
     int sampled_ref_F = -1;
@@ -624,7 +626,7 @@ static int run() {
                 // Sampling path: temperature > 0 routes codebook 0 AND the Code
                 // Predictor through the seeded device-counter sampler. Verify it
                 // is (a) reproducible for a fixed seed, (b) seed-sensitive, and
-                // (c) bit-identical CPU vs CUDA (device-neutral stochastic path).
+                // (c) bit-identical CPU vs GPU (device-neutral stochastic path).
                 {
                     brosoundml::QwenTtsGenParams sp = gp;
                     sp.temperature = 0.8f;
@@ -663,14 +665,14 @@ static int run() {
                                 "seed-sensitive=%d\n",
                                 f1, (int)(s1 == s2), (int)(sd != s1));
 
-                    // CPU vs CUDA must agree exactly on the sampled stream.
+                    // CPU vs GPU must agree exactly on the sampled stream.
                     if (dev == brotensor::Device::CPU) {
                         sampled_ref = s1;
                         sampled_ref_F = f1;
                     } else if (sampled_ref_F >= 0) {
                         CHECK(f1 == sampled_ref_F && s1 == sampled_ref,
-                              tag("sampling stream is bit-identical CPU vs CUDA"));
-                        std::printf("    [synth sampling] CPU/CUDA parity: %s\n",
+                              tag("sampling stream is bit-identical CPU vs GPU"));
+                        std::printf("    [synth sampling] CPU/GPU parity: %s\n",
                                     (f1 == sampled_ref_F && s1 == sampled_ref)
                                         ? "exact" : "MISMATCH");
                     }
@@ -717,11 +719,9 @@ static int run() {
     };
 
     run_real_smoke(brotensor::Device::CPU, "CPU");
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
-        run_real_smoke(brotensor::Device::CUDA, "CUDA");
-    }
-    if (brotensor::is_available(brotensor::Device::Metal)) {
-        run_real_smoke(brotensor::Device::Metal, "Metal");
+    const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        run_real_smoke(gpu, brosoundml_test::device_name(gpu));
     }
 
     // ─── Base speaker encoder (ECAPA-TDNN x-vector) vs ground-truth fixture ──

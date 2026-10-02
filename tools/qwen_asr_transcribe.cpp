@@ -6,7 +6,7 @@
 //
 // Usage:
 //   brosoundml_qwen_asr_transcribe <wav> <model_dir>
-//                                  [--device cpu|cuda] [--context TEXT]
+//                                  [--device auto|cpu|gpu|cuda|hip|metal] [--context TEXT]
 //                                  [--max-new-tokens N] [--stream] [--ids]
 //
 // Notes:
@@ -35,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -48,7 +50,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_qwen_asr_transcribe <wav> <model_dir>\n"
-        "                                 [--device cpu|cuda] [--context TEXT]\n"
+        "                                 [--device auto|cpu|gpu|cuda|hip|metal] [--context TEXT]\n"
         "                                 [--max-new-tokens N] [--stream] [--ids]\n");
 }
 
@@ -85,15 +87,7 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if (device_name == "hip" || device_name == "rocm") {
-            dev = brotensor::Device::HIP;
-        } else if (device_name == "cuda") {
-            dev = brotensor::Device::CUDA;
-        } else if (device_name == "auto") {
-            dev = brotensor::default_device();
-        } else if (device_name != "cpu") {
-            die("unknown --device '" + device_name + "' (want auto, hip, cuda, or cpu)");
-        }
+        if (std::string err; !brosoundml_tool::resolve_device(device_name, dev, err)) die(err);
 
         const brosoundml::AudioBuffer audio = brosoundml::read_wav(wav_path);
         std::fprintf(stderr, "audio: %.2fs @ %d Hz\n",

@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs  = std::filesystem;
 namespace stf = brotensor::safetensors;
 
@@ -402,20 +404,11 @@ static int run_for_device(brotensor::Device dev, const char* dev_name) {
 
 static int run() {
     int f = run_for_device(brotensor::Device::CPU, "CPU");
-    if (brotensor::is_available(brotensor::Device::HIP)) {
-        f += run_for_device(brotensor::Device::HIP, "HIP");
+    const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        f += run_for_device(gpu, brosoundml_test::device_name(gpu));
     } else {
-        std::printf("test_whisper_e2e: HIP not available — HIP path skipped\n");
-    }
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
-        f += run_for_device(brotensor::Device::CUDA, "CUDA");
-    } else {
-        std::printf("test_whisper_e2e: CUDA not available — CUDA path skipped\n");
-    }
-    if (brotensor::is_available(brotensor::Device::Metal)) {
-        f += run_for_device(brotensor::Device::Metal, "Metal");
-    } else {
-        std::printf("test_whisper_e2e: Metal not available — Metal path skipped\n");
+        std::printf("test_whisper_e2e: no GPU backend available — GPU path skipped\n");
     }
     return f;
 }

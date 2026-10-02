@@ -123,8 +123,8 @@ replaces it.
 
 ```js
 const clap = bro.ear.loadClap();                   // default dir, GPU by default
-// bro.ear.loadClap(dir?, { device: 'cpu'|'cuda'|'metal', onReady, onError })
-clap.loaded; clap.device; clap.sampleRate;         // true, 'CUDA', 48000
+// bro.ear.loadClap(dir?, { device: 'cpu'|'cuda'|'hip'|'metal', onReady, onError })
+clap.loaded; clap.device; clap.sampleRate;         // true, 'CUDA' (or 'HIP'), 48000
 clap.embeddingSize; clap.windowSeconds;            // 512, 10
 clap.logitScale;                                   // ≈ 38.66
 

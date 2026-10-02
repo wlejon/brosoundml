@@ -2,7 +2,7 @@
 // OmniVoice tests — every stage of the port against the upstream fixtures
 // (tests/fixtures/omnivoice_*.bin, made by tests/ref/gen_omnivoice_fixture.py
 // from the genuine k2-fsa implementation in FP32 on CUDA), on CPU first and
-// then on CUDA when brotensor reports it.
+// then on the GPU (HIP / CUDA / Metal, test_device.h) when brotensor reports one.
 //
 //   Part A  tokenizer: plain and tag-aware ids of 65 strings, exact
 //   Part B  prompt assembly (ids + audio-mask layout, 18 cases) and the
@@ -16,7 +16,7 @@
 //   Part E  voice clone: prompt codes from the preprocessed reference (100 %),
 //           the preprocessing itself, and the cloned generation
 //   Part F  the post-processing helpers in isolation (exact)
-//   CPU vs CUDA parity, an end-to-end synthesis checked by Whisper, the
+//   CPU vs GPU parity, an end-to-end synthesis checked by Whisper, the
 //   contract checks (throws before load / on empty text / on a bad instruct /
 //   on a mismatched init; cancel returns empty), and FP32 / BF16 timings.
 //
@@ -49,6 +49,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "test_device.h"
 
 namespace fs = std::filesystem;
 using brosoundml::OmniVoice;
@@ -1217,24 +1219,28 @@ static int run() {
     const bool hf = read_F(fixtures / "omnivoice_post.bin", f);
     std::printf("fixtures: A %s, B %s, C %s, D %s, E %s, F %s\n", ha ? "ok" : "absent", hb ? "ok" : "absent",
                 hc ? "ok" : "absent", hd ? "ok" : "absent", he ? "ok" : "absent", hf ? "ok" : "absent");
+    // The end-to-end stages drop their WAVs beside the fixtures; the directory
+    // is untracked, so it is absent until a fixture generator has run.
+    fs::create_directories(fixtures);
     PipelineFixtures fx;
     fx.a = ha ? &a : nullptr; fx.b = hb ? &b : nullptr; fx.c = hc ? &c : nullptr;
     fx.d = hd ? &d : nullptr; fx.e = he ? &e : nullptr; fx.f = hf ? &f : nullptr;
 
     // The CPU pass covers only the model-free stages (tokenizer, prompt
     // assembly, duration rule, post-processing helpers, OVCP, rules). Every
-    // stage that runs the LM trunk or the codec is CUDA-only: the upstream
+    // stage that runs the LM trunk or the codec is GPU-only: the upstream
     // fixtures (generated on CUDA) are the correctness oracle.
-    const bool has_cuda = brotensor::is_available(brotensor::Device::CUDA);
+    const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+    const char* gpu_name = brosoundml_test::device_name(gpu);
     std::printf("=== CPU (model-free stages) ===\n");
     run_pipeline_parts(brotensor::Device::CPU, "CPU", repo, fx, /*model=*/false);
-    if (has_cuda) {
-        std::printf("=== CUDA ===\n");
-        run_lm_parts(brotensor::Device::CUDA, "CUDA", weights, hc ? &c : nullptr, hd ? &d : nullptr);
-        run_pipeline_parts(brotensor::Device::CUDA, "CUDA", repo, fx, /*model=*/true);
-        run_timings(brotensor::Device::CUDA, "CUDA", weights);
+    if (gpu.is_gpu()) {
+        std::printf("=== %s ===\n", gpu_name);
+        run_lm_parts(gpu, gpu_name, weights, hc ? &c : nullptr, hd ? &d : nullptr);
+        run_pipeline_parts(gpu, gpu_name, repo, fx, /*model=*/true);
+        run_timings(gpu, gpu_name, weights);
     } else {
-        std::printf("  CUDA not available — Parts C/D/E, the contract checks that run the model, "
+        std::printf("  no GPU backend available — Parts C/D/E, the contract checks that run the model, "
                     "the end-to-end synthesis and the timings are skipped\n");
     }
 

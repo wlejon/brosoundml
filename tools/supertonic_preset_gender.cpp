@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs = std::filesystem;
 using brosoundml::AudioBuffer;
 using brosoundml::VoiceStyle;
@@ -51,15 +53,15 @@ static void save_basis(const std::string& path, const std::vector<float>& mid, c
 
 int main(int argc, char** argv){
     brotensor::init();
-    const bool gpu = brotensor::is_available(brotensor::Device::CUDA);
-    brotensor::set_default_device(gpu?brotensor::Device::CUDA:brotensor::Device::CPU);
+    const brotensor::Device dev = brosoundml_tool::best_gpu();
+    brotensor::set_default_device(dev);
     if(argc<5){std::printf("usage: %s <model> <enc> <out_wav> <out_basis.json>\n",argv[0]);return 2;}
     const std::string model_dir=argv[1], enc_dir=argv[2], outw=argv[3], outb=argv[4];
     fs::create_directories(outw);
     const std::string vsdir=(fs::path(model_dir)/"voice_styles").string();
 
     brosoundml::Supertonic model; brosoundml::SpeakerEncoder enc;
-    model.load(model_dir, gpu?brotensor::Device::CUDA:brotensor::Device::CPU);
+    model.load(model_dir, dev);
     enc.load(enc_dir);
     const std::size_t E=std::size_t(enc.enc_dim());
     std::vector<float> mean=load_f32((fs::path(enc_dir)/"xvector_mean.f32").string(),E);

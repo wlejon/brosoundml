@@ -239,8 +239,16 @@ CLI drivers, built when brosoundml is the top-level project
   validator, trainer, evaluator, front-end diagnostics).
 - `build_pos_dataset.py` / `build_lexicon.py` — G2P data prep (offline).
 
+Device choice goes through `tools/tool_device.h` (`resolve_device`,
+`best_gpu`, `device_name`): `--device auto|cpu|gpu|cuda|hip|rocm|metal`, where
+`auto` is `brotensor::default_device()` (the best GPU — HIP > CUDA > Metal —
+else CPU) and `cuda` means CUDA when present, else the best GPU. Never
+hard-code `Device::CUDA` in a tool.
+
 ## Tests
 
 `ctest --test-dir build -C Release`. Tests are built only when brosoundml is the
 top-level project (`BROSOUNDML_TESTS`, ON by default standalone) — when consumed
-as a subdirectory by bro they are skipped.
+as a subdirectory by bro they are skipped. A test's GPU block runs on
+`brosoundml_test::preferred_gpu()` (`tests/test_device.h`: HIP > CUDA > Metal,
+CPU = skip), so the same block covers a ROCm, CUDA or Metal build.

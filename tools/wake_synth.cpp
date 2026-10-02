@@ -36,6 +36,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs = std::filesystem;
 namespace g  = brosoundml::g2p;
 
@@ -144,7 +146,8 @@ int main(int argc, char** argv) {
                 "  --confusables CSV   Comma-separated confusable negatives\n"
                 "  --lexicon PATH      G2P lexicon (.bin)\n"
                 "  --pos-tagger PATH   POS tagger (.bin)\n"
-                "  --device cpu|cuda   Kokoro inference device (default cpu)\n"
+                "  --device D          Kokoro inference device: auto|cpu|gpu|cuda|hip|metal\n"
+                "                      (default cpu; auto/gpu = the best GPU)\n"
                 "  --seed N            Deterministic RNG seed (default 42)\n"
                 "  --small             Tiny dataset variant for tests / iteration\n");
             return 0;
@@ -160,11 +163,7 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if      (device_str == "cpu")  dev = brotensor::Device::CPU;
-        else if (device_str == "cuda") dev = brotensor::Device::CUDA;
-        else die("--device must be one of cpu|cuda");
-        if (dev != brotensor::Device::CPU && !brotensor::is_available(dev))
-            die("--device " + device_str + " not available in this build");
+        if (std::string err; !brosoundml_tool::resolve_device(device_str, dev, err)) die(err);
 
         // ─── Load Kokoro ───────────────────────────────────────────────
         if (!fs::exists(model_dir + "/config.json"))
@@ -172,7 +171,7 @@ int main(int argc, char** argv) {
         brosoundml::Kokoro k;
         k.load(model_dir, dev);
         std::fprintf(stderr, "loaded kokoro from %s on %s\n",
-                     model_dir.c_str(), device_str.c_str());
+                     model_dir.c_str(), brosoundml_tool::device_name(dev));
 
         // ─── Load voices (stable sort by filename) ─────────────────────
         if (!fs::exists(voices_dir))

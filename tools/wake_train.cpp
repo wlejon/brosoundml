@@ -9,7 +9,7 @@
 // Adam + fused BCE-with-logits, evaluates on a stratified held-out split, and
 // writes a fused-BN inference-ready 'BWK2' checkpoint at the end of training.
 //
-// Compute runs on the model's device — CUDA in production (the 2D backward is
+// Compute runs on the model's device — the GPU in production (the 2D backward is
 // device-resident through brotensor's conv2d/batch_norm/relu ops). The PCEN
 // front-end is computed once on the CPU during the cache-build prep step.
 
@@ -38,6 +38,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -53,7 +55,7 @@ struct Args {
     std::string cache_dir;                          // <dataset>/mel-cache by default
     std::string out_checkpoint = "weights/wake/computer.bw";
     std::string resume;                             // empty = none
-    std::string device         = "auto";            // 'auto'|'cpu'|'cuda'|'metal'
+    std::string device         = "auto";            // see tool_device.h
     float       val_frac       = 0.1f;
     int         epochs         = 50;
     int         batch_size     = 32;
@@ -81,7 +83,7 @@ void print_help() {
         "  --seed N             (default 42)\n"
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bw\n"
-        "  --device cpu|cuda    target device (default auto — CUDA if available)\n"
+        "  --device D           auto|cpu|gpu|cuda|hip|metal (default auto — best GPU)\n"
         "  --small              3 epochs / batch 4 — smoke-test preset\n";
 }
 
@@ -343,16 +345,10 @@ int main(int argc, char** argv) try {
     // ── Device selection ──
     bt::init();
     bt::Device device = bt::Device::CPU;
-    if (a.device == "auto") {
-        device = bt::is_available(bt::Device::CUDA) ? bt::Device::CUDA
-                                                    : bt::Device::CPU;
-    } else if (a.device == "cuda")  device = bt::Device::CUDA;
-    else if  (a.device == "metal") device = bt::Device::Metal;
-    else if  (a.device == "cpu")   device = bt::Device::CPU;
-    else fail("wake_train", "unknown --device '" + a.device + "'");
+    if (std::string err; !brosoundml_tool::resolve_device(a.device, device, err))
+        fail("wake_train", err);
 
-    const char* dev_name = (device == bt::Device::CUDA)  ? "CUDA"  :
-                           (device == bt::Device::Metal) ? "Metal" : "CPU";
+    const char* dev_name = brosoundml_tool::device_name(device);
 
     // ── Mel front-end + cache key ──
     // Mel features are cached to disk as device-agnostic FP32 bytes; we keep

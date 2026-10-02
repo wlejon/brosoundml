@@ -22,6 +22,8 @@
 #include <filesystem>
 #include <string>
 
+#include "tool_device.h"
+
 namespace fs = std::filesystem;
 using clk = std::chrono::steady_clock;
 
@@ -52,7 +54,7 @@ int main(int argc, char** argv) {
         voice.find(".json") == std::string::npos)
         voice_path = (fs::path(root) / "voice_styles" / (voice + ".json")).string();
 
-    std::printf("device: %s\n", dev.is_gpu() ? (dev == brotensor::Device::HIP ? "HIP" : "CUDA") : "CPU");
+    std::printf("device: %s\n", brosoundml_tool::device_name(dev));
 
     brosoundml::Supertonic model;
     auto t0 = clk::now();

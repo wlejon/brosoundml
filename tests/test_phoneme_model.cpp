@@ -6,7 +6,7 @@
 //   + save→load round-trip (config + class map + forward output preserved).
 //
 // Device choice mirrors test_bc_resnet2d_train.cpp: bt::init() then run on CPU,
-// and additionally on CUDA when available. The gradient check is NOT CUDA-only —
+// and additionally on the GPU when available. The gradient check is NOT GPU-only —
 // bc_resnet2d's train test runs it on CPU first — so this test's primary path is
 // CPU (build/Debug).
 
@@ -23,6 +23,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "test_device.h"
 
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -327,7 +329,8 @@ static void run_device(bt::Device dev, const char* dn) {
 int main() {
     bt::init();
     run_device(bt::Device::CPU, "CPU");
-    if (bt::is_available(bt::Device::CUDA)) run_device(bt::Device::CUDA, "CUDA");
+    const bt::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) run_device(gpu, brosoundml_test::device_name(gpu));
     if (g_fail == 0) std::fprintf(stderr, "test_phoneme_model: all checks passed\n");
     else             std::fprintf(stderr, "test_phoneme_model: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -35,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 [[noreturn]] void die(const std::string& msg) {
@@ -100,16 +102,11 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if      (device_str == "cpu")   dev = brotensor::Device::CPU;
-        else if (device_str == "cuda")  dev = brotensor::Device::CUDA;
-        else if (device_str == "metal") dev = brotensor::Device::Metal;
-        else die("--device must be one of cpu|cuda|metal");
-        if (dev != brotensor::Device::CPU && !brotensor::is_available(dev))
-            die("--device " + device_str + " not available in this build");
+        if (std::string err; !brosoundml_tool::resolve_device(device_str, dev, err)) die(err);
 
         brosoundml::Kokoro k;
         k.load(model_dir, dev);
-        std::fprintf(stderr, "device: %s\n", device_str.c_str());
+        std::fprintf(stderr, "device: %s\n", brosoundml_tool::device_name(dev));
         brosoundml::Voice voice = k.load_voice(voice_path);
         std::fprintf(stderr, "loaded voice %s (%dx%d)\n",
                      voice.name.c_str(), voice.packs.rows, voice.packs.cols);

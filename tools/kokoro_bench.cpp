@@ -8,7 +8,7 @@
 // the library on every synthesize call.
 //
 // Usage:
-//   brosoundml_kokoro_bench [--model DIR] [--voice PATH] [--device cpu|cuda]
+//   brosoundml_kokoro_bench [--model DIR] [--voice PATH] [--device auto|cpu|gpu|cuda|hip|metal]
 //                           [--text "..."] [--iters N] [--warmup N]
 //                           [--speed F] [--out file.wav]
 //
@@ -34,6 +34,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#include "tool_device.h"
 
 namespace fs = std::filesystem;
 namespace g  = brosoundml::g2p;
@@ -89,7 +91,7 @@ int main(int argc, char** argv) {
         else if (a == "--out")        out_path     = next("--out");
         else if (a == "-h" || a == "--help") {
             std::printf("Usage: brosoundml_kokoro_bench [--model DIR] [--voice PATH] "
-                        "[--device cpu|cuda] [--text STR] [--iters N] [--warmup N] "
+                        "[--device auto|cpu|gpu|cuda|hip|metal] [--text STR] [--iters N] [--warmup N] "
                         "[--speed F] [--out file.wav]\n");
             return 0;
         }
@@ -105,23 +107,7 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if (device_str.empty()) {
-            if (brotensor::is_available(brotensor::Device::HIP)) {
-                dev = brotensor::Device::HIP;
-                device_str = "hip";
-            } else if (brotensor::is_available(brotensor::Device::CUDA)) {
-                dev = brotensor::Device::CUDA;
-                device_str = "cuda";
-            } else {
-                dev = brotensor::Device::CPU;
-                device_str = "cpu";
-            }
-        } else if (device_str == "cpu")  dev = brotensor::Device::CPU;
-        else if (device_str == "cuda") dev = brotensor::Device::CUDA;
-        else if (device_str == "hip")  dev = brotensor::Device::HIP;
-        else die("--device must be cpu|cuda|hip");
-        if (dev != brotensor::Device::CPU && !brotensor::is_available(dev))
-            die("--device " + device_str + " not available in this build");
+        if (std::string err; !brosoundml_tool::resolve_device(device_str, dev, err)) die(err);
 
         // ─── Load model + voice ────────────────────────────────────────
         const auto t_load = clk::now();
@@ -130,7 +116,7 @@ int main(int argc, char** argv) {
         const double load_ms = ms_since(t_load);
         brosoundml::Voice voice = k.load_voice(voice_path);
         std::fprintf(stderr, "model: %s  device: %s  load: %.0f ms\n",
-                     model_dir.c_str(), device_str.c_str(), load_ms);
+                     model_dir.c_str(), brosoundml_tool::device_name(dev), load_ms);
         std::fprintf(stderr, "voice: %s (%dx%d)\n",
                      voice.name.c_str(), voice.packs.rows, voice.packs.cols);
 

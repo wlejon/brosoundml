@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 static int failures = 0;
 
 #define CHECK(cond, msg)                                              \
@@ -191,9 +193,7 @@ int main() {
     // net only that chunk's new frames.
     {
         brotensor::init();
-        const brotensor::Device dev = brotensor::is_available(brotensor::Device::CUDA)
-                                          ? brotensor::Device::CUDA
-                                          : brotensor::Device::CPU;
+        const brotensor::Device dev = brosoundml_test::preferred_gpu();
         brosoundml::BcResnet2dConfig vad_cfg;
         vad_cfg.n_mels = 40;
         auto vad_model = std::make_shared<brosoundml::BcResnet2d>(

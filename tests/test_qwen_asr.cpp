@@ -5,7 +5,7 @@
 // the genuine upstream model (tests/ref/gen_qwen_asr_fixture.py); they skip
 // silently when either is absent. Every boundary the fixture captures is
 // compared — log-mel features, encoder output, prefill logits, and the greedy
-// token stream — on CPU and (when available) CUDA.
+// token stream — on CPU and (when available) the GPU.
 
 #include "brosoundml/qwen_asr.h"
 
@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace fs = std::filesystem;
 namespace bt = brotensor;
@@ -434,9 +436,10 @@ static int run() {
 
     std::printf("  [cpu]\n");
     run_device(bt::Device::CPU, "cpu");
-    if (bt::is_available(bt::Device::CUDA)) {
-        std::printf("  [cuda]\n");
-        run_device(bt::Device::CUDA, "cuda");
+    const bt::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        std::printf("  [%s]\n", brosoundml_test::device_name(gpu));
+        run_device(gpu, brosoundml_test::device_name(gpu));
     }
 
     if (failures) {

@@ -41,6 +41,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 [[noreturn]] void die(const std::string& msg) {
@@ -94,8 +96,7 @@ int main(int argc, char** argv) {
 
     try {
         brotensor::init();
-        const brotensor::Device dev =
-            brotensor::is_available(brotensor::Device::CUDA) ? brotensor::Device::CUDA : brotensor::Device::CPU;
+        const brotensor::Device dev = brosoundml_tool::best_gpu();
         const std::vector<laya_audio::AlignedUtterance> utts = laya_audio::read_alignments(align);
         brosoundml::QwenAsr asr;
         asr.load_encoder(model_dir, dev, half);

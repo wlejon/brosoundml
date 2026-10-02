@@ -2,8 +2,9 @@
 // low-rate (nLatent x frames) latent grid, edit it, decode it back (mono, or
 // multi-channel with RAVE's stochastic latent pad for stereo decorrelation).
 //
-// Loading is GPU by default (CUDA > Metal > CPU by availability); opts.device
-// picks explicitly and must be a string. encode / decode run synchronously.
+// Loading is GPU by default (brotensor's default device: the registered HIP,
+// CUDA or Metal GPU, else the CPU); opts.device picks explicitly and must be
+// a string. encode / decode run synchronously.
 #include "soundml_loader.h"
 
 #include <brosoundml/rave.h>

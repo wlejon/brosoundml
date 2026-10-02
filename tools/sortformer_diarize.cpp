@@ -6,7 +6,7 @@
 //
 // Usage:
 //   brosoundml_sortformer_diarize <wav> <model_dir>
-//                                 [--device auto|cpu|cuda]
+//                                 [--device auto|cpu|gpu|cuda|hip|metal]
 //                                 [--threshold T] [--uri NAME]
 //                                 [--probs-out FILE]
 //
@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 [[noreturn]] void die(const std::string& msg) {
@@ -43,7 +45,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_sortformer_diarize <wav> <model_dir>\n"
-        "                                [--device auto|cpu|cuda]\n"
+        "                                [--device auto|cpu|gpu|cuda|hip|metal]\n"
         "                                [--threshold T] [--uri NAME]\n"
         "                                [--probs-out FILE]\n");
 }
@@ -94,22 +96,8 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
 
-        brotensor::Device device = brotensor::default_device();
-        if (device_arg == "hip" || device_arg == "rocm") {
-            if (!brotensor::is_available(brotensor::Device::HIP))
-                die("--device hip requested but no HIP backend is available");
-            device = brotensor::Device::HIP;
-        } else if (device_arg == "cuda") {
-            if (!brotensor::is_available(brotensor::Device::CUDA))
-                die("--device cuda requested but no CUDA backend is available");
-            device = brotensor::Device::CUDA;
-        } else if (device_arg == "cpu") {
-            device = brotensor::Device::CPU;
-        } else if (device_arg == "auto") {
-            device = brotensor::default_device();
-        } else {
-            die("--device must be auto, hip, cuda, or cpu");
-        }
+        brotensor::Device device = brotensor::Device::CPU;
+        if (std::string err; !brosoundml_tool::resolve_device(device_arg, device, err)) die(err);
 
         brosoundml::Sortformer model;
         model.load(model_dir, device);
@@ -120,7 +108,7 @@ int main(int argc, char** argv) {
                 " Hz; Sortformer requires 16 kHz mono PCM.");
         std::fprintf(stderr, "brosoundml_sortformer_diarize: %.2fs audio on %s\n",
                      audio.duration_seconds(),
-                     device.is_gpu() ? "GPU" : "CPU");
+                     brosoundml_tool::device_name(device));
 
         brosoundml::Sortformer::Diarization d;
         const auto t0 = std::chrono::steady_clock::now();

@@ -7,7 +7,7 @@
 // matrix of probabilities in [0,1], a re-run is bit-identical, bad inputs throw,
 // and the streaming session reduces to the offline forward for a sub-chunk clip.
 // No real weights needed — this is what CI relies on. Runs on CPU and (when
-// present) CUDA. A CUDA-only real-weights smoke runs if the converted checkpoint
+// present) the GPU. A GPU-only real-weights smoke runs if the converted checkpoint
 // is on disk.
 
 #include "brosoundml/audio.h"
@@ -26,6 +26,8 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace fs  = std::filesystem;
 namespace stf = brotensor::safetensors;
@@ -302,7 +304,7 @@ static int run_for_device(brotensor::Device dev, const char* dn) {
     return failures;
 }
 
-// CUDA-only real-weights smoke: load the converted checkpoint (if present) and
+// GPU-only real-weights smoke: load the converted checkpoint (if present) and
 // confirm a real diarization runs and is well-formed. CPU is skipped — the real
 // 17-layer encoder is slow on CPU and the synthetic test already covers the
 // contract; numerical parity is pinned by scripts/sortformer_parity*.py.
@@ -339,11 +341,12 @@ int main() {
     brotensor::init();
     try {
         int f = run_for_device(brotensor::Device::CPU, "CPU");
-        if (brotensor::is_available(brotensor::Device::CUDA)) {
-            f += run_for_device(brotensor::Device::CUDA, "CUDA");
-            f += run_real_smoke(brotensor::Device::CUDA, "CUDA");
+        const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+        if (gpu.is_gpu()) {
+            f += run_for_device(gpu, brosoundml_test::device_name(gpu));
+            f += run_real_smoke(gpu, brosoundml_test::device_name(gpu));
         } else {
-            std::printf("test_sortformer: CUDA not available — CUDA path skipped\n");
+            std::printf("test_sortformer: no GPU backend available — GPU path skipped\n");
         }
         if (f) {
             std::fprintf(stderr, "test_sortformer: %d failure(s)\n", f);

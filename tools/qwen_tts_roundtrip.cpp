@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 using brosoundml::AudioBuffer;
 using brosoundml::QwenTts;
 using clk = std::chrono::steady_clock;
@@ -46,13 +48,11 @@ int main(int argc, char** argv) {
         ? argv[3] : std::string("weights/qwen-tts/0.6B-customvoice");
 
     brotensor::init();
-    const bool cuda = brotensor::is_available(brotensor::Device::CUDA);
-    const brotensor::Device dev =
-        cuda ? brotensor::Device::CUDA : brotensor::Device::CPU;
+    const brotensor::Device dev = brosoundml_tool::best_gpu();
 
     QwenTts q;
     q.load(root, dev);
-    std::printf("loaded %s on %s\n", root.c_str(), cuda ? "CUDA" : "CPU");
+    std::printf("loaded %s on %s\n", root.c_str(), brosoundml_tool::device_name(dev));
 
     AudioBuffer ref = brosoundml::read_wav(in_path);
     std::printf("input: %s  %.2fs  @ %d Hz  (%zu samples)\n",

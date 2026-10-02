@@ -2,7 +2,7 @@
 //
 // Usage:
 //   brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav>
-//                                    [--device cpu|cuda] [--levels N]
+//                                    [--device auto|cpu|gpu|cuda|hip|metal] [--levels N]
 //
 // Reads a 16-bit PCM WAV (any rate; resampled to 24 kHz mono inside encode()),
 // encodes it to 25 Hz RVQ codes, prints the frame count and a codebook-0
@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 [[noreturn]] void die(const std::string& msg) {
@@ -32,12 +34,12 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav>\n"
-        "                                   [--device cpu|cuda] [--levels N]\n"
+        "                                   [--device auto|cpu|gpu|cuda|hip|metal] [--levels N]\n"
         "\n"
         "  <audio_tokenizer_dir>  config.json + model.safetensors (OmniVoice audio_tokenizer/)\n"
         "  <in.wav>               16-bit PCM WAV, any rate (resampled to 24 kHz mono)\n"
         "  <out.wav>              24 kHz mono reconstruction\n"
-        "  --device D             cpu (default) or cuda\n"
+        "  --device D             cpu (default), or auto/gpu/cuda/hip/metal for a GPU\n"
         "  --levels N             decode with the first N of 8 RVQ levels (default 8)\n");
 }
 
@@ -64,13 +66,10 @@ int main(int argc, char** argv) {
         die("expected <audio_tokenizer_dir> <in.wav> <out.wav>");
     }
 
-    brotensor::Device dev = brotensor::Device::CPU;
-    if (device == "cuda")     dev = brotensor::Device::CUDA;
-    else if (device != "cpu") die("--device must be cpu or cuda");
-
     try {
         brotensor::init();
-        if (!brotensor::is_available(dev)) die("device '" + device + "' is not available in this build");
+        brotensor::Device dev = brotensor::Device::CPU;
+        if (std::string err; !brosoundml_tool::resolve_device(device, dev, err)) die(err);
 
         using clock = std::chrono::steady_clock;
         brosoundml::HiggsCodec codec;
@@ -78,7 +77,7 @@ int main(int argc, char** argv) {
         codec.load(positional[0], dev);
         const auto& cfg = codec.config();
         std::fprintf(stderr, "loaded %s on %s in %.2fs (hop %d, %d Hz frames, %d x %d codes)\n",
-                     positional[0].c_str(), device.c_str(),
+                     positional[0].c_str(), brosoundml_tool::device_name(dev),
                      std::chrono::duration<double>(clock::now() - t0).count(),
                      cfg.hop_length, cfg.frame_rate, cfg.num_quantizers, cfg.codebook_size);
         if (levels <= 0 || levels > cfg.num_quantizers) levels = cfg.num_quantizers;

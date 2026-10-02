@@ -68,6 +68,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -941,7 +943,8 @@ void print_help() {
         "         [--score-norm 1.0] [--score-norm-ref 0.5]\n"
         "         [--coverage-frac 0.75] [--min-phonemes 1]\n"
         "         [--enroll-conf-gate 0] [--enroll-alts 0] [--enroll-takes 1]\n"
-        "  kmeans/label/spot-eval take --device cuda|cpu (default: cuda if available)\n");
+        "  kmeans/label/spot-eval take --device auto|cpu|gpu|cuda|hip|metal\n"
+        "  (default auto: the best GPU, else CPU)\n");
 }
 
 }  // namespace
@@ -1000,17 +1003,10 @@ int main(int argc, char** argv) try {
 
     bt::init();
     bt::Device dev = bt::Device::CPU;
-    if (device.empty()) {
-        if (bt::is_available(bt::Device::CUDA)) dev = bt::Device::CUDA;
-    } else if (device == "cuda") {
-        if (!bt::is_available(bt::Device::CUDA)) fail("--device cuda: not available");
-        dev = bt::Device::CUDA;
-    } else if (device != "cpu") {
-        fail("--device must be cuda or cpu");
-    }
+    if (std::string err; !brosoundml_tool::resolve_device(device, dev, err)) fail(err);
     if (cmd == "kmeans" || cmd == "label" || cmd == "spot-eval")
         std::fprintf(stderr, "sound_units: mel device %s\n",
-                     dev == bt::Device::CUDA ? "CUDA" : "CPU");
+                     brosoundml_tool::device_name(dev));
 
     if (cmd == "gen")         cmd_gen(out, count, seed, variants);
     else if (cmd == "kmeans") cmd_kmeans(split_csv(inputs), out, units,

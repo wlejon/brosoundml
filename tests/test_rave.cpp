@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 static int failures = 0;
 
 #define CHECK(cond, msg)                                  \
@@ -69,10 +71,8 @@ int main() {
     }
 
     brotensor::init();
-    const brotensor::Device dev =
-        brotensor::is_available(brotensor::Device::CUDA) ? brotensor::Device::CUDA
-                                                         : brotensor::Device::CPU;
-    std::printf("RAVE parity on device: %s\n", brotensor::device_name(dev));
+    const brotensor::Device dev = brosoundml_test::preferred_gpu();
+    std::printf("RAVE parity on device: %s\n", brosoundml_test::device_name(dev));
 
     brosoundml::Rave rave;
     rave.load(dir, dev);

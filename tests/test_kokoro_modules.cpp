@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs = std::filesystem;
 namespace bt = brotensor;
 namespace stf = brotensor::safetensors;
@@ -258,22 +260,20 @@ int main() {
             static_cast<int>(audio_ref.numel()),
             "generator.audio", 5e-2f, 5e-3f);
 
-    // Note on CUDA coverage: test_kokoro_modules runs an exact-numerics
+    // Note on GPU coverage: test_kokoro_modules runs an exact-numerics
     // parity check against the upstream Python reference (with sub-1e-3
     // tolerances and an integer-exact `pred_dur` check). The kokoro_modules
-    // load_from family loads weights onto CPU; running these comparisons on
-    // CUDA would re-upload weights to the device and could shift integer
+    // load_from family loads weights onto CPU; running these comparisons on a
+    // GPU would re-upload weights to the device and could shift integer
     // durations across rounding boundaries — diluting the diagnostic value of
-    // the exact-match oracle. End-to-end CUDA coverage for Kokoro lives in
+    // the exact-match oracle. End-to-end GPU coverage for Kokoro lives in
     // test_kokoro (synthesize -> audio bounds), which exercises the same
-    // submodules on CUDA without requiring sample-identical outputs.
-    if (bt::is_available(bt::Device::CUDA)) {
-        std::printf("test_kokoro_modules: CUDA available — exact-numerics "
-                    "checks kept CPU-only; CUDA covered by test_kokoro\n");
-    }
-    if (bt::is_available(bt::Device::Metal)) {
-        std::printf("test_kokoro_modules: Metal available — exact-numerics "
-                    "checks kept CPU-only; Metal covered by test_kokoro\n");
+    // submodules on the GPU without requiring sample-identical outputs.
+    const bt::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        std::printf("test_kokoro_modules: %s available — exact-numerics "
+                    "checks kept CPU-only; %s covered by test_kokoro\n",
+                    brosoundml_test::device_name(gpu), brosoundml_test::device_name(gpu));
     }
 
     if (failures == 0) {

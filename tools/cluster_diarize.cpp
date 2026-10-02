@@ -6,7 +6,7 @@
 // path resolves similar-voiced speakers the 4-slot Sortformer head collapses.
 //
 //   brosoundml_cluster_diarize <wav> <sortformer_dir> <speaker_encoder_dir>
-//                              [--device auto|cpu|cuda]
+//                              [--device auto|cpu|gpu|cuda|hip|metal]
 //                              [--cluster-threshold T] [--vad T] [--uri NAME]
 
 #include "brosoundml/audio.h"
@@ -20,6 +20,8 @@
 #include <exception>
 #include <string>
 #include <vector>
+
+#include "tool_device.h"
 
 namespace {
 [[noreturn]] void die(const std::string& m) {
@@ -41,7 +43,7 @@ int main(int argc, char** argv) {
         };
         if      (a == "-h" || a == "--help") {
             std::printf("usage: brosoundml_cluster_diarize <wav> <sortformer_dir> "
-                        "<speaker_encoder_dir> [--device auto|cpu|cuda] "
+                        "<speaker_encoder_dir> [--device auto|cpu|gpu|cuda|hip|metal] "
                         "[--cluster-threshold T] [--vad T] [--uri NAME]\n");
             return 0;
         }
@@ -60,10 +62,7 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device device = brotensor::Device::CPU;
-        if (device_arg == "cuda" || device_arg == "auto")
-            device = brotensor::is_available(brotensor::Device::CUDA)
-                         ? brotensor::Device::CUDA : brotensor::Device::CPU;
-        else if (device_arg != "cpu") die("--device must be auto, cpu, or cuda");
+        if (std::string err; !brosoundml_tool::resolve_device(device_arg, device, err)) die(err);
 
         brosoundml::ClusterDiarizer diar;
         diar.load(pos[1], pos[2], device);

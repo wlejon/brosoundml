@@ -12,7 +12,7 @@
 // Evaluates on a deterministic held-out split each epoch and writes a fused-BN
 // inference-ready 'BPM1' checkpoint (with the class map embedded) at the end.
 //
-// Compute runs on the model's device — CUDA in production (the 2D backward is
+// Compute runs on the model's device — the GPU in production (the 2D backward is
 // device-resident through brotensor's conv2d/batch_norm/relu ops). The PCEN
 // front-end is computed once on the CPU during the in-memory prep step.
 //
@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -74,7 +76,7 @@ struct Args {
     std::string dataset;                             // default <data>/phoneme/english.bpds
     std::string out_checkpoint = "weights/phoneme/english.bpm";
     std::string resume;                              // empty = none
-    std::string device         = "auto";            // 'auto'|'cpu'|'cuda'|'metal'
+    std::string device         = "auto";            // see tool_device.h
     std::string class_weights  = "sqrt-inv";        // 'inv'|'sqrt-inv'|'uniform'
     float       val_frac       = 0.1f;
     int         epochs         = 50;
@@ -128,7 +130,7 @@ void print_help() {
         "  --seed N             (default 42)\n"
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bpm\n"
-        "  --device cpu|cuda    target device (default auto — CUDA if available)\n"
+        "  --device D           auto|cpu|gpu|cuda|hip|metal (default auto — best GPU)\n"
         "  --c-stem N           stem channels (default 32)\n"
         "  --channels a,b,c,d   per-stage output channels (default 32,48,64,96)\n"
         "  --blocks a,b,c,d     blocks per stage incl. transition (default 2,2,2,2)\n"
@@ -241,15 +243,9 @@ int main(int argc, char** argv) try {
     // ── Device selection ──
     bt::init();
     bt::Device device = bt::Device::CPU;
-    if (a.device == "auto") {
-        device = bt::is_available(bt::Device::CUDA) ? bt::Device::CUDA
-                                                    : bt::Device::CPU;
-    } else if (a.device == "cuda")  device = bt::Device::CUDA;
-    else if  (a.device == "metal") device = bt::Device::Metal;
-    else if  (a.device == "cpu")   device = bt::Device::CPU;
-    else fail("phoneme_train", "unknown --device '" + a.device + "'");
-    const char* dev_name = (device == bt::Device::CUDA)  ? "CUDA"  :
-                           (device == bt::Device::Metal) ? "Metal" : "CPU";
+    if (std::string err; !brosoundml_tool::resolve_device(a.device, device, err))
+        fail("phoneme_train", err);
+    const char* dev_name = brosoundml_tool::device_name(device);
 
     // ── Dataset(s) ──
     // --dataset may be a comma-separated list; clips are concatenated. Every

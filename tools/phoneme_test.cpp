@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -70,7 +72,7 @@ void print_help() {
         "  --whole-clip        run each clip end-to-end instead of a window\n"
         "  --per-class         print a per-class recall/precision table\n"
         "  --confusion PATH    dump the full K x K confusion matrix to PATH\n"
-        "  --device cpu|cuda   target device (default auto)\n");
+        "  --device D          auto|cpu|gpu|cuda|hip|metal (default auto: best GPU)\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -110,15 +112,9 @@ int main(int argc, char** argv) try {
 
     bt::init();
     bt::Device device = bt::Device::CPU;
-    if (a.device == "auto") {
-        device = bt::is_available(bt::Device::CUDA) ? bt::Device::CUDA
-                                                    : bt::Device::CPU;
-    } else if (a.device == "cuda")  device = bt::Device::CUDA;
-    else if  (a.device == "metal") device = bt::Device::Metal;
-    else if  (a.device == "cpu")   device = bt::Device::CPU;
-    else fail("phoneme_test", "unknown --device '" + a.device + "'");
-    const char* dev_name = (device == bt::Device::CUDA)  ? "CUDA"  :
-                           (device == bt::Device::Metal) ? "Metal" : "CPU";
+    if (std::string err; !brosoundml_tool::resolve_device(a.device, device, err))
+        fail("phoneme_test", err);
+    const char* dev_name = brosoundml_tool::device_name(device);
 
     // ── Model (class map restored from the checkpoint) ──
     bsm::PhonemeNet model = bsm::PhonemeNet::load(a.weights, device);

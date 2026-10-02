@@ -13,7 +13,8 @@
 //      reference's own 16 kHz input substituted for brosoundml's resample,
 //      which isolates the model from the resampler; the code agreement is
 //      reported both ways, and the resampler itself against torchaudio's.
-//   4. CPU vs CUDA parity (when brotensor reports CUDA): waveform + codes.
+//   4. CPU vs GPU parity (HIP / CUDA / Metal, whichever brotensor reports):
+//      waveform + codes.
 //   5. decoder_only = true: loads without the encoder, decode still matches.
 //   6. Round trip on the test clip: encode -> decode -> Whisper (weights/whisper,
 //      when present) transcript contains "test".
@@ -41,6 +42,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "test_device.h"
 
 namespace fs = std::filesystem;
 
@@ -137,7 +140,7 @@ static void print_rates(const char* label, const std::vector<double>& per_cb, do
     std::printf("\n");
 }
 
-// Results kept from the CPU pass for the CUDA parity check.
+// Results kept from the CPU pass for the GPU parity check.
 struct DeviceResults {
     std::vector<std::vector<float>>   wav;    // decode(fixture codes) per case
     std::vector<std::vector<int32_t>> codes;  // encode(fixture input) per case
@@ -286,18 +289,18 @@ static void run_device(brotensor::Device dev, const char* dev_name, const std::s
             }
         }
 
-        // ── CPU vs CUDA ──
+        // ── CPU vs GPU ──
         if (cpu && ci < cpu->wav.size() && cpu->wav[ci].size() == out.wav[ci].size() &&
             !cpu->wav[ci].empty()) {
             const Diff d = diff(out.wav[ci].data(), cpu->wav[ci].data(), cpu->wav[ci].size());
-            std::printf("      CPU/CUDA decode max|Δ|=%.3e mean|Δ|=%.3e\n", d.max_abs, d.mean_abs);
-            CHECK(d.max_abs < 1e-4, tag("CUDA decode tracks CPU (max abs < 1e-4)"));
+            std::printf("      CPU/GPU decode max|Δ|=%.3e mean|Δ|=%.3e\n", d.max_abs, d.mean_abs);
+            CHECK(d.max_abs < 1e-4, tag("GPU decode tracks CPU (max abs < 1e-4)"));
             if (cpu->codes[ci].size() == out.codes[ci].size() && !out.codes[ci].empty()) {
                 std::vector<double> per;
                 const double total = code_agreement(out.codes[ci], cpu->codes[ci], c.K, c.T, per);
-                print_rates("CPU/CUDA codes", per, total);
-                CHECK(per[0] >= 0.99, tag("CUDA codebook 0 tracks CPU (>=99%)"));
-                CHECK(total >= 0.95, tag("CUDA codes track CPU (>=95%)"));
+                print_rates("CPU/GPU codes", per, total);
+                CHECK(per[0] >= 0.99, tag("GPU codebook 0 tracks CPU (>=99%)"));
+                CHECK(total >= 0.95, tag("GPU codes track CPU (>=95%)"));
             }
         }
     }
@@ -405,18 +408,17 @@ static int run() {
 
     DeviceResults cpu_res;
     run_device(brotensor::Device::CPU, "CPU", dir.string(), cases, cpu_res, nullptr);
-    const bool has_cuda = brotensor::is_available(brotensor::Device::CUDA);
-    if (has_cuda) {
-        DeviceResults cuda_res;
-        run_device(brotensor::Device::CUDA, "CUDA", dir.string(), cases, cuda_res, &cpu_res);
+    const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        DeviceResults gpu_res;
+        run_device(gpu, brosoundml_test::device_name(gpu), dir.string(), cases, gpu_res, &cpu_res);
     } else {
-        std::printf("  CUDA not available — device parity skipped\n");
+        std::printf("  no GPU backend available — device parity skipped\n");
     }
 
     const fs::path clip = repo / "weights" / "qwen-tts-hello-there-this-is-a-test-of-th.wav";
     if (fs::exists(clip)) {
-        round_trip(has_cuda ? brotensor::Device::CUDA : brotensor::Device::CPU,
-                   has_cuda ? "CUDA" : "CPU", dir.string(), clip, repo / "weights" / "whisper");
+        round_trip(gpu, brosoundml_test::device_name(gpu), dir.string(), clip, repo / "weights" / "whisper");
     } else {
         std::printf("  test clip absent — round trip skipped\n");
     }

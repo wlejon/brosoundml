@@ -1,7 +1,7 @@
 // brosoundml_omnivoice_say — OmniVoice text-to-speech from the command line.
 //
 //   brosoundml_omnivoice_say <model_dir> "<text>" <out.wav>
-//       [--device cpu|cuda] [--bf16]
+//       [--device auto|cpu|gpu|cuda|hip|metal] [--bf16]
 //       [--lang X] [--instruct "..."]
 //       [--ref ref.wav --ref-text "..."] [--prompt file.ovcp | --save-prompt file.ovcp]
 //       [--steps N] [--guidance G] [--speed S] [--duration D] [--seed N] [--no-noise]
@@ -24,12 +24,14 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 void usage() {
     std::fprintf(stderr,
                  "usage: brosoundml_omnivoice_say <model_dir> \"<text>\" <out.wav>\n"
-                 "         [--device cpu|cuda] [--bf16] [--lang X] [--instruct \"...\"]\n"
+                 "         [--device auto|cpu|gpu|cuda|hip|metal] [--bf16] [--lang X] [--instruct \"...\"]\n"
                  "         [--ref ref.wav --ref-text \"...\"] [--prompt file.ovcp | --save-prompt file.ovcp]\n"
                  "         [--steps N] [--guidance G] [--speed S] [--duration D] [--seed N]\n"
                  "         [--no-noise] [--no-post] [--trace]\n");
@@ -70,8 +72,8 @@ int main(int argc, char** argv) {
     const std::string text = argv[2];
     const std::string out_path = argv[3];
 
-    brotensor::Device dev = brotensor::Device::CUDA;
-    bool device_given = false, bf16 = false, trace = false;
+    std::string device_arg;
+    bool bf16 = false, trace = false;
     std::string ref_wav, ref_text, prompt_path, save_prompt;
     brosoundml::OmniVoiceParams p;
 
@@ -81,13 +83,8 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); usage(); std::exit(2); }
             return argv[++i];
         };
-        if (a == "--device") {
-            const std::string d = need("--device");
-            if (d == "cpu") dev = brotensor::Device::CPU;
-            else if (d == "cuda") dev = brotensor::Device::CUDA;
-            else { std::fprintf(stderr, "unknown device '%s'\n", d.c_str()); return 2; }
-            device_given = true;
-        } else if (a == "--bf16") bf16 = true;
+        if (a == "--device") device_arg = need("--device");
+        else if (a == "--bf16") bf16 = true;
         else if (a == "--lang") p.language = need("--lang");
         else if (a == "--instruct") p.instruct = need("--instruct");
         else if (a == "--ref") ref_wav = need("--ref");
@@ -107,21 +104,24 @@ int main(int argc, char** argv) {
 
     try {
         brotensor::init();
-        // CUDA is the default; the CPU fallback is taken only when CUDA is
-        // absent and no --device was given, and it is never silent.
-        if (!device_given && !brotensor::is_available(brotensor::Device::CUDA)) {
-            std::fprintf(stderr, "warning: CUDA is not available — running on CPU (slow); pass --device cpu to run there deliberately\n");
-            dev = brotensor::Device::CPU;
+        // The best GPU is the default; the CPU fallback is taken only when no
+        // GPU backend is present and no --device was given, and it is never
+        // silent.
+        brotensor::Device dev = brosoundml_tool::best_gpu();
+        if (!device_arg.empty()) {
+            std::string err;
+            if (!brosoundml_tool::resolve_device(device_arg, dev, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        } else if (!dev.is_gpu()) {
+            std::fprintf(stderr, "warning: no GPU backend is available — running on CPU (slow); pass --device cpu to run there deliberately\n");
         }
-        if (!brotensor::is_available(dev)) { std::fprintf(stderr, "device not available\n"); return 1; }
-        if (bf16 && dev == brotensor::Device::CPU) { std::fprintf(stderr, "--bf16 needs --device cuda\n"); return 2; }
+        if (bf16 && dev == brotensor::Device::CPU) { std::fprintf(stderr, "--bf16 needs a GPU device\n"); return 2; }
 
         brosoundml::OmniVoice ov;
         const bool need_encoder = !ref_wav.empty();
         auto t0 = std::chrono::steady_clock::now();
         ov.load(model_dir, dev, bf16 ? brosoundml::OmniVoicePrecision::BF16 : brosoundml::OmniVoicePrecision::FP32,
                 /*codec_decoder_only=*/!need_encoder);
-        std::printf("loaded %s (%s, %s) in %.2fs\n", model_dir.c_str(), dev == brotensor::Device::CUDA ? "cuda" : "cpu",
+        std::printf("loaded %s (%s, %s) in %.2fs\n", model_dir.c_str(), brosoundml_tool::device_name(dev),
                     bf16 ? "bf16" : "fp32", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 
         brosoundml::OmniVoicePrompt prompt;

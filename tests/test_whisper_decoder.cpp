@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace stf = brotensor::safetensors;
@@ -747,15 +749,11 @@ int main() {
     bt::init();
     try {
         run_all(bt::Device::CPU, "CPU");
-        if (bt::is_available(bt::Device::CUDA)) {
-            run_all(bt::Device::CUDA, "CUDA");
+        const bt::Device gpu = brosoundml_test::preferred_gpu();
+        if (gpu.is_gpu()) {
+            run_all(gpu, brosoundml_test::device_name(gpu));
         } else {
-            std::printf("test_whisper_decoder: CUDA not available — CUDA path skipped\n");
-        }
-        if (bt::is_available(bt::Device::Metal)) {
-            run_all(bt::Device::Metal, "Metal");
-        } else {
-            std::printf("test_whisper_decoder: Metal not available — Metal path skipped\n");
+            std::printf("test_whisper_decoder: no GPU backend available — GPU path skipped\n");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "test_whisper_decoder: uncaught exception: %s\n",

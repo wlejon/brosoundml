@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "test_device.h"
+
 namespace fs = std::filesystem;
 
 static int failures = 0;
@@ -170,7 +172,7 @@ static int run() {
 
     // ─── Real-weights smoke (opt-in) ───────────────────────────────────────
     //
-    // Runs on CPU and (if available) CUDA. Synthesized audio is not required
+    // Runs on CPU and (if available) the GPU. Synthesized audio is not required
     // to be sample-identical between devices — only that each device produces
     // bounded, finite, non-silent audio on the same input.
     auto run_real_smoke = [&](brotensor::Device dev, const char* dev_name) {
@@ -366,11 +368,9 @@ static int run() {
     };  // run_real_smoke
 
     run_real_smoke(brotensor::Device::CPU, "CPU");
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
-        run_real_smoke(brotensor::Device::CUDA, "CUDA");
-    }
-    if (brotensor::is_available(brotensor::Device::Metal)) {
-        run_real_smoke(brotensor::Device::Metal, "Metal");
+    const brotensor::Device gpu = brosoundml_test::preferred_gpu();
+    if (gpu.is_gpu()) {
+        run_real_smoke(gpu, brosoundml_test::device_name(gpu));
     }
 
     if (failures == 0) {

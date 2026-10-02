@@ -7,7 +7,7 @@
 //
 // Usage:
 //   brosoundml_parakeet_transcribe <wav> <model_dir>
-//                                  [--device auto|cpu|cuda]
+//                                  [--device auto|cpu|gpu|cuda|hip|metal]
 //                                  [--max-new-tokens N] [--stream]
 //                                  [--timestamps]
 //
@@ -15,7 +15,8 @@
 //   * The WAV must be 16 kHz mono PCM — Parakeet's input rate is fixed;
 //     resample externally (ffmpeg -ar 16000 -ac 1 ...).
 //   * <model_dir> holds config.json, model.safetensors and tokenizer.json.
-//   * --device defaults to CUDA when a GPU backend is present, else CPU.
+//   * --device defaults to the best GPU backend (HIP / CUDA / Metal) when one
+//     is present, else CPU (tool_device.h).
 //   * --timestamps prints one "start\tpiece" line per token (start = encoder
 //     frame index * 0.08 s) instead of the single transcript line.
 
@@ -34,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace {
 
 [[noreturn]] void die(const std::string& msg) {
@@ -45,7 +48,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_parakeet_transcribe <wav> <model_dir>\n"
-        "                                 [--device auto|cpu|cuda]\n"
+        "                                 [--device auto|cpu|gpu|cuda|hip|metal]\n"
         "                                 [--max-new-tokens N] [--stream]\n"
         "                                 [--timestamps]\n"
         "\n"
@@ -54,7 +57,7 @@ void print_usage() {
         "               tokenizer.json.\n"
         "\n"
         "Options:\n"
-        "  --device D          auto (default), cpu, or cuda.\n"
+        "  --device D          auto (default: best GPU), cpu, gpu, cuda, hip, metal.\n"
         "  --max-new-tokens N  Cap emitted tokens (0 = whole clip).\n"
         "  --stream            Print the transcript incrementally as it decodes.\n"
         "  --timestamps        Print per-token start times instead of one line.\n"
@@ -96,21 +99,7 @@ int main(int argc, char** argv) {
 
         // Device selection: GPU-first, with explicit override.
         brotensor::Device device = brotensor::Device::CPU;
-        if (device_arg == "hip" || device_arg == "rocm") {
-            if (!brotensor::is_available(brotensor::Device::HIP))
-                die("--device hip requested but no HIP backend is available");
-            device = brotensor::Device::HIP;
-        } else if (device_arg == "cuda") {
-            if (!brotensor::is_available(brotensor::Device::CUDA))
-                die("--device cuda requested but no CUDA backend is available");
-            device = brotensor::Device::CUDA;
-        } else if (device_arg == "cpu") {
-            device = brotensor::Device::CPU;
-        } else if (device_arg == "auto") {
-            device = brotensor::default_device();
-        } else {
-            die("--device must be auto, hip, cuda, or cpu");
-        }
+        if (std::string err; !brosoundml_tool::resolve_device(device_arg, device, err)) die(err);
 
         // 1. Load model.
         brosoundml::Parakeet model;
@@ -131,7 +120,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "brosoundml_parakeet_transcribe: %.2fs audio on %s\n",
                      audio.duration_seconds(),
-                     device.is_gpu() ? (device == brotensor::Device::HIP ? "HIP" : "CUDA") : "CPU");
+                     brosoundml_tool::device_name(device));
 
         brosoundml::Parakeet::TranscribeOptions opts;
         opts.max_new_tokens = max_new;

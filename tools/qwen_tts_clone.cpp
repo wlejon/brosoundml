@@ -5,7 +5,7 @@
 //   qwen_tts_clone <ref.wav> "<text to speak>" [out.wav] [language] [model_dir]
 //
 // model_dir defaults to a Base checkpoint (the only variant with a speaker
-// encoder). Prefers CUDA; the speaker encoder runs host-side either way
+// encoder). Prefers the GPU; the speaker encoder runs host-side either way
 // (enrollment is one-shot), the AR loop + codec decode run on the load device.
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+
+#include "tool_device.h"
 
 using brosoundml::AudioBuffer;
 using brosoundml::QwenTts;
@@ -37,13 +39,11 @@ int main(int argc, char** argv) {
         ? argv[5] : std::string("weights/qwen-tts/0.6B-Base");
 
     brotensor::init();
-    const bool cuda = brotensor::is_available(brotensor::Device::CUDA);
-    const brotensor::Device dev =
-        cuda ? brotensor::Device::CUDA : brotensor::Device::CPU;
+    const brotensor::Device dev = brosoundml_tool::best_gpu();
 
     QwenTts q;
     q.load(root, dev);
-    std::printf("loaded %s on %s\n", root.c_str(), cuda ? "CUDA" : "CPU");
+    std::printf("loaded %s on %s\n", root.c_str(), brosoundml_tool::device_name(dev));
     if (!q.config().speaker_encoder.present) {
         std::fprintf(stderr,
             "error: %s has no speaker encoder; the zero-shot clone needs a Base "

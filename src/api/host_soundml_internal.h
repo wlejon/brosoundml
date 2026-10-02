@@ -9,8 +9,8 @@
 //     the argument ("loadWhisper(modelDir, opts?): path required").
 //   - Runtime failures (a missing model dir, a model that threw) are plain
 //     Errors carrying the entry point as a prefix ("loadWhisper: ...").
-//   - Loaders run on the GPU by default (CUDA, then Metal, then CPU) and
-//     honour opts.device = 'cpu' | 'cuda' | 'metal'; anything else is a
+//   - Loaders run on the GPU by default (HIP, CUDA or Metal, else CPU) and
+//     honour opts.device = 'cpu' | 'cuda' | 'hip' | 'metal'; anything else is a
 //     TypeError. No model has a CPU fallback the caller did not ask for.
 //   - A heavy call with an onDone / onReady callback runs on a background
 //   thread through soundml_async.h; the same call without one blocks.
@@ -26,6 +26,7 @@
 #include <brotensor/tensor.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -355,18 +356,19 @@ inline Value audioBufferToJs(const brosoundml::AudioBuffer& buf) {
 // Devices
 // ---------------------------------------------------------------------------
 
-// The default device — CUDA, then Metal, then CPU. Calls brotensor::init()
-// first (idempotent) so the GPU probes have run.
+// The default device — brotensor's default_device(): the registered GPU
+// (HIP, CUDA or Metal), else the CPU, unless BROTENSOR_DEFAULT_DEVICE says
+// otherwise. Calls brotensor::init() first (idempotent) so the GPU probes
+// have run.
 inline brotensor::Device autoDevice() {
     brotensor::init();
-    if (brotensor::is_available(brotensor::Device::CUDA))  return brotensor::Device::CUDA;
-    if (brotensor::is_available(brotensor::Device::Metal)) return brotensor::Device::Metal;
-    return brotensor::Device::CPU;
+    return brotensor::default_device();
 }
 
 inline const char* deviceName(brotensor::Device d) {
     switch (d.type) {
         case brotensor::DeviceType::CUDA:  return "CUDA";
+        case brotensor::DeviceType::HIP:   return "HIP";
         case brotensor::DeviceType::Metal: return "Metal";
         case brotensor::DeviceType::CPU:   return "CPU";
     }
@@ -374,8 +376,9 @@ inline const char* deviceName(brotensor::Device d) {
 }
 
 // Parse opts.device. Missing key: `out` untouched, true. A string naming a
-// device: `out` set, true. Anything else: `err` set, false — the caller
-// throws a TypeError. `explicitDevice` reports whether the key was given.
+// device (any case; 'rocm' is 'hip'): `out` set, true. Anything else: `err`
+// set, false — the caller throws a TypeError. `explicitDevice` reports
+// whether the key was given.
 inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
                            bool* explicitDevice = nullptr) {
     if (explicitDevice) *explicitDevice = false;
@@ -383,15 +386,18 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
     Value v = ev::getProperty(opts, "device");
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     if (!ev::isString(v)) {
-        err = "opts.device must be a string ('cpu', 'cuda', or 'metal')";
+        err = "opts.device must be a string ('cpu', 'cuda', 'hip', or 'metal')";
         return false;
     }
-    std::string sv = ev::toUtf8(v);
+    const std::string given = ev::toUtf8(v);
+    std::string sv = given;
+    for (char& c : sv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (explicitDevice) *explicitDevice = true;
-    if (sv == "cpu" || sv == "CPU")     { out = brotensor::Device::CPU;   return true; }
-    if (sv == "cuda" || sv == "CUDA")   { out = brotensor::Device::CUDA;  return true; }
-    if (sv == "metal" || sv == "Metal") { out = brotensor::Device::Metal; return true; }
-    err = "opts.device must be 'cpu', 'cuda', or 'metal' (got '" + sv + "')";
+    if (sv == "cpu")                  { out = brotensor::Device::CPU;   return true; }
+    if (sv == "cuda")                 { out = brotensor::Device::CUDA;  return true; }
+    if (sv == "hip" || sv == "rocm")  { out = brotensor::Device::HIP;   return true; }
+    if (sv == "metal")                { out = brotensor::Device::Metal; return true; }
+    err = "opts.device must be 'cpu', 'cuda', 'hip', or 'metal' (got '" + given + "')";
     return false;
 }
 

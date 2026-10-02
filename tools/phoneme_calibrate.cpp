@@ -63,6 +63,8 @@
 #include <string>
 #include <vector>
 
+#include "tool_device.h"
+
 namespace fs  = std::filesystem;
 namespace bt  = brotensor;
 namespace bsm = brosoundml;
@@ -183,7 +185,7 @@ void print_help() {
         "  --smoothing-hits M   M-of-N smoother hits (default 2)\n"
         "  --smoothing-window N M-of-N smoother window (default 3)\n"
         "  --entry-silence N    entry-gate silence frames (default 2; 0 = no boundary needed)\n"
-        "  --device auto|cuda|cpu\n"
+        "  --device auto|cpu|gpu|cuda|hip|metal\n"
         "  -h --help\n");
 }
 
@@ -273,10 +275,9 @@ int main(int argc, char** argv) try {
 
     bt::init();
     bt::Device device = bt::Device::CPU;
-    if (a.device == "cuda" || (a.device == "auto" && bt::is_available(bt::Device::CUDA)))
-        device = bt::Device::CUDA;
-    if (a.device == "cpu") device = bt::Device::CPU;
-    const char* dev_name = (device == bt::Device::CUDA) ? "cuda" : "cpu";
+    if (std::string err; !brosoundml_tool::resolve_device(a.device, device, err))
+        fail("phoneme_calibrate", err);
+    const char* dev_name = brosoundml_tool::device_name(device);
 
     // ── Model (for forward) + its class map / framing ──
     bsm::PhonemeNet model = bsm::PhonemeNet::load(checkpoint, device);
