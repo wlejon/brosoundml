@@ -67,7 +67,7 @@ jobs:
           - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++,     sdl_args: "" }
           - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++, sdl_args: "" }
           - { name: windows-msvc, os: windows-2022, sdl_args: "-DSDL_SHARED=OFF -DSDL_STATIC=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" }
-          - { name: macos-arm64,  os: macos-14,     sdl_args: "" }
+          - { name: macos-arm64,  os: macos-15,     sdl_args: "" }
     steps:
       - uses: actions/checkout@v7
         with:
