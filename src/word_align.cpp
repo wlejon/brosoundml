@@ -74,6 +74,15 @@ void refine_with_energy(std::vector<WordTiming>& words, const std::vector<std::s
             long long best = -1;
             for (long long f = std::max(0LL, s - reach); f < std::min(n - 1, s + reach); ++f)
                 if (!v[f] && v[f + 1] && (best < 0 || std::llabs(f + 1 - s) < std::llabs(best - s))) best = f + 1;
+            // A start still sitting in silence with no onset within reach is
+            // early by more than the reach — Parakeet's 80 ms frames put it
+            // anywhere in a pause, so the same word lands a frame apart at
+            // two sample rates and only one of them saw the onset. The word
+            // starts at the first onset inside its own span.
+            if (best < 0 && s < n && !v[s]) {
+                for (long long f = s; f < std::min(n - 1, idx(cur.end)); ++f)
+                    if (!v[f] && v[f + 1]) { best = f + 1; break; }
+            }
             if (best >= 0) {
                 const double t = best * step;
                 if (t >= prev_end && t < cur.end) cur.start = t;
