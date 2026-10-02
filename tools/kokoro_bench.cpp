@@ -61,7 +61,7 @@ double ms_since(clk::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_dir, voice_path, device_str = "cuda";
+    std::string model_dir, voice_path, device_str;
     std::string lexicon_path, pos_path, out_path;
     std::string text =
         "The quick brown fox jumps over the lazy dog, and then runs far away "
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
         else die("unknown flag '" + a + "'");
     }
 
-    const std::string data_dir = default_data_dir();
+    const std::string data_dir = fs::exists("../weights/kokoro") ? "../weights" : default_data_dir();
     if (model_dir.empty())    model_dir    = data_dir + "/kokoro";
     if (voice_path.empty())   voice_path   = model_dir + "/voices/af_heart.bin";
     if (lexicon_path.empty()) lexicon_path = data_dir + "/g2p/lexicon_en_us.bin";
@@ -105,9 +105,21 @@ int main(int argc, char** argv) {
     try {
         brotensor::init();
         brotensor::Device dev = brotensor::Device::CPU;
-        if      (device_str == "cpu")  dev = brotensor::Device::CPU;
+        if (device_str.empty()) {
+            if (brotensor::is_available(brotensor::Device::HIP)) {
+                dev = brotensor::Device::HIP;
+                device_str = "hip";
+            } else if (brotensor::is_available(brotensor::Device::CUDA)) {
+                dev = brotensor::Device::CUDA;
+                device_str = "cuda";
+            } else {
+                dev = brotensor::Device::CPU;
+                device_str = "cpu";
+            }
+        } else if (device_str == "cpu")  dev = brotensor::Device::CPU;
         else if (device_str == "cuda") dev = brotensor::Device::CUDA;
-        else die("--device must be cpu|cuda");
+        else if (device_str == "hip")  dev = brotensor::Device::HIP;
+        else die("--device must be cpu|cuda|hip");
         if (dev != brotensor::Device::CPU && !brotensor::is_available(dev))
             die("--device " + device_str + " not available in this build");
 
