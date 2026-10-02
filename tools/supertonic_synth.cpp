@@ -31,9 +31,7 @@ static double ms_since(clk::time_point t0) {
 
 int main(int argc, char** argv) {
     brotensor::init();
-    const brotensor::Device dev = brotensor::is_available(brotensor::Device::CUDA)
-                                      ? brotensor::Device::CUDA
-                                      : brotensor::Device::CPU;
+    const brotensor::Device dev = brotensor::default_device();
 
     std::string root = argc > 1 ? argv[1] : "";
     if (root.empty()) {
@@ -54,7 +52,7 @@ int main(int argc, char** argv) {
         voice.find(".json") == std::string::npos)
         voice_path = (fs::path(root) / "voice_styles" / (voice + ".json")).string();
 
-    std::printf("device: %s\n", dev == brotensor::Device::CUDA ? "CUDA" : "CPU");
+    std::printf("device: %s\n", dev.is_gpu() ? (dev == brotensor::Device::HIP ? "HIP" : "CUDA") : "CPU");
 
     brosoundml::Supertonic model;
     auto t0 = clk::now();

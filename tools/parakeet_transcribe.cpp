@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "brosoundml_parakeet_transcribe: %.2fs audio on %s\n",
                      audio.duration_seconds(),
-                     device == brotensor::Device::CUDA ? "CUDA" : "CPU");
+                     device.is_gpu() ? (device == brotensor::Device::HIP ? "HIP" : "CUDA") : "CPU");
 
         brosoundml::Parakeet::TranscribeOptions opts;
         opts.max_new_tokens = max_new;
