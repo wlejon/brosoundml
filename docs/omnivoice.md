@@ -303,7 +303,7 @@ build-omni-codec/tests/Release/brosoundml_test_omnivoice.exe
 
 ```
 brosoundml_omnivoice_say <model_dir> "<text>" <out.wav>
-    [--device auto|cpu|gpu|cuda|hip|metal] [--bf16] [--lang X] [--instruct "..."]
+    [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--bf16] [--lang X] [--instruct "..."]
     [--ref ref.wav --ref-text "..."] [--prompt file.ovcp | --save-prompt file.ovcp]
     [--steps N] [--guidance G] [--speed S] [--duration D] [--seed N]
     [--no-noise] [--no-post] [--trace]

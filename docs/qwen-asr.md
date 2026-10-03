@@ -72,7 +72,7 @@ stem). No op brotensor lacks.
 ## Tools
 
 - `brosoundml_qwen_asr_transcribe` — WAV → detected language + transcript
-  (`--device auto|cpu|gpu|cuda|hip|metal`, `--context TEXT`, `--max-new-tokens N`, `--stream`,
+  (`--device auto|cpu|gpu|cuda|hip|vulkan|metal`, `--context TEXT`, `--max-new-tokens N`, `--stream`,
   `--ids`).
 
 Weights are fetched by `scripts/download-qwen-asr.sh`.

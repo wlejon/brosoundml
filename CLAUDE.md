@@ -27,7 +27,7 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   to ~1e-6 against the reference NeMo model. Shares the FastConformer encoder with
   Parakeet.
 - **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ editable
-  PCA-sorted latent. Device-neutral CPU / CUDA / Metal; library-only (no CLI).
+  PCA-sorted latent. Device-neutral CPU / CUDA / Metal / Vulkan / HIP; library-only (no CLI).
 - **HiggsAudio v2 codec** — the 25 Hz x 8-codebook RVQ audio tokenizer OmniVoice
   speaks (DAC encoder/decoder + a HuBERT-base semantic branch). Device-neutral
   CPU + CUDA; codes 100% and waveform ~1e-6 against transformers' reference.
@@ -106,7 +106,8 @@ ctest --test-dir build -C Release
 
 # CPU + CUDA — forwarded to brotensor's CUDA backend (brosoundml ships no kernels)
 cmake -S . -B build -DBROTENSOR_WITH_CUDA=ON && cmake --build build --config Release
-# AMD: HIP + Vulkan (Vulkan is the default device; BROTENSOR_PREFER_HIP=1 runs on HIP)
+# AMD: Vulkan (the AMD backend of choice) + HIP as the comparison backend
+# (Vulkan is the default device; BROTENSOR_PREFER_HIP=1 runs on HIP)
 cmake -S . -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_HIP=ON -DBROTENSOR_WITH_VULKAN=ON
 ```
 
@@ -126,8 +127,8 @@ repo at `../<name>`, else a `third_party/` submodule fallback — see
 - **brotensor** — the unified `Tensor` + the device-neutral op surface. All of
   brosoundml's compute goes through `<brotensor/ops.h>`; brosoundml writes no
   kernels. The audio op family it leans on (FFT/STFT, conv1d, vocoder/codec
-  activations, codec quantization, resampling, `sample_logits`) is FP32 on all
-  three backends — CPU, CUDA, Metal.
+  activations, codec quantization, resampling, `sample_logits`) is FP32 on
+  every backend — CPU, CUDA, Metal, Vulkan, HIP.
 - **brolm** — tokenizers for the speech models: `brolm::whisper::Tokenizer` for
   Whisper, the Qwen BPE tokenizer for Qwen3-TTS.
 
@@ -149,7 +150,7 @@ the application resolves them:
 - **Compute is brotensor; brosoundml is composition.** A new model is a graph
   of `brotensor` op calls plus weight loading and pre/post-processing — never a
   new kernel. If an op is genuinely missing, add it to `brotensor` (and mirror
-  it across CPU/CUDA/Metal there), not here.
+  it across the CPU / GPU backends there), not here.
 - **`AudioBuffer` is the waveform currency** — mono FP32 PCM nominally in
   [-1, 1], carrying its `sample_rate`. Synthesis returns one; file I/O consumes
   one. Long-running synthesis loops poll a `CancelCheck` (see `audio.h`).
@@ -210,7 +211,7 @@ The shape is the same for every model already here:
    `brotensor::safetensors`, placed on the load device.
 2. **Module graph** — compose the forward pass from `brotensor` ops (and the
    shared `modules.h` layers). No new kernels — if an op is missing, it goes in
-   brotensor, mirrored across CPU/CUDA/Metal.
+   brotensor, mirrored across its CPU / GPU backends.
 3. **Public pipeline class** — pImpl, `load(dir, device)` + a `synthesize` /
    `transcribe` / `feed` entry point, throwing `std::runtime_error` on misuse.
 4. **A `test_<model>.cpp`** locking the loader contract and an end-to-end
