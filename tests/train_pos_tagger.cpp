@@ -958,7 +958,7 @@ void print_help() {
         "  --warmup N         (default 1000)\n"
         "  --seed N           (default 42)\n"
         "  --device cpu|gpu   (default cpu; gpu = the best GPU backend —\n"
-        "                     HIP / CUDA / Metal; cuda/hip are accepted aliases)\n"
+        "                     CUDA / Metal / Vulkan; cuda is an accepted alias)\n"
         "  --synthetic        ignore --train/--val, build a tiny in-memory set\n"
         "                     and run 2 epochs end-to-end (smoke test).\n"
         "  --byte-noise F     byte-noise probability (default 0.10)\n"
@@ -1144,7 +1144,7 @@ int run_training(Args& a) {
     const bt::Device gpu = brosoundml_test::preferred_gpu();
     std::cout << "gpu available: "
               << (gpu.is_gpu() ? brosoundml_test::device_name(gpu) : "no") << "\n";
-    if (a.device == "gpu" || a.device == "cuda" || a.device == "hip") {
+    if (a.device == "gpu" || a.device == "cuda") {
         if (gpu.is_gpu()) bt::set_default_device(gpu);
         else std::cerr << "warn: " << a.device << " requested but no GPU is available, falling back to cpu\n";
     } else {

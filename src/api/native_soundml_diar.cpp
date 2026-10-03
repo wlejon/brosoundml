@@ -3,8 +3,8 @@
 // ClusterDiarizer (Sortformer VAD + ECAPA x-vectors + centered-cosine
 // clustering, discovers the speaker count).
 //
-// Loading is GPU by default (brotensor's default device: the registered HIP,
-// CUDA or Metal GPU, else the CPU); opts.device picks explicitly and must be
+// Loading is GPU by default (brotensor's default device: the registered CUDA,
+// Metal or Vulkan GPU, else the CPU); opts.device picks explicitly and must be
 // a string. Model methods run synchronously on the JS thread;
 // bro.diar.diarize / clusterDiarize run on a work thread and report through
 // opts.onDone(result|null, { cancelled, error? }). One op in flight per

@@ -2,7 +2,7 @@
 // against itself — the load-bearing check is that consume()-in-chunks of an
 // arbitrary signal produces frames bit-equivalent to compute_offline() on the
 // same buffer (within FP32 STFT noise). The CPU baseline runs unconditionally;
-// the GPU (HIP / CUDA / Metal, test_device.h) additionally runs when one is
+// the GPU (CUDA / Metal / Vulkan, test_device.h) additionally runs when one is
 // registered, mirroring
 // test_kokoro.cpp's run_real_smoke pattern.
 #include "brosoundml/mel.h"

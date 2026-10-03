@@ -27,7 +27,7 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   to ~1e-6 against the reference NeMo model. Shares the FastConformer encoder with
   Parakeet.
 - **RAVE** — neural audio autoencoder (ACIDS/IRCAM v2): a waveform ⇄ editable
-  PCA-sorted latent. Device-neutral CPU / CUDA / Metal / Vulkan / HIP; library-only (no CLI).
+  PCA-sorted latent. Device-neutral CPU / CUDA / Metal / Vulkan; library-only (no CLI).
 - **HiggsAudio v2 codec** — the 25 Hz x 8-codebook RVQ audio tokenizer OmniVoice
   speaks (DAC encoder/decoder + a HuBERT-base semantic branch). Device-neutral
   CPU + CUDA; codes 100% and waveform ~1e-6 against transformers' reference.
@@ -106,14 +106,13 @@ ctest --test-dir build -C Release
 
 # CPU + CUDA — forwarded to brotensor's CUDA backend (brosoundml ships no kernels)
 cmake -S . -B build -DBROTENSOR_WITH_CUDA=ON && cmake --build build --config Release
-# AMD: Vulkan (the AMD backend of choice) + HIP as the comparison backend
-# (Vulkan is the default device; BROTENSOR_PREFER_HIP=1 runs on HIP)
-cmake -S . -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_HIP=ON -DBROTENSOR_WITH_VULKAN=ON
+# AMD: Vulkan (the AMD backend; the default device when present)
+cmake -S . -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 ```
 
 On Windows use the Visual Studio multi-config generator (`--config` picks the
 config); on Linux/macOS use a separate build dir per config. brosoundml builds
-no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` / `_WITH_HIP` /
+no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` /
 `_WITH_VULKAN` only forward
 the backend choice so a standalone GPU build resolves brotensor's backend.
 
@@ -128,7 +127,7 @@ repo at `../<name>`, else a `third_party/` submodule fallback — see
   brosoundml's compute goes through `<brotensor/ops.h>`; brosoundml writes no
   kernels. The audio op family it leans on (FFT/STFT, conv1d, vocoder/codec
   activations, codec quantization, resampling, `sample_logits`) is FP32 on
-  every backend — CPU, CUDA, Metal, Vulkan, HIP.
+  every backend — CPU, CUDA, Metal, Vulkan.
 - **brolm** — tokenizers for the speech models: `brolm::whisper::Tokenizer` for
   Whisper, the Qwen BPE tokenizer for Qwen3-TTS.
 
@@ -244,9 +243,9 @@ CLI drivers, built when brosoundml is the top-level project
 - `build_pos_dataset.py` / `build_lexicon.py` — G2P data prep (offline).
 
 Device choice goes through `tools/tool_device.h` (`resolve_device`,
-`best_gpu`, `device_name`): `--device auto|cpu|gpu|cuda|hip|rocm|vulkan|vk|metal`,
+`best_gpu`, `device_name`): `--device auto|cpu|gpu|cuda|vulkan|vk|metal`,
 where `auto` is `brotensor::default_device()` (the best GPU — CUDA > Metal >
-Vulkan > HIP unless BROTENSOR_PREFER_HIP=1 — else CPU) and `cuda` means CUDA when present, else the best GPU. Never
+Vulkan — else CPU) and `cuda` means CUDA when present, else the best GPU. Never
 hard-code `Device::CUDA` in a tool.
 
 ## Tests
@@ -255,7 +254,7 @@ hard-code `Device::CUDA` in a tool.
 top-level project (`BROSOUNDML_TESTS`, ON by default standalone) — when consumed
 as a subdirectory by bro they are skipped. A test's GPU block runs on
 `brosoundml_test::preferred_gpu()` (`tests/test_device.h`: the default device
-when it is a GPU, CPU = skip), so the same block covers a Vulkan, ROCm, CUDA or
+when it is a GPU, CPU = skip), so the same block covers a Vulkan, CUDA or
 Metal build. On Vulkan the BC-ResNet / phoneme-model training tests fail on
 brotensor's null `batch_norm_forward` (training) slot and `test_mel`'s CPU
 parity on the GEMM-based STFT's precision (brotensor docs/vulkan-coverage.md).

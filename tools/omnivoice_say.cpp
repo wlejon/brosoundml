@@ -1,7 +1,7 @@
 // brosoundml_omnivoice_say — OmniVoice text-to-speech from the command line.
 //
 //   brosoundml_omnivoice_say <model_dir> "<text>" <out.wav>
-//       [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--bf16]
+//       [--device auto|cpu|gpu|cuda|vulkan|metal] [--bf16]
 //       [--lang X] [--instruct "..."]
 //       [--ref ref.wav --ref-text "..."] [--prompt file.ovcp | --save-prompt file.ovcp]
 //       [--steps N] [--guidance G] [--speed S] [--duration D] [--seed N] [--no-noise]
@@ -31,7 +31,7 @@ namespace {
 void usage() {
     std::fprintf(stderr,
                  "usage: brosoundml_omnivoice_say <model_dir> \"<text>\" <out.wav>\n"
-                 "         [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--bf16] [--lang X] [--instruct \"...\"]\n"
+                 "         [--device auto|cpu|gpu|cuda|vulkan|metal] [--bf16] [--lang X] [--instruct \"...\"]\n"
                  "         [--ref ref.wav --ref-text \"...\"] [--prompt file.ovcp | --save-prompt file.ovcp]\n"
                  "         [--steps N] [--guidance G] [--speed S] [--duration D] [--seed N]\n"
                  "         [--no-noise] [--no-post] [--trace]\n");

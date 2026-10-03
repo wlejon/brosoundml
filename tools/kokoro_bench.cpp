@@ -8,7 +8,7 @@
 // the library on every synthesize call.
 //
 // Usage:
-//   brosoundml_kokoro_bench [--model DIR] [--voice PATH] [--device auto|cpu|gpu|cuda|hip|vulkan|metal]
+//   brosoundml_kokoro_bench [--model DIR] [--voice PATH] [--device auto|cpu|gpu|cuda|vulkan|metal]
 //                           [--text "..."] [--iters N] [--warmup N]
 //                           [--speed F] [--out file.wav]
 //
@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
         else if (a == "--out")        out_path     = next("--out");
         else if (a == "-h" || a == "--help") {
             std::printf("Usage: brosoundml_kokoro_bench [--model DIR] [--voice PATH] "
-                        "[--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--text STR] [--iters N] [--warmup N] "
+                        "[--device auto|cpu|gpu|cuda|vulkan|metal] [--text STR] [--iters N] [--warmup N] "
                         "[--speed F] [--out file.wav]\n");
             return 0;
         }

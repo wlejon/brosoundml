@@ -415,7 +415,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     clk::time_point t0;
     if (prof) t0 = clk::now();
 
-    // CUDA/HIP: the whole frame is a fixed-shape sequence of device ops with no host
+    // CUDA: the whole frame is a fixed-shape sequence of device ops with no host
     // control flow, so capture it once and replay it as a single launch (~700
     // tiny kernel launches/frame -> one cudaGraphLaunch). This now covers
     // sampling too: sample_logits_into reads/advances its Philox counter from a

@@ -430,9 +430,6 @@ static int run() {
         };
 
         run_case(brotensor::Device::CPU, "CPU");
-        if (brotensor::is_available(brotensor::Device::HIP)) {
-            run_case(brotensor::Device::HIP, "HIP");
-        }
         if (brotensor::is_available(brotensor::Device::CUDA)) {
             run_case(brotensor::Device::CUDA, "CUDA");
         }
@@ -666,8 +663,8 @@ static int run() {
     // CPU enforces the filename-target substring (the deterministic baseline);
     // the GPU only checks that the pipeline runs and produces a well-formed
     // transcript — token argmax may tip on FP noise. The GPU is the preferred
-    // one (test_device.h: the default device, so BROTENSOR_DEFAULT_DEVICE /
-    // BROTENSOR_PREFER_HIP pick HIP or Vulkan on an AMD build).
+    // one (test_device.h: the default device, so BROTENSOR_DEFAULT_DEVICE picks
+    // it when more than one backend is built).
     RealRun cpu_run, gpu_real;
     run_real_smoke(brotensor::Device::CPU, "CPU",
                    /*enforce_filename_target=*/true, &cpu_run);

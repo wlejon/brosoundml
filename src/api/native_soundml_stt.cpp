@@ -2,8 +2,8 @@
 // opts.onError), the generic bro.stt.transcribe(model, ...) dispatch, and
 // the class handles shared by native_soundml_stt_{whisper,parakeet,qwen}.cpp.
 //
-// Loading is GPU by default (brotensor's default device: the registered HIP,
-// CUDA or Metal GPU, else the CPU); opts.device picks explicitly and must be
+// Loading is GPU by default (brotensor's default device: the registered CUDA,
+// Metal or Vulkan GPU, else the CPU); opts.device picks explicitly and must be
 // a string. Every loader resolves its path the way the host's fs module does
 // (setPathResolver).
 #include "soundml_stt_internal.h"

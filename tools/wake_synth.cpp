@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
                 "  --confusables CSV   Comma-separated confusable negatives\n"
                 "  --lexicon PATH      G2P lexicon (.bin)\n"
                 "  --pos-tagger PATH   POS tagger (.bin)\n"
-                "  --device D          Kokoro inference device: auto|cpu|gpu|cuda|hip|vulkan|metal\n"
+                "  --device D          Kokoro inference device: auto|cpu|gpu|cuda|vulkan|metal\n"
                 "                      (default cpu; auto/gpu = the best GPU)\n"
                 "  --seed N            Deterministic RNG seed (default 42)\n"
                 "  --small             Tiny dataset variant for tests / iteration\n");

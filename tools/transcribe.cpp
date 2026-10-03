@@ -8,7 +8,7 @@
 //   brosoundml_transcribe <wav> <model_dir>
 //                         [--lang en] [--task transcribe]
 //                         [--no-timestamps] [--max-new-tokens N] [--stream]
-//                         [--device cpu|auto|gpu|hip|vulkan|...]
+//                         [--device cpu|auto|gpu|vulkan|...]
 //
 // Notes:
 //   * The WAV must be 16 kHz mono PCM — Whisper's input rate is fixed and
@@ -65,7 +65,7 @@ void print_usage() {
         "  --no-timestamps     Suppress timestamp tokens (disables long-form).\n"
         "  --max-new-tokens N  Cap generated tokens (0 = model default).\n"
         "  --stream            Print the transcript incrementally as it decodes.\n"
-        "  --device D          cpu (default) | auto | gpu | cuda | hip | vulkan | metal\n"
+        "  --device D          cpu (default) | auto | gpu | cuda | vulkan | metal\n"
         "                      (tool_device.h).\n"
         "  -h, --help          Show this help and exit.\n");
 }

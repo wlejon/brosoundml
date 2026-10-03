@@ -943,7 +943,7 @@ void print_help() {
         "         [--score-norm 1.0] [--score-norm-ref 0.5]\n"
         "         [--coverage-frac 0.75] [--min-phonemes 1]\n"
         "         [--enroll-conf-gate 0] [--enroll-alts 0] [--enroll-takes 1]\n"
-        "  kmeans/label/spot-eval take --device auto|cpu|gpu|cuda|hip|vulkan|metal\n"
+        "  kmeans/label/spot-eval take --device auto|cpu|gpu|cuda|vulkan|metal\n"
         "  (default auto: the best GPU, else CPU)\n");
 }
 

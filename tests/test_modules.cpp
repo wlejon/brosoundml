@@ -3,7 +3,7 @@
 // reference activations from an external framework involved.
 //
 // Each device-dependent test is parameterized over brotensor::Device so the
-// CPU baseline runs unconditionally and the GPU path (HIP / CUDA / Metal, per
+// CPU baseline runs unconditionally and the GPU path (CUDA / Metal / Vulkan, per
 // test_device.h's preferred_gpu()) runs additionally when one is registered.
 // Module outputs run on the GPU are downloaded via `to_host_vector()` before comparing against the
 // from-scratch CPU oracle.

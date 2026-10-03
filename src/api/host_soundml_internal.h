@@ -9,8 +9,8 @@
 //     the argument ("loadWhisper(modelDir, opts?): path required").
 //   - Runtime failures (a missing model dir, a model that threw) are plain
 //     Errors carrying the entry point as a prefix ("loadWhisper: ...").
-//   - Loaders run on the GPU by default (HIP, CUDA or Metal, else CPU) and
-//     honour opts.device = 'cpu' | 'cuda' | 'hip' | 'metal'; anything else is a
+//   - Loaders run on the GPU by default (CUDA, Metal or Vulkan, else CPU) and
+//     honour opts.device = 'cpu' | 'cuda' | 'vulkan' | 'metal'; anything else is a
 //     TypeError. No model has a CPU fallback the caller did not ask for.
 //   - A heavy call with an onDone / onReady callback runs on a background
 //   thread through soundml_async.h; the same call without one blocks.
@@ -357,7 +357,7 @@ inline Value audioBufferToJs(const brosoundml::AudioBuffer& buf) {
 // ---------------------------------------------------------------------------
 
 // The default device — brotensor's default_device(): the registered GPU
-// (CUDA, Metal, then Vulkan before HIP unless BROTENSOR_PREFER_HIP=1), else
+// (CUDA, Metal, then Vulkan), else
 // the CPU, unless BROTENSOR_DEFAULT_DEVICE says otherwise. Calls brotensor::init() first (idempotent) so the GPU probes
 // have run.
 inline brotensor::Device autoDevice() {
@@ -368,7 +368,6 @@ inline brotensor::Device autoDevice() {
 inline const char* deviceName(brotensor::Device d) {
     switch (d.type) {
         case brotensor::DeviceType::CUDA:  return "CUDA";
-        case brotensor::DeviceType::HIP:   return "HIP";
         case brotensor::DeviceType::Metal: return "Metal";
         case brotensor::DeviceType::VULKAN: return "Vulkan";
         case brotensor::DeviceType::CPU:   return "CPU";
@@ -377,7 +376,7 @@ inline const char* deviceName(brotensor::Device d) {
 }
 
 // Parse opts.device. Missing key: `out` untouched, true. A string naming a
-// device (any case; 'rocm' is 'hip', 'vk' is 'vulkan'): `out` set, true. Anything else: `err`
+// device (any case; 'vk' is 'vulkan'): `out` set, true. Anything else: `err`
 // set, false — the caller throws a TypeError. `explicitDevice` reports
 // whether the key was given.
 inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
@@ -387,7 +386,7 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
     Value v = ev::getProperty(opts, "device");
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     if (!ev::isString(v)) {
-        err = "opts.device must be a string ('cpu', 'cuda', 'hip', 'vulkan', or 'metal')";
+        err = "opts.device must be a string ('cpu', 'cuda', 'vulkan', or 'metal')";
         return false;
     }
     const std::string given = ev::toUtf8(v);
@@ -396,10 +395,9 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
     if (explicitDevice) *explicitDevice = true;
     if (sv == "cpu")                  { out = brotensor::Device::CPU;   return true; }
     if (sv == "cuda")                 { out = brotensor::Device::CUDA;  return true; }
-    if (sv == "hip" || sv == "rocm")  { out = brotensor::Device::HIP;   return true; }
     if (sv == "vulkan" || sv == "vk") { out = brotensor::Device::VULKAN; return true; }
     if (sv == "metal")                { out = brotensor::Device::Metal; return true; }
-    err = "opts.device must be 'cpu', 'cuda', 'hip', 'vulkan', or 'metal' (got '" + given + "')";
+    err = "opts.device must be 'cpu', 'cuda', 'vulkan', or 'metal' (got '" + given + "')";
     return false;
 }
 

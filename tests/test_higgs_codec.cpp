@@ -13,7 +13,7 @@
 //      reference's own 16 kHz input substituted for brosoundml's resample,
 //      which isolates the model from the resampler; the code agreement is
 //      reported both ways, and the resampler itself against torchaudio's.
-//   4. CPU vs GPU parity (HIP / CUDA / Metal, whichever brotensor reports):
+//   4. CPU vs GPU parity (CUDA / Metal / Vulkan, whichever brotensor reports):
 //      waveform + codes.
 //   5. decoder_only = true: loads without the encoder, decode still matches.
 //   6. Round trip on the test clip: encode -> decode -> Whisper (weights/whisper,

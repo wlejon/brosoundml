@@ -13,7 +13,7 @@
 //
 //   --dataset PATH[,...]  input BPDS shard(s); class maps + framing must match
 //   --out PATH            output BPMC (default: first input with .bpmc ext)
-//   --device D            mel compute device: auto|cpu|gpu|cuda|hip|vulkan|metal
+//   --device D            mel compute device: auto|cpu|gpu|cuda|vulkan|metal
 //                         (default auto: the best GPU, else CPU)
 
 #include "brosoundml/mel.h"
@@ -65,7 +65,7 @@ int main(int argc, char** argv) try {
                 "brosoundml_phoneme_melcache — precompute PCEN mels: BPDS -> BPMC\n\n"
                 "  --dataset PATH[,...]  input BPDS shard(s), comma-separated\n"
                 "  --out PATH            output BPMC (default: first input, .bpmc)\n"
-                "  --device D            mel compute device: auto|cpu|gpu|cuda|hip|vulkan|metal\n"
+                "  --device D            mel compute device: auto|cpu|gpu|cuda|vulkan|metal\n"
                 "                        (default auto: the best GPU, else CPU)\n");
             return 0;
         }

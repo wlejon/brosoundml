@@ -7,7 +7,7 @@
 //
 // Usage:
 //   brosoundml_parakeet_transcribe <wav> <model_dir>
-//                                  [--device auto|cpu|gpu|cuda|hip|vulkan|metal]
+//                                  [--device auto|cpu|gpu|cuda|vulkan|metal]
 //                                  [--max-new-tokens N] [--stream]
 //                                  [--timestamps]
 //
@@ -15,7 +15,7 @@
 //   * The WAV must be 16 kHz mono PCM — Parakeet's input rate is fixed;
 //     resample externally (ffmpeg -ar 16000 -ac 1 ...).
 //   * <model_dir> holds config.json, model.safetensors and tokenizer.json.
-//   * --device defaults to the best GPU backend (HIP / CUDA / Metal) when one
+//   * --device defaults to the best GPU backend (CUDA / Metal / Vulkan) when one
 //     is present, else CPU (tool_device.h).
 //   * --timestamps prints one "start\tpiece" line per token (start = encoder
 //     frame index * 0.08 s) instead of the single transcript line.
@@ -48,7 +48,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_parakeet_transcribe <wav> <model_dir>\n"
-        "                                 [--device auto|cpu|gpu|cuda|hip|vulkan|metal]\n"
+        "                                 [--device auto|cpu|gpu|cuda|vulkan|metal]\n"
         "                                 [--max-new-tokens N] [--stream]\n"
         "                                 [--timestamps]\n"
         "\n"
@@ -57,7 +57,7 @@ void print_usage() {
         "               tokenizer.json.\n"
         "\n"
         "Options:\n"
-        "  --device D          auto (default: best GPU), cpu, gpu, cuda, hip, metal.\n"
+        "  --device D          auto (default: best GPU), cpu, gpu, cuda, vulkan, metal.\n"
         "  --max-new-tokens N  Cap emitted tokens (0 = whole clip).\n"
         "  --stream            Print the transcript incrementally as it decodes.\n"
         "  --timestamps        Print per-token start times instead of one line.\n"

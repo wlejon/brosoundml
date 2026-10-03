@@ -193,7 +193,7 @@ encode and ~26 s to decode the 3 s clip; CUDA does the same in 0.08 s /
 ## CLI
 
 ```
-brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav> [--device cpu|gpu|cuda|hip|vulkan|metal] [--levels N]
+brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav> [--device cpu|gpu|cuda|vulkan|metal] [--levels N]
 ```
 
 Encodes the WAV (any rate; resampled to 24 kHz mono), prints `T` and a

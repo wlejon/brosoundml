@@ -82,16 +82,15 @@ ctest --test-dir build -C Release
 cmake -B build -DBROTENSOR_WITH_CUDA=ON
 cmake --build build --config Release
 
-# AMD: Vulkan (the AMD backend of choice) + HIP as the comparison backend
-# (Vulkan is the default device; BROTENSOR_PREFER_HIP=1 runs on HIP)
-cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON -DBROTENSOR_WITH_HIP=ON
+# AMD: Vulkan (the AMD backend; the default device when present)
+cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk
 ```
 
 On Windows use the Visual Studio multi-config generator (`--config` picks the
 config); on Linux/macOS use a separate build dir per config. brosoundml builds
-no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` / `_WITH_VULKAN` /
-`_WITH_HIP` only forward
+no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` / `_WITH_VULKAN`
+only forward
 the backend choice so a standalone GPU build resolves brotensor's backend. The
 CLI tools and tests build only when brosoundml is the top-level project
 (`BROSOUNDML_TOOLS` / `BROSOUNDML_TESTS`, both ON by default standalone).

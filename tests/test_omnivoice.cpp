@@ -2,7 +2,7 @@
 // OmniVoice tests — every stage of the port against the upstream fixtures
 // (tests/fixtures/omnivoice_*.bin, made by tests/ref/gen_omnivoice_fixture.py
 // from the genuine k2-fsa implementation in FP32 on CUDA), on CPU first and
-// then on the GPU (HIP / CUDA / Metal, test_device.h) when brotensor reports one.
+// then on the GPU (CUDA / Metal / Vulkan, test_device.h) when brotensor reports one.
 //
 //   Part A  tokenizer: plain and tag-aware ids of 65 strings, exact
 //   Part B  prompt assembly (ids + audio-mask layout, 18 cases) and the

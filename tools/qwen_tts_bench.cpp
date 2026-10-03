@@ -1,5 +1,5 @@
 // Wall-clock benchmark for the Qwen3-TTS pipeline on the GPU (the best backend
-// brotensor reports: HIP / CUDA / Metal). Uses only the public
+// brotensor reports: CUDA / Metal / Vulkan). Uses only the public
 // QwenTts API (load / decode_codes / synthesize) so it builds unchanged against
 // any revision — letting us A/B the on-device codec work against the old
 // host-fallback path by reverting just the implementation files.

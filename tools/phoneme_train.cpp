@@ -130,7 +130,7 @@ void print_help() {
         "  --seed N             (default 42)\n"
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bpm\n"
-        "  --device D           auto|cpu|gpu|cuda|hip|vulkan|metal (default auto — best GPU)\n"
+        "  --device D           auto|cpu|gpu|cuda|vulkan|metal (default auto — best GPU)\n"
         "  --c-stem N           stem channels (default 32)\n"
         "  --channels a,b,c,d   per-stage output channels (default 32,48,64,96)\n"
         "  --blocks a,b,c,d     blocks per stage incl. transition (default 2,2,2,2)\n"
