@@ -42,6 +42,9 @@ endif()
 option(BROTENSOR_WITH_CUDA  "Build the CUDA GPU backend"  OFF)
 option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 option(BROTENSOR_WITH_HIP   "Build the HIP GPU backend"   OFF)
+# Vulkan compute backend (brotensor's docs/vulkan.md). Additive: it coexists
+# with HIP, and brosoundml needs no GLSL of its own, so this only forwards it.
+option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
 # --- Siblings: bromath (header-only) + brotensor (tensor + ops) ---
 #
@@ -169,16 +172,10 @@ target_link_libraries(brosoundml PUBLIC
     brolm::brolm
 )
 
-# Compile-time flag for the CUDA-only fast paths (the Qwen3-TTS Code Predictor
-# CUDA-graph capture). The brotensor_cuda target exists only when the CUDA
-# backend was built — standalone (-DBROTENSOR_WITH_CUDA=ON) or inside bro — so
-# keying on it forwards the backend choice without a brosoundml-side option.
-if(TARGET brotensor_cuda)
-    target_compile_definitions(brosoundml PRIVATE BROSOUNDML_HAS_CUDA=1)
-endif()
-if(BROTENSOR_WITH_HIP OR BROTENSOR_HAS_HIP OR TARGET brotensor_hip)
-    target_compile_definitions(brosoundml PRIVATE BROSOUNDML_HAS_HIP=1)
-endif()
+# The graph-captured decode / step paths (LSTM, Whisper, Qwen3-TTS, OmniVoice,
+# Supertonic) need no compile-time flag: brotensor's CudaGraphCapture is
+# device-neutral, and brotensor::graph_capture_available(device) gates them at
+# run time (CUDA, HIP, Vulkan).
 
 if(MSVC)
     target_compile_options(brosoundml PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)

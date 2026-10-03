@@ -8,6 +8,7 @@
 //   brosoundml_transcribe <wav> <model_dir>
 //                         [--lang en] [--task transcribe]
 //                         [--no-timestamps] [--max-new-tokens N] [--stream]
+//                         [--device cpu|auto|gpu|hip|vulkan|...]
 //
 // Notes:
 //   * The WAV must be 16 kHz mono PCM — Whisper's input rate is fixed and
@@ -22,6 +23,7 @@
 //     windowing (30 s segments + timestamp seek) instead of being truncated;
 //     this needs timestamps, so it is disabled under `--no-timestamps`.
 
+#include "tool_device.h"
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
 
@@ -63,6 +65,8 @@ void print_usage() {
         "  --no-timestamps     Suppress timestamp tokens (disables long-form).\n"
         "  --max-new-tokens N  Cap generated tokens (0 = model default).\n"
         "  --stream            Print the transcript incrementally as it decodes.\n"
+        "  --device D          cpu (default) | auto | gpu | cuda | hip | vulkan | metal\n"
+        "                      (tool_device.h).\n"
         "  -h, --help          Show this help and exit.\n");
 }
 
@@ -75,6 +79,7 @@ int main(int argc, char** argv) {
     bool        with_timestamps = true;
     int         max_new_tokens  = 0;
     bool        stream          = false;
+    std::string device_arg      = "cpu";
 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
@@ -88,6 +93,7 @@ int main(int argc, char** argv) {
         else if (a == "--task")             task = next("--task");
         else if (a == "--no-timestamps")    with_timestamps = false;
         else if (a == "--stream")           stream = true;
+        else if (a == "--device")           device_arg = next("--device");
         else if (a == "--max-new-tokens")   max_new_tokens = std::atoi(next("--max-new-tokens").c_str());
         else if (!a.empty() && a[0] == '-') die("unknown flag '" + a + "'");
         else                                positional.push_back(std::move(a));
@@ -102,8 +108,11 @@ int main(int argc, char** argv) {
 
     try {
         // 1. Load model.
+        brotensor::init();
+        brotensor::Device device = brotensor::Device::CPU;
+        if (std::string err; !brosoundml_tool::resolve_device(device_arg, device, err)) die(err);
         brosoundml::Whisper model;
-        model.load(model_dir);
+        model.load(model_dir, device);
 
         // 2. Load tokenizer (vocab.json + merges.txt under the model dir).
         namespace fs = std::filesystem;

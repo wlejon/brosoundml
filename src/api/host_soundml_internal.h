@@ -357,8 +357,8 @@ inline Value audioBufferToJs(const brosoundml::AudioBuffer& buf) {
 // ---------------------------------------------------------------------------
 
 // The default device — brotensor's default_device(): the registered GPU
-// (HIP, CUDA or Metal), else the CPU, unless BROTENSOR_DEFAULT_DEVICE says
-// otherwise. Calls brotensor::init() first (idempotent) so the GPU probes
+// (CUDA, Metal, then Vulkan before HIP unless BROTENSOR_PREFER_HIP=1), else
+// the CPU, unless BROTENSOR_DEFAULT_DEVICE says otherwise. Calls brotensor::init() first (idempotent) so the GPU probes
 // have run.
 inline brotensor::Device autoDevice() {
     brotensor::init();
@@ -370,13 +370,14 @@ inline const char* deviceName(brotensor::Device d) {
         case brotensor::DeviceType::CUDA:  return "CUDA";
         case brotensor::DeviceType::HIP:   return "HIP";
         case brotensor::DeviceType::Metal: return "Metal";
+        case brotensor::DeviceType::VULKAN: return "Vulkan";
         case brotensor::DeviceType::CPU:   return "CPU";
     }
     return "?";
 }
 
 // Parse opts.device. Missing key: `out` untouched, true. A string naming a
-// device (any case; 'rocm' is 'hip'): `out` set, true. Anything else: `err`
+// device (any case; 'rocm' is 'hip', 'vk' is 'vulkan'): `out` set, true. Anything else: `err`
 // set, false — the caller throws a TypeError. `explicitDevice` reports
 // whether the key was given.
 inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
@@ -386,7 +387,7 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
     Value v = ev::getProperty(opts, "device");
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     if (!ev::isString(v)) {
-        err = "opts.device must be a string ('cpu', 'cuda', 'hip', or 'metal')";
+        err = "opts.device must be a string ('cpu', 'cuda', 'hip', 'vulkan', or 'metal')";
         return false;
     }
     const std::string given = ev::toUtf8(v);
@@ -396,8 +397,9 @@ inline bool parseDeviceOpt(Value opts, brotensor::Device& out, std::string& err,
     if (sv == "cpu")                  { out = brotensor::Device::CPU;   return true; }
     if (sv == "cuda")                 { out = brotensor::Device::CUDA;  return true; }
     if (sv == "hip" || sv == "rocm")  { out = brotensor::Device::HIP;   return true; }
+    if (sv == "vulkan" || sv == "vk") { out = brotensor::Device::VULKAN; return true; }
     if (sv == "metal")                { out = brotensor::Device::Metal; return true; }
-    err = "opts.device must be 'cpu', 'cuda', 'hip', or 'metal' (got '" + given + "')";
+    err = "opts.device must be 'cpu', 'cuda', 'hip', 'vulkan', or 'metal' (got '" + given + "')";
     return false;
 }
 

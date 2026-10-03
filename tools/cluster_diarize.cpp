@@ -6,7 +6,7 @@
 // path resolves similar-voiced speakers the 4-slot Sortformer head collapses.
 //
 //   brosoundml_cluster_diarize <wav> <sortformer_dir> <speaker_encoder_dir>
-//                              [--device auto|cpu|gpu|cuda|hip|metal]
+//                              [--device auto|cpu|gpu|cuda|hip|vulkan|metal]
 //                              [--cluster-threshold T] [--vad T] [--uri NAME]
 
 #include "brosoundml/audio.h"
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
         };
         if      (a == "-h" || a == "--help") {
             std::printf("usage: brosoundml_cluster_diarize <wav> <sortformer_dir> "
-                        "<speaker_encoder_dir> [--device auto|cpu|gpu|cuda|hip|metal] "
+                        "<speaker_encoder_dir> [--device auto|cpu|gpu|cuda|hip|vulkan|metal] "
                         "[--cluster-threshold T] [--vad T] [--uri NAME]\n");
             return 0;
         }

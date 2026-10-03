@@ -83,7 +83,7 @@ void print_help() {
         "  --seed N             (default 42)\n"
         "  --save-every N       periodic checkpoint cadence (default 5)\n"
         "  --resume PATH        warm-start from a .bw\n"
-        "  --device D           auto|cpu|gpu|cuda|hip|metal (default auto — best GPU)\n"
+        "  --device D           auto|cpu|gpu|cuda|hip|vulkan|metal (default auto — best GPU)\n"
         "  --small              3 epochs / batch 4 — smoke-test preset\n";
 }
 

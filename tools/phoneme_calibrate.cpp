@@ -185,7 +185,7 @@ void print_help() {
         "  --smoothing-hits M   M-of-N smoother hits (default 2)\n"
         "  --smoothing-window N M-of-N smoother window (default 3)\n"
         "  --entry-silence N    entry-gate silence frames (default 2; 0 = no boundary needed)\n"
-        "  --device auto|cpu|gpu|cuda|hip|metal\n"
+        "  --device auto|cpu|gpu|cuda|hip|vulkan|metal\n"
         "  -h --help\n");
 }
 

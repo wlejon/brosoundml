@@ -72,7 +72,7 @@ void print_help() {
         "  --whole-clip        run each clip end-to-end instead of a window\n"
         "  --per-class         print a per-class recall/precision table\n"
         "  --confusion PATH    dump the full K x K confusion matrix to PATH\n"
-        "  --device D          auto|cpu|gpu|cuda|hip|metal (default auto: best GPU)\n");
+        "  --device D          auto|cpu|gpu|cuda|hip|vulkan|metal (default auto: best GPU)\n");
 }
 
 bool parse_args(int argc, char** argv, Args& a) {

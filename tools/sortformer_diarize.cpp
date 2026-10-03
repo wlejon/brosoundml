@@ -6,7 +6,7 @@
 //
 // Usage:
 //   brosoundml_sortformer_diarize <wav> <model_dir>
-//                                 [--device auto|cpu|gpu|cuda|hip|metal]
+//                                 [--device auto|cpu|gpu|cuda|hip|vulkan|metal]
 //                                 [--threshold T] [--uri NAME]
 //                                 [--probs-out FILE]
 //
@@ -45,7 +45,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_sortformer_diarize <wav> <model_dir>\n"
-        "                                [--device auto|cpu|gpu|cuda|hip|metal]\n"
+        "                                [--device auto|cpu|gpu|cuda|hip|vulkan|metal]\n"
         "                                [--threshold T] [--uri NAME]\n"
         "                                [--probs-out FILE]\n");
 }

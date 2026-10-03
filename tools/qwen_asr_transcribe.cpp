@@ -6,7 +6,7 @@
 //
 // Usage:
 //   brosoundml_qwen_asr_transcribe <wav> <model_dir>
-//                                  [--device auto|cpu|gpu|cuda|hip|metal] [--context TEXT]
+//                                  [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--context TEXT]
 //                                  [--max-new-tokens N] [--stream] [--ids]
 //
 // Notes:
@@ -50,7 +50,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_qwen_asr_transcribe <wav> <model_dir>\n"
-        "                                 [--device auto|cpu|gpu|cuda|hip|metal] [--context TEXT]\n"
+        "                                 [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--context TEXT]\n"
         "                                 [--max-new-tokens N] [--stream] [--ids]\n");
 }
 

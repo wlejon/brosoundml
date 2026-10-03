@@ -1,12 +1,14 @@
 // Whisper stage-1 loader contract: config.json + model.safetensors parsing.
 // The forward pass is still in build-out, so transcribe() must throw a staged
 // std::runtime_error naming the stage.
+#include "test_device.h"
 #include "brosoundml/audio.h"
 #include "brosoundml/whisper.h"
 #include "brosoundml/whisper_modules.h"   // white-box CPU↔CUDA logits parity
 
 #include <brolm/whisper_tokenizer.h>
 
+#include <brotensor/cuda_graph.h>
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
@@ -394,7 +396,7 @@ static int run() {
                 }
             }
 
-            if (dev == bt::Device::CUDA || dev == bt::Device::HIP) {
+            if (bt::graph_capture_available(dev)) {
                 CHECK(used_graph,
                       "step_begin returns true on a GPU-resident decoder");
             } else {
@@ -433,6 +435,9 @@ static int run() {
         }
         if (brotensor::is_available(brotensor::Device::CUDA)) {
             run_case(brotensor::Device::CUDA, "CUDA");
+        }
+        if (brotensor::is_available(brotensor::Device::VULKAN)) {
+            run_case(brotensor::Device::VULKAN, "Vulkan");
         }
         fs::remove(stub_path);
     }
@@ -659,22 +664,18 @@ static int run() {
         }
     };
     // CPU enforces the filename-target substring (the deterministic baseline);
-    // CUDA only checks that the pipeline runs and produces a well-formed
-    // transcript — token argmax may tip on FP noise.
-    RealRun cpu_run, cuda_run, hip_run;
+    // the GPU only checks that the pipeline runs and produces a well-formed
+    // transcript — token argmax may tip on FP noise. The GPU is the preferred
+    // one (test_device.h: the default device, so BROTENSOR_DEFAULT_DEVICE /
+    // BROTENSOR_PREFER_HIP pick HIP or Vulkan on an AMD build).
+    RealRun cpu_run, gpu_real;
     run_real_smoke(brotensor::Device::CPU, "CPU",
                    /*enforce_filename_target=*/true, &cpu_run);
-    if (brotensor::is_available(brotensor::Device::HIP)) {
-        run_real_smoke(brotensor::Device::HIP, "HIP",
-                       /*enforce_filename_target=*/false, &hip_run);
-    }
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
-        run_real_smoke(brotensor::Device::CUDA, "CUDA",
-                       /*enforce_filename_target=*/false, &cuda_run);
-    }
-    if (brotensor::is_available(brotensor::Device::Metal)) {
-        run_real_smoke(brotensor::Device::Metal, "Metal",
-                       /*enforce_filename_target=*/false);
+    const brotensor::Device gpu_dev = brosoundml_test::preferred_gpu();
+    const char* gpu_dev_name = brosoundml_test::device_name(gpu_dev);
+    if (gpu_dev.is_gpu()) {
+        run_real_smoke(gpu_dev, gpu_dev_name,
+                       /*enforce_filename_target=*/false, &gpu_real);
     }
 
     // ─── CPU↔GPU parity (opt-in: real weights + a GPU device) ─────────────
@@ -688,9 +689,7 @@ static int run() {
     //  2. White-box: encode + prompt prefill on each device and compare the
     //     last-position logits within an FP16-attention tolerance (the same
     //     5e-2 bound test_qwen_asr uses for its upstream-logits check).
-    const RealRun* gpu_run = hip_run.ran ? &hip_run : (cuda_run.ran ? &cuda_run : nullptr);
-    const char* gpu_dev_name = hip_run.ran ? "HIP" : (cuda_run.ran ? "CUDA" : "GPU");
-    const brotensor::Device gpu_dev = hip_run.ran ? brotensor::Device::HIP : brotensor::Device::CUDA;
+    const RealRun* gpu_run = gpu_real.ran && !gpu_dev.is_metal() ? &gpu_real : nullptr;
 
     if (cpu_run.ran && gpu_run && gpu_run->ran) {
         std::printf("  [parity] CPU %.2f s vs %s %.2f s (%.1fx)\n",

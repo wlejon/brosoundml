@@ -2,9 +2,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
-#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -234,12 +232,9 @@ struct LstmGraphPlan {
     LstmDirState fwd;
     LstmDirState rev;        // initialised only for a BiLSTM plan
     bool         captured = false;
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;
-#endif
 };
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 namespace {
 
 // Capture-or-replay driver for one direction (fwd) or two (fwd + rev in a
@@ -262,7 +257,7 @@ void lstm_graph_forward(const LSTMCellWeights& w_f, const LSTMCellWeights* w_r,
         if (w_r) lstm_step_body(*w_r, H, p.rev);
         bt::sync_all();
         {
-            bt::CudaGraphCapture cap;
+            bt::CudaGraphCapture cap(gates_all_f.device);
             lstm_step_body(w_f, H, p.fwd);
             if (w_r) lstm_step_body(*w_r, H, p.rev);
             p.graph = cap.finish();
@@ -289,7 +284,6 @@ void lstm_graph_forward(const LSTMCellWeights& w_f, const LSTMCellWeights* w_r,
 }
 
 }  // namespace
-#endif  // BROSOUNDML_HAS_CUDA
 
 void LSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     if (X.cols != input_size) {
@@ -307,14 +301,12 @@ void LSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     bt::Tensor gates_all;
     lstm_input_proj(cell, X, gates_all);
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
-    if (X.device == bt::Device::CUDA || X.device == bt::Device::HIP) {
+    if (bt::graph_capture_available(X.device)) {
         if (!plan) plan = std::make_shared<LstmGraphPlan>();
         lstm_graph_forward(cell, nullptr, gates_all, nullptr,
                            L, hidden_size, Y, hidden_size, *plan);
         return;
     }
-#endif
     LstmDirState s;
     s.init(hidden_size, X.device, X.dtype);
     lstm_run(cell, gates_all, L, hidden_size, Y,
@@ -338,15 +330,13 @@ void BiLSTM::forward(const bt::Tensor& X, bt::Tensor& Y) const {
     lstm_input_proj(forward_cell, X, gates_all_f);
     lstm_input_proj(reverse_cell, X, gates_all_r);
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
-    if (X.device == bt::Device::CUDA || X.device == bt::Device::HIP) {
+    if (bt::graph_capture_available(X.device)) {
         if (!plan) plan = std::make_shared<LstmGraphPlan>();
         lstm_graph_forward(forward_cell, &reverse_cell,
                            gates_all_f, &gates_all_r,
                            L, H, Y, /*y_stride=*/2 * H, *plan);
         return;
     }
-#endif
     LstmDirState s_fwd, s_rev;
     s_fwd.init(H, X.device, X.dtype);
     s_rev.init(H, X.device, X.dtype);

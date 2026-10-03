@@ -106,11 +106,14 @@ ctest --test-dir build -C Release
 
 # CPU + CUDA — forwarded to brotensor's CUDA backend (brosoundml ships no kernels)
 cmake -S . -B build -DBROTENSOR_WITH_CUDA=ON && cmake --build build --config Release
+# AMD: HIP + Vulkan (Vulkan is the default device; BROTENSOR_PREFER_HIP=1 runs on HIP)
+cmake -S . -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_HIP=ON -DBROTENSOR_WITH_VULKAN=ON
 ```
 
 On Windows use the Visual Studio multi-config generator (`--config` picks the
 config); on Linux/macOS use a separate build dir per config. brosoundml builds
-no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` only forward
+no GPU language of its own — `BROTENSOR_WITH_CUDA` / `_WITH_METAL` / `_WITH_HIP` /
+`_WITH_VULKAN` only forward
 the backend choice so a standalone GPU build resolves brotensor's backend.
 
 ## Dependencies
@@ -240,9 +243,9 @@ CLI drivers, built when brosoundml is the top-level project
 - `build_pos_dataset.py` / `build_lexicon.py` — G2P data prep (offline).
 
 Device choice goes through `tools/tool_device.h` (`resolve_device`,
-`best_gpu`, `device_name`): `--device auto|cpu|gpu|cuda|hip|rocm|metal`, where
-`auto` is `brotensor::default_device()` (the best GPU — HIP > CUDA > Metal —
-else CPU) and `cuda` means CUDA when present, else the best GPU. Never
+`best_gpu`, `device_name`): `--device auto|cpu|gpu|cuda|hip|rocm|vulkan|vk|metal`,
+where `auto` is `brotensor::default_device()` (the best GPU — CUDA > Metal >
+Vulkan > HIP unless BROTENSOR_PREFER_HIP=1 — else CPU) and `cuda` means CUDA when present, else the best GPU. Never
 hard-code `Device::CUDA` in a tool.
 
 ## Tests
@@ -250,5 +253,8 @@ hard-code `Device::CUDA` in a tool.
 `ctest --test-dir build -C Release`. Tests are built only when brosoundml is the
 top-level project (`BROSOUNDML_TESTS`, ON by default standalone) — when consumed
 as a subdirectory by bro they are skipped. A test's GPU block runs on
-`brosoundml_test::preferred_gpu()` (`tests/test_device.h`: HIP > CUDA > Metal,
-CPU = skip), so the same block covers a ROCm, CUDA or Metal build.
+`brosoundml_test::preferred_gpu()` (`tests/test_device.h`: the default device
+when it is a GPU, CPU = skip), so the same block covers a Vulkan, ROCm, CUDA or
+Metal build. On Vulkan the BC-ResNet / phoneme-model training tests fail on
+brotensor's null `batch_norm_forward` (training) slot and `test_mel`'s CPU
+parity on the GEMM-based STFT's precision (brotensor docs/vulkan-coverage.md).

@@ -4,9 +4,7 @@
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -116,9 +114,7 @@ struct CpFrameState {
     bt::Tensor code_dev;       // (n_out, 1) INT32 accumulated codes
     bt::Tensor sample_scratch; // (1, 3*vocab) FP32 sampler workspace (sampling)
     DepthCache cache;
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;       // captured whole-frame step (CUDA only)
-#endif
     bool captured = false;
     // The captured graph bakes in the draw policy (argmax vs sample_logits_into)
     // and, when sampling, the sampling params — so a call whose policy/params
@@ -419,7 +415,6 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     clk::time_point t0;
     if (prof) t0 = clk::now();
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     // CUDA/HIP: the whole frame is a fixed-shape sequence of device ops with no host
     // control flow, so capture it once and replay it as a single launch (~700
     // tiny kernel launches/frame -> one cudaGraphLaunch). This now covers
@@ -431,7 +426,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     // then advances 15 more, matching the CPU eager path frame for frame.
     // BROSOUNDML_QWEN_NO_GRAPH forces the eager path (A/B + escape hatch).
     static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
-    const bool use_graph = (dev == bt::Device::CUDA || dev == bt::Device::HIP) && !no_graph;
+    const bool use_graph = bt::graph_capture_available(dev) && !no_graph;
     if (use_graph) {
         CpProf::graph() = true;
         // Drop a captured graph whose baked policy/params differ from this call.
@@ -453,7 +448,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
             bt::sync_all();
             st.cache.len = 0;   // re-bake offsets 0,1,2,... into the graph
             {
-                bt::CudaGraphCapture cap;
+                bt::CudaGraphCapture cap(dev);
                 run_frame_body(*this, st, sampling, temperature, top_k, top_p,
                                key, counter);
                 st.graph = cap.finish();
@@ -469,7 +464,6 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
         }
         bt::sync(dev);
     } else
-#endif
     {
         // Eager path (CPU, or any sampling frame): the same body over the same
         // persistent buffers, run directly. cache.len resets per frame.

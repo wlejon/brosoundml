@@ -2,16 +2,19 @@
 //
 // Device choice shared by the tools/ CLI drivers, so every tool spells
 // `--device` the same way and lands on whichever GPU backend the binary was
-// built with (HIP on a ROCm build, CUDA on a CUDA build, Metal on a Metal
-// build) instead of hard-coding Device::CUDA. Call brotensor::init() first —
+// built with (Vulkan or HIP on an AMD build, CUDA on a CUDA build, Metal on
+// a Metal build) instead of hard-coding Device::CUDA. Call brotensor::init() first —
 // availability is only known after the driver probes.
 //
 //   auto  default_device(): the best GPU, else CPU (BROTENSOR_DEFAULT_DEVICE
 //         overrides, as everywhere in brotensor)
-//   gpu   the best GPU (HIP > CUDA > Metal); an error when there is none
+//   gpu   the best GPU (the default device when it is one, else CUDA > HIP >
+//         Metal > Vulkan); an error when there is none
 //   cuda  CUDA when present, else the best GPU — `--device cuda` has always
-//         meant "use the GPU", and keeps meaning it on a HIP or Metal build
+//         meant "use the GPU", and keeps meaning it on a HIP, Vulkan or Metal
+//         build
 //   hip   HIP (alias: rocm); an error when it is not available
+//   vulkan Vulkan (alias: vk); an error when it is not available
 //   metal Metal; an error when it is not available
 //   cpu   CPU
 #include <brotensor/runtime.h>
@@ -22,14 +25,18 @@
 namespace brosoundml_tool {
 
 // The spellings resolve_device() accepts, for usage strings.
-inline constexpr const char* kDeviceChoices = "auto|cpu|gpu|cuda|hip|rocm|metal";
+inline constexpr const char* kDeviceChoices = "auto|cpu|gpu|cuda|hip|rocm|vulkan|vk|metal";
 
-// The best registered GPU backend (HIP > CUDA > Metal), or Device::CPU when
-// the build or the machine has none.
+// The best registered GPU backend: brotensor's default device when it is a
+// GPU (its policy puts Vulkan before HIP unless BROTENSOR_PREFER_HIP=1), else
+// CUDA > HIP > Metal > Vulkan, or Device::CPU when the build or the machine
+// has none.
 inline brotensor::Device best_gpu() {
-    if (brotensor::is_available(brotensor::Device::HIP))   return brotensor::Device::HIP;
-    if (brotensor::is_available(brotensor::Device::CUDA))  return brotensor::Device::CUDA;
-    if (brotensor::is_available(brotensor::Device::Metal)) return brotensor::Device::Metal;
+    if (brotensor::default_device().is_gpu()) return brotensor::default_device();
+    for (brotensor::Device d : {brotensor::Device::CUDA, brotensor::Device::HIP,
+                                brotensor::Device::Metal, brotensor::Device::VULKAN}) {
+        if (brotensor::is_available(d)) return d;
+    }
     return brotensor::Device::CPU;
 }
 
@@ -38,6 +45,7 @@ inline const char* device_name(brotensor::Device d) {
         case brotensor::DeviceType::HIP:   return "HIP";
         case brotensor::DeviceType::CUDA:  return "CUDA";
         case brotensor::DeviceType::Metal: return "Metal";
+        case brotensor::DeviceType::VULKAN: return "Vulkan";
         default:                           return "CPU";
     }
 }
@@ -54,6 +62,7 @@ inline bool resolve_device(const std::string& arg, brotensor::Device& out, std::
     if (arg.empty() || arg == "auto") { out = brotensor::default_device(); return true; }
     if (arg == "cpu")                 { out = Device::CPU; return true; }
     if (arg == "hip" || arg == "rocm") return require(Device::HIP, "HIP");
+    if (arg == "vulkan" || arg == "vk") return require(Device::VULKAN, "Vulkan");
     if (arg == "metal")                return require(Device::Metal, "Metal");
     if (arg == "gpu" || arg == "cuda") {
         if (arg == "cuda" && brotensor::is_available(Device::CUDA)) { out = Device::CUDA; return true; }

@@ -7,9 +7,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
 #include <brotensor/detail/dispatch.h>
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -1043,9 +1041,7 @@ struct WhisperDecoderStepState {
     bt::Tensor hidden_n;         // (1, d_model) post-final-LN output
     bt::Tensor logits;           // (1, vocab_size) LM-head output
     WhisperStepScratch sc;
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     bt::CudaGraph graph;
-#endif
     bool captured = false;
     // Device pointers baked into the captured graph: per-layer self/cross K/V
     // slabs + embed_tokens (the token-row staging source). Checked per step.
@@ -1146,7 +1142,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
         if (dis[0] != '\0' && std::string(dis) != "0") return false;
     }
     const bt::Device dev = layer_norm.gamma.device;
-    if (dev != bt::Device::CUDA && dev != bt::Device::HIP) return false;
+    if (!bt::graph_capture_available(dev)) return false;
     if (static_cast<int>(cache.layers.size()) != decoder_layers) return false;
     bt::DeviceScope scope(dev);
 
@@ -1181,9 +1177,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
             *t = bt::Tensor::empty_on(dev, 0, 0, bt::Dtype::FP32);
         }
         st.cap = cap;
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
-#endif
         st.captured = false;
     } else {
         // Reuse the existing mask storage (its pointer is baked into the
@@ -1199,9 +1193,7 @@ bool WhisperDecoder::step_begin(WhisperKVCache& cache) const {
     std::vector<const void*> keys = whisper_step_keys(*this, cache);
     if (keys != st.keys) {
         st.keys = std::move(keys);
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
-#endif
         st.captured = false;
     }
     return true;
@@ -1270,9 +1262,7 @@ void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
     std::vector<const void*> keys = whisper_step_keys(*this, cache);
     if (keys != st.keys) {
         st.keys = std::move(keys);
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
         st.graph.reset();
-#endif
         st.captured = false;
     }
 
@@ -1283,7 +1273,6 @@ void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
     bt::copy_d2d(embed_tokens, token_id * d_model, st.in_tok, 0, d_model);
     bt::copy_d2d(embed_positions, pos * d_model, st.in_pos, 0, d_model);
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
     if (!st.captured) {
         // Warm-up sizes every scratch buffer (capture must not allocate). The
         // step body is idempotent over the staged inputs — the capture re-run
@@ -1300,9 +1289,6 @@ void WhisperDecoder::step_decode(std::int32_t token_id, int pos,
     } else {
         st.graph.launch();
     }
-#else
-    whisper_step_body(*this, cache, st);
-#endif
 
     for (auto& l : cache.layers) l.self_len = pos + 1;
     logits_view = bt::Tensor::view(dev, st.logits.data, 1, vocab_size,

@@ -112,7 +112,7 @@ void print_help() {
         "  --cap N              max clips per (speaker x emotion) / per manifest tag,\n"
         "                       0=all (default 200)\n"
         "  --min-score F        drop clips with mean path log-posterior < F (default -3.5)\n"
-        "  --device auto|cpu|gpu|cuda|hip|metal\n  -h --help\n");
+        "  --device auto|cpu|gpu|cuda|hip|vulkan|metal\n  -h --help\n");
 }
 
 Args parse_args(int argc, char** argv) {

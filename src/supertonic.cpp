@@ -9,9 +9,7 @@
 #include <brotensor/safetensors.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
 #include <brotensor/cuda_graph.h>
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -1614,13 +1612,12 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
     stage_time(0);
     field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt, gc, gu);
 
-#if defined(BROSOUNDML_HAS_CUDA) || defined(BROSOUNDML_HAS_HIP)
-    if ((dev == bt::Device::CUDA || dev == bt::Device::HIP) && total_step > 1) {
+    if (bt::graph_capture_available(dev) && total_step > 1) {
         bt::sync_all();
         stage_time(1);
         bt::CudaGraph graph;
         {
-            bt::CudaGraphCapture cap;
+            bt::CudaGraphCapture cap(dev);
             field_step(noisyT, time_emb, text_cond, text_unc, style_val_cond, onesL, rt, L, T, dt, gc, gu);
             graph = cap.finish();
         }
@@ -1630,7 +1627,6 @@ AudioBuffer Supertonic::Impl::synthesize(const std::string& text,
         }
         bt::sync_all();
     } else
-#endif
     {
         for (int step = 1; step < total_step; ++step) {
             stage_time(step);

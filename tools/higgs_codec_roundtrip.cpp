@@ -2,7 +2,7 @@
 //
 // Usage:
 //   brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav>
-//                                    [--device auto|cpu|gpu|cuda|hip|metal] [--levels N]
+//                                    [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--levels N]
 //
 // Reads a 16-bit PCM WAV (any rate; resampled to 24 kHz mono inside encode()),
 // encodes it to 25 Hz RVQ codes, prints the frame count and a codebook-0
@@ -34,7 +34,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_higgs_codec_roundtrip <audio_tokenizer_dir> <in.wav> <out.wav>\n"
-        "                                   [--device auto|cpu|gpu|cuda|hip|metal] [--levels N]\n"
+        "                                   [--device auto|cpu|gpu|cuda|hip|vulkan|metal] [--levels N]\n"
         "\n"
         "  <audio_tokenizer_dir>  config.json + model.safetensors (OmniVoice audio_tokenizer/)\n"
         "  <in.wav>               16-bit PCM WAV, any rate (resampled to 24 kHz mono)\n"

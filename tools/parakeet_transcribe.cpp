@@ -7,7 +7,7 @@
 //
 // Usage:
 //   brosoundml_parakeet_transcribe <wav> <model_dir>
-//                                  [--device auto|cpu|gpu|cuda|hip|metal]
+//                                  [--device auto|cpu|gpu|cuda|hip|vulkan|metal]
 //                                  [--max-new-tokens N] [--stream]
 //                                  [--timestamps]
 //
@@ -48,7 +48,7 @@ void print_usage() {
     std::printf(
         "Usage:\n"
         "  brosoundml_parakeet_transcribe <wav> <model_dir>\n"
-        "                                 [--device auto|cpu|gpu|cuda|hip|metal]\n"
+        "                                 [--device auto|cpu|gpu|cuda|hip|vulkan|metal]\n"
         "                                 [--max-new-tokens N] [--stream]\n"
         "                                 [--timestamps]\n"
         "\n"
