@@ -45,55 +45,44 @@ option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 # brosoundml needs no GLSL of its own, so this only forwards it.
 option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
-# --- Siblings: bromath (header-only) + brotensor (tensor + ops) ---
+# --- Siblings: bromath, brotensor, broimage, brolm, broaudio ---
 #
-# Prefer standalone repos at ../<name>; fall back to third_party/ submodules.
-# Matches the pattern documented in bro/docs/multi-repo-workflow.md.
-
-set(BROMATH_DIR "${CMAKE_SOURCE_DIR}/../bromath" CACHE PATH
-    "Path to standalone bromath repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET bromath)
-    if(EXISTS "${BROMATH_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROMATH_DIR}" "${CMAKE_BINARY_DIR}/bromath" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/bromath/CMakeLists.txt")
-        add_subdirectory(third_party/bromath EXCLUDE_FROM_ALL)
+# Each resolves like every repo in the bro ecosystem: an existing target (a
+# superbuild such as bro already added it) wins; otherwise a checkout beside the
+# top-level project (../<name>, overridable with -D<NAME>_DIR=<path>);
+# otherwise the top-level project's third_party/<name> submodule (`git
+# submodule update --init --recursive`). third_party/ is flat: it carries every
+# sibling brosoundml needs, transitive ones included (broimage is brolm's).
+# Resolved in dependency order, so each finds the ones it needs already there.
+function(brosoundml_sibling name what)
+    if(TARGET ${name})
+        return()
+    endif()
+    string(TOUPPER "${name}" _upper)
+    set(${_upper}_DIR "${CMAKE_SOURCE_DIR}/../${name}" CACHE PATH
+        "Path to standalone ${name} repo (set to a missing path to force submodule fallback)")
+    if(EXISTS "${${_upper}_DIR}/CMakeLists.txt")
+        message(STATUS "brosoundml: ${name} from ${${_upper}_DIR}")
+        add_subdirectory("${${_upper}_DIR}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${name}/CMakeLists.txt")
+        message(STATUS "brosoundml: ${name} from ${CMAKE_SOURCE_DIR}/third_party/${name} (submodule)")
+        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/${name}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
     else()
         message(FATAL_ERROR
-            "bromath not found at ${BROMATH_DIR} or third_party/bromath. "
-            "Clone the bromath repo next to this repo, or override with -DBROMATH_DIR=...")
+            "brosoundml needs ${name} (${what}): not found at ${${_upper}_DIR} or "
+            "${CMAKE_SOURCE_DIR}/third_party/${name}. Clone https://github.com/wlejon/${name} next "
+            "to this repo, run `git submodule update --init --recursive`, or override with "
+            "-D${_upper}_DIR=...")
     endif()
-endif()
+endfunction()
 
-set(BROTENSOR_DIR "${CMAKE_SOURCE_DIR}/../brotensor" CACHE PATH
-    "Path to standalone brotensor repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET brotensor)
-    if(EXISTS "${BROTENSOR_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROTENSOR_DIR}" "${CMAKE_BINARY_DIR}/brotensor" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brotensor/CMakeLists.txt")
-        add_subdirectory(third_party/brotensor EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brotensor not found at ${BROTENSOR_DIR} or third_party/brotensor. "
-            "Clone the brotensor repo next to this repo, or override with -DBROTENSOR_DIR=...")
-    endif()
-endif()
-
+brosoundml_sibling(bromath "math headers")
+brosoundml_sibling(brotensor "tensors and ops")
+brosoundml_sibling(broimage "brolm's image preprocessing")
 # brolm — sibling text/model library. brosoundml consumes brolm for tokenizers
-# (the upcoming Whisper target uses brolm::whisper::Tokenizer); brolm's own
-# tests + tools are skipped because we add it with EXCLUDE_FROM_ALL.
-set(BROLM_DIR "${CMAKE_SOURCE_DIR}/../brolm" CACHE PATH
-    "Path to standalone brolm repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET brolm)
-    if(EXISTS "${BROLM_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROLM_DIR}" "${CMAKE_BINARY_DIR}/brolm" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/brolm/CMakeLists.txt")
-        add_subdirectory(third_party/brolm EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brolm not found at ${BROLM_DIR} or third_party/brolm. "
-            "Clone the brolm repo next to this repo, or override with -DBROLM_DIR=...")
-    endif()
-endif()
+# (brolm::whisper::Tokenizer and friends); brolm's own tests + tools are
+# skipped because it is added with EXCLUDE_FROM_ALL.
+brosoundml_sibling(brolm "tokenizers and text models")
 
 # broaudio probes for an SDL3 and prefers bro's pre-built SDL3-static, which
 # bro compiles against the DLL CRT (/MD). This standalone tree is static-CRT
@@ -116,19 +105,7 @@ if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
 endif()
 
 # broaudio — sibling audio engine library
-set(BROAUDIO_DIR "${CMAKE_SOURCE_DIR}/../broaudio" CACHE PATH
-    "Path to standalone broaudio repo (set to a missing path to force submodule fallback)")
-if(NOT TARGET broaudio)
-    if(EXISTS "${BROAUDIO_DIR}/CMakeLists.txt")
-        add_subdirectory("${BROAUDIO_DIR}" "${CMAKE_BINARY_DIR}/broaudio" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broaudio/CMakeLists.txt")
-        add_subdirectory(third_party/broaudio EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "broaudio not found at ${BROAUDIO_DIR} or third_party/broaudio. "
-            "Clone the broaudio repo next to this repo, or override with -DBROAUDIO_DIR=...")
-    endif()
-endif()
+brosoundml_sibling(broaudio "the audio engine")
 
 # bronze, the JavaScript runtime the api binds: a checkout beside this one
 # (../bronze, with ../brass beside it — bronze resolves and add_subdirectory()s
@@ -144,6 +121,10 @@ if(NOT TARGET bronze_runtime_shared)
         # Explicit BRONZE_DIR supplied
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
         set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        # Beside the top-level project: this repo is a third_party/ submodule
+        # of the project being built.
+        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
     endif()
 
     if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")

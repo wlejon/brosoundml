@@ -15,12 +15,21 @@ audio family: FFT/STFT, 1D/2D convolution, vocoder/codec activations, codec
 quantization, resampling, autoregressive sampling. Everything lives in one flat
 namespace, `brosoundml::`.
 
+Inside [bro](https://github.com/wlejon/bro) it is the engine behind the
+`bro.tts`, `bro.stt`, `bro.diar`, `bro.rave`, `bro.wake`, `bro.kws`,
+`bro.sense`, `bro.gesture` and `bro.listen` JavaScript namespaces and
+`bro.ear.loadClap`. Where it sits among the other libraries is in the
+[ecosystem index](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md).
+
 ## Models
 
 Every model runs FP32 on CPU. The device-neutral ones place weights on the chosen
 backend and dispatch the whole forward pass through `brotensor` device ops, so a
 CUDA build reproduces the CPU result — a bit-identical token stream for the
-discrete-token models, ~1e-5 for the continuous codec/vocoder tail.
+discrete-token models, ~1e-5 for the continuous codec/vocoder tail. The same
+dispatch reaches brotensor's Vulkan and Metal backends (the loaders and tools
+take `cuda|vulkan|metal`); the Device column records where each model has been
+checked against the CPU result.
 
 | Model | Task | Device | Notes |
 |---|---|---|---|
@@ -37,24 +46,51 @@ discrete-token models, ~1e-5 for the continuous codec/vocoder tail.
 | [Wake-word](docs/wake-word.md) | keyword spotting | CPU + CUDA | 2D BC-ResNet (PCEN) single-keyword streaming spotter + training toolchain |
 | [Phoneme spotter](docs/phoneme-spotter.md) | open-vocab spotting | CPU + CUDA | PhonemeNet posteriors + streaming template matcher; "type a word, spot it" |
 
+Also in the library, documented in their headers:
+
+| Header | What |
+|---|---|
+| `supertonic.h` | Supertonic-3, a ~99M flow-matching multilingual TTS recomposed from its ONNX graphs as brotensor ops |
+| `speaker_encoder.h` | Qwen3-TTS's ECAPA-TDNN speaker encoder on its own (~18 MB), for fast voice-clone enrolment |
+| `cluster_diarizer.h` | embedding + cosine-AHC diarization for similar voices and an unknown speaker count |
+| `word_align.h` | word timings for a known text by forced alignment over Parakeet |
+| `listen_bus.h`, `sensor_hub.h`, `gesture_spotter.h` | the listening stack: one shared streaming front-end, model-free acoustic sensors (VAD, onset, tonality), non-speech gesture matching |
+| `voice_agent.h` | a streaming duplex voice-agent harness coordinating the pieces above |
+| `decoder_lora.h` | a trainable LoRA over Kokoro's decoder style projections |
+
 The in-tree English **[G2P](docs/g2p.md)** (`brosoundml::g2p::`) lets Kokoro
 phonemize text with no misaki/Python dependency.
 
 ## Dependencies
 
 brosoundml ships no GPU kernels of its own — all compute (and all GPU work)
-happens inside `brotensor`. It depends on three libraries:
+happens inside `brotensor`. It depends on these libraries:
 
 | Library | Role |
 |---|---|
 | [`brotensor`](https://github.com/wlejon/brotensor) | the unified `Tensor` + device-neutral op surface (including the audio op family) — where every model's compute runs |
 | [`brolm`](https://github.com/wlejon/brolm) | tokenizers used by the speech models (`brolm::whisper::Tokenizer`, the Qwen BPE tokenizer, `brolm::t5::Tokenizer`) |
+| [`broaudio`](https://github.com/wlejon/broaudio) | the audio engine the listening stack's host runs on (needs SDL3) |
 | [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
+| [`broimage`](https://github.com/wlejon/broimage) | not used directly; brolm needs it, so it is resolved here too |
 
-Each resolves either to a standalone repo at `../<name>` or to a `third_party/`
-submodule fallback — see
-[bro/docs/multi-repo-workflow.md](https://github.com/wlejon/bro/blob/main/docs/multi-repo-workflow.md)
-for the layout.
+Each resolves in the same order as everywhere in the bro ecosystem:
+
+1. A target that already exists (a superbuild such as bro added it) wins.
+2. A checkout beside this repo, `../<name>` (override with `-D<NAME>_DIR=<path>`).
+3. The flat `third_party/<name>` git submodules, which carry every sibling,
+   transitive ones included: `git clone --recursive`, or
+   `git submodule update --init --recursive` in an existing clone.
+
+The configure log names where each one came from
+(`brosoundml: brolm from .../third_party/brolm (submodule)`).
+
+[bronze](https://github.com/wlejon/bronze) and
+[brass](https://github.com/wlejon/brass) are the exception: they have no
+submodule, because `brosoundml_api` (the JavaScript binding bro links) binds
+across bronze's C++ embed boundary and must compile against the same bronze as
+the program that loads it. A standalone build needs both checked out beside
+this repo, or `-DBRONZE_DIR=<path>`.
 
 ## Data and weights
 
@@ -126,9 +162,12 @@ specs: [pos_tagger](docs/pos_tagger.md), [lexicon](docs/lexicon.md),
 ## CI
 
 Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
-checks out bromath, brotensor, brolm and broimage alongside this repo and builds
-the whole stack from source, so a breaking change in a sibling fails here rather
-than in whoever next builds brosoundml by hand.
+checks out bromath, brotensor, broimage, brolm and broaudio alongside this repo
+and builds the whole stack from source, so a breaking change in a sibling fails
+here rather than in whoever next builds brosoundml by hand. A "Submodule
+fallback" job builds and tests the same tree from a recursive clone alone, at
+the pinned submodule commits. CI has no GPU: it runs the CPU backend only, and
+CUDA, Vulkan and Metal are exercised on real hardware.
 
 What a green run does and does not mean: the trained weights are not in this repo,
 so a runner never has them. Every model test gates on its checkpoint being present

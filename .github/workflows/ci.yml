@@ -34,11 +34,10 @@ concurrency:
 # puts ../bromath outside the workspace and the configure dies on the FATAL_ERROR
 # in CMakeLists.
 #
-# broimage is here even though brosoundml's own CMakeLists never names it. brolm
-# needs it, and brolm resolves it from `${CMAKE_SOURCE_DIR}/../broimage` —
-# CMAKE_SOURCE_DIR being the *top-level* project, which here is brosoundml. So it
-# has to sit beside brosoundml in the workspace like the rest, or brolm's
-# configure dies looking for it.
+# broimage is here even though brosoundml's own code never includes it: brolm
+# needs it, and siblings resolve against the *top-level* project, so brosoundml
+# resolves it (before brolm) like the rest. The Submodule fallback job below
+# builds the same tree from third_party/ submodules alone.
 #
 # Siblings track main, which is how the stack is developed — so a breaking change
 # landing in brotensor or brolm fails here, rather than in whoever next builds
@@ -150,6 +149,61 @@ jobs:
         env:
           SDL_AUDIODRIVER: dummy
         run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── Submodule fallback ────────────────────────────────────────────────────
+  #
+  # No siblings beside the repo: bromath, brotensor, broimage, brolm and
+  # broaudio come from the flat third_party/ submodules at the commits this
+  # repo pins, as they do for a fresh `git clone --recursive`. bronze and brass
+  # are the documented exception (no submodule; the api has to compile against
+  # the bronze of the program that loads it) and are laid out beside the repo
+  # as in the other jobs. The configure step checks each sibling really took
+  # the submodule path.
+  submodule:
+    name: Submodule fallback · ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brosoundml
+          submodules: recursive
+
+      - name: Provision SDL3
+        uses: libsdl-org/setup-sdl@v1
+        with:
+          version: 3.4.12
+          build-type: Release
+          add-to-environment: true
+          install-linux-dependencies: true
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: brosoundml-submodule
+          max-size: 500M
+
+      - name: Configure
+        shell: bash
+        run: |
+          for s in bromath brotensor broimage brolm broaudio; do test ! -e $s; done
+          cmake -S brosoundml -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache | tee configure.log
+          for s in bromath brotensor broimage brolm broaudio; do
+            grep -q "brosoundml: $s from .*third_party/$s (submodule)" configure.log
+          done
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        env:
+          SDL_AUDIODRIVER: dummy
+        run: ctest --test-dir build --output-on-failure
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
