@@ -13,18 +13,18 @@ concurrency:
 # Every job builds a plain clone, checked out under brosoundml/ with the build
 # tree beside it. Its dependencies — bromath, brotensor, broimage, brolm,
 # broaudio (the listen host's audio engine), and bronze (the JavaScript runtime
-# brosoundml_api binds, with brass, its code generator) — come from the commits
-# CMakeLists.txt pins (cmake/bro_deps.cmake), fetched at configure. There are no
-# submodules and no sibling checkouts.
+# brosoundml_api binds, with brass, its code generator) — come from the heads
+# of their main branches (cmake/bro_deps.cmake), fetched at configure. There are
+# no submodules and no sibling checkouts.
 #
 # bronze and brass compile inside this build tree with the job's own compiler
 # and CRT — the api is bound across bronze's C++ embed boundary, so a prebuilt
 # bronze would be an unverifiable ABI hazard. That is what makes
 # brosoundml_test_api the check that the library works the way bro uses it.
 #
-# broimage is pinned even though brosoundml's own code never includes it: brolm
-# needs it, and the top-level project's pins win, so brosoundml pins it (before
-# brolm) like the rest.
+# broimage is declared even though brosoundml's own code never includes it:
+# brolm needs it, and the top-level project's declaration wins, so brosoundml
+# declares it (before brolm) like the rest.
 #
 # What ctest actually covers here: the trained weights are not in this repo (they
 # live in the brosoundml-data dataset), so a runner never has them. Every model

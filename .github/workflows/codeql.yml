@@ -34,7 +34,7 @@ jobs:
 
       # The dependencies — the siblings, broaudio (the listen host's audio
       # engine), and bronze (with brass) for the api — are fetched at configure
-      # from the pinned commits and pre-built below, ahead of the trace. SDL3,
+      # from the heads of their main branches and pre-built below, ahead of the trace. SDL3,
       # which broaudio needs, is provisioned as in ci.yml.
       - name: Provision SDL3
         uses: libsdl-org/setup-sdl@v1

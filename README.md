@@ -81,7 +81,8 @@ the same order as everywhere in the bro ecosystem:
 1. A target that already exists (a superbuild such as bro added it) wins.
 2. A working tree beside this repo, `../<name>` (override with
    `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>`).
-3. The pinned commit, fetched at configure.
+3. The head of its main branch (or the commit the top-level project's
+   `cmake/bro_lock.cmake` names), fetched at configure.
 
 The configure log names where each one came from (`brolm: working tree ...`
 or the fetched archive URL).

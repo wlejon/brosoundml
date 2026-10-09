@@ -118,9 +118,9 @@ the backend choice so a standalone GPU build resolves brotensor's backend.
 
 ## Dependencies
 
-Code-side siblings, pinned by `bro_dependency()` in `CMakeLists.txt`
-(`cmake/bro_deps.cmake`): a working tree at `../<name>` wins, else the pinned
-commit is fetched at configure — see `bro/docs/multi-repo-workflow.md`:
+Code-side siblings, each a `bro_dependency()` in `CMakeLists.txt`
+(`cmake/bro_deps.cmake`): a working tree at `../<name>` wins, else the head of
+its main is fetched at configure — see `bro/docs/multi-repo-workflow.md`:
 
 - **bromath** — header-only math.
 - **brotensor** — the unified `Tensor` + the device-neutral op surface. All of
