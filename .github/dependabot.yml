@@ -1,7 +1,8 @@
 version: 2
 
-# No package manifest to watch: the siblings (bromath, brotensor, brolm, broimage)
-# are vendored by CMake from ../, and there are no third-party libraries. That
+# No package manifest to watch: the dependencies (bromath, brotensor, brolm,
+# broimage, broaudio, bronze; SDL3 on standalone MSVC) are pinned to commits with
+# bro_dependency() in CMakeLists.txt. That
 # leaves the pinned actions in .github/workflows/.
 updates:
   - package-ecosystem: github-actions

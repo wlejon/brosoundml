@@ -45,96 +45,45 @@ option(BROTENSOR_WITH_METAL "Build the Metal GPU backend" OFF)
 # brosoundml needs no GLSL of its own, so this only forwards it.
 option(BROTENSOR_WITH_VULKAN "Build the Vulkan GPU backend" OFF)
 
-# --- Siblings: bromath, brotensor, broimage, brolm, broaudio ---
+# --- Dependencies: bromath, bronze (+ brass), brotensor, broimage, brolm, broaudio ---
 #
-# Each resolves like every repo in the bro ecosystem: an existing target (a
-# superbuild such as bro already added it) wins; otherwise a checkout beside the
-# top-level project (../<name>, overridable with -D<NAME>_DIR=<path>);
-# otherwise the top-level project's third_party/<name> submodule (`git
-# submodule update --init --recursive`). third_party/ is flat: it carries every
-# sibling brosoundml needs, transitive ones included (broimage is brolm's).
-# Resolved in dependency order, so each finds the ones it needs already there.
-function(brosoundml_sibling name what)
-    if(TARGET ${name})
-        return()
-    endif()
-    string(TOUPPER "${name}" _upper)
-    set(${_upper}_DIR "${CMAKE_SOURCE_DIR}/../${name}" CACHE PATH
-        "Path to standalone ${name} repo (set to a missing path to force submodule fallback)")
-    if(EXISTS "${${_upper}_DIR}/CMakeLists.txt")
-        message(STATUS "brosoundml: ${name} from ${${_upper}_DIR}")
-        add_subdirectory("${${_upper}_DIR}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${name}/CMakeLists.txt")
-        message(STATUS "brosoundml: ${name} from ${CMAKE_SOURCE_DIR}/third_party/${name} (submodule)")
-        add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/${name}" "${CMAKE_BINARY_DIR}/${name}" EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR
-            "brosoundml needs ${name} (${what}): not found at ${${_upper}_DIR} or "
-            "${CMAKE_SOURCE_DIR}/third_party/${name}. Clone https://github.com/wlejon/${name} next "
-            "to this repo, run `git submodule update --init --recursive`, or override with "
-            "-D${_upper}_DIR=...")
-    endif()
-endfunction()
+# Each resolves through cmake/bro_deps.cmake, like every repo in the bro
+# ecosystem: an existing target (a superbuild such as bro already added it, and
+# its pins win) first; otherwise the ../<name> working tree beside the top-level
+# project; otherwise the commit pinned here, fetched at configure. Leaves first,
+# so each finds the ones it needs already there (broimage is brolm's).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
-brosoundml_sibling(bromath "math headers")
-brosoundml_sibling(brotensor "tensors and ops")
-brosoundml_sibling(broimage "brolm's image preprocessing")
+bro_dependency(bromath GITHUB wlejon/bromath REF 8b511fbd69c014bf0584d2b42e6c96a8cf720f6a TARGET bromath::bromath)
+
+# bronze, the JavaScript runtime the api binds (it brings brass, its code
+# generator). The api is bound across bronze's C++ embed boundary, so it has to
+# build against the bronze the surrounding tree builds against.
+bro_dependency(bronze GITHUB wlejon/bronze REF 15ce4cf5fc25d8afe03882985ae95adcba46a6a9 TARGET bronze_runtime_shared
+               OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
+
+bro_dependency(brotensor GITHUB wlejon/brotensor REF a332d9283c1e23b9f39e8ecaa4393f937dd26c0a)
+bro_dependency(broimage GITHUB wlejon/broimage REF 9346cd5e97cb2fba0bae15e9f15fc0d9e37349ee)
 # brolm — sibling text/model library. brosoundml consumes brolm for tokenizers
 # (brolm::whisper::Tokenizer and friends); brolm's own tests + tools are
 # skipped because it is added with EXCLUDE_FROM_ALL.
-brosoundml_sibling(brolm "tokenizers and text models")
+bro_dependency(brolm GITHUB wlejon/brolm REF 3e2547cba802e183196b95523bc53ee99304664b)
 
-# broaudio probes for an SDL3 and prefers bro's pre-built SDL3-static, which
-# bro compiles against the DLL CRT (/MD). This standalone tree is static-CRT
-# (/MT, above), and a /MD static library does not link into a /MT executable
-# (unresolved __imp_* CRT imports the moment the api's listen host pulls in
-# broaudio::Engine). So standalone on MSVC, build SDL3 from a source checkout
-# under this tree's own runtime setting; inside bro SDL3::SDL3-static already
-# exists and this is skipped.
+# broaudio probes for an SDL3 and would take an installed one built against the
+# DLL CRT (/MD). This standalone tree is static-CRT (/MT, above), and a /MD
+# static library does not link into a /MT executable (unresolved __imp_* CRT
+# imports the moment the api's listen host pulls in broaudio::Engine). So
+# standalone on MSVC, build SDL3 from the pinned source under this tree's own
+# runtime setting; inside bro SDL3::SDL3-static already exists and this is
+# skipped.
 if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
    AND NOT TARGET SDL3::SDL3 AND NOT TARGET SDL3::SDL3-static)
-    foreach(_sdl_src "${CMAKE_SOURCE_DIR}/../bro/third_party/SDL" "${CMAKE_SOURCE_DIR}/../SDL")
-        if(EXISTS "${_sdl_src}/CMakeLists.txt")
-            set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-            set(SDL_STATIC ON CACHE BOOL "" FORCE)
-            set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-            add_subdirectory("${_sdl_src}" "${CMAKE_BINARY_DIR}/SDL" EXCLUDE_FROM_ALL)
-            break()
-        endif()
-    endforeach()
+    bro_dependency(SDL GITHUB libsdl-org/SDL REF 1df279a04f604bc50b6f36c9e903b5e64c4fe2a3 THIRD_PARTY
+                   TARGET SDL3-static OPTIONS SDL_SHARED=OFF SDL_STATIC=ON SDL_TEST_LIBRARY=OFF)
 endif()
 
 # broaudio — sibling audio engine library
-brosoundml_sibling(broaudio "the audio engine")
-
-# bronze, the JavaScript runtime the api binds: a checkout beside this one
-# (../bronze, with ../brass beside it — bronze resolves and add_subdirectory()s
-# its own code generator), the layout of a bro tree and of CI (bronze's
-# .github/actions/checkout-toolchain), or an explicit -DBRONZE_DIR. No vendored
-# fallback: the api is bound across bronze's C++ embed boundary, so it has to
-# build against the bronze the surrounding tree builds against. Under bro this
-# block is skipped, bro having added bronze already.
-if(NOT TARGET bronze_runtime_shared)
-    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
-    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        # Explicit BRONZE_DIR supplied
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        # Beside the top-level project: this repo is a third_party/ submodule
-        # of the project being built.
-        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    endif()
-
-    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "bronze not found: check it out beside this repository (../bronze, with ../brass beside it) "
-            "or pass -DBRONZE_DIR=<path>.")
-    endif()
-
-    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
-endif()
+bro_dependency(broaudio GITHUB wlejon/broaudio REF 964a428ce8d8eae432cba8ac1a437ca5e2bf1b3f)
 
 # --- brosoundml library ---
 

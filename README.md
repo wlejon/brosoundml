@@ -74,23 +74,24 @@ happens inside `brotensor`. It depends on these libraries:
 | [`bromath`](https://github.com/wlejon/bromath) | header-only math (Vec/Quat/Mat, easing) |
 | [`broimage`](https://github.com/wlejon/broimage) | not used directly; brolm needs it, so it is resolved here too |
 
-Each resolves in the same order as everywhere in the bro ecosystem:
+A plain clone is all it takes. Each dependency is pinned to a commit in
+`CMakeLists.txt` (`bro_dependency()`, `cmake/bro_deps.cmake`) and resolves in
+the same order as everywhere in the bro ecosystem:
 
 1. A target that already exists (a superbuild such as bro added it) wins.
-2. A checkout beside this repo, `../<name>` (override with `-D<NAME>_DIR=<path>`).
-3. The flat `third_party/<name>` git submodules, which carry every sibling,
-   transitive ones included: `git clone --recursive`, or
-   `git submodule update --init --recursive` in an existing clone.
+2. A working tree beside this repo, `../<name>` (override with
+   `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>`).
+3. The pinned commit, fetched at configure.
 
-The configure log names where each one came from
-(`brosoundml: brolm from .../third_party/brolm (submodule)`).
+The configure log names where each one came from (`brolm: working tree ...`
+or the fetched archive URL).
 
 [bronze](https://github.com/wlejon/bronze) and
-[brass](https://github.com/wlejon/brass) are the exception: they have no
-submodule, because `brosoundml_api` (the JavaScript binding bro links) binds
-across bronze's C++ embed boundary and must compile against the same bronze as
-the program that loads it. A standalone build needs both checked out beside
-this repo, or `-DBRONZE_DIR=<path>`.
+[brass](https://github.com/wlejon/brass) compile inside this build tree,
+because `brosoundml_api` (the JavaScript binding bro links) binds across
+bronze's C++ embed boundary and must compile against the same bronze as the
+program that loads it. A standalone MSVC build also fetches SDL3 at its pinned
+commit, so it builds under this tree's static CRT.
 
 ## Data and weights
 
@@ -161,12 +162,9 @@ specs: [pos_tagger](docs/pos_tagger.md), [lexicon](docs/lexicon.md),
 
 ## CI
 
-Builds and tests on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64. Each job
-checks out bromath, brotensor, broimage, brolm and broaudio alongside this repo
-and builds the whole stack from source, so a breaking change in a sibling fails
-here rather than in whoever next builds brosoundml by hand. A "Submodule
-fallback" job builds and tests the same tree from a recursive clone alone, at
-the pinned submodule commits. CI has no GPU: it runs the CPU backend only, and
+Builds and tests a plain clone on Linux (GCC + Clang), Windows (MSVC) and
+macOS/arm64, building the whole stack from source at the pinned dependency
+commits. CI has no GPU: it runs the CPU backend only, and
 CUDA, Vulkan and Metal are exercised on real hardware.
 
 What a green run does and does not mean: the trained weights are not in this repo,
