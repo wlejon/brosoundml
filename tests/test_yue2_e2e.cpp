@@ -143,6 +143,7 @@ int main() {
     p.cot = cot == "off" ? brosoundml::Yue2Cot::Off : cot == "melody" ? brosoundml::Yue2Cot::Melody
                                                                           : brosoundml::Yue2Cot::Full;
     p.seed = static_cast<std::uint64_t>(req.get_int("seed", 831001));
+    p.abc_draft_tokens = std::atoi(env("YUE2_ABC_DRAFTS", "0").c_str());   // speculative planning
     const fs::path out = env("YUE2_OUT_DIR", (repo() / "build" / "yue2_e2e").string());
     fs::create_directories(out);
 
@@ -219,10 +220,11 @@ int main() {
             const auto r = y.generate(q, cb, [&] { return dec.first_audio >= 0; });
             const auto& tm = r.timing;
             if (print)
-                std::printf("TTFA cot=%s W=%d: first latent %.2f s, first audio %.2f s (plan %d tokens %.2f s at "
-                            "%.1f tok/s; semantic TTFT %.1f ms)\n",
+                std::printf("TTFA cot=%s W=%d: first latent %.2f s, first audio %.2f s (plan %d tokens in %d forwards, "
+                            "%.2f s at %.1f tok/s; semantic TTFT %.1f ms)\n",
                             c == brosoundml::Yue2Cot::Off ? "off" : "full", W, tm.first_latent_seconds,
-                            dec.first_audio, tm.plan_tokens, tm.plan_seconds, tm.plan_tps, tm.semantic_ttft * 1e3);
+                            dec.first_audio, tm.plan_tokens, tm.plan_forwards, tm.plan_seconds, tm.plan_tps,
+                            tm.semantic_ttft * 1e3);
         };
         ttfa(brosoundml::Yue2Cot::Off, false);
         ttfa(brosoundml::Yue2Cot::Full, true);

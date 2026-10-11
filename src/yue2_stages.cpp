@@ -68,11 +68,14 @@ ArRun run_ar(const Model& m, Phase ph, const std::vector<int32_t>& prefix,
              const std::vector<int32_t>* negative, float cfg, bool legacy_off, const Yue2Sampling& s,
              const UniformFn& uniform, const LayerHooks* hooks, const CancelCheck& cancel,
              const TokenFn& on_token, const std::function<void(int, int)>& on_progress,
-             std::unique_ptr<ArSession>* keep) {
+             std::unique_ptr<ArSession>* keep, int draft) {
     validate(s, ph == Phase::Abc ? "abc" : "semantic");
     if (static_cast<int>(prefix.size()) + s.max_tokens > CONTEXT)
         fail("prefix + requested generation budget exceeds 24576; no implicit truncation");
     const bool use_cfg = cfg != 1.0f;
+    if (draft < 0 || draft > 7) fail("draft tokens must be 0..7");
+    if (draft > 0 && !use_cfg)
+        return run_ar_spec(m, ph, prefix, legacy_off, s, uniform, hooks, cancel, on_token, on_progress, keep, draft);
     if (use_cfg && !negative) fail("CFG requires a negative prefix");
     if (use_cfg && static_cast<int>(negative->size()) + s.max_tokens > CONTEXT)
         fail("negative prefix + generation budget exceeds context");
@@ -113,7 +116,10 @@ ArRun run_ar(const Model& m, Phase ph, const std::vector<int32_t>& prefix,
         }
         r.tokens.push_back(tok);
         if (on_token) on_token(tok, *sess);
-        if (step + 1 < s.max_tokens) m.ar_step(*sess, tok);
+        if (step + 1 < s.max_tokens) {
+            m.ar_step(*sess, tok);
+            ++r.forwards;
+        }
     }
     r.truncated = !eos && !r.cancelled;
     r.seconds = seconds_since(t0);

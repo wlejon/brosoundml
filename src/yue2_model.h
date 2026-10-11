@@ -102,6 +102,15 @@ public:
     // Feed `token` to every branch and compute each branch's next logits row
     // over the range the session was last prefilled with.
     void ar_step(ArSession& s, int32_t token) const;
+    // Feed R tokens (1..8, the same to every branch) at consecutive positions
+    // in one forward — each weight read once for all B * R rows — and compute
+    // every row's logits: ar_logits then holds B * R rows, branch-major (row
+    // b * R + r is the next-token row after tokens[r]). Draft verification.
+    // R > 1 needs CUDA or the CPU.
+    void ar_step_rows(ArSession& s, const int32_t* tokens, int R) const;
+    // Cut branch b's cache back to `len` tokens (rejected drafts); the rows
+    // past it are dead and the next step overwrites them.
+    void ar_truncate(ArSession& s, int b, int len) const;
     // Host copy of the logits rows: branches * (hi - lo) floats, branch-major.
     void ar_logits(ArSession& s, std::vector<float>& out) const;
     int ar_len(const ArSession& s, int b) const;

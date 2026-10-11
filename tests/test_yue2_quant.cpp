@@ -71,35 +71,6 @@ std::vector<double> probs(const std::vector<float>& sc) {
     return p;
 }
 
-struct Fixture {
-    std::vector<std::vector<int32_t>> prefixes;
-    std::vector<std::vector<float>> ref_logits;
-    // Two single-branch greedy streams: [0] ABC, [1] semantic.
-    std::vector<int32_t> stream_prefix[2];
-};
-
-bool read_fixture(Fixture& fx, int V) {
-    Reader r(fixture("yue2_model.bin"));
-    if (!r || r.i32() != 0x314d5559) return false;
-    const int nl = r.i32();
-    for (int i = 0; i < nl; ++i) {
-        fx.prefixes.push_back(r.i32list());
-        fx.ref_logits.push_back(r.f32arr(V));
-    }
-    for (int k = 0; k < 3; ++k) {
-        const bool abc = r.i32() == 0;
-        auto prefix = r.i32list();
-        r.i32list();                              // negative prefix
-        const float cfg = r.f32();
-        r.i32();                                  // legacy
-        for (int i = 0; i < 7; ++i) r.i32();      // sampling (7 words)
-        r.i32list();                              // reference tokens
-        r.i32();                                  // truncated
-        if (cfg == 1.0f) fx.stream_prefix[abc ? 0 : 1] = std::move(prefix);
-    }
-    return !fx.stream_prefix[0].empty() && !fx.stream_prefix[1].empty();
-}
-
 // Per format, per phase: the logits rows along BF16's greedy tokens and the
 // format's own greedy tokens.
 struct PhaseRun {
@@ -137,30 +108,6 @@ std::vector<int32_t> rollout(const y2::Model& m, y2::Phase ph, const std::vector
         if (i + 1 < n) m.ar_step(*s, t);
     }
     return toks;
-}
-
-struct PlanStats {
-    int tokens = 0, truncated = 0, headers = 0, bars = 0, voices = 0;
-    double tps = 0;
-};
-PlanStats plan_stats(const brosoundml::Yue2Plan& p, double tps) {
-    PlanStats s;
-    s.tokens = static_cast<int>(p.abc_ids.size());
-    s.truncated = p.truncated;
-    s.tps = tps;
-    std::istringstream in(p.abc);
-    std::string line;
-    std::vector<char> seen;
-    while (std::getline(in, line)) {
-        if (line.size() >= 2 && line[1] == ':' && std::string("XTMLKQ").find(line[0]) != std::string::npos &&
-            std::find(seen.begin(), seen.end(), line[0]) == seen.end()) {
-            seen.push_back(line[0]);
-            ++s.headers;
-        }
-        if (line.rfind("V:", 0) == 0) ++s.voices;
-        s.bars += static_cast<int>(std::count(line.begin(), line.end(), '|'));
-    }
-    return s;
 }
 
 }  // namespace
@@ -291,7 +238,8 @@ int main() {
                     const auto t0 = y2::Clock::now();
                     const auto plan = y.plan(p);
                     const double secs = y2::seconds_since(t0);
-                    const PlanStats st = plan_stats(plan, plan.abc_ids.size() / secs);
+                    const PlanStats st = plan_stats(plan.abc, static_cast<int>(plan.abc_ids.size()), plan.truncated,
+                                                    plan.abc_ids.size() / secs);
                     std::printf("D. plan seed %d: %d tokens%s, %d header fields, %d bars, %d V: lines, %.1f tok/s\n",
                                 seed, st.tokens, st.truncated ? " (truncated)" : "", st.headers, st.bars, st.voices,
                                 st.tps);

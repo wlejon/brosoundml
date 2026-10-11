@@ -42,11 +42,6 @@ float bf16_to_f32(std::uint16_t b) {
     return r;
 }
 
-void h2d(bt::Device dev, void* dst, const void* src, std::size_t bytes) {
-    if (bytes == 0) return;
-    if (dev.is_cpu()) std::memcpy(dst, src, bytes);
-    else bt::detail::alloc_for(dev).memcpy_h2d(dst, src, bytes, dev.index);
-}
 
 // The rotate_half -> interleaved-pair permutation of one head's rows:
 // new 2i <- old i, new 2i+1 <- old i + hd/2.
@@ -112,6 +107,12 @@ Config Config::from_json(const std::string& path) {
 }
 
 // ─── shared helpers ─────────────────────────────────────────────────────────
+
+void h2d(bt::Device dev, void* dst, const void* src, std::size_t bytes) {
+    if (bytes == 0) return;
+    if (dev.is_cpu()) std::memcpy(dst, src, bytes);
+    else bt::detail::alloc_for(dev).memcpy_h2d(dst, src, bytes, dev.index);
+}
 
 bt::Tensor rows_view(const bt::Tensor& t, int row0, int rows) {
     const std::size_t es = static_cast<std::size_t>(bt::dtype_size_bytes(t.dtype));
@@ -379,8 +380,6 @@ std::unique_ptr<ArSession> Model::ar_session(int branches, int capacity, const L
 
 int Model::ar_len(const ArSession& s, int b) const { return s.len.at(b); }
 
-namespace {
-
 bt::Tensor lm_rows(const ModelWeights& w, int lo, int hi) {
     if (lo < 0 || hi > w.cfg.vocab || lo >= hi) model_fail("bad logit range");
     return rows_view(w.lm_head, lo, hi - lo);
@@ -391,14 +390,10 @@ QuantW q_lm_rows(const ModelWeights& w, int lo, int hi) {
     return {rows_view(w.q_lm_head.w, lo, hi - lo), rows_view(w.q_lm_head.scales, lo, hi - lo)};
 }
 
-// A decode linear: the quantised copy when the model has one, else BF16.
-void dlin(const bt::Tensor& W, const QuantW& q, const bt::Tensor& X, bt::Tensor& Y, bt::Tensor* ws,
-          int epi = bt::kLinearEpiStore) {
+void dlin(const bt::Tensor& W, const QuantW& q, const bt::Tensor& X, bt::Tensor& Y, bt::Tensor* ws, int epi) {
     if (q.empty()) bt::linear_forward_batched_ex(W, nullptr, X, bt::kLinearActNone, epi, ws, Y);
     else bt::linear_forward_batched_wq_ex(q.w, q.scales, nullptr, X, bt::kLinearActNone, epi, Y);
 }
-
-}  // namespace
 
 void Model::ar_prefill(ArSession& s, int b, const std::vector<int32_t>& ids, int lo, int hi) const {
     const ModelWeights& w = *w_;
@@ -425,7 +420,7 @@ void Model::ar_prefill(ArSession& s, int b, const std::vector<int32_t>& ids, int
 
 void Model::ar_logits(ArSession& s, std::vector<float>& out) const {
     const ModelWeights& w = *w_;
-    const std::size_t n = static_cast<std::size_t>(s.B) * (s.hi - s.lo);
+    const std::size_t n = static_cast<std::size_t>(s.logits.rows) * s.logits.cols;
     out.resize(n);
     if (w.dt == bt::Dtype::FP32) {
         s.logits.copy_to_host(out.data());
@@ -434,134 +429,6 @@ void Model::ar_logits(ArSession& s, std::vector<float>& out) const {
     std::vector<std::uint16_t> raw(n);
     s.logits.copy_to_host_bf16(raw.data());
     for (std::size_t i = 0; i < n; ++i) out[i] = bf16_to_f32(raw[i]);
-}
-
-void Model::ar_step(ArSession& s, int32_t token) const {
-    const ModelWeights& w = *w_;
-    const Config& c = w.cfg;
-    bt::DeviceScope scope(w.dev);
-    if (token < 0 || token >= c.vocab) model_fail("token id outside the vocabulary");
-    if (s.hi <= s.lo) model_fail("step before prefill");
-    const int B = s.B, hd = c.head_dim, half = hd / 2, qd = c.n_q * hd;
-    for (int b = 0; b < B; ++b)
-        if (s.len[b] < 1 || s.len[b] >= s.cap) model_fail("decode beyond the session capacity");
-    auto& st = s.st;
-    if (st.mask.empty()) {
-        st.tok = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
-        st.rows = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
-        st.lens = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
-        for (int b = 0; b < B; ++b) {
-            st.row1.push_back(rows_view(st.rows, b, 1));
-            st.mask.push_back(bt::Tensor::zeros_on(w.dev, s.cap, 1, bt::Dtype::FP32));
-        }
-        st.mask_len.assign(B, 0);
-        const float one = 1.0f;
-        st.ones = bt::Tensor::from_host_on(w.dev, &one, 1, 1);
-        st.cos = bt::Tensor::zeros_on(w.dev, B, half, bt::Dtype::FP32);
-        st.sin = bt::Tensor::zeros_on(w.dev, B, half, bt::Dtype::FP32);
-        st.att = bt::Tensor::zeros_on(w.dev, B, qd, w.dt);
-    }
-    // Stage this step: token, cache rows, the valid-key masks, RoPE rows.
-    std::vector<int32_t> toks(B, token), rows(B), lens(B);
-    for (int b = 0; b < B; ++b) rows[b] = s.len[b], lens[b] = s.len[b] + 1;
-    h2d(w.dev, st.tok.data, toks.data(), B * sizeof(int32_t));
-    h2d(w.dev, st.rows.data, rows.data(), B * sizeof(int32_t));
-    h2d(w.dev, st.lens.data, lens.data(), B * sizeof(int32_t));
-    // CUDA reads each branch's key count on the device (the work divides the
-    // valid keys, not the session capacity); elsewhere a key mask.
-    const bool dev_len = w.dev.type == bt::DeviceType::CUDA;
-    for (int b = 0; b < B; ++b) {
-        const int pos = s.len[b];
-        if (dev_len) {
-            bt::copy_d2d(w.cos_tbl, pos * half, st.cos, b * half, half);
-            bt::copy_d2d(w.sin_tbl, pos * half, st.sin, b * half, half);
-            continue;
-        }
-        if (st.mask_len[b] != pos) {
-            std::vector<float> m(s.cap, 0.0f);
-            std::fill(m.begin(), m.begin() + pos, 1.0f);
-            h2d(w.dev, st.mask[b].data, m.data(), m.size() * sizeof(float));
-        }
-        bt::copy_d2d(st.ones, 0, st.mask[b], pos, 1);
-        bt::copy_d2d(w.cos_tbl, pos * half, st.cos, b * half, half);
-        bt::copy_d2d(w.sin_tbl, pos * half, st.sin, b * half, half);
-    }
-
-    const bt::Tensor lm = lm_rows(w, s.lo, s.hi);
-    const QuantW qlm = q_lm_rows(w, s.lo, s.hi);
-    auto body = [&]() {
-        const int kd = c.n_kv * hd;
-        bt::embedding_lookup_forward(w.embed, static_cast<const int32_t*>(st.tok.data), B, st.x);
-        bt::rms_norm_forward(st.x, w.layers[0].ar.in_ln, c.eps, st.n);
-        for (int l = 0; l < c.layers; ++l) {
-            const PathW& p = w.layers[l].ar;
-            dlin(p.q, p.qq, st.n, st.q, &st.ws);
-            dlin(p.k, p.qk, st.n, st.k, &st.ws);
-            dlin(p.v, p.qv, st.n, st.v, &st.ws);
-            head_norm(w, st.q, c.n_q, p.q_norm, st.qn);
-            head_norm(w, st.k, c.n_kv, p.k_norm, st.kn);
-            bt::Tensor qv = reshape_view(st.qn, B, qd), kv = reshape_view(st.kn, B, kd);
-            bt::rope_apply(qv, st.cos, st.sin, hd, c.n_q, qv);
-            bt::rope_apply(kv, st.cos, st.sin, hd, c.n_kv, kv);
-            for (int b = 0; b < B; ++b) {
-                bt::scatter_rows(rows_view(kv, b, 1), st.row1[b], s.K[b][l]);
-                bt::scatter_rows(rows_view(st.v, b, 1), st.row1[b], s.V[b][l]);
-                bt::Tensor ab = rows_view(st.att, b, 1);
-                if (dev_len)
-                    bt::flash_attention_decode_len(rows_view(qv, b, 1), s.K[b][l], s.V[b][l],
-                                                   static_cast<const int32_t*>(st.lens.data) + b, c.n_q, c.n_kv,
-                                                   ab);
-                else
-                    bt::flash_attention_decode_masked(rows_view(qv, b, 1), s.K[b][l], s.V[b][l],
-                                                      static_cast<const float*>(st.mask[b].data), c.n_q, c.n_kv,
-                                                      ab);
-            }
-            dlin(p.o, p.qo, st.att, st.x, &st.ws, bt::kLinearEpiAccumulate);
-            bt::rms_norm_forward(st.x, p.post_ln, c.eps, st.n);
-            // silu(gate) * up in the GEMV's FP32 epilogue (one BF16 rounding
-            // where the reference rounds gate, silu and the product).
-            dlin(p.gate_up, p.qgate_up, st.n, st.g, &st.ws, bt::kLinearEpiSwiglu);
-            dlin(p.down, p.qdown, st.g, st.x, &st.ws, bt::kLinearEpiAccumulate);
-            if (s.hooks)
-                for (int b = 0; b < B; ++b) {
-                    bt::Tensor xb = rows_view(st.x, b, 1);
-                    apply_hooks(w, s.hooks, l, xb, s.len[b], 0, 1, -1, b == 0);
-                }
-            const bt::Tensor& next = l + 1 < c.layers ? w.layers[l + 1].ar.in_ln : w.final_norm;
-            bt::rms_norm_forward(st.x, next, c.eps, st.n);
-        }
-        dlin(lm, qlm, st.n, st.logits, &st.ws);
-    };
-
-    static const bool no_graph = [] {
-        const char* v = std::getenv("BROSOUNDML_YUE2_NO_GRAPH");
-        return v && *v && *v != '0';
-    }();
-    const bool hooks_eager = s.hooks && (s.hooks->any_capture() || s.hooks->any_per_position());
-    const bool graph = !no_graph && !hooks_eager && bt::graph_capture_available(w.dev);
-    if (!graph) {
-        body();
-    } else if (!st.captured || st.graph_lo != s.lo || st.graph_hi != s.hi) {
-        body();  // warm-up: sizes every buffer and computes this step
-        bt::sync_all();
-        {
-            bt::CudaGraphCapture cap;
-            body();
-            st.graph = cap.finish();
-        }
-        st.captured = true;
-        st.graph_lo = s.lo;
-        st.graph_hi = s.hi;
-    } else {
-        st.graph.launch();
-    }
-    if (s.logits.rows != B || s.logits.cols != s.hi - s.lo)
-        s.logits = bt::Tensor::zeros_on(w.dev, B, s.hi - s.lo, w.dt);
-    bt::copy_d2d(st.logits, 0, s.logits, 0, B * (s.hi - s.lo));
-    for (int b = 0; b < B; ++b) {
-        st.mask_len[b] = s.len[b] + 1;
-        ++s.len[b];
-    }
 }
 
 }  // namespace brosoundml::yue2

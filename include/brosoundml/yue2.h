@@ -128,6 +128,15 @@ struct Yue2Params {
     Yue2Sampling abc_sampling{0.7f, 0.9f, 30, 1.005f, 100, 32, 4096};
     Yue2Sampling semantic_sampling{};
 
+    // Speculative ABC planning: each decode forward also verifies up to this
+    // many draft tokens copied from earlier in the prompt + score (prompt
+    // lookup: what followed the latest earlier match of the last few tokens),
+    // accepted by standard speculative sampling, so the plan's distribution
+    // is exactly the one-token sampler's (a seed draws a different plan from
+    // the one-token path's, though; greedy is the same plan). 0 = off, at
+    // most 7. CUDA or the CPU.
+    int abc_draft_tokens = 0;
+
     int ode_steps = 32;                // midpoint steps per chunk
     // NAR chunking. 0 = the protocol's chunks (chunk_ranges over the 24576
     // context: in practice one chunk per song, so latents arrive only after
@@ -168,6 +177,7 @@ struct Yue2Timing {
     double plan_ttft = 0, semantic_ttft = 0;     // first token after prefill
     int    plan_tokens = 0, semantic_tokens = 0;
     double plan_tps = 0, semantic_tps = 0;
+    int    plan_forwards = 0;            // decode forwards of the plan (< tokens with drafts)
     // generate() only: wall time from the call to the first on_latents, and
     // the NAR seconds spent per second of audio synthesized.
     double first_latent_seconds = 0;

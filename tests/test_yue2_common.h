@@ -2,8 +2,10 @@
 // Shared helpers of the YuE2 backbone tests: CHECK, the fixture reader
 // (tests/ref/gen_yue2_fixture.py's binary conventions), the model folder.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -102,6 +104,63 @@ inline std::vector<T> read_npy(const fs::path& p, std::vector<long long>* shape 
     f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(n * sizeof(T)));
     if (!f) return {};
     return v;
+}
+
+// The parts of tests/fixtures/yue2_model.bin the quant / spec tests use: the
+// logit prefixes with the reference rows, and the prefixes of the two
+// single-branch greedy streams ([0] ABC, [1] semantic).
+struct Fixture {
+    std::vector<std::vector<int32_t>> prefixes;
+    std::vector<std::vector<float>> ref_logits;
+    std::vector<int32_t> stream_prefix[2];
+};
+
+inline bool read_fixture(Fixture& fx, int V) {
+    Reader r(fixture("yue2_model.bin"));
+    if (!r || r.i32() != 0x314d5559) return false;
+    const int nl = r.i32();
+    for (int i = 0; i < nl; ++i) {
+        fx.prefixes.push_back(r.i32list());
+        fx.ref_logits.push_back(r.f32arr(static_cast<std::size_t>(V)));
+    }
+    for (int k = 0; k < 3; ++k) {
+        const bool abc = r.i32() == 0;
+        auto prefix = r.i32list();
+        r.i32list();                              // negative prefix
+        const float cfg = r.f32();
+        r.i32();                                  // legacy
+        for (int i = 0; i < 7; ++i) r.i32();      // sampling (7 words)
+        r.i32list();                              // reference tokens
+        r.i32();                                  // truncated
+        if (cfg == 1.0f) fx.stream_prefix[abc ? 0 : 1] = std::move(prefix);
+    }
+    return !fx.stream_prefix[0].empty() && !fx.stream_prefix[1].empty();
+}
+
+// Shape statistics of a sampled ABC score: header fields (X T M L K Q, each
+// counted once), bar lines, voice lines.
+struct PlanStats {
+    int tokens = 0, truncated = 0, headers = 0, bars = 0, voices = 0;
+    double tps = 0;
+};
+inline PlanStats plan_stats(const std::string& abc, int tokens, bool truncated, double tps) {
+    PlanStats s;
+    s.tokens = tokens;
+    s.truncated = truncated;
+    s.tps = tps;
+    std::istringstream in(abc);
+    std::string line;
+    std::vector<char> seen;
+    while (std::getline(in, line)) {
+        if (line.size() >= 2 && line[1] == ':' && std::string("XTMLKQ").find(line[0]) != std::string::npos &&
+            std::find(seen.begin(), seen.end(), line[0]) == seen.end()) {
+            seen.push_back(line[0]);
+            ++s.headers;
+        }
+        if (line.rfind("V:", 0) == 0) ++s.voices;
+        s.bars += static_cast<int>(std::count(line.begin(), line.end(), '|'));
+    }
+    return s;
 }
 
 struct Diff {

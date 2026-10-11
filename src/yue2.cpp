@@ -62,7 +62,7 @@ PlanOut plan_impl(const Core& I, const Yue2Params& p, const Yue2Callbacks& cb,
     std::function<void(int, int)> prog;
     if (cb.on_progress) prog = [&](int d, int t) { cb.on_progress(Yue2Stage::Plan, d, t); };
     o.run = run_ar(I.model, Phase::Abc, prefix, nullptr, 1.0f, false, p.abc_sampling, uniform, hooks.get(),
-                   cancel, on_tok, prog, nullptr);
+                   cancel, on_tok, prog, nullptr, p.abc_draft_tokens);
     o.plan.abc_ids = o.run.tokens;
     o.plan.abc = utf8_replace(I.tok->decode(o.plan.abc_ids));
     o.plan.prefix = token_prefix(p, enc, &o.plan.abc_ids);

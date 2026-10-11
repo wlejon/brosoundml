@@ -8,6 +8,7 @@
 #include <brotensor/cuda_graph.h>
 #include <brotensor/tensor.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,15 @@ void head_norm(const ModelWeights& w, const bt::Tensor& src, int heads, const bt
                bt::Tensor& dst);
 // Upload host int32 ids to a device (n,1) INT32 tensor.
 void upload_ids(const ModelWeights& w, const int32_t* ids, int n, bt::Tensor& dst);
+// Host -> device bytes (a memcpy on the CPU).
+void h2d(bt::Device dev, void* dst, const void* src, std::size_t bytes);
+
+// lm_head rows [lo, hi) (BF16), and their quantised copy (empty without one).
+bt::Tensor lm_rows(const ModelWeights& w, int lo, int hi);
+QuantW q_lm_rows(const ModelWeights& w, int lo, int hi);
+// A decode linear: the quantised copy when there is one, else the BF16 W.
+void dlin(const bt::Tensor& W, const QuantW& q, const bt::Tensor& X, bt::Tensor& Y, bt::Tensor* ws,
+          int epi = 0 /* kLinearEpiStore */);
 
 // Apply `hooks` for layer l to the residual rows `x`: row r is position
 // pos_row0 + r; per-position steers and the capture cover rows [lo, hi)
@@ -102,19 +112,21 @@ struct ArSession {
     bt::Tensor logits;                             // (B, hi - lo)
     RowScratch pre;
 
-    // Decode step (B rows), persistent across replays.
+    // Decode step of R tokens per branch (B * R rows, branch-major), one per
+    // R used, persistent across replays (each keeps its own graph).
     struct Step {
-        bt::Tensor tok, rows, lens;                // (B,1) INT32 staged per step
-        std::vector<bt::Tensor> row1;              // per branch (1,1) INT32 views of rows
-        std::vector<bt::Tensor> mask;              // per branch (cap,1) FP32 (non-CUDA decode)
+        bt::Tensor tok, rows, lens;                // (B*R,1) / (B*R,1) / (B,1) INT32 staged per step
+        std::vector<bt::Tensor> rowsb;             // per branch (R,1) INT32 views of rows
+        std::vector<bt::Tensor> mask;              // per branch (cap,1) FP32 (non-CUDA decode, R = 1)
         bt::Tensor ones;                           // (1,1) FP32
-        bt::Tensor cos, sin;                       // (B, hd/2) FP32
+        bt::Tensor cos, sin;                       // (B*R, hd/2) FP32
         bt::Tensor x, n, q, k, v, qn, kn, att, g, u, logits, ws;
         bt::CudaGraph graph;
         bool captured = false;
         int graph_lo = -1, graph_hi = -1;
         std::vector<int> mask_len;
-    } st;
+    };
+    std::map<int, Step> steps;                     // by R
 };
 
 struct NarChunk {

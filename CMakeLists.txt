@@ -147,6 +147,8 @@ target_sources(brosoundml PRIVATE
     src/yue2_protocol.cpp
     src/yue2_model.cpp
     src/yue2_nar.cpp
+    src/yue2_decode.cpp
+    src/yue2_spec.cpp
     src/supertonic.cpp
     src/speaker_encoder.cpp
     src/wake.cpp

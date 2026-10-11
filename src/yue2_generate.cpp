@@ -39,6 +39,7 @@ Yue2Result Yue2::generate(const Yue2Params& p, const Yue2Callbacks& cb, const Ca
         res.timing.plan_seconds = po.run.seconds;
         res.timing.plan_ttft = po.run.ttft;
         res.timing.plan_tokens = po.run.count;
+        res.timing.plan_forwards = po.run.forwards;
         res.timing.plan_tps = po.run.seconds > 0 ? po.run.count / po.run.seconds : 0;
         if (po.run.cancelled || (cancel && cancel())) {
             res.cancelled = true;

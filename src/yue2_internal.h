@@ -59,17 +59,43 @@ struct ArRun {
     bool cancelled = false;
     double seconds = 0, ttft = 0;
     int count = 0;                 // tokens output, the end token included
+    int forwards = 0;              // decode forwards (prefill excluded)
 };
 
 // Called after each sampled non-end token, before it is fed back; the session
 // then caches the prefix plus every earlier token.
 using TokenFn = std::function<void(int32_t token, ArSession& session)>;
 
+// `draft` > 0 (single branch, no CFG): speculative decode with up to `draft`
+// prompt-lookup draft tokens per forward (run_ar_spec).
 ArRun run_ar(const Model& m, Phase ph, const std::vector<int32_t>& prefix,
              const std::vector<int32_t>* negative, float cfg, bool legacy_off, const Yue2Sampling& s,
              const UniformFn& uniform, const LayerHooks* hooks, const CancelCheck& cancel,
              const TokenFn& on_token, const std::function<void(int, int)>& on_progress,
-             std::unique_ptr<ArSession>* keep);
+             std::unique_ptr<ArSession>* keep, int draft = 0);
+
+// The speculative loop (yue2_spec.cpp): each forward feeds the last sampled
+// token plus up to `draft` tokens that followed the latest earlier match of
+// the context's last n-gram; drafts are accepted with probability p(d) under
+// the stage's distribution (greedy: when d is the argmax), the first
+// rejection draws from p with d removed, and a fully accepted block draws
+// one more from its last row. on_token fires per accepted token (its
+// session may hold rows past it).
+ArRun run_ar_spec(const Model& m, Phase ph, const std::vector<int32_t>& prefix, bool legacy_off,
+                  const Yue2Sampling& s, const UniformFn& uniform, const LayerHooks* hooks,
+                  const CancelCheck& cancel, const TokenFn& on_token,
+                  const std::function<void(int, int)>& on_progress, std::unique_ptr<ArSession>* keep, int draft);
+
+// Verify draft token d (absolute id) against one position's scores row
+// (distribution's output, ids [lo, lo + size)): true = emit d; false = emit
+// *next instead, drawn from the scores with d removed (greedy: the argmax).
+// `sc` may be modified.
+bool spec_accept(std::vector<float>& sc, int32_t d, int lo, float temperature, const UniformFn& uniform,
+                 int32_t* next);
+
+// Prompt lookup: up to `k` tokens that followed the latest earlier
+// occurrence of ctx's last n tokens (n from `n_max` down to `n_min`).
+std::vector<int32_t> lookup_draft(const std::vector<int32_t>& ctx, int k, int n_max = 4, int n_min = 1);
 
 // The NAR noise for frames [0, frames): the test seam's, else the seed's
 // torch CPU draw (prefix-stable: frame f's values do not depend on `frames`).
