@@ -20,6 +20,7 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -230,7 +231,7 @@ int main() {
                         std::copy_n(a.channel(ch), a.frames, out.data() + std::size_t(ch) * c.N + s0);
                 next = s0 + a.frames;
                 ++chunks;
-            }, 16);
+            }, 16, 0, /*first_core_frames=*/16);
             static const int kSizes[] = {7, 13, 1, 30, 4, 25};
             int f = 0, k = 0;
             while (f < c.T) {
@@ -250,6 +251,47 @@ int main() {
             CHECK(throws_runtime_error([&] { stream.push(c.T, 1, c.latents.data()); }), "push after finish throws");
             stream.reset();
             CHECK(throws_runtime_error([&] { stream.push(5, 1, c.latents.data()); }), "push with a gap throws");
+
+            // Growing tiles (default first 8, core 50): frame-by-frame pushes
+            // give 8, 16, 32, 50, ...; whole NAR windows (50) give a 38-frame
+            // tile on the first push. Both concatenate to the full decode.
+            for (const int step : {1, 50}) {
+                std::fill(out.begin(), out.end(), 0.0f);
+                std::vector<int> tiles;
+                std::int64_t at = 0;
+                double first_ms = -1;
+                auto t_push = std::chrono::steady_clock::now();
+                Yue2VaeStream grow(vae, [&](const StereoAudio& a, std::int64_t s0) {
+                    if (first_ms < 0)
+                        first_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_push).count();
+                    if (s0 == at && s0 + a.frames <= c.N)
+                        for (int ch = 0; ch < 2; ++ch)
+                            std::copy_n(a.channel(ch), a.frames, out.data() + std::size_t(ch) * c.N + s0);
+                    at = s0 + a.frames;
+                    tiles.push_back((a.frames + 1919) / 1920);
+                });
+                int pushes_before_audio = 0;
+                for (int fr = 0; fr < c.T; fr += step) {
+                    if (tiles.empty()) { ++pushes_before_audio; t_push = std::chrono::steady_clock::now(); }
+                    grow.push(fr, std::min(step, c.T - fr), c.latents.data() + std::size_t(fr) * 64);
+                }
+                grow.finish();
+                std::string sizes;
+                for (int t : tiles) sizes += std::to_string(t) + " ";
+                std::printf("  growing tiles, pushes of %d: %s(first tile %.1f ms, after %d push(es))\n",
+                            step, sizes.c_str(), first_ms, pushes_before_audio);
+                CHECK(at == c.N, "growing stream emits exactly the full length");
+                const Diff g = diff(out.data(), c.full.data(), out.size());
+                report("growing stream vs full", g);
+                CHECK(g.max_abs < kWaveMax && g.mean_abs < kWaveMean, "growing stream matches the full decode");
+                if (step == 1) {
+                    CHECK(tiles.size() >= 2 && tiles[0] == 8 && tiles[1] == 16, "frame pushes: tiles start 8, 16");
+                    for (std::size_t i = 1; i + 1 < tiles.size(); ++i)
+                        CHECK(tiles[i] == std::min(50, 2 * tiles[i - 1]), "frame pushes: each tile doubles up to the core");
+                } else if (c.T > 50) {
+                    CHECK(pushes_before_audio == 1 && tiles[0] == 50 - 12, "window pushes: audio after the first window");
+                }
+            }
         }
 
         // ── 5. decoder_only ──

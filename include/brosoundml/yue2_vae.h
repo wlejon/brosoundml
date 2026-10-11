@@ -132,15 +132,22 @@ private:
 // held-back tail. Output chunks are contiguous from sample 0, planar stereo,
 // and concatenate to exactly decode()'s waveform.
 //
-// Latency: a tile of `core_frames` is decoded once core_frames + halo frames
-// past its start exist, so smaller cores play sooner and cost more halo
-// recompute (core 50 = 2 s of audio per tile, 12-frame halo: ~1.5x work).
+// Latency: a frame is decodable once `halo` frames past it exist. Tiles grow:
+// the first is decoded as soon as `first_core_frames` frames are decodable,
+// and each later one waits until it can take at least twice the previous
+// tile (capped at `core_frames`), then takes every decodable frame up to the
+// cap. Pushes of a whole NAR window (50 frames) so give one 38-frame tile at
+// once and full cores after; frame-by-frame pushes give 8, 16, 32, 50, 50...
+// so playback is never waiting on a big tile. Every tile carries the halo
+// both sides, so small tiles cost relatively more (core 50 + 2x12: ~1.5x).
+// first_core_frames >= core_frames gives fixed tiles of core_frames.
 class Yue2VaeStream {
 public:
     using ChunkFn = std::function<void(const StereoAudio& chunk, std::int64_t sample0)>;
 
-    // `vae` must outlive the stream. core_frames 0 = 50 (2 s).
-    Yue2VaeStream(const Yue2Vae& vae, ChunkFn on_chunk, int core_frames = 0, int halo_frames = 0);
+    // `vae` must outlive the stream. core_frames 0 = 50 (2 s); first_core_frames 0 = 8.
+    Yue2VaeStream(const Yue2Vae& vae, ChunkFn on_chunk, int core_frames = 0, int halo_frames = 0,
+                  int first_core_frames = 0);
     ~Yue2VaeStream();
     Yue2VaeStream(const Yue2VaeStream&) = delete;
     Yue2VaeStream& operator=(const Yue2VaeStream&) = delete;
@@ -164,9 +171,9 @@ private:
 
     const Yue2Vae* vae_;
     ChunkFn on_chunk_;
-    int core_, halo_;
+    int core_, halo_, first_;
     std::vector<float> latents_;         // every frame pushed, frame-major
-    int pushed_ = 0, decoded_ = 0;
+    int pushed_ = 0, decoded_ = 0, last_tile_ = 0;
     std::int64_t emitted_ = 0;
     bool finished_ = false;
 };

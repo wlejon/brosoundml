@@ -259,7 +259,7 @@ struct MusicJob {
     ModelGate gate;
     std::shared_ptr<brosoundml::Yue2Vae> vae;   // optional: stream latents to audio
     ModelGate vaeGate;
-    int vaeCore = 0, vaeHalo = 0;
+    int vaeCore = 0, vaeHalo = 0, vaeFirst = 0;
 
     // work -> JS
     SpscSlots<AbcPiece> abc;
@@ -316,7 +316,7 @@ void runMusicJob(const std::shared_ptr<MusicJob>& job, const std::atomic<bool>& 
             j.audioParts.push_back(a);
             if (j.wantAudio)
                 j.audio.emplace([&](AudioChunk& slot) { slot.sample0 = s0; slot.audio = a; });
-        }, j.vaeCore, j.vaeHalo);
+        }, j.vaeCore, j.vaeHalo, j.vaeFirst);
     }
 
     brosoundml::Yue2Callbacks cb;
@@ -534,6 +534,7 @@ Value launchMusic(Value self, std::span<const Value> a, size_t optsAt, std::shar
             job->vaeRef = ev::Persistent(vaeVal.get());
             getIntOpt(opts.get(), "decodeCoreFrames", job->vaeCore);
             getIntOpt(opts.get(), "decodeHaloFrames", job->vaeHalo);
+            getIntOpt(opts.get(), "decodeFirstFrames", job->vaeFirst);
             if (job->vaeHalo > 0 && job->vaeHalo < vw->vae->required_halo(job->vaeCore > 0 ? job->vaeCore : 50))
                 return ev::throwTypeError(std::string(fn) + ": decodeHaloFrames is below the VAE's required halo");
         }
@@ -666,7 +667,8 @@ void decorateYue2(ObjectBuilder& b) {
 //                              | AsyncHandle (opts.onDone; opts.onChunk streams)
 //   latents: frame-major Float32Array (frames * 64). opts.coreFrames /
 //   haloFrames tile the decode (exact); opts.onChunk(chunk) receives audio in
-//   order (chunk.sample0) as tiles finish.
+//   order (chunk.sample0) as tiles finish, tiles growing from opts.firstFrames
+//   (default 8) to coreFrames.
 Value vaeDecode(Value self, std::span<const Value> a) {
     ev::Persistent selfRoot(self);
     auto* w = vaeOf(selfRoot.get());
@@ -678,10 +680,11 @@ Value vaeDecode(Value self, std::span<const Value> a) {
         return ev::throwTypeError("decode: latents.length must be a positive multiple of " + std::to_string(D));
     const int frames = static_cast<int>(lat.size() / static_cast<size_t>(D));
     ev::Persistent opts(isObjectArg(a, 1) ? a[1] : ev::undefined());
-    int core = 0, halo = 0;
+    int core = 0, halo = 0, first = 0;
     if (ev::isObject(opts.get())) {
         getIntOpt(opts.get(), "coreFrames", core);
         getIntOpt(opts.get(), "haloFrames", halo);
+        getIntOpt(opts.get(), "firstFrames", first);
     }
     if (halo > 0 && halo < w->vae->required_halo(core))
         return ev::throwTypeError("decode: haloFrames is below the required halo (" +
@@ -706,7 +709,7 @@ Value vaeDecode(Value self, std::span<const Value> a) {
         brotensor::Device device;
         ModelGate gate;
         std::vector<float> lat;
-        int frames = 0, core = 0, halo = 0;
+        int frames = 0, core = 0, halo = 0, first = 0;
         brosoundml::StereoAudio out;
         SpscSlots<AudioChunk> chunks;
         std::atomic<int> tilesDone{0}, tilesTotal{0};
@@ -722,6 +725,7 @@ Value vaeDecode(Value self, std::span<const Value> a) {
     job->frames = frames;
     job->core = core;
     job->halo = halo;
+    job->first = first;
     job->streaming = ev::isFunction(onChunk.get());
     job->self = ev::Persistent(selfRoot.get());
     job->onDone = onDone;
@@ -735,9 +739,10 @@ Value vaeDecode(Value self, std::span<const Value> a) {
         if (job->streaming) {
             brosoundml::Yue2VaeStream stream(*job->vae, [&](const brosoundml::StereoAudio& c, std::int64_t s0) {
                 job->chunks.emplace([&](AudioChunk& slot) { slot.sample0 = s0; slot.audio = c; });
-            }, job->core, job->halo);
-            // Push one core at a time so cancel is checked between tiles.
-            const int step = job->core > 0 ? job->core : 50;
+            }, job->core, job->halo, job->first);
+            // Push a first tile's worth at a time: tiles grow as they would
+            // under live latents, and cancel is checked between them.
+            const int step = job->first > 0 ? job->first : 8;
             for (int f = 0; f < job->frames && !cancel.load(); f += step) {
                 const int n = std::min(step, job->frames - f);
                 stream.push(f, n, job->lat.data() + static_cast<size_t>(f) * brosoundml::Yue2::kLatentDim);

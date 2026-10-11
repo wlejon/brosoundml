@@ -612,10 +612,13 @@ AudioBuffer StereoAudio::mono() const {
 
 // ─── Yue2VaeStream ───────────────────────────────────────────────────────────
 
-Yue2VaeStream::Yue2VaeStream(const Yue2Vae& vae, ChunkFn on_chunk, int core_frames, int halo_frames)
-    : vae_(&vae), on_chunk_(std::move(on_chunk)), core_(core_frames > 0 ? core_frames : 50) {
+Yue2VaeStream::Yue2VaeStream(const Yue2Vae& vae, ChunkFn on_chunk, int core_frames, int halo_frames,
+                             int first_core_frames)
+    : vae_(&vae), on_chunk_(std::move(on_chunk)), core_(core_frames > 0 ? core_frames : 50),
+      first_(std::min(core_, first_core_frames > 0 ? first_core_frames : 8)) {
     if (!vae.loaded()) fail("stream: the VAE is not loaded");
-    const int need_halo = vae.required_halo(core_);
+    // The halo is set by the largest tile; smaller tiles need no more.
+    const int need_halo = std::max(vae.required_halo(core_), vae.required_halo(first_));
     halo_ = halo_frames > 0 ? halo_frames : need_halo;
     if (halo_ < need_halo) fail("stream: halo_frames must be at least " + std::to_string(need_halo));
 }
@@ -642,7 +645,7 @@ void Yue2VaeStream::finish() {
 
 void Yue2VaeStream::reset() {
     latents_.clear();
-    pushed_ = decoded_ = 0;
+    pushed_ = decoded_ = last_tile_ = 0;
     emitted_ = 0;
     finished_ = false;
 }
@@ -652,8 +655,13 @@ void Yue2VaeStream::decode_ready(bool final_pass) {
     const int R = m.cfg.downsampling_ratio, C = m.cfg.channels;
     while (decoded_ < pushed_) {
         const int start = decoded_;
-        const int end = std::min(pushed_, start + core_);
-        if (!final_pass && (end - start < core_ || pushed_ < end + halo_)) break;
+        int end = std::min(pushed_, start + core_);
+        if (!final_pass) {
+            // Frames before pushed_ - halo_ have all their right context.
+            end = std::min(end, pushed_ - halo_);
+            const int want = last_tile_ ? std::min(core_, 2 * last_tile_) : first_;
+            if (end - start < want) break;
+        }
         const int left = std::max(0, start - halo_), right = std::min(pushed_, end + halo_);
         int L = 0;
         const std::vector<float> tile = m.decode_window(latents_.data(), left, right, &L);
@@ -673,6 +681,7 @@ void Yue2VaeStream::decode_ready(bool final_pass) {
         for (int c = 0; c < C; ++c)
             std::memcpy(chunk.channel(c), tile.data() + std::size_t(c) * L + crop, std::size_t(n) * sizeof(float));
         decoded_ = end;
+        last_tile_ = end - start;
         const std::int64_t s0 = emitted_;
         emitted_ += n;
         if (on_chunk_) on_chunk_(chunk, s0);
