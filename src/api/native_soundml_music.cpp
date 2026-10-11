@@ -114,7 +114,9 @@ bool readParams(Value opts, brosoundml::Yue2Params& p, std::string& err) {
     getBoolOpt(root.get(), "runSemantic", p.run_semantic);
     getBoolOpt(root.get(), "runSynthesize", p.run_synthesize);
     getBoolOpt(root.get(), "reusePrefixKv", p.reuse_prefix_kv);
+    getIntOpt(root.get(), "abcDraftTokens", p.abc_draft_tokens);
     if (p.ode_steps < 1) { err = "odeSteps must be >= 1"; return false; }
+    if (p.abc_draft_tokens < 0 || p.abc_draft_tokens > 7) { err = "abcDraftTokens must be 0..7"; return false; }
 
     // steer: [{ layer, nar?, delta: Float32Array, scale?, perPosition?, pos0?, plan?, semantic? }]
     {
@@ -394,6 +396,7 @@ Value makeTiming(const brosoundml::Yue2Timing& t) {
     o.set("planTokens", ev::fromDouble(t.plan_tokens));
     o.set("semanticTokens", ev::fromDouble(t.semantic_tokens));
     o.set("planTps", ev::fromDouble(t.plan_tps));
+    o.set("planForwards", ev::fromDouble(t.plan_forwards));
     o.set("semanticTps", ev::fromDouble(t.semantic_tps));
     o.set("firstLatentSeconds", ev::fromDouble(t.first_latent_seconds));
     o.set("narSecondsPerAudioSecond", ev::fromDouble(t.nar_seconds_per_audio_second));
