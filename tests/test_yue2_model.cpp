@@ -177,6 +177,36 @@ static int run(const fs::path& mdir, brotensor::Device dev) {
         const Diff dr = diff(m.nar_velocity(*c2, noise, raw), v);
         std::printf("nar chunk from a session cache vs fresh: cosine %.7f, max |diff| %.3g\n", dr.cosine, dr.max_abs);
         CHECK(dr.cosine > 0.9999, "nar chunk from a reused cache differs (cosine %.7f)", dr.cosine);
+
+        // Evaluations replay as CUDA graphs except those whose residuals are
+        // captured: a solve whose every evaluation captures (all eager), one
+        // capturing evaluation 3 only (graphs around an eager one) and one
+        // without hooks (all graphs) give the same latents bit for bit. 50
+        // frames: the 52-row linears of a streaming window.
+        const int f50 = 50, s4 = 4;
+        y2::LayerHooks hk;
+        hk.capture.assign(m.config().layers, 0);
+        hk.capture[3] = 1;
+        std::vector<int> evals_seen;
+        hk.on_capture = [&](int, int, int, int eval, const float*) { evals_seen.push_back(eval); };
+        y2::Model::NarOptions all;
+        all.hooks = &hk;
+        for (int e = 0; e < 2 * s4; ++e) all.capture_evals.push_back(e);
+        auto ce = m.nar_chunk(ar, f50, all);
+        const auto l_eager = m.nar_solve(*ce, noise.data(), s4, {}, {});
+        CHECK(static_cast<int>(evals_seen.size()) == 2 * s4, "captured %zu evaluations", evals_seen.size());
+        y2::Model::NarOptions one;
+        one.hooks = &hk;
+        one.capture_evals = {3};
+        evals_seen.clear();
+        auto cm = m.nar_chunk(ar, f50, one);
+        const auto l_mixed = m.nar_solve(*cm, noise.data(), s4, {}, {});
+        CHECK(evals_seen.size() == 1 && evals_seen[0] == 3, "evaluation 3 alone captured");
+        auto cg = m.nar_chunk(ar, f50, {});
+        const auto l_graph = m.nar_solve(*cg, noise.data(), s4, {}, {});
+        const double de = diff(l_graph, l_eager).max_abs, dm = diff(l_mixed, l_eager).max_abs;
+        std::printf("nar graph replay vs eager: max |diff| %.3g (all graphs), %.3g (one eager evaluation)\n", de, dm);
+        CHECK(de == 0.0 && dm == 0.0, "graph replay differs from the eager solve");
     }
 
     // 4. hidden-state seam

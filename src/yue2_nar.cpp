@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace brosoundml::yue2 {
@@ -57,12 +58,11 @@ float shifted_t(const ModelWeights& w, double raw) {
     return R(R(shift * sig) / R(1.0f + R((shift - 1.0f) * sig)));
 }
 
-void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
-    const Config& cf = w.cfg;
-    const int hd = cf.head_dim, qd = cf.n_q * hd, kd = cf.n_kv * hd, N = c.N;
-    RowScratch& sc = c.sc;
+void layers(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin, bool capture);
 
-    // Time embedding (TimestepEmbedder): FP32 sinusoid, cast, MLP.
+void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
+    // Time embedding (TimestepEmbedder): FP32 sinusoid on the host, cast; the
+    // MLP runs with the layers.
     {
         const float ts = shifted_t(w, c.cur_raw);
         constexpr int half = 128;
@@ -76,16 +76,46 @@ void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
         }
         if (c.temb_in.rows != 1) c.temb_in = bt::Tensor::zeros_on(w.dev, 1, 2 * half, w.dt);
         upload_rows(w, emb, 1, c.temb_in, 0);
-        lin(w.t0_w, &w.t0_b, c.temb_in, c.temb_h, &sc.ws);
-        bt::silu_forward(c.temb_h, c.temb_h);
-        lin(w.t2_w, &w.t2_b, c.temb_h, c.temb, &sc.ws);
     }
+    const bool capture =
+        c.hooks && std::find(c.capture_evals.begin(), c.capture_evals.end(), c.eval) != c.capture_evals.end();
+    // From here on every op reads and writes the chunk's fixed buffers: one
+    // CUDA graph per input buffer (the state and the midpoint) replays the
+    // ~600 launches of an evaluation as one. An evaluation that captures
+    // activations to the host runs eagerly.
+    static const bool no_graph = [] {
+        const char* v = std::getenv("BROSOUNDML_YUE2_NO_GRAPH");
+        return v && *v && *v != '0';
+    }();
+    const int slot = xin.data == c.xpad.data ? 0 : 1;
+    if (!no_graph && !capture && bt::graph_capture_available(w.dev)) {
+        if (c.graphed[slot]) {
+            c.graph[slot].launch();
+        } else {
+            layers(w, c, xin, false);  // warm-up: sizes every buffer and computes this evaluation
+            bt::sync_all();
+            bt::CudaGraphCapture cap;
+            layers(w, c, xin, false);
+            c.graph[slot] = cap.finish();
+            c.graphed[slot] = true;
+        }
+    } else {
+        layers(w, c, xin, capture);
+    }
+    ++c.eval;
+}
+
+void layers(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin, bool capture) {
+    const Config& cf = w.cfg;
+    const int hd = cf.head_dim, qd = cf.n_q * hd, kd = cf.n_kv * hd, N = c.N;
+    RowScratch& sc = c.sc;
+    lin(w.t0_w, &w.t0_b, c.temb_in, c.temb_h, &sc.ws);
+    bt::silu_forward(c.temb_h, c.temb_h);
+    lin(w.t2_w, &w.t2_b, c.temb_h, c.temb, &sc.ws);
     lin(w.vae2llm_w, &w.vae2llm_b, xin, sc.x, &sc.ws);
     bt::add_row_bias_inplace(sc.x, c.temb);
     bt::add_inplace(sc.x, rows_view(w.pe, 0, N));
 
-    const bool capture =
-        c.hooks && std::find(c.capture_evals.begin(), c.capture_evals.end(), c.eval) != c.capture_evals.end();
     for (int l = 0; l < cf.layers; ++l) {
         const PathW& p = w.layers[l].nar;
         bt::rms_norm_forward(sc.x, p.in_ln, cf.eps, sc.n);
@@ -102,16 +132,13 @@ void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
         bt::flash_attention_gqa_forward(qv, c.K[l], c.V[l], nullptr, cf.n_q, cf.n_kv, false, sc.att);
         lin(p.o, nullptr, sc.att, sc.x, &sc.ws, true);
         bt::rms_norm_forward(sc.x, p.post_ln, cf.eps, sc.n);
-        lin(p.gate, nullptr, sc.n, sc.g, &sc.ws);
-        lin(p.up, nullptr, sc.n, sc.u, &sc.ws);
-        bt::silu_forward(sc.g, sc.g);
-        bt::mul_inplace(sc.g, sc.u);
+        bt::linear_forward_batched_ex(p.gate_up, nullptr, sc.n, bt::kLinearActNone, bt::kLinearEpiSwiglu, &sc.ws,
+                                      sc.g);
         lin(p.down, nullptr, sc.g, sc.x, &sc.ws, true);
         apply_hooks(w, c.hooks, l, sc.x, c.frame0 - 1, 1, N - 1, c.eval, capture);
     }
     bt::rms_norm_forward(sc.x, w.final_norm, cf.eps, sc.n);
     lin(w.llm2vae_w, &w.llm2vae_b, rows_view(sc.n, 1, c.frames), c.vel, &sc.ws);
-    ++c.eval;
 }
 
 double raw_t(double t) {

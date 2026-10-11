@@ -140,7 +140,9 @@ public:
     // The midpoint ODE from `noise` (frames * 64, FP32, rounded to BF16 like
     // the reference's state) over `steps` steps; returns FP32 latents.
     // `on_step(done)` after each step; `cancel` polled twice per step
-    // (returns an empty vector when cancelled).
+    // (returns an empty vector when cancelled). On CUDA an evaluation replays
+    // as a graph (one per chunk and state buffer, captured at its first use)
+    // unless it is in capture_evals; BROSOUNDML_YUE2_NO_GRAPH=1 runs all eager.
     std::vector<float> nar_solve(NarChunk& c, const float* noise, int steps,
                                  const CancelCheck& cancel,
                                  const std::function<void(int)>& on_step) const;

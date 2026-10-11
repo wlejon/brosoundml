@@ -141,6 +141,8 @@ struct NarChunk {
     bt::Tensor xpad, mpad, vel, tmp;               // (N,64) (N,64) (frames,64) (frames,64)
     bt::Tensor temb_in, temb_h, temb;              // (1,256) (1,H) (1,H)
     bt::Tensor cos, sin;                           // (N, hd/2) views of the tables
+    bt::CudaGraph graph[2];                        // an evaluation from xpad / from mpad
+    bool graphed[2] = {false, false};
 };
 
 }  // namespace brosoundml::yue2
