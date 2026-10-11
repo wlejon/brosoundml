@@ -51,6 +51,19 @@ namespace brosoundml {
 
 enum class Yue2Cot { Off, Melody, Full };
 
+// Weights the AR decode (one token per forward: plan and semantic sampling)
+// reads. Decode is weight-bandwidth bound, so its speed is the bytes per
+// token. Bf16 = the checkpoint's. Int8 / Fp8 = weight-only quantised copies,
+// one FP32 scale per output row (INT8 symmetric +-127, or FP8 E4M3), of every
+// layer's AR q/k/v/o/gate/up/down and of lm_head; activations, accumulation
+// and everything else stay as in Bf16. Prefill, the NAR path and the VAE
+// always use the BF16 weights. Costs ~1.9 GB more device memory.
+enum class Yue2ArWeights { Bf16, Int8, Fp8 };
+
+struct Yue2LoadOptions {
+    Yue2ArWeights ar_weights = Yue2ArWeights::Bf16;
+};
+
 // One AR stage's sampling (protocol.Sampling). Defaults are the semantic
 // stage's; Yue2Params::abc_sampling defaults to the ABC preset.
 struct Yue2Sampling {
@@ -201,7 +214,8 @@ public:
     // config.json, model.safetensors and qwen.tiktoken from `model_dir`
     // (the YuE2-3B folder), weights on `device`. Throws std::runtime_error.
     void load(const std::string& model_dir,
-              brotensor::Device device = brotensor::Device::CUDA);
+              brotensor::Device device = brotensor::Device::CUDA,
+              const Yue2LoadOptions& options = {});
 
     // The whole pipeline up to latents (see Yue2Params::run_*). `cancel` is
     // polled per token and per ODE step; a cancel returns what exists with

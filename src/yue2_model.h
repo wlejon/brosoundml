@@ -23,6 +23,7 @@
 // token; each branch keeps its own cache and position.
 
 #include "brosoundml/audio.h"
+#include "brosoundml/yue2.h"
 
 #include <brotensor/tensor.h>
 
@@ -64,6 +65,8 @@ struct LayerHooks {
     bool any_per_position() const;
 };
 
+using ArWeights = Yue2ArWeights;
+
 struct ArSession;   // B-branch KV caches + decode graph + logits rows
 struct NarChunk;    // one chunk's AR K/V + NAR scratch + ODE state
 struct ModelWeights;
@@ -75,7 +78,9 @@ public:
     Model(Model&&) noexcept;
     Model& operator=(Model&&) noexcept;
 
-    void load(const std::string& model_dir, brotensor::Device dev);
+    // `ar` picks the weights the decode step reads (yue2.h, Yue2ArWeights).
+    void load(const std::string& model_dir, brotensor::Device dev, ArWeights ar = ArWeights::Bf16);
+    ArWeights ar_weights() const;
     bool loaded() const;
     const Config& config() const;
     brotensor::Device device() const;

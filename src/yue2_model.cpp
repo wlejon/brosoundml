@@ -245,7 +245,9 @@ bool Model::loaded() const { return w_ && w_->loaded; }
 const Config& Model::config() const { return w_->cfg; }
 bt::Device Model::device() const { return w_->dev; }
 
-void Model::load(const std::string& dir, bt::Device dev) {
+ArWeights Model::ar_weights() const { return w_->ar_weights; }
+
+void Model::load(const std::string& dir, bt::Device dev, ArWeights ar) {
     auto w = std::make_unique<ModelWeights>();
     w->cfg = Config::from_json(dir + "/config.json");
     w->dev = dev;
@@ -313,6 +315,23 @@ void Model::load(const std::string& dir, bt::Device dev) {
         }
     w->cos_tbl = bt::Tensor::from_host_on(dev, cs.data(), c.max_pos, half);
     w->sin_tbl = bt::Tensor::from_host_on(dev, sn.data(), c.max_pos, half);
+
+    // Decode's quantised AR copies (per output row, from the BF16 weights).
+    w->ar_weights = ar;
+    if (ar != ArWeights::Bf16) {
+        const bt::Dtype qf = ar == ArWeights::Int8 ? bt::Dtype::INT8 : bt::Dtype::FP8_E4M3;
+        auto qz = [&](const bt::Tensor& W, QuantW& q) { bt::quantize_rows(W, qf, q.w, q.scales); };
+        for (LayerW& L : w->layers) {
+            PathW& p = L.ar;
+            qz(p.q, p.qq);
+            qz(p.k, p.qk);
+            qz(p.v, p.qv);
+            qz(p.o, p.qo);
+            qz(p.gate_up, p.qgate_up);
+            qz(p.down, p.qdown);
+        }
+        qz(w->lm_head, w->q_lm_head);
+    }
     if (!dev.is_cpu()) bt::sync(dev);
     w->loaded = true;
     w_ = std::move(w);
@@ -365,6 +384,18 @@ namespace {
 bt::Tensor lm_rows(const ModelWeights& w, int lo, int hi) {
     if (lo < 0 || hi > w.cfg.vocab || lo >= hi) model_fail("bad logit range");
     return rows_view(w.lm_head, lo, hi - lo);
+}
+
+QuantW q_lm_rows(const ModelWeights& w, int lo, int hi) {
+    if (w.q_lm_head.empty()) return {};
+    return {rows_view(w.q_lm_head.w, lo, hi - lo), rows_view(w.q_lm_head.scales, lo, hi - lo)};
+}
+
+// A decode linear: the quantised copy when the model has one, else BF16.
+void dlin(const bt::Tensor& W, const QuantW& q, const bt::Tensor& X, bt::Tensor& Y, bt::Tensor* ws,
+          int epi = bt::kLinearEpiStore) {
+    if (q.empty()) bt::linear_forward_batched_ex(W, nullptr, X, bt::kLinearActNone, epi, ws, Y);
+    else bt::linear_forward_batched_wq_ex(q.w, q.scales, nullptr, X, bt::kLinearActNone, epi, Y);
 }
 
 }  // namespace
@@ -457,15 +488,16 @@ void Model::ar_step(ArSession& s, int32_t token) const {
     }
 
     const bt::Tensor lm = lm_rows(w, s.lo, s.hi);
+    const QuantW qlm = q_lm_rows(w, s.lo, s.hi);
     auto body = [&]() {
         const int kd = c.n_kv * hd;
         bt::embedding_lookup_forward(w.embed, static_cast<const int32_t*>(st.tok.data), B, st.x);
         bt::rms_norm_forward(st.x, w.layers[0].ar.in_ln, c.eps, st.n);
         for (int l = 0; l < c.layers; ++l) {
             const PathW& p = w.layers[l].ar;
-            lin(p.q, nullptr, st.n, st.q, &st.ws);
-            lin(p.k, nullptr, st.n, st.k, &st.ws);
-            lin(p.v, nullptr, st.n, st.v, &st.ws);
+            dlin(p.q, p.qq, st.n, st.q, &st.ws);
+            dlin(p.k, p.qk, st.n, st.k, &st.ws);
+            dlin(p.v, p.qv, st.n, st.v, &st.ws);
             head_norm(w, st.q, c.n_q, p.q_norm, st.qn);
             head_norm(w, st.k, c.n_kv, p.k_norm, st.kn);
             bt::Tensor qv = reshape_view(st.qn, B, qd), kv = reshape_view(st.kn, B, kd);
@@ -484,13 +516,12 @@ void Model::ar_step(ArSession& s, int32_t token) const {
                                                       static_cast<const float*>(st.mask[b].data), c.n_q, c.n_kv,
                                                       ab);
             }
-            lin(p.o, nullptr, st.att, st.x, &st.ws, true);
+            dlin(p.o, p.qo, st.att, st.x, &st.ws, bt::kLinearEpiAccumulate);
             bt::rms_norm_forward(st.x, p.post_ln, c.eps, st.n);
             // silu(gate) * up in the GEMV's FP32 epilogue (one BF16 rounding
             // where the reference rounds gate, silu and the product).
-            bt::linear_forward_batched_ex(p.gate_up, nullptr, st.n, bt::kLinearActNone, bt::kLinearEpiSwiglu,
-                                          &st.ws, st.g);
-            lin(p.down, nullptr, st.g, st.x, &st.ws, true);
+            dlin(p.gate_up, p.qgate_up, st.n, st.g, &st.ws, bt::kLinearEpiSwiglu);
+            dlin(p.down, p.qdown, st.g, st.x, &st.ws, bt::kLinearEpiAccumulate);
             if (s.hooks)
                 for (int b = 0; b < B; ++b) {
                     bt::Tensor xb = rows_view(st.x, b, 1);
@@ -499,7 +530,7 @@ void Model::ar_step(ArSession& s, int32_t token) const {
             const bt::Tensor& next = l + 1 < c.layers ? w.layers[l + 1].ar.in_ln : w.final_norm;
             bt::rms_norm_forward(st.x, next, c.eps, st.n);
         }
-        lin(lm, nullptr, st.n, st.logits, &st.ws);
+        dlin(lm, qlm, st.n, st.logits, &st.ws);
     };
 
     static const bool no_graph = [] {

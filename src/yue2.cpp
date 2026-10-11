@@ -80,13 +80,13 @@ Yue2& Yue2::operator=(Yue2&&) noexcept = default;
 bool Yue2::loaded() const { return impl_ && impl_->model.loaded() && impl_->tok.has_value(); }
 brotensor::Device Yue2::device() const { return impl_->model.device(); }
 
-void Yue2::load(const std::string& model_dir, brotensor::Device device) {
+void Yue2::load(const std::string& model_dir, brotensor::Device device, const Yue2LoadOptions& options) {
     brotensor::init();
     auto impl = std::make_unique<Impl>();
     impl->dir = model_dir;
     impl->tok = brolm::qwen::Tokenizer::from_tiktoken(model_dir + "/qwen.tiktoken", specials());
     if (impl->tok->vocab_count() != 151643) fail("expected the checkpoint-native qwen.tiktoken (151643 tokens)");
-    impl->model.load(model_dir, device);
+    impl->model.load(model_dir, device, options.ar_weights);
     impl_ = std::move(impl);
 }
 

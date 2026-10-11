@@ -17,9 +17,18 @@ namespace bt = brotensor;
 
 [[noreturn]] void model_fail(const std::string& msg);
 
+// A weight-only quantised copy of a weight (Model::load's ArWeights): codes
+// (out, in) INT8 / FP8_E4M3 and FP32 per-row scales. Empty = use the BF16.
+struct QuantW {
+    bt::Tensor w, scales;
+    bool empty() const { return w.rows == 0; }
+};
+
 // One attention + MLP path of one layer (AR or NAR).
 struct PathW {
     bt::Tensor in_ln, q, k, v, o, q_norm, k_norm, post_ln, gate_up, gate, up, down;  // gate/up: views
+    // AR decode's quantised copies (prefill and the NAR path keep the BF16).
+    QuantW qq, qk, qv, qo, qgate_up, qdown;
 };
 
 struct LayerW {
@@ -33,6 +42,8 @@ struct ModelWeights {
     bool loaded = false;
 
     bt::Tensor embed, lm_head, final_norm;  // (V,H) (V,H) (H,1)
+    ArWeights ar_weights = ArWeights::Bf16;
+    QuantW q_lm_head;                       // decode's lm_head (empty = BF16)
     std::vector<LayerW> layers;
     bt::Tensor vae2llm_w, vae2llm_b;        // (H,64) (H,1)
     bt::Tensor llm2vae_w, llm2vae_b;        // (64,H) (64,1)

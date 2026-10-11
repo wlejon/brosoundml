@@ -148,8 +148,14 @@ int main() {
 
     Yue2 y;
     double t = now_s();
-    y.load(mdir.string());
-    std::printf("load %.1f s\n", now_s() - t);
+    // $YUE2_AR_WEIGHTS = bf16 (default) / int8 / fp8: the decode's weights.
+    brosoundml::Yue2LoadOptions lo;
+    const std::string aw = env("YUE2_AR_WEIGHTS", "bf16");
+    lo.ar_weights = aw == "int8" ? brosoundml::Yue2ArWeights::Int8
+                    : aw == "fp8" ? brosoundml::Yue2ArWeights::Fp8
+                                  : brosoundml::Yue2ArWeights::Bf16;
+    y.load(mdir.string(), brotensor::Device::CUDA, lo);
+    std::printf("load %.1f s (AR decode weights %s)\n", now_s() - t, aw.c_str());
     std::unique_ptr<brosoundml::Yue2Vae> vae;
     if (const std::string vd = env("YUE2_VAE_DIR"); !vd.empty()) {
         vae = std::make_unique<brosoundml::Yue2Vae>();
@@ -190,6 +196,38 @@ int main() {
         std::printf("semantic only: %zu tokens after a %zu-token prefix in %.2f s = %.1f tok/s\n", codes.size(),
                     plan.prefix.size(), secs, codes.size() / secs);
         return 0;
+    }
+
+    // YUE2_E2E_TTFA=1: time to first latent and first audio only, for
+    // cot = full and cot = off, streaming at $YUE2_STREAM_FRAMES (default 50)
+    // with Yue2VaeStream's defaults; each run is cancelled once audio exists.
+    // One cot = off run first warms the GPU (graph capture, allocator).
+    if (env("YUE2_E2E_TTFA") == "1") {
+        if (!vae) {
+            std::printf("SKIP: YUE2_E2E_TTFA needs YUE2_VAE_DIR\n");
+            return 0;
+        }
+        const int W = std::atoi(env("YUE2_STREAM_FRAMES", "50").c_str());
+        auto ttfa = [&](brosoundml::Yue2Cot c, bool print) {
+            brosoundml::Yue2Params q = p;
+            q.cot = c;
+            q.nar_chunk_frames = W;
+            brosoundml::Yue2Callbacks cb;
+            cb.on_latents = [&](int f0, int n, const float* d) { dec.stream->push(f0, n, d); };
+            const double t0 = now_s();
+            dec.start(t0);
+            const auto r = y.generate(q, cb, [&] { return dec.first_audio >= 0; });
+            const auto& tm = r.timing;
+            if (print)
+                std::printf("TTFA cot=%s W=%d: first latent %.2f s, first audio %.2f s (plan %d tokens %.2f s at "
+                            "%.1f tok/s; semantic TTFT %.1f ms)\n",
+                            c == brosoundml::Yue2Cot::Off ? "off" : "full", W, tm.first_latent_seconds,
+                            dec.first_audio, tm.plan_tokens, tm.plan_seconds, tm.plan_tps, tm.semantic_ttft * 1e3);
+        };
+        ttfa(brosoundml::Yue2Cot::Off, false);
+        ttfa(brosoundml::Yue2Cot::Full, true);
+        ttfa(brosoundml::Yue2Cot::Off, true);
+        return failures ? 1 : 0;
     }
 
     // A. synthesis parity.
