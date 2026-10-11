@@ -19,7 +19,7 @@
 #include "test_yue2_common.h"
 #include "test_device.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "yue2_internal.h"
 
 #include <algorithm>
@@ -197,7 +197,7 @@ int gpu_checks(const fs::path& mdir, brotensor::Device dev) {
     std::ifstream rf((mdir / "examples" / "tonight-awake.json").string(), std::ios::binary);
     std::stringstream ss;
     ss << rf.rdbuf();
-    const auto req = brosoundml::detail::json::parse(ss.str());
+    const auto req = brotensor::json::parse(ss.str());
     brosoundml::Yue2 y;
     y.load(mdir.string(), dev, {arw});
     brosoundml::Yue2Params p;

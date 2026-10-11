@@ -5,7 +5,7 @@
 
 #include "mel_slaney.h"
 
-#include <brosoundml/detail/json.h>
+#include <brotensor/json.h>
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
@@ -71,7 +71,7 @@ std::string slurp(const fs::path& p) {
 
 // config.json (+ preprocessor_config.json when present) over the defaults.
 ClapConfig parse_config(const fs::path& dir) {
-    namespace j = brosoundml::detail::json;
+    namespace j = brotensor::json;
     ClapConfig c;
     const j::Value root = j::parse(slurp(dir / "config.json"));
     c.projection_dim = root.get_int("projection_dim", c.projection_dim);

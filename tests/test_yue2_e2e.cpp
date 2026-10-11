@@ -20,7 +20,7 @@
 
 #include "test_yue2_common.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "brosoundml/yue2.h"
 #include "brosoundml/yue2_vae.h"
 
@@ -135,7 +135,7 @@ int main() {
     std::ifstream rf(req_path.string(), std::ios::binary);
     std::stringstream ss;
     ss << rf.rdbuf();
-    const auto req = brosoundml::detail::json::parse(ss.str());
+    const auto req = brotensor::json::parse(ss.str());
     brosoundml::Yue2Params p;
     p.style = req.get_string("style", "");
     p.lyrics = req.get_string("lyrics", "");

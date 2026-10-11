@@ -10,7 +10,7 @@
 // full safetensors model on disk).
 
 #include "brosoundml/g2p/phoneme_adapter.h"
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace g = brosoundml::g2p;
-namespace j = brosoundml::detail::json;
+namespace j = brotensor::json;
 
 static int failures = 0;
 #define CHECK(cond, msg)                                              \

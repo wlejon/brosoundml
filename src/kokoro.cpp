@@ -1,6 +1,6 @@
 #include "brosoundml/kokoro.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "brosoundml/kokoro_modules.h"
 
 #include <brotensor/ops.h>
@@ -36,7 +36,7 @@ void set_kokoro_load_device(brotensor::Device d);
 void kokoro_profile_mark(brotensor::Device dev, const char* name);
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 
 namespace {
 

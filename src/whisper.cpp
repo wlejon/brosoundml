@@ -1,6 +1,6 @@
 #include "brosoundml/whisper.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "brosoundml/whisper_modules.h"
 
 #include <brotensor/runtime.h>
@@ -18,7 +18,7 @@
 namespace brosoundml {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 
 namespace {
 

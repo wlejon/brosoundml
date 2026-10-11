@@ -6,7 +6,7 @@
 
 #include "higgs_codec_common.h"
 #include "higgs_codec_model.h"
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -25,7 +25,7 @@
 namespace brosoundml {
 
 namespace bt = brotensor;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 namespace fs = std::filesystem;
 using namespace hcodec;   // fail/need/up/up_vec, ncl<->seq, conv_same/strided/
                           // trans_conv_up, snake, elu, lnorm, download_idx

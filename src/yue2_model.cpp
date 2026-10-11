@@ -2,7 +2,7 @@
 
 #include "yue2_model_impl.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -87,7 +87,7 @@ Config Config::from_json(const std::string& path) {
     if (!in) model_fail("cannot open " + path);
     std::stringstream ss;
     ss << in.rdbuf();
-    const auto j = brosoundml::detail::json::parse(ss.str());
+    const auto j = brotensor::json::parse(ss.str());
     Config c;
     c.hidden = j.get_int("hidden_size", c.hidden);
     c.layers = j.get_int("num_hidden_layers", c.layers);

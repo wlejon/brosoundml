@@ -16,7 +16,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/runtime.h>
 #include <brotensor/safetensors.h>
@@ -30,7 +30,7 @@
 
 namespace fs = std::filesystem;
 namespace sf = brotensor::safetensors;
-namespace j  = brosoundml::detail::json;
+namespace j  = brotensor::json;
 
 static const std::string kPrefix = "speaker_encoder.";
 

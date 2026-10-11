@@ -4,7 +4,7 @@
 #include "qwen_asr_encoder.h"
 #include "qwen_tts_device.h"   // qtd:: device-neutral helpers (model-agnostic)
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -23,7 +23,7 @@
 namespace brosoundml {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 namespace bt = brotensor;
 
 namespace {

@@ -1,7 +1,7 @@
 #include "brosoundml/speaker_encoder.h"
 
 #include "qwen_tts_speaker_encoder.h"
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -18,7 +18,7 @@ namespace brosoundml {
 namespace {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error("brosoundml: SpeakerEncoder::load: " + msg);

@@ -2,7 +2,7 @@
 
 #include "brosoundml/audio.h"
 
-#include <brolm/detail/json.h>
+#include <brotensor/json.h>
 
 #include <algorithm>
 #include <cctype>
@@ -15,7 +15,7 @@
 
 namespace laya_audio {
 
-namespace json = brolm::detail::json;
+namespace json = brotensor::json;
 
 std::vector<Utterance> load_manifest(const std::string& path) {
     std::ifstream f(path, std::ios::binary);

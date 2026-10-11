@@ -15,7 +15,7 @@
 #include "brosoundml/g2p/phoneme_adapter.h"
 #include "brosoundml/g2p/phonemizer.h"
 #include "brosoundml/g2p/tags.h"
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/runtime.h>
 
@@ -31,7 +31,7 @@
 #include <vector>
 
 namespace g = brosoundml::g2p;
-namespace j = brosoundml::detail::json;
+namespace j = brotensor::json;
 
 static int failures = 0;
 #define CHECK(cond, msg)                                              \

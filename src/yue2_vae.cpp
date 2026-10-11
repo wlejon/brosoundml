@@ -15,7 +15,7 @@
 //                             SnakeBeta, .3 conv k1
 #include "brosoundml/yue2_vae.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -37,7 +37,7 @@ namespace brosoundml {
 
 namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 namespace fs = std::filesystem;
 
 namespace {

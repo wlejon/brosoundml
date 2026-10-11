@@ -16,7 +16,7 @@
 #include <brosoundml/g2p/morphology.h>
 #include <brosoundml/g2p/special_cases.h>
 #include <brosoundml/g2p/phonemizer.h>
-#include <brosoundml/detail/json.h>
+#include <brotensor/json.h>
 
 #include <filesystem>
 #include <fstream>
@@ -217,7 +217,7 @@ std::string brosoundmlRoot() {
 }
 
 std::unordered_map<std::string, int> loadKokoroVocab(const std::string& configPath) {
-    namespace j = brosoundml::detail::json;
+    namespace j = brotensor::json;
     std::ifstream f(configPath, std::ios::binary);
     std::ostringstream os;
     os << f.rdbuf();

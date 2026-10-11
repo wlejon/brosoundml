@@ -7,7 +7,7 @@
 #include "qwen_tts_generate.h"
 #include "qwen_tts_talker.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 
 #include <brolm/qwen_tokenizer.h>
 
@@ -27,7 +27,7 @@
 namespace brosoundml {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 
 namespace {
 

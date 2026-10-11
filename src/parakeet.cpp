@@ -1,6 +1,6 @@
 #include "brosoundml/parakeet.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "parakeet_modules.h"
 #include "qwen_tts_device.h"   // qtd:: device-neutral helpers
 
@@ -25,7 +25,7 @@
 namespace brosoundml {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
 

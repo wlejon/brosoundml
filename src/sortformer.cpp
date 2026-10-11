@@ -1,6 +1,6 @@
 #include "brosoundml/sortformer.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "fastconformer_modules.h"
 #include "sortformer_modules.h"
 
@@ -22,7 +22,7 @@
 namespace brosoundml {
 
 namespace fs = std::filesystem;
-namespace j  = detail::json;
+namespace j  = brotensor::json;
 namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
 

@@ -89,7 +89,7 @@ include/brosoundml/
   wake_data.h        wake training-dataset binary format
   g2p/               in-tree English G2P: pos_tagger, lexicon, morphology,
                      special_cases, normalizer, phoneme_adapter, phonemizer
-  detail/json.h      vendored JSON parser (kept in sync with brolm's)
+                     (JSON configs parse with brotensor/json.h)
 src/                 one .cpp per header above; qwen_tts split across
                      qwen_tts{,_talker,_code_predictor,_generate,_codec,
                      _codec_encoder,_speaker_encoder}.cpp

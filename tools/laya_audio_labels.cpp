@@ -33,7 +33,7 @@
 
 #include "laya_audio_data.h"
 
-#include <brolm/detail/json.h>
+#include <brotensor/json.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -51,7 +51,7 @@
 
 using namespace laya_audio;
 namespace fs = std::filesystem;
-namespace json = brolm::detail::json;
+namespace json = brotensor::json;
 
 namespace {
 

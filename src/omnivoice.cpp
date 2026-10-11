@@ -8,7 +8,7 @@
 
 #include "brosoundml/omnivoice.h"
 
-#include "brosoundml/detail/json.h"
+#include "brotensor/json.h"
 #include "higgs_codec_common.h"
 #include "omnivoice_lm.h"
 #include "omnivoice_prompt.h"
@@ -35,7 +35,7 @@ namespace {
 
 namespace bt = brotensor;
 namespace sf = brotensor::safetensors;
-namespace j = brosoundml::detail::json;
+namespace j = brotensor::json;
 namespace fs = std::filesystem;
 
 [[noreturn]] void fail(const std::string& msg) {
