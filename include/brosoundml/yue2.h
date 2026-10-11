@@ -63,6 +63,47 @@ struct Yue2Sampling {
     int   max_tokens         = 9000;
 };
 
+enum class Yue2Stage { Plan, Semantic, Synthesize };
+
+// ── Residual-stream steering + capture (interpretability seam) ──────────────
+// Both act on the residual stream AFTER a decoder layer (its MLP add — the
+// stream layer + 1 reads), on the AR path (plan / semantic stages) and the
+// NAR path (synthesis). Empty = off; when off the forward is unchanged and
+// pays nothing. Like QwenTtsSampling::voice_steer, a delta is plain host
+// floats of hidden_size (2048) width.
+struct Yue2Steer {
+    bool nar = false;          // false: AR path, true: NAR path
+    int  layer = 0;            // 0 .. 27
+    // hidden floats: added at every position. rows * hidden floats with
+    // per_position: row r is added at position pos0 + r (AR: absolute token
+    // position in the stage's sequence; NAR: absolute latent frame), rows
+    // outside a forward's positions are ignored.
+    std::vector<float> delta;
+    float scale = 1.0f;
+    bool  per_position = false;
+    int   pos0 = 0;
+    bool  plan = true, semantic = true;   // AR stages it applies to
+};
+
+struct Yue2Capture {
+    std::vector<int> layers;              // AR + NAR layers to report (empty = off)
+    bool plan = true, semantic = true;    // AR stages reported (branch 0 = conditional)
+    // NAR velocity evaluations to report, counted per chunk/window from 0
+    // (2 per ODE step: step s = evals 2s, 2s+1). Empty = no NAR capture.
+    std::vector<int> nar_evals;
+};
+
+// One captured residual block (pointer valid during the callback only).
+struct Yue2Hidden {
+    Yue2Stage stage = Yue2Stage::Plan;
+    int layer = 0;
+    int pos0 = 0;          // AR: first token position; NAR: first latent frame
+    int rows = 0;          // positions in `data`
+    int hidden = 0;        // floats per row
+    int nar_eval = -1;     // NAR: velocity evaluation within its chunk
+    const float* data = nullptr;   // rows * hidden, FP32
+};
+
 struct Yue2Params {
     std::string style;                 // "[Tags]" text
     std::string lyrics;                // "[Lyrics]" text (sections like [verse])
@@ -84,6 +125,21 @@ struct Yue2Params {
 
     bool run_semantic   = true;        // false: stop after the plan
     bool run_synthesize = true;        // false: stop after semantic tokens
+
+    std::vector<Yue2Steer> steer;      // residual-stream steering (empty = off)
+    Yue2Capture capture;               // residual capture -> Yue2Callbacks::on_hidden
+
+    // Reuse the semantic stage's KV cache for synthesis instead of prefilling
+    // prompt + codec again (generate() only; protocol chunks and the prompt
+    // part of streaming windows). Same weights and positions, so the K/V
+    // differ from a fresh prefill only by kernel rounding.
+    bool reuse_prefix_kv = true;
+
+    // Test seam: uniforms for the AR token draws (one per sampled token, in
+    // order; plan first, then semantic) replacing the seeded generator, and
+    // the NAR noise (frames * 64) replacing the seed's torch CPU draw.
+    std::vector<double> test_uniforms;
+    std::vector<float>  test_noise;
 };
 
 // Stage results, also the seams a lab drives stage by stage.
@@ -99,6 +155,10 @@ struct Yue2Timing {
     double plan_ttft = 0, semantic_ttft = 0;     // first token after prefill
     int    plan_tokens = 0, semantic_tokens = 0;
     double plan_tps = 0, semantic_tps = 0;
+    // generate() only: wall time from the call to the first on_latents, and
+    // the NAR seconds spent per second of audio synthesized.
+    double first_latent_seconds = 0;
+    double nar_seconds_per_audio_second = 0;
 };
 
 struct Yue2Result {
@@ -111,9 +171,9 @@ struct Yue2Result {
     bool                 cancelled = false;
 };
 
-enum class Yue2Stage { Plan, Semantic, Synthesize };
-
 struct Yue2Callbacks {
+    // Residual blocks requested by Yue2Params::capture.
+    std::function<void(const Yue2Hidden&)> on_hidden;
     // ABC text as it is sampled (UTF-8 pieces; may split a code point only at
     // token boundaries the tokenizer produces — the binding buffers).
     std::function<void(const std::string& piece, int32_t token)> on_abc;

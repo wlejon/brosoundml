@@ -141,6 +141,12 @@ target_sources(brosoundml PRIVATE
     src/qwen_asr_decoder.cpp
     src/rave.cpp
     src/yue2_vae.cpp
+    src/yue2.cpp
+    src/yue2_generate.cpp
+    src/yue2_stages.cpp
+    src/yue2_protocol.cpp
+    src/yue2_model.cpp
+    src/yue2_nar.cpp
     src/supertonic.cpp
     src/speaker_encoder.cpp
     src/wake.cpp

@@ -1,0 +1,138 @@
+#pragma once
+
+// YuE2-3B backbone — the AR–NAR Mixture-of-Transformers forward on brotensor.
+// Internal to src/ (yue2.cpp drives it; the tests include it to white-box the
+// AR logits and the NAR velocity against the reference fixtures).
+//
+// Every layer holds two attention projections (q/k/v/o + q/k RMSNorm) and two
+// SwiGLU MLPs with their own pre-norms: the AR path (causal, KV cached,
+// lm_head over the 184704-way vocabulary) and the NAR path (flow matching over
+// 64-dim latents). The NAR path never runs on AR rows: a chunk prefills its AR
+// tokens once on the AR path, keeps every layer's K/V, and the NAR rows attend
+// bidirectionally to [AR K/V | their own K/V] (modeling_yue2.nar_velocity's
+// hybrid mask, as nar.CachedNAR computes it).
+//
+// Numerics follow the BF16 reference: BF16 weights and activations, FP32
+// accumulation in every GEMM / norm / attention, RoPE tables rounded to BF16
+// (the reference casts cos/sin to the activation dtype). HF rotate_half RoPE
+// is carried as brotensor's interleaved-pair rotation by permuting each head's
+// q/k projection rows (and q_norm/k_norm) at load.
+//
+// Decode runs B branches (1, or 2 for a CFG pair) as B-row GEMMs — one weight
+// read for both rows — captured as one CUDA graph per session and replayed per
+// token; each branch keeps its own cache and position.
+
+#include "brosoundml/audio.h"
+
+#include <brotensor/tensor.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace brosoundml::yue2 {
+
+struct Config {
+    int hidden = 2048, layers = 28, n_q = 16, n_kv = 8, head_dim = 128, inter = 6144;
+    int vocab = 184704, latent = 64, max_latent_frames = 24576, max_pos = 24576;
+    float eps = 1e-6f, rope_theta = 1000000.0f, timestep_shift = 1.0f;
+    static Config from_json(const std::string& path);
+};
+
+// Residual-stream hooks of one path (AR or NAR), applied after a layer's MLP
+// add (the stream the next layer reads). Empty hooks cost nothing.
+struct SteerDev {
+    brotensor::Tensor delta;    // (1, H) or (rows, H), scale already folded in
+    int  pos0 = 0;              // per-position: first position row 0 covers
+    bool per_position = false;  // false: delta row 0 is added at every position
+};
+struct LayerHooks {
+    std::vector<std::vector<SteerDev>> steer;   // [layer], may be empty
+    std::vector<char> capture;                  // [layer] 1 = report the residual
+    // (layer, pos0, rows, eval, data[rows * H]) — host FP32 copy of the
+    // residual after `layer` at positions [pos0, pos0 + rows); eval = the NAR
+    // velocity evaluation index, -1 on the AR path.
+    std::function<void(int, int, int, int, const float*)> on_capture;
+
+    bool steers(int l) const { return l < static_cast<int>(steer.size()) && !steer[l].empty(); }
+    bool captures(int l) const {
+        return on_capture && l < static_cast<int>(capture.size()) && capture[l];
+    }
+    bool any_capture() const;
+    bool any_per_position() const;
+};
+
+struct ArSession;   // B-branch KV caches + decode graph + logits rows
+struct NarChunk;    // one chunk's AR K/V + NAR scratch + ODE state
+struct ModelWeights;
+
+class Model {
+public:
+    Model();
+    ~Model();
+    Model(Model&&) noexcept;
+    Model& operator=(Model&&) noexcept;
+
+    void load(const std::string& model_dir, brotensor::Device dev);
+    bool loaded() const;
+    const Config& config() const;
+    brotensor::Device device() const;
+
+    // ── AR path ──
+    // A session of `branches` caches, each holding up to `capacity` tokens.
+    // `hooks` (nullable, must outlive the session) steer / capture every
+    // forward of the session; steering applies to every branch, capture
+    // reports branch 0. A capture or a per-position steer runs decode eagerly
+    // (no graph); a whole-sequence steer vector rides inside the graph.
+    std::unique_ptr<ArSession> ar_session(int branches, int capacity,
+                                          const LayerHooks* hooks = nullptr) const;
+    // Upload a host steering delta (n * H floats, n = 1 or rows) scaled by
+    // `scale` at the model's dtype.
+    SteerDev make_steer(const std::vector<float>& delta, float scale, int pos0, bool per_position) const;
+    // Prefill `ids` into branch b (empty cache) and compute that branch's
+    // logits row for its last token over lm_head rows [lo, hi).
+    void ar_prefill(ArSession& s, int b, const std::vector<int32_t>& ids, int lo, int hi) const;
+    // Feed `token` to every branch and compute each branch's next logits row
+    // over the range the session was last prefilled with.
+    void ar_step(ArSession& s, int32_t token) const;
+    // Host copy of the logits rows: branches * (hi - lo) floats, branch-major.
+    void ar_logits(ArSession& s, std::vector<float>& out) const;
+    int ar_len(const ArSession& s, int b) const;
+
+    // ── NAR path ──
+    // A chunk over AR tokens `ar` (prompt prefix + codec + MUSIC_END) and
+    // `frames` latent frames. With `reuse` the first `reuse_rows` AR rows are
+    // copied from that session's branch 0 cache (whose tokens must be
+    // ar[0, reuse_rows)), and only the rest is prefilled.
+    struct NarOptions {
+        const ArSession* reuse = nullptr;   // copy rows [0, reuse_rows) of its branch 0
+        int reuse_rows = 0;
+        const LayerHooks* ar_hooks = nullptr;  // steer the chunk's own AR prefill (no capture)
+        // NAR-row hooks: positions are absolute latent frames (frame0 + row);
+        // LATENT_START/END rows take only whole-sequence steers and are never
+        // reported; capture_evals names the velocity evaluations (2 per ODE
+        // step, counted from 0 per chunk) whose residuals are reported.
+        const LayerHooks* hooks = nullptr;
+        int frame0 = 0;
+        std::vector<int> capture_evals;
+    };
+    std::unique_ptr<NarChunk> nar_chunk(const std::vector<int32_t>& ar, int frames,
+                                        const NarOptions& opt) const;
+    // One velocity v(x, t) for a host state x (frames * 64, frame-major) at
+    // the raw (pre-sigmoid) timestep — the per-op parity seam.
+    std::vector<float> nar_velocity(NarChunk& c, const std::vector<float>& x, double raw_t) const;
+    // The midpoint ODE from `noise` (frames * 64, FP32, rounded to BF16 like
+    // the reference's state) over `steps` steps; returns FP32 latents.
+    // `on_step(done)` after each step; `cancel` polled twice per step
+    // (returns an empty vector when cancelled).
+    std::vector<float> nar_solve(NarChunk& c, const float* noise, int steps,
+                                 const CancelCheck& cancel,
+                                 const std::function<void(int)>& on_step) const;
+
+private:
+    std::unique_ptr<ModelWeights> w_;
+};
+
+}  // namespace brosoundml::yue2
