@@ -240,6 +240,21 @@ static int run(const fs::path& mdir, brotensor::Device dev) {
         std::printf("decode at context %d: prefill %.1f ms, %.2f ms per token (%.1f tok/s)\n", ctx, pre * 1e3,
                     per * 1e3, 1.0 / per);
     }
+    // 6. a streaming window's NAR (timings only): AR = a 2900-token prompt +
+    // the window's codec + MUSIC_END, 32 midpoint steps.
+    for (int frames : {50, 250}) {
+        std::vector<int32_t> ar = sem_prefix;
+        for (int i = 0; static_cast<int>(ar.size()) < 2900; ++i) ar.push_back(y2::CODEC_OFFSET + (i * 7919) % 32768);
+        for (int i = 0; i < frames; ++i) ar.push_back(y2::CODEC_OFFSET + (i * 104729) % 32768);
+        ar.push_back(y2::MUSIC_END);
+        const auto noise = y2::torch_cpu_randn(1, static_cast<std::size_t>(frames) * 64);
+        t0 = y2::Clock::now();
+        auto c = m.nar_chunk(ar, frames, {});
+        const auto lat = m.nar_solve(*c, noise.data(), 32, {}, {});
+        const double secs = y2::seconds_since(t0);
+        std::printf("nar window of %d frames over %zu AR tokens: %.1f ms = %.3f s per audio s\n", frames, ar.size(),
+                    secs * 1e3, secs / (frames / 25.0));
+    }
     return 0;
 }
 
