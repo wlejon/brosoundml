@@ -232,6 +232,7 @@ int main() {
                 p.style = req.get_string("style", "");
                 p.lyrics = req.get_string("lyrics", "");
                 p.cot = brosoundml::Yue2Cot::Full;
+                p.abc_draft_tokens = 0;   // the one-token path: tok/s is the weights' alone
                 PlanStats sum;
                 for (int seed = 1; seed <= S; ++seed) {
                     p.seed = static_cast<std::uint64_t>(seed);

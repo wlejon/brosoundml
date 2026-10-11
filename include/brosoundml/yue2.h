@@ -57,11 +57,13 @@ enum class Yue2Cot { Off, Melody, Full };
 // one FP32 scale per output row (INT8 symmetric +-127, or FP8 E4M3), of every
 // layer's AR q/k/v/o/gate/up/down and of lm_head; activations, accumulation
 // and everything else stay as in Bf16. Prefill, the NAR path and the VAE
-// always use the BF16 weights. Costs ~1.9 GB more device memory.
+// always use the BF16 weights. Int8 / Fp8 cost ~1.9 GB more device memory.
+// Int8 by default (ABC plan ~1.6x faster); Bf16 is the reference-parity
+// choice, the one to pass when comparing with the PyTorch model.
 enum class Yue2ArWeights { Bf16, Int8, Fp8 };
 
 struct Yue2LoadOptions {
-    Yue2ArWeights ar_weights = Yue2ArWeights::Bf16;
+    Yue2ArWeights ar_weights = Yue2ArWeights::Int8;
 };
 
 // One AR stage's sampling (protocol.Sampling). Defaults are the semantic
@@ -133,9 +135,9 @@ struct Yue2Params {
     // lookup: what followed the latest earlier match of the last few tokens),
     // accepted by standard speculative sampling, so the plan's distribution
     // is exactly the one-token sampler's (a seed draws a different plan from
-    // the one-token path's, though; greedy is the same plan). 0 = off, at
-    // most 7. CUDA or the CPU.
-    int abc_draft_tokens = 0;
+    // the one-token path's, though; greedy is the same plan). 0 = off (the
+    // one-token path), at most 7; 5 by default. CUDA or the CPU.
+    int abc_draft_tokens = 5;
 
     int ode_steps = 32;                // midpoint steps per chunk
     // NAR chunking. 0 = the protocol's chunks (chunk_ranges over the 24576

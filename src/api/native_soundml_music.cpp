@@ -924,14 +924,15 @@ Value musicInit(Value, std::span<const Value>) {
 }
 
 // bro.music.loadYuE2(modelDir, opts?) -> YuE2 | AsyncHandle (opts.onReady)
-//   opts.arWeights: 'bf16' (default) | 'int8' | 'fp8', the weights the
-//   one-token AR decode (plan + semantic sampling) reads.
+//   opts.arWeights: 'int8' (default) | 'fp8' | 'bf16', the weights the
+//   one-token AR decode (plan + semantic sampling) reads; 'bf16' is the
+//   checkpoint's own (reference parity).
 Value loadYuE2(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
     ev::Persistent opts;
     if (!modelLoaderArgs("loadYuE2", args, dir, dev, opts)) return ev::undefined();
-    const std::string ar = ev::isObject(opts.get()) ? getPropertyString(opts.get(), "arWeights", "bf16") : "bf16";
+    const std::string ar = ev::isObject(opts.get()) ? getPropertyString(opts.get(), "arWeights", "int8") : "int8";
     brosoundml::Yue2LoadOptions lo;
     if (ar == "bf16") lo.ar_weights = brosoundml::Yue2ArWeights::Bf16;
     else if (ar == "int8") lo.ar_weights = brosoundml::Yue2ArWeights::Int8;
