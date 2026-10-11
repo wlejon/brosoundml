@@ -418,6 +418,7 @@ void Model::ar_step(ArSession& s, int32_t token) const {
     if (st.mask.empty()) {
         st.tok = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
         st.rows = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
+        st.lens = bt::Tensor::empty_on(w.dev, B, 1, bt::Dtype::INT32);
         for (int b = 0; b < B; ++b) {
             st.row1.push_back(rows_view(st.rows, b, 1));
             st.mask.push_back(bt::Tensor::zeros_on(w.dev, s.cap, 1, bt::Dtype::FP32));
@@ -430,12 +431,21 @@ void Model::ar_step(ArSession& s, int32_t token) const {
         st.att = bt::Tensor::zeros_on(w.dev, B, qd, w.dt);
     }
     // Stage this step: token, cache rows, the valid-key masks, RoPE rows.
-    std::vector<int32_t> toks(B, token), rows(B);
-    for (int b = 0; b < B; ++b) rows[b] = s.len[b];
+    std::vector<int32_t> toks(B, token), rows(B), lens(B);
+    for (int b = 0; b < B; ++b) rows[b] = s.len[b], lens[b] = s.len[b] + 1;
     h2d(w.dev, st.tok.data, toks.data(), B * sizeof(int32_t));
     h2d(w.dev, st.rows.data, rows.data(), B * sizeof(int32_t));
+    h2d(w.dev, st.lens.data, lens.data(), B * sizeof(int32_t));
+    // CUDA reads each branch's key count on the device (the work divides the
+    // valid keys, not the session capacity); elsewhere a key mask.
+    const bool dev_len = w.dev.type == bt::DeviceType::CUDA;
     for (int b = 0; b < B; ++b) {
         const int pos = s.len[b];
+        if (dev_len) {
+            bt::copy_d2d(w.cos_tbl, pos * half, st.cos, b * half, half);
+            bt::copy_d2d(w.sin_tbl, pos * half, st.sin, b * half, half);
+            continue;
+        }
         if (st.mask_len[b] != pos) {
             std::vector<float> m(s.cap, 0.0f);
             std::fill(m.begin(), m.begin() + pos, 1.0f);
@@ -465,9 +475,14 @@ void Model::ar_step(ArSession& s, int32_t token) const {
                 bt::scatter_rows(rows_view(kv, b, 1), st.row1[b], s.K[b][l]);
                 bt::scatter_rows(rows_view(st.v, b, 1), st.row1[b], s.V[b][l]);
                 bt::Tensor ab = rows_view(st.att, b, 1);
-                bt::flash_attention_decode_masked(rows_view(qv, b, 1), s.K[b][l], s.V[b][l],
-                                                  static_cast<const float*>(st.mask[b].data), c.n_q, c.n_kv,
-                                                  ab);
+                if (dev_len)
+                    bt::flash_attention_decode_len(rows_view(qv, b, 1), s.K[b][l], s.V[b][l],
+                                                   static_cast<const int32_t*>(st.lens.data) + b, c.n_q, c.n_kv,
+                                                   ab);
+                else
+                    bt::flash_attention_decode_masked(rows_view(qv, b, 1), s.K[b][l], s.V[b][l],
+                                                      static_cast<const float*>(st.mask[b].data), c.n_q, c.n_kv,
+                                                      ab);
             }
             lin(p.o, nullptr, st.att, st.x, &st.ws, true);
             bt::rms_norm_forward(st.x, p.post_ln, c.eps, st.n);

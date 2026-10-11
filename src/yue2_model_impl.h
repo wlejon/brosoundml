@@ -93,9 +93,9 @@ struct ArSession {
 
     // Decode step (B rows), persistent across replays.
     struct Step {
-        bt::Tensor tok, rows;                      // (B,1) INT32 staged per step
+        bt::Tensor tok, rows, lens;                // (B,1) INT32 staged per step
         std::vector<bt::Tensor> row1;              // per branch (1,1) INT32 views of rows
-        std::vector<bt::Tensor> mask;              // per branch (cap,1) FP32
+        std::vector<bt::Tensor> mask;              // per branch (cap,1) FP32 (non-CUDA decode)
         bt::Tensor ones;                           // (1,1) FP32
         bt::Tensor cos, sin;                       // (B, hd/2) FP32
         bt::Tensor x, n, q, k, v, qn, kn, att, g, u, logits, ws;
