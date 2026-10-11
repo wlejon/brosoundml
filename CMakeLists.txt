@@ -140,6 +140,7 @@ target_sources(brosoundml PRIVATE
     src/qwen_asr_encoder.cpp
     src/qwen_asr_decoder.cpp
     src/rave.cpp
+    src/yue2_vae.cpp
     src/supertonic.cpp
     src/speaker_encoder.cpp
     src/wake.cpp

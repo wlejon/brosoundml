@@ -29,6 +29,9 @@ brosoundml_add_test(brosoundml_test_clap test_clap.cpp)
 target_compile_definitions(brosoundml_test_clap PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 brosoundml_add_test(brosoundml_test_rave     test_rave.cpp)
+brosoundml_add_test(brosoundml_test_yue2_vae test_yue2_vae.cpp)
+target_compile_definitions(brosoundml_test_yue2_vae PRIVATE
+    BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
 brosoundml_add_test(brosoundml_test_supertonic test_supertonic.cpp)
 target_compile_definitions(brosoundml_test_supertonic PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
