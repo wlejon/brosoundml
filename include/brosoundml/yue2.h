@@ -1,0 +1,179 @@
+#pragma once
+
+#include "brosoundml/audio.h"
+
+#include <brotensor/tensor.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace brosoundml {
+
+// ─── YuE2-3B (song generation: lyrics + style -> score -> semantic -> latents) ─
+//
+// YuE2 (m-a-p, 2026) is one AR–NAR Mixture-of-Transformers backbone: every
+// layer carries two attention projections and two MLPs, an AR path (causal,
+// KV cached, next-token over a 184704-way vocabulary) and a NAR path (flow
+// matching over 64-dim acoustic latents). Shape: Qwen3-like, 2048 hidden,
+// 28 layers, GQA 16/8, head_dim 128, q/k RMSNorm, RoPE theta 1e6, SwiGLU 6144,
+// 24576 context. Weights are BF16 (CC BY-NC 4.0, data shipped with
+// attribution). Pipeline — the order brosoundml drives it, matching the
+// reference yue2 package (protocol "yue2-native-v1"):
+//
+//   1. Plan        (cot = Full / Melody) AR sampling of an ABC score after
+//                  [EOD] instruction+[Tags]style+[Lyrics]lyrics [ABC_START].
+//                  Skipped when an ABC is supplied or cot = Off.
+//   2. Semantic    AR sampling of codec tokens (25 Hz, 32768 codes) after the
+//                  plan prefix [... ABC_END MUSIC_START], with optional CFG
+//                  against a negative prefix (instruction only + same ABC).
+//   3. Synthesize  NAR flow matching: the AR prefix (prompt + codec tokens)
+//                  is prefilled once per chunk on the AR path, then a
+//                  midpoint ODE (ode_steps) integrates noise -> latents on the
+//                  NAR path, attending to that cached prefix.
+//   4. Decode      NOT in this module. The YuE2 VAE (yue2_vae.h) turns the
+//                  latents into 48 kHz stereo; a binding chains on_latents
+//                  into its streaming decoder.
+//
+// ── Contract with the VAE / binding (do not change without telling them) ──
+//   * Latents are frame-major float[frames * 64], i.e. [frame][channel], at
+//     25 Hz, already in VAE-input space: exactly what the VAE decoder eats
+//     (the reference passes NAR output to vae.decode with no scale/shift).
+//   * on_latents emits only FINAL frames: frame0 starts at 0, is monotonic
+//     and contiguous across calls, and no frame is ever re-emitted.
+//   * on_done fires exactly once per generate() that reached synthesis or
+//     was cancelled/failed after starting — after the last on_latents — so a
+//     streaming decoder knows to flush its held-back halo. `cancelled` /
+//     `error` say why it ended early.
+//   * generate() never touches the VAE.
+
+enum class Yue2Cot { Off, Melody, Full };
+
+// One AR stage's sampling (protocol.Sampling). Defaults are the semantic
+// stage's; Yue2Params::abc_sampling defaults to the ABC preset.
+struct Yue2Sampling {
+    float temperature        = 1.0f;   // 0 = greedy
+    float top_p              = 0.95f;
+    int   top_k              = 100;
+    float repetition_penalty = 1.2f;   // windowed, sign-aware (logit<0 ? *a : /a)
+    int   penalty_window     = 50;     // 1..100 most recent tokens
+    int   min_tokens         = 200;    // end token masked before this
+    int   max_tokens         = 9000;
+};
+
+struct Yue2Params {
+    std::string style;                 // "[Tags]" text
+    std::string lyrics;                // "[Lyrics]" text (sections like [verse])
+    Yue2Cot     cot  = Yue2Cot::Full;
+    std::string abc;                   // non-empty: use this score, skip planning
+    std::uint64_t seed = 831001;       // each AR stage reseeds with it; NAR noise too
+    float cfg_scale = -1.0f;           // < 0: protocol default (1.0 Full/Melody, 1.01 Off)
+
+    Yue2Sampling abc_sampling{0.7f, 0.9f, 30, 1.005f, 100, 32, 4096};
+    Yue2Sampling semantic_sampling{};
+
+    int ode_steps = 32;                // midpoint steps per chunk
+    // NAR chunking. 0 = the protocol's chunks (chunk_ranges over the 24576
+    // context: in practice one chunk per song, so latents arrive only after
+    // all semantic tokens). > 0 = streaming mode: synthesize each window of
+    // this many frames as soon as its semantic tokens exist (a quality /
+    // latency trade-off; see docs).
+    int nar_chunk_frames = 0;
+
+    bool run_semantic   = true;        // false: stop after the plan
+    bool run_synthesize = true;        // false: stop after semantic tokens
+};
+
+// Stage results, also the seams a lab drives stage by stage.
+struct Yue2Plan {
+    std::string          abc;          // empty for cot = Off
+    std::vector<int32_t> abc_ids;
+    std::vector<int32_t> prefix;       // token prefix for the semantic stage
+    bool truncated = false;            // hit max_tokens without ABC_END
+};
+
+struct Yue2Timing {
+    double plan_seconds = 0, semantic_seconds = 0, synth_seconds = 0;
+    double plan_ttft = 0, semantic_ttft = 0;     // first token after prefill
+    int    plan_tokens = 0, semantic_tokens = 0;
+    double plan_tps = 0, semantic_tps = 0;
+};
+
+struct Yue2Result {
+    Yue2Plan             plan;
+    std::vector<int32_t> semantic;     // codec ids 0..32767 (CODEC_OFFSET removed)
+    bool                 semantic_truncated = false;
+    std::vector<float>   latents;      // frames * 64, frame-major
+    int                  frames = 0;
+    Yue2Timing           timing;
+    bool                 cancelled = false;
+};
+
+enum class Yue2Stage { Plan, Semantic, Synthesize };
+
+struct Yue2Callbacks {
+    // ABC text as it is sampled (UTF-8 pieces; may split a code point only at
+    // token boundaries the tokenizer produces — the binding buffers).
+    std::function<void(const std::string& piece, int32_t token)> on_abc;
+    // Each sampled codec id (0..32767), in order.
+    std::function<void(int32_t code)> on_semantic;
+    // Final latent frames [frame0, frame0 + frames), frame-major * 64.
+    std::function<void(int frame0, int frames, const float* data)> on_latents;
+    // Progress within a stage: tokens so far / budget, or ODE steps done /
+    // total over all chunks.
+    std::function<void(Yue2Stage stage, int done, int total)> on_progress;
+    // Exactly once, last. `error` empty unless generate() is about to throw.
+    std::function<void(bool cancelled, const std::string& error)> on_done;
+};
+
+class Yue2 {
+public:
+    Yue2();
+    ~Yue2();
+    Yue2(Yue2&&) noexcept;
+    Yue2& operator=(Yue2&&) noexcept;
+    Yue2(const Yue2&) = delete;
+    Yue2& operator=(const Yue2&) = delete;
+
+    // config.json, model.safetensors and qwen.tiktoken from `model_dir`
+    // (the YuE2-3B folder), weights on `device`. Throws std::runtime_error.
+    void load(const std::string& model_dir,
+              brotensor::Device device = brotensor::Device::CUDA);
+
+    // The whole pipeline up to latents (see Yue2Params::run_*). `cancel` is
+    // polled per token and per ODE step; a cancel returns what exists with
+    // result.cancelled set (and fires on_done(true, "")).
+    Yue2Result generate(const Yue2Params& params,
+                        const Yue2Callbacks& callbacks = {},
+                        const CancelCheck& cancel = {}) const;
+
+    // Stage seams, for a lab that edits between stages (e.g. edit the ABC,
+    // re-roll semantic with a new seed, re-synthesize with other ode_steps).
+    Yue2Plan plan(const Yue2Params& params, const Yue2Callbacks& callbacks = {},
+                  const CancelCheck& cancel = {}) const;
+    std::vector<int32_t> semantic(const Yue2Params& params, const Yue2Plan& plan,
+                                  const Yue2Callbacks& callbacks = {},
+                                  const CancelCheck& cancel = {},
+                                  bool* truncated = nullptr) const;
+    std::vector<float> synthesize(const Yue2Params& params, const Yue2Plan& plan,
+                                  const std::vector<int32_t>& semantic,
+                                  const Yue2Callbacks& callbacks = {},
+                                  const CancelCheck& cancel = {}) const;
+
+    std::vector<int32_t> tokenize(const std::string& text) const;
+    std::string detokenize(const std::vector<int32_t>& ids) const;
+
+    bool loaded() const;
+    brotensor::Device device() const;
+
+    static constexpr int kLatentDim = 64;
+    static constexpr int kFrameRate = 25;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace brosoundml
