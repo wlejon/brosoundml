@@ -220,7 +220,10 @@ int main() {
                 const maxDiff = (a, b) => { let m = 0; for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
 
                 // A file path clip; the reference ranks the hum at 0.958 'a person humming'.
-                const r = clap.score(HUM_WAV, prompts);
+                // The clip is ~1 s, so the default ('auto') pads it with silence; the
+                // reference repeats it.
+                const REF = { pad: 'repeat' };
+                const r = clap.score(HUM_WAV, prompts, REF);
                 if (!(r.scores instanceof Float32Array) || r.scores.length !== 4) throw new Error('scores');
                 if (r.similarities.length !== 4 || r.logits.length !== 4) throw new Error('similarities/logits');
                 if (!(r.embedding instanceof Float32Array) || r.embedding.length !== 512) throw new Error('embedding');
@@ -283,7 +286,7 @@ int main() {
 
                 // Async score + busy guard.
                 globalThis.sDone = false;
-                clap.score(HUM_WAV, prompts, { onDone: (res, info) => { globalThis.sRes = res; globalThis.sInfo = info; globalThis.sDone = true; } });
+                clap.score(HUM_WAV, prompts, { pad: 'repeat', onDone: (res, info) => { globalThis.sRes = res; globalThis.sInfo = info; globalThis.sDone = true; } });
                 let threw = false;
                 try { clap.embedText('x'); } catch (e) { threw = true; }
                 if (!threw) throw new Error('a sync call while busy did not throw');
@@ -298,7 +301,7 @@ int main() {
                     globalThis.eDone = false;
                     clap.embedText(['a whistle', 'rain'], { onDone: (res) => {
                         globalThis.eText = res;
-                        clap.embedAudio(HUM_WAV, { onDone: (emb, info) => {
+                        clap.embedAudio(HUM_WAV, { pad: 'repeat', onDone: (emb, info) => {
                             globalThis.eAudio = emb; globalThis.eInfo = info; globalThis.eDone = true;
                         } });
                     } });
