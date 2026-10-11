@@ -21,6 +21,7 @@
 #include <brolm/qwen_tokenizer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 
 using namespace yue2_test;
@@ -181,6 +182,33 @@ int main() {
             const int32_t t = y2::draw(got, lo, s.temperature, [] { return 0.5; });
             CHECK(!std::isinf(ref[t - lo]), "case %d: draw outside the kept set", c);
         }
+    }
+
+    // Host cost of one sampled token (distribution + draw), the per-token CPU
+    // work between two decode steps.
+    for (const y2::Phase ph : {y2::Phase::Abc, y2::Phase::Semantic}) {
+        const auto [lo, hi] = y2::logit_range(ph);
+        const int n = hi - lo;
+        std::vector<float> lg(n);
+        uint32_t st = 12345;
+        for (auto& v : lg) {
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<float>(st >> 8) * (8.0f / 16777216.0f) - 4.0f;
+        }
+        brosoundml::Yue2Params p;
+        const auto& s = ph == y2::Phase::Abc ? p.abc_sampling : p.semantic_sampling;
+        std::vector<int32_t> hist;
+        for (int i = 0; i < 400; ++i) hist.push_back(lo + (i * 37) % n);
+        const auto u = y2::make_uniform(1);
+        const auto t0 = std::chrono::steady_clock::now();
+        int32_t sink = 0;
+        for (int i = 0; i < 200; ++i) {
+            const auto sc = y2::distribution(lg.data(), n, ph, s, hist, 300, false);
+            sink += y2::draw(sc, lo, s.temperature, u);
+        }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 200;
+        std::printf("host sampling cost (%s, %d logits): %.0f us per token (%d)\n",
+                    ph == y2::Phase::Abc ? "abc" : "semantic", n, us, sink & 1);
     }
 
     if (failures) {

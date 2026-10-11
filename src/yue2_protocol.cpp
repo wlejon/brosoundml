@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -154,12 +155,24 @@ std::vector<float> distribution(const float* logits, int n, Phase ph, const Yue2
         for (float& v : sc) v = R(v / s.temperature);
 
     // top-k threshold: values strictly below the k-th largest are removed.
+    // The k-th largest value through a size-k min-heap: one pass, and after
+    // the first k values almost every candidate is rejected by one compare
+    // (an nth_element over the 151849 ABC logits cost ~2 ms per token).
     const int k = std::min(s.top_k, n);
-    std::vector<int> order(n);
-    for (int i = 0; i < n; ++i) order[i] = i;
-    std::nth_element(order.begin(), order.begin() + (k - 1), order.end(),
-                     [&](int a, int b) { return sc[a] > sc[b]; });
-    const float threshold = sc[order[k - 1]];
+    std::vector<float> heap;
+    heap.reserve(static_cast<std::size_t>(k));
+    for (int i = 0; i < n; ++i) {
+        const float v = sc[i];
+        if (static_cast<int>(heap.size()) < k) {
+            heap.push_back(v);
+            std::push_heap(heap.begin(), heap.end(), std::greater<float>());
+        } else if (v > heap.front()) {
+            std::pop_heap(heap.begin(), heap.end(), std::greater<float>());
+            heap.back() = v;
+            std::push_heap(heap.begin(), heap.end(), std::greater<float>());
+        }
+    }
+    const float threshold = heap.front();
     std::vector<int> kept;
     for (int i = 0; i < n; ++i) {
         if (sc[i] < threshold) sc[i] = kNegInf;

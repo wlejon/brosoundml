@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace yue2_test {
@@ -61,6 +62,47 @@ struct Reader {
         return v;
     }
 };
+
+// A little-endian C-order .npy of '<f4' or '<i4' (what the reference CLI
+// writes); `shape` receives the dimensions. Empty on failure.
+template <typename T>
+inline std::vector<T> read_npy(const fs::path& p, std::vector<long long>* shape = nullptr) {
+    std::ifstream f(p.string(), std::ios::binary);
+    if (!f) return {};
+    char magic[8];
+    f.read(magic, 8);
+    if (std::string(magic, 6) != "\x93NUMPY") return {};
+    std::size_t hl = 0;
+    if (magic[6] == 1) {
+        uint16_t h = 0;
+        f.read(reinterpret_cast<char*>(&h), 2);
+        hl = h;
+    } else {
+        uint32_t h = 0;
+        f.read(reinterpret_cast<char*>(&h), 4);
+        hl = h;
+    }
+    std::string hdr(hl, '\0');
+    f.read(hdr.data(), static_cast<std::streamsize>(hl));
+    const char* want = sizeof(T) == 4 && std::is_floating_point_v<T> ? "<f4" : "<i4";
+    if (hdr.find(want) == std::string::npos || hdr.find("'fortran_order': True") != std::string::npos) return {};
+    std::vector<long long> dims;
+    const auto a = hdr.find('(', hdr.find("shape")), b = hdr.find(')', a);
+    std::size_t n = 1;
+    for (std::size_t i = a + 1; i < b;) {
+        while (i < b && (hdr[i] == ' ' || hdr[i] == ',')) ++i;
+        if (i >= b) break;
+        const long long d = std::strtoll(hdr.c_str() + i, nullptr, 10);
+        dims.push_back(d);
+        n *= static_cast<std::size_t>(d);
+        while (i < b && hdr[i] != ',') ++i;
+    }
+    if (shape) *shape = dims;
+    std::vector<T> v(n);
+    f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(n * sizeof(T)));
+    if (!f) return {};
+    return v;
+}
 
 struct Diff {
     double max_abs = 0, max_rel = 0, rms = 0, ref_rms = 0;

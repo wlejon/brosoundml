@@ -216,6 +216,30 @@ static int run(const fs::path& mdir, brotensor::Device dev) {
         CHECK(moved < 0.02, "steered residual = captured + delta (%.3g)", moved);
         CHECK(diff(steered, base).max_abs > 0.1, "steer moved the logits");
     }
+    // 5. decode cost against context length (timings only): a semantic
+    // session prefilled with the prefix plus filler codec tokens, then 32
+    // steps, each read back like the sampler does.
+    for (int ctx : {600, 3000, 7000}) {
+        std::vector<int32_t> ids = sem_prefix;
+        for (int i = 0; static_cast<int>(ids.size()) < ctx; ++i) ids.push_back(y2::CODEC_OFFSET + (i * 7919) % 32768);
+        const auto [lo, hi] = y2::logit_range(y2::Phase::Semantic);
+        auto s = m.ar_session(1, ctx + 64);
+        t0 = y2::Clock::now();
+        m.ar_prefill(*s, 0, ids, lo, hi);
+        std::vector<float> lg;
+        m.ar_logits(*s, lg);
+        const double pre = y2::seconds_since(t0);
+        m.ar_step(*s, y2::CODEC_OFFSET + 1);   // warm-up + graph capture
+        m.ar_logits(*s, lg);
+        t0 = y2::Clock::now();
+        for (int i = 0; i < 32; ++i) {
+            m.ar_step(*s, y2::CODEC_OFFSET + 2 + i);
+            m.ar_logits(*s, lg);
+        }
+        const double per = y2::seconds_since(t0) / 32;
+        std::printf("decode at context %d: prefill %.1f ms, %.2f ms per token (%.1f tok/s)\n", ctx, pre * 1e3,
+                    per * 1e3, 1.0 / per);
+    }
     return 0;
 }
 
