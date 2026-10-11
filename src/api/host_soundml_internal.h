@@ -546,6 +546,7 @@ void installStt(ObjectBuilder& bro);
 void installTts(ObjectBuilder& bro);
 void installDiar(ObjectBuilder& bro);
 void installRave(ObjectBuilder& bro);
+void installMusic(ObjectBuilder& bro);
 // bro.ear.loadClap: mounts onto an existing bro.ear (broaudio's), never replaces it.
 void installEar(ObjectBuilder& bro);
 // The listen-host tenants (soundml_listen_internal.h has their seams).
