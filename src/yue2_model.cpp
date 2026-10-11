@@ -272,8 +272,17 @@ void Model::load(const std::string& dir, bt::Device dev) {
             p.q_norm = load_w(f, *w, b + attn + ".q_norm.weight", hd, 1, &pn);
             p.k_norm = load_w(f, *w, b + attn + ".k_norm.weight", hd, 1, &pn);
             p.post_ln = load_w(f, *w, b + post_ln + ".weight", H, 1);
-            p.gate = load_w(f, *w, b + mlp + ".gate_proj.weight", c.inter, H);
-            p.up = load_w(f, *w, b + mlp + ".up_proj.weight", c.inter, H);
+            // gate and up stacked in one matrix: decode runs them as one
+            // SwiGLU GEMV; prefill takes the two row views.
+            {
+                const bt::Tensor g = load_w(f, *w, b + mlp + ".gate_proj.weight", c.inter, H);
+                const bt::Tensor u = load_w(f, *w, b + mlp + ".up_proj.weight", c.inter, H);
+                p.gate_up = bt::Tensor::empty_on(w->dev, 2 * c.inter, H, w->dt);
+                bt::copy_d2d(g, 0, p.gate_up, 0, c.inter * H);
+                bt::copy_d2d(u, 0, p.gate_up, c.inter * H, c.inter * H);
+            }
+            p.gate = rows_view(p.gate_up, 0, c.inter);
+            p.up = rows_view(p.gate_up, c.inter, c.inter);
             p.down = load_w(f, *w, b + mlp + ".down_proj.weight", H, c.inter);
         };
         path(w->layers[l].ar, "self_attn", "input_layernorm", "post_attention_layernorm", "mlp");
@@ -462,10 +471,10 @@ void Model::ar_step(ArSession& s, int32_t token) const {
             }
             lin(p.o, nullptr, st.att, st.x, &st.ws, true);
             bt::rms_norm_forward(st.x, p.post_ln, c.eps, st.n);
-            lin(p.gate, nullptr, st.n, st.g, &st.ws);
-            lin(p.up, nullptr, st.n, st.u, &st.ws);
-            bt::silu_forward(st.g, st.g);
-            bt::mul_inplace(st.g, st.u);
+            // silu(gate) * up in the GEMV's FP32 epilogue (one BF16 rounding
+            // where the reference rounds gate, silu and the product).
+            bt::linear_forward_batched_ex(p.gate_up, nullptr, st.n, bt::kLinearActNone, bt::kLinearEpiSwiglu,
+                                          &st.ws, st.g);
             lin(p.down, nullptr, st.g, st.x, &st.ws, true);
             if (s.hooks)
                 for (int b = 0; b < B; ++b) {

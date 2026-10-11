@@ -19,7 +19,7 @@ namespace bt = brotensor;
 
 // One attention + MLP path of one layer (AR or NAR).
 struct PathW {
-    bt::Tensor in_ln, q, k, v, o, q_norm, k_norm, post_ln, gate, up, down;
+    bt::Tensor in_ln, q, k, v, o, q_norm, k_norm, post_ln, gate_up, gate, up, down;  // gate/up: views
 };
 
 struct LayerW {
