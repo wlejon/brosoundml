@@ -172,7 +172,8 @@ struct Yue2Result {
 };
 
 struct Yue2Callbacks {
-    // Residual blocks requested by Yue2Params::capture.
+    // Residual blocks requested by Yue2Params::capture. Yue2Hidden::data is
+    // valid only during the call; copy what you keep.
     std::function<void(const Yue2Hidden&)> on_hidden;
     // ABC text as it is sampled (UTF-8 pieces; may split a code point only at
     // token boundaries the tokenizer produces — the binding buffers).
@@ -217,6 +218,9 @@ public:
                                   const Yue2Callbacks& callbacks = {},
                                   const CancelCheck& cancel = {},
                                   bool* truncated = nullptr) const;
+    // plan() and semantic() never fire on_done; synthesize() fires on_latents
+    // per chunk/window and then on_done exactly once (also on cancel, and with
+    // the error before it throws), as generate() does.
     std::vector<float> synthesize(const Yue2Params& params, const Yue2Plan& plan,
                                   const std::vector<int32_t>& semantic,
                                   const Yue2Callbacks& callbacks = {},
