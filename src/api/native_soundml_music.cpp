@@ -31,6 +31,7 @@ HostClass g_yue2VaeClass;
 struct HostYue2 {
     std::shared_ptr<brosoundml::Yue2> model;
     brotensor::Device device = brotensor::Device::CPU;
+    std::string arWeights = "bf16";   // the AR decode weights it was loaded with
     ModelGate busy;
 };
 
@@ -629,6 +630,10 @@ void decorateYue2(ObjectBuilder& b) {
         auto* w = yue2Of(self);
         return ev::fromBool(w && w->busy.isBusy());
     });
+    b.accessor("arWeights", [](Value self, std::span<const Value>) -> Value {
+        auto* w = yue2Of(self);
+        return ev::fromUtf8(w ? w->arWeights : std::string("bf16"));
+    });
     b.accessor("latentDim", [](Value, std::span<const Value>) -> Value {
         return ev::fromDouble(brosoundml::Yue2::kLatentDim);
     });
@@ -916,20 +921,29 @@ Value musicInit(Value, std::span<const Value>) {
 }
 
 // bro.music.loadYuE2(modelDir, opts?) -> YuE2 | AsyncHandle (opts.onReady)
+//   opts.arWeights: 'bf16' (default) | 'int8' | 'fp8', the weights the
+//   one-token AR decode (plan + semantic sampling) reads.
 Value loadYuE2(Value, std::span<const Value> args) {
     std::string dir;
     brotensor::Device dev = brotensor::Device::CPU;
     ev::Persistent opts;
     if (!modelLoaderArgs("loadYuE2", args, dir, dev, opts)) return ev::undefined();
-    return runModelLoader<HostYue2>("loadYuE2", opts.get(), g_yue2Class, [dir, dev] {
+    const std::string ar = ev::isObject(opts.get()) ? getPropertyString(opts.get(), "arWeights", "bf16") : "bf16";
+    brosoundml::Yue2LoadOptions lo;
+    if (ar == "bf16") lo.ar_weights = brosoundml::Yue2ArWeights::Bf16;
+    else if (ar == "int8") lo.ar_weights = brosoundml::Yue2ArWeights::Int8;
+    else if (ar == "fp8") lo.ar_weights = brosoundml::Yue2ArWeights::Fp8;
+    else return ev::throwTypeError("loadYuE2: arWeights must be 'bf16', 'int8' or 'fp8', got '" + ar + "'");
+    return runModelLoader<HostYue2>("loadYuE2", opts.get(), g_yue2Class, [dir, dev, lo, ar] {
         auto w = std::make_unique<HostYue2>();
         w->device = dev;
+        w->arWeights = ar;
         w->model = std::make_shared<brosoundml::Yue2>();
         {
             brotensor::DeviceScope scope(dev);
-            w->model->load(dir, dev);
+            w->model->load(dir, dev, lo);
         }
-        logInfo(std::string("[music] YuE2 loaded on ") + deviceName(dev));
+        logInfo(std::string("[music] YuE2 loaded on ") + deviceName(dev) + " (AR decode weights " + ar + ")");
         return w;
     });
 }
