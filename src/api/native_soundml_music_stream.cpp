@@ -181,6 +181,7 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
         return false;
     }
     getBoolOpt(r.get(), "autoFull", o.auto_full);
+    readSeconds(r.get(), "airMarginSeconds", o.air_margin_seconds);
     ev::Persistent k(ev::getProperty(r.get(), "knobs"));
     readKnobs(k.get(), o.knobs);
     o.knobs = brosoundml::Yue2Knobs::clamp(o.knobs);

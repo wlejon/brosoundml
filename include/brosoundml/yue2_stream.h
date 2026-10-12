@@ -39,9 +39,10 @@
 // a minute. An unchosen preview crossfades into the next one. make_full()
 // continues a preview: its AR session resumes (reopened over its codec rows
 // if released), and from the join (the last kJoinFrames not yet heard) the
-// NAR re-solves with the continuation as lookahead; the playing song's
-// continuation preempts the songs ahead. `auto_full` does that for each song
-// as it goes on air.
+// NAR re-solves with the continuation as lookahead; the make-full preempts the
+// songs ahead, and its continuation is built first until it runs
+// `air_margin_seconds` past the audio handed out, then the songs ahead are,
+// then the rest of it. `auto_full` does that for each song as it goes on air.
 //
 // Steering (Yue2Knobs, each clamped below where the research found the music
 // breaks): energy is a latent offset (re-decoded, heard within the emit lead);
@@ -153,6 +154,11 @@ struct Yue2StreamOptions {
     // it goes on air. 0 = whole songs.
     double preview_seconds = 0;
     bool auto_full = false;
+    // The playing song is built first only until its solved audio runs this
+    // far past the audio handed out; beyond that the songs ahead are built
+    // (so a skip has somewhere to go), then the rest of it. 0 = the playing
+    // song always first.
+    double air_margin_seconds = 20.0;
     Yue2Knobs knobs;                      // initial
     Yue2Directions directions = Yue2Directions::builtin();
     // Oracle / test seams (run()'s thread): each landed window's core

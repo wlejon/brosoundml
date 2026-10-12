@@ -669,7 +669,8 @@ void Yue2Stream::Impl::do_skip() {
     skip_pending = false;
 }
 
-// One unit of work, the playing song first. False when there is none.
+// One unit of work, the playing song first while it is short of the air
+// margin. False when there is none.
 bool Yue2Stream::Impl::step() {
     if (drop_marked()) return true;
     check_want();
@@ -856,6 +857,13 @@ bool Yue2Stream::Impl::step() {
         announce();
         Song* nx = next_song(p);
         if (skip_pending && p->start >= 0 && nx && build(*nx)) return true;
+        // Far enough ahead of the playhead, the songs ahead come before the
+        // rest of the playing one, so a whole song does not starve them.
+        const int margin = static_cast<int>(opt.air_margin_seconds * 25);
+        const bool covered = margin > 0 && p->start >= 0 && p->planned && !p->failed &&
+                             p->lat_valid >= emitted_frame(*p) + margin;
+        if (covered)
+            if (Song* t = to_build(); t && build(*t)) return true;
         if (build(*p)) return true;
         if (Song* t = to_build(); t && build(*t)) return true;
     }
