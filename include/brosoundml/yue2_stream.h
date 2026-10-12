@@ -99,6 +99,9 @@ struct Yue2StreamOptions {
     // semantic stage ends.
     std::function<void(int, int, int, const float*)> on_latents;
     std::function<void(int, const std::vector<int32_t>&)> on_semantic;
+    // Polled on run()'s thread (at least every 10 ms, and inside long ops):
+    // true = stop(), as from another thread.
+    CancelCheck cancel;
 };
 
 struct Yue2StreamEvent {

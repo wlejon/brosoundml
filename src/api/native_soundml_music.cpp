@@ -9,6 +9,7 @@
 // Streaming callbacks are drained on the JS thread each tick (poll); the
 // work thread publishes through fixed-capacity SPSC slots.
 #include "soundml_loader.h"
+#include "soundml_music_internal.h"
 
 #include <brosoundml/yue2.h>
 #include <brosoundml/yue2_vae.h>
@@ -24,22 +25,11 @@
 namespace brosoundml::api {
 
 namespace {
-
 HostClass g_yue2Class;
 HostClass g_yue2VaeClass;
+}  // namespace
 
-struct HostYue2 {
-    std::shared_ptr<brosoundml::Yue2> model;
-    brotensor::Device device = brotensor::Device::CPU;
-    std::string arWeights = "bf16";   // the AR decode weights it was loaded with
-    ModelGate busy;
-};
-
-struct HostYue2Vae {
-    std::shared_ptr<brosoundml::Yue2Vae> vae;
-    brotensor::Device device = brotensor::Device::CPU;
-    ModelGate busy;
-};
+namespace music {
 
 HostYue2* yue2Of(Value v) {
     return g_yue2Class.isInstance(v) ? static_cast<HostYue2*>(g_yue2Class.unwrap(v)) : nullptr;
@@ -219,6 +209,12 @@ bool readStereo(Value v, brosoundml::StereoAudio& out, std::string& err) {
     if (out.frames <= 0 || out.sample_rate <= 0) { err = "audio is empty"; return false; }
     return true;
 }
+
+}  // namespace music
+
+using namespace music;
+
+namespace {
 
 // Length of the longest prefix of `s` that ends on a UTF-8 code-point boundary.
 size_t utf8CompletePrefix(const std::string& s) {
@@ -647,6 +643,7 @@ void decorateYue2(ObjectBuilder& b) {
     b.def("plan", 1, yue2Plan);
     b.def("semantic", 2, yue2Semantic);
     b.def("synthesize", 3, yue2Synthesize);
+    b.def("stream", 1, music::yue2Stream);
     b.def("tokenize", 1, [](Value self, std::span<const Value> a) -> Value {
         auto* w = yue2Of(self);
         if (!w || !w->model || !w->model->loaded()) return ev::throwError("tokenize: model is not loaded");
@@ -978,6 +975,7 @@ Value loadVae(Value, std::span<const Value> args) {
 void installMusic(ObjectBuilder& bro) {
     g_yue2Class.install("YuE2", 0, nullptr, decorateYue2);
     g_yue2VaeClass.install("YuE2Vae", 0, nullptr, decorateYue2Vae);
+    music::installStreamClass();
 
     ObjectBuilder music;
     music.def("init", 0, musicInit);

@@ -17,6 +17,7 @@ set(BROSOUNDML_API_SOURCES
     native_soundml_diar.cpp
     native_soundml_rave.cpp
     native_soundml_music.cpp
+    native_soundml_music_stream.cpp
     native_soundml_ear.cpp
     soundml_listen_host.cpp
     native_soundml_wake.cpp

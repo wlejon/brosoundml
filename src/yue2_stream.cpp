@@ -321,6 +321,7 @@ void Yue2Stream::Impl::emit() {
 void Yue2Stream::Impl::service() {
     if (in_service) return;
     in_service = true;
+    if (opt.cancel && opt.cancel()) stopping.store(true);
     drain_commands();
     emit();
     // Interrupt stages become audible as the player passes their samples:
