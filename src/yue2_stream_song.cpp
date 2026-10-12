@@ -42,6 +42,40 @@ void Yue2Stream::Impl::start_song(Song& s, Yue2Song req) {
     s.nar21 = knobs.texture;
     s.nar9 = knobs.percussion;
     s.ar = knobs.semantic;
+    s.limit = opt.preview_seconds > 0 ? std::max(50, static_cast<int>(std::lround(opt.preview_seconds * 25.0))) : -1;
+}
+
+int Yue2Stream::Impl::make_full(Song& s) {
+    if (s.limit < 0) return -1;
+    const int L = s.limit;
+    s.limit = -1;
+    if (!s.planned || !s.sem_done) return 0;   // still being built: it simply goes on
+    if (s.ended && static_cast<int>(s.codec.size()) <= L) {
+        s.natural = vae.output_length(s.frames());   // its own end came within the preview
+        return -1;
+    }
+    if (s.ended || !s.req.semantic.empty()) {
+        // The tokens are all there (its end came in the lookahead, or given
+        // tokens): the rest is latents.
+        s.natural = vae.output_length(s.frames());
+    } else {
+        Busy busy_guard(busy, &s);
+        // The session holds the prompt and every token so far (a preview
+        // built ahead released it: rebuilt over them), so sampling resumes
+        // after the lookahead tokens.
+        if (!s.sess) open_session(s, static_cast<int>(s.codec.size()));
+        s.sem_done = false;
+        s.natural = -1;
+    }
+    s.cut = -1;
+    s.built_announced = false;
+    // The preview's last frames were solved against MUSIC_END after its
+    // lookahead: re-solve them (what is not handed out yet) with the
+    // continuation as their lookahead, inpainted against what precedes.
+    const int join = std::min(s.lat_valid, std::max(L - kJoinFrames, emitted_frame(s) + 25));
+    resolve_from(s, join);
+    unplace_after(&s);
+    return join;
 }
 
 // The semantic session over the prompt (and the CFG negative), then the
@@ -97,8 +131,10 @@ void Yue2Stream::Impl::plan(Song& s) {
         s.tokens.clear();
         for (int32_t c : s.codec) s.tokens.push_back(c + CODEC_OFFSET);
         s.sem_done = true;
-        s.natural = vae.output_length(static_cast<int>(s.codec.size()));
+        s.ended = s.limit < 0 || static_cast<int>(s.codec.size()) <= s.limit;
+        s.natural = vae.output_length(s.frames());
     }
+    s.est_frames = s.plan.abc.empty() ? 0 : static_cast<int>(abc_seconds(s.plan.abc) * 25.0);
     s.planned = true;
     Yue2StreamEvent e{Yue2StreamEvent::Kind::Plan};
     e.song = s.index;
@@ -121,9 +157,10 @@ void Yue2Stream::Impl::semantic_step(Song& s, int n) {
     const auto [lo, hi] = logit_range(Phase::Semantic);
     const int nn = hi - lo;
     std::vector<float> logits, combined;
-    auto finish = [&]() {
+    auto finish = [&](bool ended) {
         s.sem_done = true;
-        const int T = static_cast<int>(s.codec.size());
+        s.ended = ended;
+        const int T = s.frames();
         if (T == 0) fail("the semantic stage ended at once (an empty song)");
         s.natural = vae.output_length(T);
         if (opt.on_semantic) opt.on_semantic(s.index, s.codec);
@@ -136,7 +173,11 @@ void Yue2Stream::Impl::semantic_step(Song& s, int n) {
     for (int k = 0; k < n && !s.sem_done; ++k) {
         const int step = static_cast<int>(s.codec.size());
         if (step >= s.sampling.max_tokens || step >= static_cast<int>(s.noise.size() / Yue2::kLatentDim)) {
-            finish();
+            finish(true);
+            break;
+        }
+        if (s.limit >= 0 && step >= s.limit + opt.right) {   // a preview: its tokens and the lookahead
+            finish(false);
             break;
         }
         m.ar_logits(*s.sess, logits);
@@ -151,7 +192,7 @@ void Yue2Stream::Impl::semantic_step(Song& s, int n) {
         const auto sc = distribution(row, nn, Phase::Semantic, s.sampling, s.tokens, step, s.p.cot == Yue2Cot::Off);
         const int32_t tok = draw(sc, lo, s.sampling.temperature, s.uniform);
         if (tok == end_token(Phase::Semantic)) {
-            finish();
+            finish(true);
             break;
         }
         s.tokens.push_back(tok);

@@ -9,6 +9,7 @@
 
 #include "yue2_internal.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -69,19 +70,30 @@ struct Song {
     bool built_announced = false;
     bool dropped = false;              // drop(): removed by step() once no long op runs on it
 
-    int frames() const { return sem_done ? static_cast<int>(codec.size()) : -1; }   // final length, -1 unknown
+    // ── preview ──
+    int limit = -1;                    // a preview's length in frames (-1 = the whole song); the semantic
+                                       // stage stops at limit + the lookahead, kept as the last window's
+    bool ended = false;                // the semantic stage reached the song's own end
+    int est_frames = 0;                // the plan's length estimate (0 = no ABC)
+
+    // Final length, -1 unknown: the tokens, or a preview's limit.
+    int frames() const {
+        if (!sem_done) return -1;
+        const int n = static_cast<int>(codec.size());
+        return limit >= 0 ? std::min(limit, n) : n;
+    }
     // Tokens and latents complete: what a knob change would have to rebuild.
-    bool complete() const { return planned && !failed && sem_done && lat_valid >= static_cast<int>(codec.size()); }
-    bool built() const { return complete() && dec_frame >= static_cast<int>(codec.size()); }
+    bool complete() const { return planned && !failed && sem_done && lat_valid >= frames(); }
+    bool built() const { return complete() && dec_frame >= frames(); }
     std::int64_t length() const { return cut >= 0 ? cut : natural; }               // song samples, -1 unknown
     std::int64_t end() const { return start >= 0 && length() >= 0 ? start + length() : -1; }
 };
 
 // Commands from the control side (any thread), applied by the worker.
 struct Command {
-    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Drop, Stop } kind;
+    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Drop, Full, AutoFull, Stop } kind;
     Yue2Song song;
-    int index = -1;                    // NextPlan (-1 = the next song) / Drop: the song
+    int index = -1;                    // NextPlan (-1 = the next song) / Drop / Full (-1 = the playing one): the song
     Yue2Knobs knobs;
     float amount = 0;
     std::string abc;
@@ -123,6 +135,7 @@ struct Yue2Stream::Impl {
     yue2::StreamClock::time_point skip_at{};
     bool knobs_pending = false;        // texture / percussion / semantic moved: step() retunes the songs
     std::vector<std::pair<int, std::string>> plan_edits;   // set_plan / set_next_plan (-1 = the next song), pending
+    std::vector<int> full_pending;     // make_full (-1 = the playing song), pending
     // wants (ahead_songs)
     int want_announced = 0;            // the last Want's value (0 = none outstanding)
     yue2::StreamClock::time_point want_since{};            // when the pool first fell short
@@ -193,6 +206,10 @@ struct Yue2Stream::Impl {
     // when nothing was continued: given tokens, past its end); always records
     // the scales.
     int continue_from(yue2::Song& s, int c, const std::map<std::string, float>& scales);
+    // A preview continues into the whole song; returns the join frame (the
+    // re-solve's start), -1 = nothing to continue (its song had ended).
+    int make_full(yue2::Song& s);
+    static constexpr int kJoinFrames = 50;   // a preview's tail re-solved with the continuation as lookahead
     void open_session(yue2::Song& s, int codec_rows);   // prompt (+ negative) + codec[0, codec_rows)
     void release_session(yue2::Song& s);                // a song built ahead: its AR session's device memory
     void invalidate_audio(yue2::Song& s, int frame);

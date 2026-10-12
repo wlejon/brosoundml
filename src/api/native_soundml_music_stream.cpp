@@ -7,7 +7,7 @@
 // through a mutex-guarded queue, which each tick's poll drains. The data is
 // paced by the player (emitLeadSeconds ahead), so it stays small.
 // Controls (enqueue, setPlayhead, setKnobs, interrupt, skip, setNextPlan,
-// setPlan, drop, stop) are Yue2Stream's own thread-safe calls, so they never block on the
+// setPlan, drop, makeFull, setAutoFull, stop) are Yue2Stream's own thread-safe calls, so they never block on the
 // model. While the stream runs, the job roots the stream object, so a
 // stream nobody references keeps playing until stop().
 #include "soundml_music_internal.h"
@@ -82,6 +82,7 @@ const char* kindName(brosoundml::Yue2StreamEvent::Kind k) {
         case K::Want: return "want";
         case K::Built: return "built";
         case K::Dropped: return "dropped";
+        case K::Full: return "full";
     }
     return "idle";
 }
@@ -174,6 +175,12 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
         err = "aheadSongs must be 1..8";
         return false;
     }
+    readSeconds(r.get(), "previewSeconds", o.preview_seconds);
+    if (o.preview_seconds != 0 && !(o.preview_seconds >= 10 && o.preview_seconds <= 600)) {
+        err = "previewSeconds must be 0 or 10..600";
+        return false;
+    }
+    getBoolOpt(r.get(), "autoFull", o.auto_full);
     ev::Persistent k(ev::getProperty(r.get(), "knobs"));
     readKnobs(k.get(), o.knobs);
     o.knobs = brosoundml::Yue2Knobs::clamp(o.knobs);
@@ -222,6 +229,10 @@ Value makeStats(const brosoundml::Yue2StreamStats& s) {
         so.set("ready", g.ready);
         so.set("onAir", g.on_air);
         so.set("hostBytes", static_cast<double>(g.host_bytes));
+        so.set("preview", g.preview);
+        so.set("previewFrames", static_cast<double>(g.preview_frames));
+        so.set("estimateFrames", static_cast<double>(g.estimate_frames));
+        so.set("ended", g.ended);
         ev::Persistent k(makeKnobs(g.knobs));
         so.set("knobs", k.get());
         return so.get();
@@ -333,6 +344,20 @@ void decorateStream(ObjectBuilder& b) {
         const int song = static_cast<int>(numAt(a, 0, -1));
         return streamControl(self, "drop", [&](StreamJob& j) -> Value {
             j.stream->drop(song);
+            return ev::undefined();
+        });
+    });
+    b.def("makeFull", 0, [](Value self, std::span<const Value> a) -> Value {
+        const int song = hasArg(a, 0) ? static_cast<int>(numAt(a, 0, -1)) : -1;
+        return streamControl(self, "makeFull", [&](StreamJob& j) -> Value {
+            j.stream->make_full(song);
+            return ev::undefined();
+        });
+    });
+    b.def("setAutoFull", 1, [](Value self, std::span<const Value> a) -> Value {
+        const bool on = hasArg(a, 0) && ev::toBool(a[0]);
+        return streamControl(self, "setAutoFull", [&](StreamJob& j) -> Value {
+            j.stream->set_auto_full(on);
             return ev::undefined();
         });
     });

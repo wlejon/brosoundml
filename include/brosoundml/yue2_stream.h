@@ -33,6 +33,16 @@
 // request; with radio on, a want unanswered for `want_grace_seconds` is
 // filled from the last request with the next seed.
 //
+// Previews (`preview_seconds` > 0): each song's semantic stage stops at the
+// preview plus the lookahead (its plan is still the whole song's), so a song
+// ahead costs ~11 s of GPU, not ~45, and a pool of `ahead_songs` fills within
+// a minute. An unchosen preview crossfades into the next one. make_full()
+// continues a preview: its AR session resumes (reopened over its codec rows
+// if released), and from the join (the last kJoinFrames not yet heard) the
+// NAR re-solves with the continuation as lookahead; the playing song's
+// continuation preempts the songs ahead. `auto_full` does that for each song
+// as it goes on air.
+//
 // Steering (Yue2Knobs, each clamped below where the research found the music
 // breaks): energy is a latent offset (re-decoded, heard within the emit lead);
 // texture and percussion are NAR steers (windows re-solved from ~1.5 s ahead);
@@ -135,6 +145,14 @@ struct Yue2StreamOptions {
     bool radio = true;                    // a want unanswered: continue with the last song's request, next seed
     int ahead_songs = 1;                  // songs kept built after the playing one (1..8)
     double want_grace_seconds = 10.0;     // radio: how long a Want waits for the app before the radio fills it
+    // Previews (> 0): each song is built as its first `preview_seconds` only
+    // (the plan is the whole song's, the semantic stage stops there plus the
+    // lookahead), and plays that long, crossfading into the next as a song
+    // end does. make_full() continues a preview into the whole song from
+    // where its audio ends, seamlessly; auto_full does it for every song as
+    // it goes on air. 0 = whole songs.
+    double preview_seconds = 0;
+    bool auto_full = false;
     Yue2Knobs knobs;                      // initial
     Yue2Directions directions = Yue2Directions::builtin();
     // Oracle / test seams (run()'s thread): each landed window's core
@@ -165,6 +183,8 @@ struct Yue2StreamEvent {
         Want,          // fewer than ahead_songs wait after the playing one: value = how many more it wants
         Built,         // a song is built: its whole audio waits (frames = its length); a skip to it is instant
         Dropped,       // a queued song was removed (drop()); songs after it are placed again
+        Full,          // make_full(): value 1 = the preview continues into the whole song, re-solved from
+                       // frame0 (the join); 0 = too late (its successor is on air) or its song had ended
     };
     Kind kind = Kind::Idle;
     int song = -1;                 // song index (queue order from 0)
@@ -190,6 +210,10 @@ struct Yue2StreamStats {
         bool on_air = false;
         std::size_t host_bytes = 0;            // audio + latents + noise held for it in host memory
         Yue2Knobs knobs;                       // what it is built / steered with (energy: its offset now)
+        bool preview = false;                  // still a preview (preview_frames long)
+        int preview_frames = 0;
+        int estimate_frames = 0;               // the plan's length estimate (its ABC), 0 = none
+        bool ended = false;                    // the semantic stage reached the song's own end
     };
     std::vector<Song> songs;                   // queued and playing, in order
     int ahead = 0;                             // songs after the playing one
@@ -226,7 +250,14 @@ public:
     // Remove a queued song that is not on air (built or not); the songs after
     // it move up. A Dropped event follows; an on-air or unknown index is ignored.
     void drop(int song);
-    void stop();                                     // run() returns soon after
+    // A preview continues into the whole song (song -1 = the playing one):
+    // its semantic stage resumes after the preview's tokens, and its last
+    // two seconds not yet handed out are re-solved with the continuation as
+    // their lookahead, joined inpainted like a window edge. A Full event
+    // follows. It builds before anything else when that song is on air.
+    void make_full(int song = -1);
+    void set_auto_full(bool on);
+    void stop();                                    // run() returns soon after
 
     // The worker: blocks until stop(), or (unpaced, radio off) until the
     // queue is played out. Throws only on misuse; model errors become Error

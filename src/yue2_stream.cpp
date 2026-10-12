@@ -64,6 +64,8 @@ Yue2Stream::Impl::Impl(const Core& c, const Yue2Vae& v, Yue2StreamOptions o, Aud
     opt.crossfade_seconds = std::clamp(opt.crossfade_seconds, 2.0, 4.0);
     opt.skip_fade_seconds = std::clamp(opt.skip_fade_seconds, 0.05, 2.0);
     opt.want_grace_seconds = std::max(0.0, opt.want_grace_seconds);
+    if (!(opt.preview_seconds >= 0) || (opt.preview_seconds > 0 && (opt.preview_seconds < 10 || opt.preview_seconds > 600)))
+        throw std::runtime_error("brosoundml: Yue2Stream: preview_seconds must be 0 or 10..600");
     R = v.config().downsampling_ratio;
     knobs = Yue2Knobs::clamp(opt.knobs, opt.directions);
     snapshot.knobs = knobs;
@@ -123,6 +125,16 @@ void Yue2Stream::set_plan(int song, const std::string& abc) {
 void Yue2Stream::drop(int song) {
     Command c{Command::Kind::Drop};
     c.index = song;
+    push(*impl_, std::move(c));
+}
+void Yue2Stream::make_full(int song) {
+    Command c{Command::Kind::Full};
+    c.index = song;
+    push(*impl_, std::move(c));
+}
+void Yue2Stream::set_auto_full(bool on) {
+    Command c{Command::Kind::AutoFull};
+    c.amount = on ? 1.0f : 0.0f;
     push(*impl_, std::move(c));
 }
 void Yue2Stream::stop() {
@@ -250,6 +262,12 @@ void Yue2Stream::Impl::apply(Command& c) {
         case Command::Kind::Drop:
             for (auto& sp : songs)
                 if (sp->index == c.index && !on_air(*sp)) sp->dropped = true;
+            break;
+        case Command::Kind::Full:
+            full_pending.push_back(c.index);
+            break;
+        case Command::Kind::AutoFull:
+            opt.auto_full = c.amount != 0;
             break;
         case Command::Kind::Stop:
             stopping.store(true);
@@ -465,7 +483,7 @@ CancelCheck Yue2Stream::Impl::preemptible(bool whole) {
     return [this, whole]() {
         service();
         return stopping.load() || int_stage2_pending || knobs_pending || (whole && skip_pending) ||
-               (busy && busy->dropped);
+               (busy && busy->dropped) || !full_pending.empty();
     };
 }
 
@@ -656,6 +674,37 @@ bool Yue2Stream::Impl::step() {
     if (drop_marked()) return true;
     check_want();
     if (skip_pending) do_skip();
+    // Previews: auto_full makes the song on air whole while its preview has
+    // room left for the join; make_full() does it for one song.
+    if (Song* p = playing(); opt.auto_full && p && p->limit >= 0 && on_air(*p) && p->cut < 0 &&
+                             emitted_frame(*p) + 25 < p->limit - kJoinFrames &&
+                             std::find(full_pending.begin(), full_pending.end(), p->index) == full_pending.end())
+        full_pending.push_back(p->index);
+    if (!full_pending.empty()) {
+        const int idx = full_pending.front();
+        full_pending.erase(full_pending.begin());
+        Song* p = playing();
+        Song* t = idx < 0 ? p : nullptr;
+        for (auto& sp : songs)
+            if (idx >= 0 && sp->index == idx && !sp->dropped) t = sp.get();
+        if (t && t->limit >= 0) {
+            Yue2StreamEvent e{Yue2StreamEvent::Kind::Full};
+            e.song = t->index;
+            e.tag = t->req.tag;
+            Song* nx = next_song(t);
+            // Too late once a skip cut it or its successor is on air.
+            if (t->cut >= 0 || (nx && on_air(*nx))) {
+                e.value = 0;
+            } else {
+                const int join = make_full(*t);
+                e.value = join >= 0 ? 1 : 0;
+                e.frame0 = std::max(0, join);
+                place_next();
+            }
+            event(e);
+        }
+        return true;
+    }
     if (knobs_pending) {
         // Texture / percussion: re-solve a song on air from a little past the
         // emitted audio; the semantic steers: continue it from there. Songs
@@ -848,6 +897,10 @@ void Yue2Stream::Impl::publish() {
         o.knobs.texture = s.nar21;
         o.knobs.percussion = s.nar9;
         o.knobs.semantic = s.ar;
+        o.preview = s.limit >= 0;
+        o.preview_frames = std::max(0, s.limit);
+        o.estimate_frames = s.est_frames;
+        o.ended = s.ended;
         if (&s != p && !s.failed) {
             ++st.ahead;
             st.ready_ahead += o.ready;
