@@ -79,7 +79,13 @@ public:
     Model& operator=(Model&&) noexcept;
 
     // `ar` picks the weights the decode step reads (yue2.h, Yue2ArWeights).
-    void load(const std::string& model_dir, brotensor::Device dev, ArWeights ar = ArWeights::Bf16);
+    // `keep_bf16_ar` = false (with Int8 / Fp8) drops the AR path's BF16
+    // q/k/v/o/gate/up/down and lm_head once quantised: prefill then
+    // dequantizes a matrix at a time into one scratch (Yue2LoadOptions).
+    void load(const std::string& model_dir, brotensor::Device dev, ArWeights ar = ArWeights::Bf16,
+              bool keep_bf16_ar = true);
+    // Device bytes of the loaded weights (model + quantised copies + scratch).
+    std::size_t weight_bytes() const;
     ArWeights ar_weights() const;
     bool loaded() const;
     const Config& config() const;
@@ -91,8 +97,18 @@ public:
     // forward of the session; steering applies to every branch, capture
     // reports branch 0. A capture or a per-position steer runs decode eagerly
     // (no graph); a whole-sequence steer vector rides inside the graph.
+    // `max_capacity` > capacity lets the caches grow on demand (a prefill or
+    // step past `capacity` reallocates them, one layer at a time, in steps of
+    // at least a quarter); 0 = fixed at `capacity`.
     std::unique_ptr<ArSession> ar_session(int branches, int capacity,
-                                          const LayerHooks* hooks = nullptr) const;
+                                          const LayerHooks* hooks = nullptr, int max_capacity = 0) const;
+    // Make every branch's cache hold at least `rows` (up to the session's
+    // max capacity, else throws). Invalidates the session's decode graphs.
+    void ar_reserve(ArSession& s, int rows) const;
+    int ar_capacity(const ArSession& s) const;
+    // Replace the session's hooks (a steer turned on, changed or off); the
+    // decode graphs are recaptured at the next step. `hooks` must outlive it.
+    void ar_set_hooks(ArSession& s, const LayerHooks* hooks) const;
     // Upload a host steering delta (n * H floats, n = 1 or rows) scaled by
     // `scale` at the model's dtype.
     SteerDev make_steer(const std::vector<float>& delta, float scale, int pos0, bool per_position) const;
@@ -131,6 +147,13 @@ public:
         const LayerHooks* hooks = nullptr;
         int frame0 = 0;
         std::vector<int> capture_evals;
+        // In place: the chunk's AR K/V and NAR rows live in this session's
+        // branch 0 cache instead of a copy (`reuse` and `reuse_rows` name the
+        // same session and its length; the rest of `ar` and the N NAR rows are
+        // written past it, reserving room). The session's length is kept, so
+        // those rows are scratch to it; it must not step, grow or be freed
+        // while the chunk lives. Saves the copy of the whole song's K/V.
+        ArSession* in_place = nullptr;
     };
     std::unique_ptr<NarChunk> nar_chunk(const std::vector<int32_t>& ar, int frames,
                                         const NarOptions& opt) const;
@@ -143,9 +166,14 @@ public:
     // (returns an empty vector when cancelled). On CUDA an evaluation replays
     // as a graph (one per chunk and state buffer, captured at its first use)
     // unless it is in capture_evals; BROSOUNDML_YUE2_NO_GRAPH=1 runs all eager.
+    // `known` (known_frames * 64, may be null): inpainting of the first
+    // known_frames frames: before every velocity evaluation at time t they are
+    // set to the flow interpolant t * noise + (1 - t) * known (each op rounded
+    // like the reference's BF16 state), and they come back as `known`.
     std::vector<float> nar_solve(NarChunk& c, const float* noise, int steps,
                                  const CancelCheck& cancel,
-                                 const std::function<void(int)>& on_step) const;
+                                 const std::function<void(int)>& on_step,
+                                 const float* known = nullptr, int known_frames = 0) const;
 
 private:
     std::unique_ptr<ModelWeights> w_;

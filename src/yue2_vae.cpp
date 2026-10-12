@@ -650,6 +650,32 @@ void Yue2VaeStream::reset() {
     finished_ = false;
 }
 
+StereoAudio Yue2Vae::decode_span(const float* latents, int frames, int start, int end, bool song_end,
+                                 int halo) const {
+    if (!loaded()) fail("decode_span: no model loaded");
+    if (!latents || start < 0 || end > frames || start >= end) fail("decode_span: bad span");
+    const Impl& m = *impl_;
+    const int core = end - start;
+    if (halo <= 0) halo = m.required_halo(core);
+    if (halo < m.required_halo(core))
+        fail("decode_span: halo_frames must be at least " + std::to_string(m.required_halo(core)));
+    const int R = m.cfg.downsampling_ratio, C = m.cfg.channels;
+    const int left = std::max(0, start - halo), right = std::min(frames, end + halo);
+    int L = 0;
+    const std::vector<float> tile = m.decode_window(latents, left, right, &L);
+    const int out0 = start * R, out1 = (song_end && end == frames) ? m.dec_len(frames) : end * R;
+    const int crop = (start - left) * R, n = out1 - out0;
+    if (crop + n > L) fail("decode_span: window did not cover its core");
+    StereoAudio a;
+    a.sample_rate = m.cfg.sample_rate;
+    a.channels = C;
+    a.frames = n;
+    a.samples.resize(std::size_t(C) * n);
+    for (int c = 0; c < C; ++c)
+        std::memcpy(a.channel(c), tile.data() + std::size_t(c) * L + crop, std::size_t(n) * sizeof(float));
+    return a;
+}
+
 void Yue2VaeStream::decode_ready(bool final_pass) {
     const Yue2Vae::Impl& m = *vae_->impl_;
     const int R = m.cfg.downsampling_ratio, C = m.cfg.channels;

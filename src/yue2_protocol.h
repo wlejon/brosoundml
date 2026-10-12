@@ -90,4 +90,20 @@ std::vector<int32_t> negative_prefix(const Yue2Params& p, const Encode& enc,
 // Checks protocol.Sampling's validation; throws std::runtime_error.
 void validate(const Yue2Sampling& s, const char* which);
 
+// ─── Guards (not protocol) ──────────────────────────────────────────────────
+
+// Seconds the score plays: the "Vocal" voice's bars (every voice spans the
+// song), each M: num/den whole notes at Q: n/d=bpm. 0 when the ABC has no
+// M:, Q: or vocal bars.
+double abc_seconds(const std::string& abc);
+// semantic_sampling with Yue2Params::semantic_length_guard applied for this
+// plan: max_tokens cut to the hard cap, end bias past the soft point.
+Yue2Sampling guarded_semantic(const Yue2Params& p, const std::string& abc);
+// Add the end bias (Yue2Sampling::end_bias_*) for `step` to row[end_index].
+void apply_end_bias(float* row, int end_index, const Yue2Sampling& s, int step);
+// Throws "non-finite logits" when a row holds NaN or +-inf: a steer that
+// blew the residual up (B1) ends the stage with an error instead of reaching
+// the sampler, where an out-of-range id would read past the logits.
+void check_finite(const float* row, int n, const char* stage);
+
 }  // namespace brosoundml::yue2

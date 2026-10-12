@@ -211,6 +211,39 @@ int main() {
                     ph == y2::Phase::Abc ? "abc" : "semantic", n, us, sink & 1);
     }
 
+    // Guards (not protocol). The length estimate: 8 vocal bars of 2/4 at
+    // quarter = 90 (the instrument voice's bars do not count) = 8 * 2 * 60/90.
+    {
+        const std::string abc =
+            "X:1\nT:\nM:2/4\nL:1/16\nQ:1/4=90\nV: Vocal clef=treble\nV: Ins clef=treble\nK:Dm\n% intro\n"
+            "V: Vocal\n\"Dm\"z8|\"Dm\"z8|\"F\"z8|\"C\"z8|\nV: Ins\nZ|D2F3FFF|F2A3FFF|G2G3GGG|\n"
+            "V: Vocal\n\"C\"z8|\"Dm\"d4a4|\"F\"c'4a4|\"C\"g4z4|\nV: Ins\nZ4|\n";
+        const double sec = y2::abc_seconds(abc);
+        CHECK(std::fabs(sec - 8 * 2 * 60.0 / 90) < 1e-9, "abc_seconds (%.3f)", sec);
+        CHECK(y2::abc_seconds("X:1\nK:C\nabc|") == 0.0, "abc_seconds without M:/Q:");
+        brosoundml::Yue2Params p;
+        const auto g = y2::guarded_semantic(p, abc);   // 10.67 s: soft 1.15x, hard max(1.5x, +20 s)
+        CHECK(g.end_bias_after == std::max(p.semantic_sampling.min_tokens, int(1.15 * sec * 25)),
+              "guard soft point %d", g.end_bias_after);
+        CHECK(g.max_tokens == std::max(p.semantic_sampling.min_tokens, int((sec + 20) * 25)), "guard hard cap %d",
+              g.max_tokens);
+        p.semantic_length_guard = false;
+        CHECK(y2::guarded_semantic(p, abc).end_bias_after == 0, "guard off");
+        std::vector<float> row(4, 1.0f);
+        y2::apply_end_bias(row.data(), 0, g, g.end_bias_after + 50);
+        CHECK(std::fabs(row[0] - (1.0f + 50 * g.end_bias_per_token)) < 1e-6 && row[1] == 1.0f, "end bias");
+        row[2] = std::numeric_limits<float>::quiet_NaN();
+        bool threw = false;
+        try {
+            y2::check_finite(row.data(), 4, "semantic");
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()).find("non-finite logits") != std::string::npos;
+        }
+        CHECK(threw, "check_finite throws on NaN logits");
+        row[2] = 0.0f;
+        y2::check_finite(row.data(), 4, "semantic");
+    }
+
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

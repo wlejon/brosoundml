@@ -27,8 +27,10 @@ void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
         if (tokens[r] < 0 || tokens[r] >= c.vocab) model_fail("token id outside the vocabulary");
     if (s.hi <= s.lo) model_fail("step before prefill");
     const int B = s.B, M = B * R, hd = c.head_dim, half = hd / 2, qd = c.n_q * hd;
-    for (int b = 0; b < B; ++b)
-        if (s.len[b] < 1 || s.len[b] + R > s.cap) model_fail("decode beyond the session capacity");
+    for (int b = 0; b < B; ++b) {
+        if (s.len[b] < 1) model_fail("step before prefill");
+        ar_reserve(s, s.len[b] + R);   // grows on demand (drops the graphs)
+    }
     // CUDA reads each branch's key count on the device (the work divides the
     // valid keys, not the session capacity); the CPU reads the same length
     // from host memory; other devices take a key mask (one token a step).

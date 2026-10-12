@@ -168,6 +168,25 @@ std::unique_ptr<NarChunk> Model::nar_chunk(const std::vector<int32_t>& ar, int f
     c->hooks = opt.hooks;
     c->frame0 = opt.frame0;
     c->capture_evals = opt.capture_evals;
+    if (opt.in_place) {
+        ArSession& s = *opt.in_place;
+        if (opt.reuse != opt.in_place || opt.reuse_rows != s.len[0] || opt.reuse_rows > ar_len)
+            model_fail("an in-place chunk extends its session's branch 0 from its length");
+        ar_reserve(s, ar_len + N);
+        if (opt.reuse_rows < ar_len)
+            ar_rows(w, c->sc, ar.data() + opt.reuse_rows, ar_len - opt.reuse_rows, opt.reuse_rows, s.K[0], s.V[0],
+                    /*kv_only=*/true, opt.ar_hooks, /*capture=*/false);
+        for (int l = 0; l < cf.layers; ++l) {
+            c->K.push_back(rows_view(s.K[0][l], 0, ar_len + N));
+            c->V.push_back(rows_view(s.V[0][l], 0, ar_len + N));
+        }
+        c->cos = rows_view(w.cos_tbl, ar_len, N);
+        c->sin = rows_view(w.sin_tbl, ar_len, N);
+        c->xpad = bt::Tensor::zeros_on(w.dev, N, cf.latent, w.dt);
+        c->mpad = bt::Tensor::zeros_on(w.dev, N, cf.latent, w.dt);
+        c->tmp = bt::Tensor::zeros_on(w.dev, frames, cf.latent, w.dt);
+        return c;
+    }
     for (int l = 0; l < cf.layers; ++l) {
         c->K.push_back(bt::Tensor::empty_on(w.dev, ar_len + N, kd, w.dt));
         c->V.push_back(bt::Tensor::empty_on(w.dev, ar_len + N, kd, w.dt));
@@ -206,17 +225,42 @@ std::vector<float> Model::nar_velocity(NarChunk& c, const std::vector<float>& x,
 }
 
 std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, const CancelCheck& cancel,
-                                    const std::function<void(int)>& on_step) const {
+                                    const std::function<void(int)>& on_step, const float* known,
+                                    int known_frames) const {
     const ModelWeights& w = *w_;
     bt::DeviceScope scope(w.dev);
     if (steps < 1) model_fail("ode_steps must be positive");
     const int F = c.frames, D = w.cfg.latent;
+    if (known_frames < 0 || known_frames > F || (known_frames > 0 && !known)) model_fail("bad inpainting span");
     upload_rows(w, noise, F, c.xpad, 1);
     bt::Tensor S = rows_view(c.xpad, 1, F), M = rows_view(c.mpad, 1, F);
+    // Inpainting (lab.nar's clamp): the known frames are replaced by the
+    // exact flow interpolant before every evaluation, in BF16 ops as torch
+    // does them on the BF16 state: bf(bf(t * n) + bf((1 - t) * k)).
+    const bool bf = w.dt != bt::Dtype::FP32;
+    auto R = [&](float v) { return bf ? bf16r(v) : v; };
+    std::vector<float> kn, kk, kv;
+    if (known_frames > 0) {
+        const std::size_t n = static_cast<std::size_t>(known_frames) * D;
+        kn.resize(n);
+        kk.resize(n);
+        kv.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            kn[i] = R(noise[i]);
+            kk[i] = R(known[i]);
+        }
+    }
+    auto clamp = [&](bt::Tensor& pad, double t) {
+        if (known_frames == 0) return;
+        const float tf = static_cast<float>(t), sf = static_cast<float>(1.0 - t);
+        for (std::size_t i = 0; i < kv.size(); ++i) kv[i] = R(R(tf * kn[i]) + R(sf * kk[i]));
+        upload_rows(w, kv.data(), known_frames, pad, 1);
+    };
     const double dt = 1.0 / steps;
     for (int step = 0; step < steps; ++step) {
         if (cancel && cancel()) return {};
         const double t = 1.0 - step * dt;
+        clamp(c.xpad, t);
         c.cur_raw = raw_t(t);
         velocity(w, c, c.xpad);
         // mid = state - v * (dt / 2), each op rounded to the state dtype.
@@ -224,6 +268,7 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
         bt::scale_inplace(c.tmp, static_cast<float>(-(dt / 2)));
         bt::copy_d2d(S, 0, M, 0, F * D);
         bt::add_inplace(M, c.tmp);
+        clamp(c.mpad, t - dt / 2);
         if (cancel && cancel()) return {};
         c.cur_raw = raw_t(t - dt / 2);
         velocity(w, c, c.mpad);
@@ -235,6 +280,7 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
     to_host_f32(w, S, out);
     for (float v : out)
         if (!std::isfinite(v)) model_fail("acoustic flow matching produced non-finite latents");
+    for (std::size_t i = 0; i < kk.size(); ++i) out[i] = kk[i];   // clamp(state, 0)
     return out;
 }
 

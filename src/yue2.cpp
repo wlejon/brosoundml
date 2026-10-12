@@ -86,7 +86,7 @@ void Yue2::load(const std::string& model_dir, brotensor::Device device, const Yu
     impl->dir = model_dir;
     impl->tok = brolm::qwen::Tokenizer::from_tiktoken(model_dir + "/qwen.tiktoken", specials());
     if (impl->tok->vocab_count() != 151643) fail("expected the checkpoint-native qwen.tiktoken (151643 tokens)");
-    impl->model.load(model_dir, device, options.ar_weights);
+    impl->model.load(model_dir, device, options.ar_weights, options.keep_bf16_ar);
     impl_ = std::move(impl);
 }
 
@@ -124,7 +124,7 @@ std::vector<int32_t> Yue2::semantic(const Yue2Params& p, const Yue2Plan& plan, c
     std::function<void(int, int)> prog;
     if (cb.on_progress) prog = [&](int d, int t) { cb.on_progress(Yue2Stage::Semantic, d, t); };
     const ArRun r = run_ar(I.model, Phase::Semantic, plan.prefix, g != 1.0f ? &neg : nullptr, g,
-                           p.cot == Yue2Cot::Off, p.semantic_sampling,
+                           p.cot == Yue2Cot::Off, guarded_semantic(p, plan.abc),
                            stage_uniform(p, std::make_shared<std::size_t>(0)), hooks.get(), cancel, on_tok, prog,
                            nullptr);
     if (truncated) *truncated = r.truncated;

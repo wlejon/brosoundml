@@ -91,15 +91,24 @@ ArRun run_ar_spec(const Model& m, Phase ph, const std::vector<int32_t>& prefix, 
     }
     const auto [lo, hi] = logit_range(ph);
     const int n = hi - lo;
-    const int cap = std::min(static_cast<int>(prefix.size()) + s.max_tokens, CONTEXT);
-    auto sess = m.ar_session(1, cap, hooks);
+    const int P = static_cast<int>(prefix.size());
+    const int cap = std::min(P + s.max_tokens, CONTEXT);
+    auto sess = m.ar_session(1, std::min(cap, P + 1024), hooks, CONTEXT);   // grows on demand
     m.ar_prefill(*sess, 0, prefix, lo, hi);
     const int32_t end = end_token(ph);
     std::vector<int32_t> ctx(prefix);
     std::vector<float> logits;
     bool eos = false;
+    std::vector<float> biased(n);
     auto dist = [&](const float* row) {
-        return distribution(row, n, ph, s, r.tokens, static_cast<int>(r.tokens.size()), legacy_off);
+        const int step = static_cast<int>(r.tokens.size());
+        check_finite(row, n, ph == Phase::Abc ? "plan" : "semantic");
+        if (s.end_bias_after > 0 && step > s.end_bias_after) {
+            std::copy(row, row + n, biased.begin());
+            apply_end_bias(biased.data(), end - lo, s, step);
+            row = biased.data();
+        }
+        return distribution(row, n, ph, s, r.tokens, step, legacy_off);
     };
     // Emit one sampled token; false when generation ends here.
     auto emit = [&](int32_t tok) {

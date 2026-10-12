@@ -72,7 +72,7 @@ Yue2Result Yue2::generate(const Yue2Params& p, const Yue2Callbacks& cb, const Ca
         double synth_s = 0;
         int ode_done = 0;
         bool synth_cancelled = false;
-        auto emit = [&](int a, int b, ArSession* reuse, int cached_codec) {
+        auto emit = [&](int a, int b, ArSession* reuse, int cached_codec, bool last = false) {
             if (synth_cancelled) return;
             if (static_cast<std::size_t>(b) * Yue2::kLatentDim > noise.size())
                 throw std::runtime_error("brosoundml: Yue2: test_noise is shorter than the song");
@@ -83,6 +83,10 @@ Yue2Result Yue2::generate(const Yue2Params& p, const Yue2Callbacks& cb, const Ca
             if (reuse && p.reuse_prefix_kv) {
                 spec.reuse = reuse;
                 spec.reuse_rows = P + (a == 0 ? std::min(b, cached_codec) : 0);
+                // The song's last chunk from frame 0 over every cached token:
+                // the NAR reads the session's own K/V (no 1.2 GB copy).
+                if (last && a == 0 && b == cached_codec && spec.reuse_rows == I.model.ar_len(*reuse, 0))
+                    spec.in_place = reuse;
             }
             const int windows_known = W > 0 ? (b + W - 1) / W : 1;
             auto lat = synth_chunk(I.model, p, prefix, res.semantic, noise, spec, nh, ah, cancel, [&](int) {
@@ -112,7 +116,8 @@ Yue2Result Yue2::generate(const Yue2Params& p, const Yue2Callbacks& cb, const Ca
         std::unique_ptr<ArSession> sess;
         const auto tsem = Clock::now();
         const ArRun r = run_ar(I.model, Phase::Semantic, prefix, g != 1.0f ? &neg : nullptr, g, p.cot == Yue2Cot::Off,
-                               p.semantic_sampling, stage_uniform(p, cursor), sh.get(), cancel, on_tok, prog,
+                               guarded_semantic(p, res.plan.abc), stage_uniform(p, cursor), sh.get(), cancel, on_tok,
+                               prog,
                                &sess);
         res.semantic_truncated = r.truncated;
         res.timing.semantic_seconds = seconds_since(tsem) - synth_s;
@@ -133,8 +138,9 @@ Yue2Result Yue2::generate(const Yue2Params& p, const Yue2Callbacks& cb, const Ca
             if (W > 0) {
                 emit(res.frames, frames, sess.get(), cached);
             } else {
-                for (const auto& [a, b] : chunk_ranges(frames, P)) {
-                    emit(a, b, sess.get(), cached);
+                const auto ranges = chunk_ranges(frames, P);
+                for (std::size_t i = 0; i < ranges.size(); ++i) {
+                    emit(ranges[i].first, ranges[i].second, sess.get(), cached, i + 1 == ranges.size());
                     if (synth_cancelled) break;
                 }
             }

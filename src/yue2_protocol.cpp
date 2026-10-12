@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -275,6 +276,61 @@ void validate(const Yue2Sampling& s, const char* which) {
         fail(w + " sampling: invalid repetition penalty/window");
     if (s.min_tokens < 0 || s.min_tokens > s.max_tokens || s.max_tokens < 1)
         fail(w + " sampling: require 0 <= min_tokens <= max_tokens");
+    if (s.end_bias_after < 0 || !std::isfinite(s.end_bias_per_token) || s.end_bias_per_token < 0)
+        fail(w + " sampling: invalid end bias");
+}
+
+double abc_seconds(const std::string& abc) {
+    int mn = 0, md = 0, qn = 0, qd = 0, bpm = 0;
+    long bars = 0;
+    bool vocal = false;
+    std::size_t i = 0;
+    while (i < abc.size()) {
+        std::size_t e = abc.find('\n', i);
+        if (e == std::string::npos) e = abc.size();
+        const std::string line = abc.substr(i, e - i);
+        i = e + 1;
+        if (line.rfind("M:", 0) == 0) std::sscanf(line.c_str() + 2, " %d/%d", &mn, &md);
+        else if (line.rfind("Q:", 0) == 0) std::sscanf(line.c_str() + 2, " %d/%d = %d", &qn, &qd, &bpm);
+        else if (line.rfind("V:", 0) == 0) {
+            std::size_t a = 2;
+            while (a < line.size() && line[a] == ' ') ++a;
+            std::size_t b = a;
+            while (b < line.size() && line[b] != ' ') ++b;
+            vocal = line.compare(a, b - a, "Vocal") == 0;
+        } else if (vocal && !line.empty() && line[0] != '%' && !(line.size() > 1 && line[1] == ':')) {
+            for (char c : line) bars += c == '|';
+        }
+    }
+    if (mn <= 0 || md <= 0 || qn <= 0 || qd <= 0 || bpm <= 0 || bars <= 0) return 0.0;
+    const double beats_per_bar = (double(mn) / md) / (double(qn) / qd);
+    return bars * beats_per_bar * 60.0 / bpm;
+}
+
+Yue2Sampling guarded_semantic(const Yue2Params& p, const std::string& abc) {
+    Yue2Sampling s = p.semantic_sampling;
+    if (!p.semantic_length_guard || s.end_bias_after > 0) return s;
+    const double sec = abc_seconds(abc);
+    if (sec <= 0) return s;
+    const int fps = Yue2::kFrameRate;
+    const int soft = static_cast<int>(1.15 * sec * fps);
+    const int hard = static_cast<int>(std::max(1.5 * sec, sec + 20.0) * fps);
+    s.end_bias_after = std::max(1, std::max(soft, s.min_tokens));
+    s.end_bias_per_token = 1.0f / fps;
+    s.max_tokens = std::max(s.min_tokens, std::min(s.max_tokens, hard));
+    return s;
+}
+
+void apply_end_bias(float* row, int end_index, const Yue2Sampling& s, int step) {
+    if (s.end_bias_after <= 0 || step <= s.end_bias_after) return;
+    row[end_index] += s.end_bias_per_token * static_cast<float>(step - s.end_bias_after);
+}
+
+void check_finite(const float* row, int n, const char* stage) {
+    for (int i = 0; i < n; ++i)
+        if (!std::isfinite(row[i]))
+            fail(std::string("non-finite logits in the ") + stage +
+                 " stage (a steer too strong for the residual stream?)");
 }
 
 }  // namespace brosoundml::yue2

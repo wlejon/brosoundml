@@ -204,12 +204,20 @@ void ar_rows(const ModelWeights& w, RowScratch& sc, const int32_t* ids, int n, i
     upload_ids(w, ids, n, sc.idx);
     bt::embedding_lookup_forward(w.embed, static_cast<const int32_t*>(sc.idx.data), n, sc.x);
     const bt::Tensor cos = rows_view(w.cos_tbl, pos0, n), sin = rows_view(w.sin_tbl, pos0, n);
+    // The BF16 weight, or (dropped) its quantised copy dequantized into the
+    // shared scratch: each use follows its dequantize in stream order.
+    auto W = [&](const bt::Tensor& bf, const QuantW& q) -> bt::Tensor {
+        if (w.ar_bf16) return rows_view(bf, 0, bf.rows);
+        bt::Tensor v = reshape_view(w.deq, q.w.rows, q.w.cols);
+        bt::dequantize_rows(q.w, q.scales, w.dt, v);
+        return v;
+    };
     for (int l = 0; l < c.layers; ++l) {
         const PathW& p = w.layers[l].ar;
         bt::rms_norm_forward(sc.x, p.in_ln, c.eps, sc.n);
-        lin(p.q, nullptr, sc.n, sc.q, &sc.ws);
-        lin(p.k, nullptr, sc.n, sc.k, &sc.ws);
-        lin(p.v, nullptr, sc.n, sc.v, &sc.ws);
+        lin(W(p.q, p.qq), nullptr, sc.n, sc.q, &sc.ws);
+        lin(W(p.k, p.qk), nullptr, sc.n, sc.k, &sc.ws);
+        lin(W(p.v, p.qv), nullptr, sc.n, sc.v, &sc.ws);
         head_norm(w, sc.q, c.n_q, p.q_norm, sc.qn);
         head_norm(w, sc.k, c.n_kv, p.k_norm, sc.kn);
         bt::Tensor qv = reshape_view(sc.qn, n, qd), kv = reshape_view(sc.kn, n, kd);
@@ -224,13 +232,16 @@ void ar_rows(const ModelWeights& w, RowScratch& sc, const int32_t* ids, int n, i
         } else {
             bt::flash_attention_decode(qv, K[l], V[l], pos0 + n, c.n_q, c.n_kv, sc.att);
         }
-        lin(p.o, nullptr, sc.att, sc.x, &sc.ws, true);
+        lin(W(p.o, p.qo), nullptr, sc.att, sc.x, &sc.ws, true);
         bt::rms_norm_forward(sc.x, p.post_ln, c.eps, sc.n);
-        lin(p.gate, nullptr, sc.n, sc.g, &sc.ws);
-        lin(p.up, nullptr, sc.n, sc.u, &sc.ws);
+        {
+            const bt::Tensor gu = W(p.gate_up, p.qgate_up);
+            lin(rows_view(gu, 0, c.inter), nullptr, sc.n, sc.g, &sc.ws);
+            lin(rows_view(gu, c.inter, c.inter), nullptr, sc.n, sc.u, &sc.ws);
+        }
         bt::silu_forward(sc.g, sc.g);
         bt::mul_inplace(sc.g, sc.u);
-        lin(p.down, nullptr, sc.g, sc.x, &sc.ws, true);
+        lin(W(p.down, p.qdown), nullptr, sc.g, sc.x, &sc.ws, true);
         apply_hooks(w, hooks, l, sc.x, pos0, 0, n, -1, capture);
     }
 }
@@ -248,7 +259,7 @@ bt::Device Model::device() const { return w_->dev; }
 
 ArWeights Model::ar_weights() const { return w_->ar_weights; }
 
-void Model::load(const std::string& dir, bt::Device dev, ArWeights ar) {
+void Model::load(const std::string& dir, bt::Device dev, ArWeights ar, bool keep_bf16_ar) {
     auto w = std::make_unique<ModelWeights>();
     w->cfg = Config::from_json(dir + "/config.json");
     w->dev = dev;
@@ -257,9 +268,22 @@ void Model::load(const std::string& dir, bt::Device dev, ArWeights ar) {
     const int H = c.hidden, hd = c.head_dim, qd = c.n_q * hd, kd = c.n_kv * hd;
     const sf::File f = sf::File::open(dir + "/model.safetensors");
     bt::DeviceScope scope(dev);
+    // Decode's quantised AR copies (per output row, from the BF16 weights),
+    // made as each weight loads so a dropped original never coexists with
+    // the rest of the model's.
+    w->ar_weights = ar;
+    const bool quant = ar != ArWeights::Bf16;
+    const bool drop = quant && !keep_bf16_ar;
+    w->ar_bf16 = !drop;
+    const bt::Dtype qf = ar == ArWeights::Int8 ? bt::Dtype::INT8 : bt::Dtype::FP8_E4M3;
+    auto qz = [&](bt::Tensor& W, QuantW& q) {
+        bt::quantize_rows(W, qf, q.w, q.scales);
+        if (drop) W = bt::Tensor{};
+    };
 
     w->embed = load_w(f, *w, "model.embed_tokens.weight", c.vocab, H);
     w->lm_head = load_w(f, *w, "lm_head.weight", c.vocab, H);
+    if (quant) qz(w->lm_head, w->q_lm_head);
     w->final_norm = load_w(f, *w, "model.norm.weight", H, 1);
     const auto pq = rope_perm(c.n_q, hd), pk = rope_perm(c.n_kv, hd), pn = rope_perm(1, hd);
     w->layers.resize(c.layers);
@@ -290,7 +314,18 @@ void Model::load(const std::string& dir, bt::Device dev, ArWeights ar) {
         };
         path(w->layers[l].ar, "self_attn", "input_layernorm", "post_attention_layernorm", "mlp");
         path(w->layers[l].nar, "nar_self_attn", "nar_input_layernorm", "nar_pre_mlp_layernorm", "nar_mlp");
+        if (quant) {
+            PathW& p = w->layers[l].ar;
+            qz(p.q, p.qq);
+            qz(p.k, p.qk);
+            qz(p.v, p.qv);
+            qz(p.o, p.qo);
+            qz(p.gate_up, p.qgate_up);
+            qz(p.down, p.qdown);
+            if (drop) p.gate = p.up = bt::Tensor{};
+        }
     }
+    if (drop) w->deq = bt::Tensor::empty_on(dev, 2 * c.inter, H, w->dt);
     w->vae2llm_w = load_w(f, *w, "vae2llm.weight", H, c.latent);
     w->vae2llm_b = load_w(f, *w, "vae2llm.bias", H, 1);
     w->llm2vae_w = load_w(f, *w, "llm2vae.weight", c.latent, H);
@@ -317,22 +352,6 @@ void Model::load(const std::string& dir, bt::Device dev, ArWeights ar) {
     w->cos_tbl = bt::Tensor::from_host_on(dev, cs.data(), c.max_pos, half);
     w->sin_tbl = bt::Tensor::from_host_on(dev, sn.data(), c.max_pos, half);
 
-    // Decode's quantised AR copies (per output row, from the BF16 weights).
-    w->ar_weights = ar;
-    if (ar != ArWeights::Bf16) {
-        const bt::Dtype qf = ar == ArWeights::Int8 ? bt::Dtype::INT8 : bt::Dtype::FP8_E4M3;
-        auto qz = [&](const bt::Tensor& W, QuantW& q) { bt::quantize_rows(W, qf, q.w, q.scales); };
-        for (LayerW& L : w->layers) {
-            PathW& p = L.ar;
-            qz(p.q, p.qq);
-            qz(p.k, p.qk);
-            qz(p.v, p.qv);
-            qz(p.o, p.qo);
-            qz(p.gate_up, p.qgate_up);
-            qz(p.down, p.qdown);
-        }
-        qz(w->lm_head, w->q_lm_head);
-    }
     if (!dev.is_cpu()) bt::sync(dev);
     w->loaded = true;
     w_ = std::move(w);
@@ -357,15 +376,18 @@ SteerDev Model::make_steer(const std::vector<float>& delta, float scale, int pos
     return s;
 }
 
-std::unique_ptr<ArSession> Model::ar_session(int branches, int capacity, const LayerHooks* hooks) const {
+std::unique_ptr<ArSession> Model::ar_session(int branches, int capacity, const LayerHooks* hooks,
+                                             int max_capacity) const {
     if (!loaded()) model_fail("not loaded");
     const ModelWeights& w = *w_;
     if (branches < 1 || branches > 2) model_fail("a session holds 1 or 2 branches");
     if (capacity < 1 || capacity > w.cfg.max_pos) model_fail("session capacity exceeds the context");
+    if (max_capacity > w.cfg.max_pos) model_fail("session max capacity exceeds the context");
     auto s = std::make_unique<ArSession>();
     s->hooks = hooks;
     s->B = branches;
     s->cap = capacity;
+    s->max_cap = std::max(capacity, max_capacity);
     s->len.assign(branches, 0);
     const int kd = w.cfg.n_kv * w.cfg.head_dim;
     s->K.resize(branches);
@@ -379,10 +401,66 @@ std::unique_ptr<ArSession> Model::ar_session(int branches, int capacity, const L
 }
 
 int Model::ar_len(const ArSession& s, int b) const { return s.len.at(b); }
+int Model::ar_capacity(const ArSession& s) const { return s.cap; }
+
+void Model::ar_reserve(ArSession& s, int rows) const {
+    if (rows <= s.cap) return;
+    if (rows > s.max_cap)
+        model_fail("session needs " + std::to_string(rows) + " rows, past its max capacity " +
+                   std::to_string(s.max_cap));
+    const ModelWeights& w = *w_;
+    bt::DeviceScope scope(w.dev);
+    const int grown = std::min(s.max_cap, std::max(rows, s.cap + std::max(1024, s.cap / 4)));
+    const int kd = w.cfg.n_kv * w.cfg.head_dim;
+    // A layer at a time, so the peak is the old caches plus one new layer.
+    // Rows past the longest branch are dead (truncated drafts, NAR scratch).
+    int keep = 0;
+    for (int b = 0; b < s.B; ++b) keep = std::max(keep, s.len[b]);
+    for (int b = 0; b < s.B; ++b)
+        for (int l = 0; l < w.cfg.layers; ++l)
+            for (auto* t : {&s.K[b][l], &s.V[b][l]}) {
+                // Zeroed like a new session's: a masked decode (non-CUDA)
+                // weighs dead rows by 0, and 0 * NaN garbage would be NaN.
+                bt::Tensor n = bt::Tensor::zeros_on(w.dev, grown, kd, w.dt);
+                if (keep > 0) bt::copy_d2d(*t, 0, n, 0, static_cast<long long>(keep) * kd);
+                *t = std::move(n);
+            }
+    s.cap = grown;
+    s.steps.clear();   // the graphs and masks were over the old buffers
+}
+
+void Model::ar_set_hooks(ArSession& s, const LayerHooks* hooks) const {
+    if (s.hooks == hooks) return;
+    s.hooks = hooks;
+    s.steps.clear();
+}
 
 bt::Tensor lm_rows(const ModelWeights& w, int lo, int hi) {
     if (lo < 0 || hi > w.cfg.vocab || lo >= hi) model_fail("bad logit range");
+    if (w.lm_head.rows == 0) return {};   // dropped: decode reads q_lm_rows
     return rows_view(w.lm_head, lo, hi - lo);
+}
+
+std::size_t Model::weight_bytes() const {
+    if (!loaded()) return 0;
+    const ModelWeights& w = *w_;
+    std::size_t n = 0;
+    auto add = [&](const bt::Tensor& t) {
+        if (t.rows > 0)   // owning tensors only (gate / up are views of gate_up, not listed)
+            n += static_cast<std::size_t>(t.rows) * t.cols * bt::dtype_size_bytes(t.dtype);
+    };
+    for (const bt::Tensor* t : {&w.embed, &w.lm_head, &w.final_norm, &w.q_lm_head.w, &w.q_lm_head.scales,
+                                &w.vae2llm_w, &w.vae2llm_b, &w.llm2vae_w, &w.llm2vae_b, &w.t0_w, &w.t0_b, &w.t2_w,
+                                &w.t2_b, &w.pe, &w.cos_tbl, &w.sin_tbl, &w.deq})
+        add(*t);
+    for (const LayerW& L : w.layers)
+        for (const PathW* p : {&L.ar, &L.nar})
+            for (const bt::Tensor* t : {&p->in_ln, &p->q, &p->k, &p->v, &p->o, &p->q_norm, &p->k_norm, &p->post_ln,
+                                        &p->gate_up, &p->down, &p->qq.w, &p->qk.w, &p->qv.w, &p->qo.w,
+                                        &p->qgate_up.w, &p->qdown.w, &p->qq.scales, &p->qk.scales, &p->qv.scales,
+                                        &p->qo.scales, &p->qgate_up.scales, &p->qdown.scales})
+                add(*t);
+    return n;
 }
 
 QuantW q_lm_rows(const ModelWeights& w, int lo, int hi) {
@@ -400,7 +478,8 @@ void Model::ar_prefill(ArSession& s, int b, const std::vector<int32_t>& ids, int
     bt::DeviceScope scope(w.dev);
     const int n = static_cast<int>(ids.size());
     if (b < 0 || b >= s.B || s.len[b] != 0) model_fail("prefill needs an empty branch");
-    if (n < 1 || n > s.cap) model_fail("prefix exceeds the session capacity");
+    if (n < 1) model_fail("empty prefix");
+    ar_reserve(s, n);
     for (int32_t t : ids)
         if (t < 0 || t >= w.cfg.vocab) model_fail("token id outside the vocabulary");
     // Capture reports branch 0 only; steering acts on every branch.
@@ -408,7 +487,8 @@ void Model::ar_prefill(ArSession& s, int b, const std::vector<int32_t>& ids, int
     bt::Tensor last = rows_view(s.pre.x, n - 1, 1);
     bt::Tensor normed, row;
     bt::rms_norm_forward(last, w.final_norm, w.cfg.eps, normed);
-    lin(lm_rows(w, lo, hi), nullptr, normed, row, &s.pre.ws);
+    if (w.ar_bf16) lin(lm_rows(w, lo, hi), nullptr, normed, row, &s.pre.ws);
+    else dlin(bt::Tensor{}, q_lm_rows(w, lo, hi), normed, row, &s.pre.ws);   // one row: the GEMV
     if (s.lo != lo || s.hi != hi || s.logits.rows != s.B) {
         s.lo = lo;
         s.hi = hi;

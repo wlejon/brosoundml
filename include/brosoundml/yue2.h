@@ -56,14 +56,18 @@ enum class Yue2Cot { Off, Melody, Full };
 // token. Bf16 = the checkpoint's. Int8 / Fp8 = weight-only quantised copies,
 // one FP32 scale per output row (INT8 symmetric +-127, or FP8 E4M3), of every
 // layer's AR q/k/v/o/gate/up/down and of lm_head; activations, accumulation
-// and everything else stay as in Bf16. Prefill, the NAR path and the VAE
-// always use the BF16 weights. Int8 / Fp8 cost ~1.9 GB more device memory.
+// and everything else stay as in Bf16. The NAR path and the VAE always use
+// the BF16 weights. With Int8 / Fp8 the AR path's BF16 originals are dropped
+// once quantised (keep_bf16_ar = false, the default): prefill dequantizes one
+// matrix at a time into a shared scratch, so it runs on the same weights the
+// decode reads, and the model holds ~3.5 GB less than with both copies.
 // Int8 by default (ABC plan ~1.6x faster); Bf16 is the reference-parity
 // choice, the one to pass when comparing with the PyTorch model.
 enum class Yue2ArWeights { Bf16, Int8, Fp8 };
 
 struct Yue2LoadOptions {
     Yue2ArWeights ar_weights = Yue2ArWeights::Int8;
+    bool keep_bf16_ar = false;   // keep the BF16 AR weights beside the quantised copies (prefill reads them)
 };
 
 // One AR stage's sampling (protocol.Sampling). Defaults are the semantic
@@ -76,6 +80,11 @@ struct Yue2Sampling {
     int   penalty_window     = 50;     // 1..100 most recent tokens
     int   min_tokens         = 200;    // end token masked before this
     int   max_tokens         = 9000;
+    // Not protocol: after `end_bias_after` tokens (0 = never) the end
+    // token's logit gains `end_bias_per_token` per token past it, so a song
+    // that has outrun its plan ends (Yue2Params::semantic_length_guard).
+    int   end_bias_after     = 0;
+    float end_bias_per_token = 0.0f;
 };
 
 enum class Yue2Stage { Plan, Semantic, Synthesize };
@@ -158,6 +167,16 @@ struct Yue2Params {
     // part of streaming windows). Same weights and positions, so the K/V
     // differ from a fresh prefill only by kernel rounding.
     bool reuse_prefix_kv = true;
+
+    // Song length guard (not protocol). The plan's length is estimated from
+    // its ABC (the vocal voice's bars, M: and Q:; normal songs end within
+    // ~1.03x of it). Past 1.15x the end token's logit gains 0.04 per token
+    // (+1 a second), and the song is cut at 1.5x (at least + 20 s): a song a
+    // strong semantic steer keeps from ending (|scale| >= 3 ran to 9000
+    // tokens) ends instead. Songs that end on their own are unchanged. No
+    // effect without an ABC (cot = Off) or with semantic_sampling's own
+    // end_bias_after set.
+    bool semantic_length_guard = true;
 
     // Test seam: uniforms for the AR token draws (one per sampled token, in
     // order; plan first, then semantic) replacing the seeded generator, and

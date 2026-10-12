@@ -106,6 +106,9 @@ struct ChunkSpec {
     int a = 0, b = 0;                         // frames [a, b)
     const ArSession* reuse = nullptr;         // semantic session (or null)
     int reuse_rows = 0;
+    ArSession* in_place = nullptr;            // = reuse, extended in place (NarOptions::in_place)
+    const float* known = nullptr;             // inpainting: latents of frames [a, a + known_frames)
+    int known_frames = 0;
 };
 std::vector<float> synth_chunk(const Model& m, const Yue2Params& p, const std::vector<int32_t>& prefix,
                                const std::vector<int32_t>& codec, const std::vector<float>& noise,

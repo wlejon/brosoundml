@@ -53,6 +53,11 @@ struct ModelWeights {
     // RoPE tables for every position, FP32 values rounded to BF16 (the
     // reference casts cos/sin to the activation dtype): (max_pos, hd/2).
     bt::Tensor cos_tbl, sin_tbl;
+    // Without the AR BF16 weights (Model::load keep_bf16_ar = false) a
+    // prefill dequantizes each AR matrix into this one scratch just before
+    // its GEMM (stream order makes the reuse safe): (2 * inter, H).
+    bool ar_bf16 = true;
+    bt::Tensor deq;
 
     int esize() const { return dt == bt::Dtype::FP32 ? 4 : 2; }
 };
@@ -105,6 +110,7 @@ void ar_rows(const ModelWeights& w, RowScratch& sc, const int32_t* ids, int n, i
 
 struct ArSession {
     int B = 1, cap = 0;
+    int max_cap = 0;                               // cap grows on demand up to this (Model::ar_reserve)
     const LayerHooks* hooks = nullptr;
     std::vector<int> len;                          // tokens cached per branch
     std::vector<std::vector<bt::Tensor>> K, V;     // [branch][layer] (cap, n_kv*hd)

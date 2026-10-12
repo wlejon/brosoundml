@@ -87,8 +87,12 @@ ArRun run_ar(const Model& m, Phase ph, const std::vector<int32_t>& prefix,
     }
     const auto [lo, hi] = logit_range(ph);
     const int n = hi - lo;
-    const int cap = static_cast<int>(std::max(prefix.size(), use_cfg ? negative->size() : 0)) + s.max_tokens;
-    auto sess = m.ar_session(use_cfg ? 2 : 1, std::min(cap, CONTEXT), hooks);
+    const int longest = static_cast<int>(std::max(prefix.size(), use_cfg ? negative->size() : 0));
+    // The caches start at the prefix + 1024 tokens and grow as the song does
+    // (a whole budget up front held ~1.2 GB a song never used).
+    const int cap = std::min(longest + s.max_tokens, CONTEXT);
+    // Max capacity is the context: an in-place NAR chunk extends the session.
+    auto sess = m.ar_session(use_cfg ? 2 : 1, std::min(cap, longest + 1024), hooks, CONTEXT);
     m.ar_prefill(*sess, 0, prefix, lo, hi);
     if (use_cfg) m.ar_prefill(*sess, 1, *negative, lo, hi);
     const int32_t end = end_token(ph);
@@ -100,11 +104,13 @@ ArRun run_ar(const Model& m, Phase ph, const std::vector<int32_t>& prefix,
             break;
         }
         m.ar_logits(*sess, logits);
-        const float* row = logits.data();
+        float* row = logits.data();
         if (use_cfg) {
             cfg_combine_bf16(logits.data(), logits.data() + n, cfg, combined.data(), n);
             row = combined.data();
         }
+        check_finite(row, n, ph == Phase::Abc ? "plan" : "semantic");
+        apply_end_bias(row, end - lo, s, step);
         const auto scores = distribution(row, n, ph, s, r.tokens, step, legacy_off);
         const int32_t tok = draw(scores, lo, s.temperature, uniform);
         if (step == 0) r.ttft = seconds_since(t0);
@@ -150,9 +156,10 @@ std::vector<float> synth_chunk(const Model& m, const Yue2Params& p, const std::v
     opt.hooks = nar_hooks.get();
     opt.frame0 = spec.a;
     opt.capture_evals = p.capture.nar_evals;
+    opt.in_place = spec.in_place;
     auto chunk = m.nar_chunk(ar, spec.b - spec.a, opt);
     return m.nar_solve(*chunk, noise.data() + static_cast<std::size_t>(spec.a) * Yue2::kLatentDim, p.ode_steps,
-                       cancel, on_step);
+                       cancel, on_step, spec.known, spec.known_frames);
 }
 
 std::string utf8_replace(const std::string& s) {

@@ -143,6 +143,8 @@ int main() {
     const auto req = brotensor::json::parse(ss.str());
 
     std::vector<std::vector<float>> bf_a;   // A: BF16 decode rows
+    std::vector<std::vector<float>> keep_pre;   // E: prefill rows with the BF16 originals kept
+    std::size_t keep_bytes = 0;
     PhaseRun bf[2];
     std::vector<PlanStats> bf_plans;
     try {
@@ -153,6 +155,18 @@ int main() {
             {
                 y2::Model m;
                 m.load(mdir.string(), dev, f);
+                // E (BF16 originals kept): each fixture prefix's prefill
+                // logits, the comparison E makes for the dropped weights.
+                if (!ref) {
+                    keep_pre.clear();
+                    for (const auto& ids : fx.prefixes) {
+                        auto s = m.ar_session(1, static_cast<int>(ids.size()));
+                        m.ar_prefill(*s, 0, ids, 0, V);
+                        keep_pre.emplace_back();
+                        m.ar_logits(*s, keep_pre.back());
+                    }
+                    keep_bytes = m.weight_bytes();
+                }
                 // A.
                 for (std::size_t i = 0; i < fx.prefixes.size(); ++i) {
                     const auto& ids = fx.prefixes[i];
@@ -257,6 +271,39 @@ int main() {
                             fmt_name(f), S, double(sum.tokens) / S, sum.truncated, double(sum.headers) / S,
                             double(sum.bars) / S, double(sum.voices) / S, sum.tps / S);
                 if (!ref) CHECK(sum.truncated == 0 || sum.truncated <= S / 2, "%s: plans truncated", fmt_name(f));
+            }
+            // E. The BF16 AR originals dropped (Yue2LoadOptions'
+            // default): prefill dequantizes the quantised copies a matrix at
+            // a time. Its logits against the reference and against the
+            // prefill that read the BF16 originals, and the bytes it frees.
+            if (!ref) {
+                y2::Model m;
+                m.load(mdir.string(), dev, f, /*keep_bf16_ar=*/false);
+                const std::size_t drop_bytes = m.weight_bytes();
+                std::printf("E. weights: %.2f GB with the BF16 AR originals, %.2f GB without (%.2f GB freed)\n",
+                            keep_bytes / 1e9, drop_bytes / 1e9, (double(keep_bytes) - drop_bytes) / 1e9);
+                CHECK(keep_bytes > drop_bytes + 2'000'000'000ull, "%s: dropping the BF16 AR weights frees > 2 GB",
+                      fmt_name(f));
+                for (std::size_t i = 0; i < fx.prefixes.size(); ++i) {
+                    const auto& ids = fx.prefixes[i];
+                    auto s = m.ar_session(1, static_cast<int>(ids.size()));
+                    m.ar_prefill(*s, 0, ids, 0, V);
+                    std::vector<float> row;
+                    m.ar_logits(*s, row);
+                    const auto& kp = keep_pre[i];
+                    // The row after ids' last token, as A's decode and the
+                    // reference's logits are.
+                    const int am = static_cast<int>(std::max_element(row.begin(), row.end()) - row.begin());
+                    const int ak = static_cast<int>(std::max_element(kp.begin(), kp.end()) - kp.begin());
+                    const auto& rl = fx.ref_logits[i];
+                    std::printf("E. prefill logits [%zu tokens], dequantized: vs BF16-weight prefill cosine %.6f, "
+                                "top10 %d, argmax %s; vs reference cosine %.6f\n",
+                                ids.size(), cosine(row.data(), kp.data(), V), overlap(row.data(), kp.data(), V, 10),
+                                am == ak ? "same" : "differs", cosine(row.data(), rl.data(), V));
+                    CHECK(cosine(row.data(), kp.data(), V) > 0.995, "%s E%zu cosine", fmt_name(f), i);
+                    CHECK(overlap(row.data(), kp.data(), V, 10) >= 7, "%s E%zu top-10", fmt_name(f), i);
+                    CHECK(cosine(row.data(), rl.data(), V) > 0.995, "%s E%zu reference cosine", fmt_name(f), i);
+                }
             }
         }
     } catch (const std::exception& e) {

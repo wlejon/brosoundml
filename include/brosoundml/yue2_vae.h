@@ -102,6 +102,13 @@ public:
                              const std::function<void(int, int)>& on_progress = {},
                              const CancelCheck& cancel = {}) const;
 
+    // Samples [start * 1920, end * 1920) of decode(latents, frames) — or up
+    // to the natural end when `end == frames` and `song_end` — decoded from
+    // one window with `halo_frames` (0 = required_halo()) of the available
+    // context each side, exactly. A just-in-time decoder: frames before `end`
+    // + halo must already be final; anything can be re-decoded after an edit.
+    StereoAudio decode_span(const float* latents, int frames, int start, int end, bool song_end = false,
+                            int halo_frames = 0) const;
     // 48 kHz stereo -> posterior-mean latents, frame-major [frame][64];
     // *frames_out receives the frame count. Other rates are resampled; a mono
     // input is duplicated to both channels. Needs >= 1920 samples. Encodes in
