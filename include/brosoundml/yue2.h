@@ -281,6 +281,7 @@ public:
     static constexpr int kFrameRate = 25;
 
 private:
+    friend class Yue2Stream;   // yue2_stream.h drives the stages directly
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -106,8 +106,9 @@ public:
     // max capacity, else throws). Invalidates the session's decode graphs.
     void ar_reserve(ArSession& s, int rows) const;
     int ar_capacity(const ArSession& s) const;
-    // Replace the session's hooks (a steer turned on, changed or off); the
-    // decode graphs are recaptured at the next step. `hooks` must outlive it.
+    // Replace the session's hooks (a steer turned on, changed or off; the
+    // same object with new deltas counts); the decode graphs are recaptured
+    // at the next step. `hooks` must outlive the session.
     void ar_set_hooks(ArSession& s, const LayerHooks* hooks) const;
     // Upload a host steering delta (n * H floats, n = 1 or rows) scaled by
     // `scale` at the model's dtype.

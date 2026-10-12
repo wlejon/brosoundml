@@ -430,7 +430,8 @@ void Model::ar_reserve(ArSession& s, int rows) const {
 }
 
 void Model::ar_set_hooks(ArSession& s, const LayerHooks* hooks) const {
-    if (s.hooks == hooks) return;
+    // Always recapture: the same hooks object may hold new delta tensors (a
+    // graph captured the old ones' addresses).
     s.hooks = hooks;
     s.steps.clear();
 }
