@@ -7,7 +7,7 @@
 // through a mutex-guarded queue, which each tick's poll drains. The data is
 // paced by the player (emitLeadSeconds ahead), so it stays small.
 // Controls (enqueue, setPlayhead, setKnobs, interrupt, skip, setNextPlan,
-// stop) are Yue2Stream's own thread-safe calls, so they never block on the
+// setPlan, drop, stop) are Yue2Stream's own thread-safe calls, so they never block on the
 // model. While the stream runs, the job roots the stream object, so a
 // stream nobody references keeps playing until stop().
 #include "soundml_music_internal.h"
@@ -79,17 +79,26 @@ const char* kindName(brosoundml::Yue2StreamEvent::Kind k) {
         case K::FirstAudio: return "firstAudio";
         case K::Error: return "error";
         case K::Idle: return "idle";
+        case K::Want: return "want";
+        case K::Built: return "built";
+        case K::Dropped: return "dropped";
     }
     return "idle";
 }
 
+// Knobs are flat in JS: energy, texture, percussion and one field per
+// semantic axis (arrangement, then the style axes).
 void readKnobs(Value v, brosoundml::Yue2Knobs& k) {
     if (!ev::isObject(v)) return;
     ev::Persistent o(v);
     getFloatOpt(o.get(), "energy", k.energy);
     getFloatOpt(o.get(), "texture", k.texture);
     getFloatOpt(o.get(), "percussion", k.percussion);
-    getFloatOpt(o.get(), "arrangement", k.arrangement);
+    for (const auto& a : brosoundml::Yue2Directions::builtin_ref().semantic) {
+        float f = k.get(a.name);
+        getFloatOpt(o.get(), a.name, f);
+        k.set(a.name, f);
+    }
 }
 
 Value makeKnobs(const brosoundml::Yue2Knobs& k) {
@@ -97,7 +106,8 @@ Value makeKnobs(const brosoundml::Yue2Knobs& k) {
     o.set("energy", static_cast<double>(k.energy));
     o.set("texture", static_cast<double>(k.texture));
     o.set("percussion", static_cast<double>(k.percussion));
-    o.set("arrangement", static_cast<double>(k.arrangement));
+    for (const auto& a : brosoundml::Yue2Directions::builtin_ref().semantic)
+        o.set(a.name, static_cast<double>(k.get(a.name)));
     return o.get();
 }
 
@@ -158,6 +168,12 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
     readSeconds(r.get(), "skipFadeSeconds", o.skip_fade_seconds);
     readSeconds(r.get(), "interruptLatencySeconds", o.interrupt_latency_seconds);
     readSeconds(r.get(), "knobLatencySeconds", o.knob_latency_seconds);
+    readSeconds(r.get(), "wantGraceSeconds", o.want_grace_seconds);
+    getIntOpt(r.get(), "aheadSongs", o.ahead_songs);
+    if (o.ahead_songs < 1 || o.ahead_songs > 8) {
+        err = "aheadSongs must be 1..8";
+        return false;
+    }
     ev::Persistent k(ev::getProperty(r.get(), "knobs"));
     readKnobs(k.get(), o.knobs);
     o.knobs = brosoundml::Yue2Knobs::clamp(o.knobs);
@@ -202,9 +218,18 @@ Value makeStats(const brosoundml::Yue2StreamStats& s) {
         so.set("start", static_cast<double>(g.start));
         so.set("end", static_cast<double>(g.end));
         so.set("latentNorm", g.latent_norm);
+        so.set("built", g.built);
+        so.set("ready", g.ready);
+        so.set("onAir", g.on_air);
+        so.set("hostBytes", static_cast<double>(g.host_bytes));
+        ev::Persistent k(makeKnobs(g.knobs));
+        so.set("knobs", k.get());
         return so.get();
     }));
     o.set("songs", songs.get());
+    o.set("ahead", static_cast<double>(s.ahead));
+    o.set("readyAhead", static_cast<double>(s.ready_ahead));
+    o.set("hostBytes", static_cast<double>(s.host_bytes));
     return o.get();
 }
 
@@ -294,6 +319,23 @@ void decorateStream(ObjectBuilder& b) {
             return ev::undefined();
         });
     });
+    b.def("setPlan", 2, [](Value self, std::span<const Value> a) -> Value {
+        if (!isStringArg(a, 1)) return ev::throwTypeError("setPlan(song, abc): a song index and an ABC string required");
+        const int song = static_cast<int>(numAt(a, 0, -1));
+        const std::string abc = strAt(a, 1);
+        return streamControl(self, "setPlan", [&](StreamJob& j) -> Value {
+            j.stream->set_plan(song, abc);
+            return ev::undefined();
+        });
+    });
+    b.def("drop", 1, [](Value self, std::span<const Value> a) -> Value {
+        if (!hasArg(a, 0)) return ev::throwTypeError("drop(song): a song index required");
+        const int song = static_cast<int>(numAt(a, 0, -1));
+        return streamControl(self, "drop", [&](StreamJob& j) -> Value {
+            j.stream->drop(song);
+            return ev::undefined();
+        });
+    });
     b.def("stop", 0, [](Value self, std::span<const Value>) -> Value {
         return streamControl(self, "stop", [](StreamJob& j) -> Value {
             j.stream->stop();
@@ -317,10 +359,18 @@ void decorateStream(ObjectBuilder& b) {
 }  // namespace
 
 Value knobRanges() {
-    const auto lo = brosoundml::Yue2Knobs::clamp({-1e9f, -1e9f, -1e9f, -1e9f});
-    const auto hi = brosoundml::Yue2Knobs::clamp({1e9f, 1e9f, 1e9f, 1e9f});
+    brosoundml::Yue2Knobs lo, hi;
+    lo.energy = lo.texture = lo.percussion = -1e9f;
+    hi.energy = hi.texture = hi.percussion = 1e9f;
+    const auto& axes = brosoundml::Yue2Directions::builtin_ref().semantic;
+    for (const auto& a : axes) {
+        lo.set(a.name, -1e9f);
+        hi.set(a.name, 1e9f);
+    }
+    lo = brosoundml::Yue2Knobs::clamp(lo);
+    hi = brosoundml::Yue2Knobs::clamp(hi);
     ObjectBuilder o;
-    auto range = [&](const char* name, float l, float h) {
+    auto range = [&](const std::string& name, float l, float h) {
         ObjectBuilder r;
         r.set("min", static_cast<double>(l));
         r.set("max", static_cast<double>(h));
@@ -329,7 +379,7 @@ Value knobRanges() {
     range("energy", lo.energy, hi.energy);
     range("texture", lo.texture, hi.texture);
     range("percussion", lo.percussion, hi.percussion);
-    range("arrangement", lo.arrangement, hi.arrangement);
+    for (const auto& a : axes) range(a.name, lo.get(a.name), hi.get(a.name));
     return o.get();
 }
 

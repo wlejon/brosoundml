@@ -6,8 +6,11 @@
 //   nar_l21  energy_nar_L21_avg        NAR residual after layer 21, mean over
 //                                      evaluations 0/21/42/63 (2048)
 //   nar_l9   energy_nar_L9_avg         the same at layer 9 (2048)
-//   ar_l21   energy_semantic_L21_e-1   semantic AR residual after layer 21 (2048)
+//   ar_l21   energy_semantic_L21_e-1   semantic AR residual after layer 21 (2048),
+//                                      the "arrangement" semantic axis
 // Each is the raw difference of means (scale 1 = one contrast's distance).
+// The style axes (density, timbre: semantic layer 24) are generated into
+// yue2_style_directions.inc by yue2-research's export_dirs.py.
 
 #include "brosoundml/yue2_stream.h"
 
@@ -222,6 +225,9 @@ const char kArL21[] =
     "401f3fa3bfabbf24c008bdd1bf893f0f3f3040153f863d3a3f873f31bf9b3f173f1e3f433eb0bd0bbf393ea8bf2dbf9cbddd3e643f303f063d683f813e1cbe48"
     "bf5a3eb13f613e93bf68bf0d3ec5be8d3f1ebe383fb3bf53bf203f2cbe153f043eb23d9c3e9ebecebfca3c9f3ea6bfa1b9efbf2abf0f3eb8bec9be5c3f1cbfc1";
 
+// The style axes: kSemantic_<axis>_L24 (yue2-research export_dirs.py).
+#include "yue2_style_directions.inc"
+
 int hexv(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -248,8 +254,33 @@ Yue2Directions Yue2Directions::builtin() {
     d.latent = decode(kLatent, 64);
     d.nar_l21 = decode(kNarL21, 2048);
     d.nar_l9 = decode(kNarL9, 2048);
-    d.ar_l21 = decode(kArL21, 2048);
+    // Arrangement: the energy direction at semantic layer 21. |s| >= 3 never
+    // ended the song; +1 already flattens the spectrum 7-9x (exp2c), so the
+    // clamp stops there.
+    d.semantic.push_back({"arrangement", 21, decode(kArL21, 2048), -2.0f, 1.0f});
+    // The style axes at semantic layer 24, where they separate from energy
+    // (cosine 0.41-0.56 with it). yue2-research exp2c (whole-song steer, 4
+    // held-out prompts) and exp3 (a continuation from 60 s, folk and rock):
+    //   density  + full band (crest down 6 dB at +1, 4/4), - sparse
+    //   timbre   + bright (centroid +1.3 kHz at +1, 4/4), - warm and dark
+    // Both clean to -1; at -2 one clip in four breaks, so the floor is -1.5.
+    // At +1 the spectrum flattens about 6x, as arrangement's does at its cap.
+    // Tempo feel did not raise the onset rate at any scale (0-1 of 4): the
+    // tempo is the plan's Q: header, so it is not an axis.
+    d.semantic.push_back({"density", 24, decode(kSemantic_density_L24, 2048), -1.5f, 1.0f});
+    d.semantic.push_back({"timbre", 24, decode(kSemantic_timbre_L24, 2048), -1.5f, 1.0f});
     return d;
+}
+
+const Yue2Directions& Yue2Directions::builtin_ref() {
+    static const Yue2Directions d = builtin();
+    return d;
+}
+
+const Yue2SemanticAxis* Yue2Directions::axis(const std::string& name) const {
+    for (const auto& a : semantic)
+        if (a.name == name) return &a;
+    return nullptr;
 }
 
 }  // namespace brosoundml

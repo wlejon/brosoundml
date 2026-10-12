@@ -41,21 +41,31 @@ void Yue2Stream::Impl::start_song(Song& s, Yue2Song req) {
     s.off_tail = knobs.energy;
     s.nar21 = knobs.texture;
     s.nar9 = knobs.percussion;
-    s.ar_scale = knobs.arrangement;
+    s.ar = knobs.semantic;
 }
 
-namespace {
-
-void open_session(const Core& core, Song& s) {
+// The semantic session over the prompt (and the CFG negative), then the
+// song's first `codec_rows` codec tokens: a fresh song (0), or one whose
+// session was released when it was built ahead and is continued on air.
+void Yue2Stream::Impl::open_session(Song& s, int codec_rows) {
     const Model& m = core.model;
     const auto [lo, hi] = logit_range(Phase::Semantic);
-    const int longest = std::max<int>(s.P, static_cast<int>(s.neg.size()));
+    codec_rows = std::clamp(codec_rows, 0, static_cast<int>(s.codec.size()));
+    const int longest = std::max<int>(s.P, static_cast<int>(s.neg.size())) + codec_rows;
+    s.sess.reset();
     s.sess = m.ar_session(s.neg.empty() ? 1 : 2, std::min(CONTEXT, longest + 1024), s.ar_hooks.get(), CONTEXT);
-    m.ar_prefill(*s.sess, 0, s.plan.prefix, lo, hi);
-    if (!s.neg.empty()) m.ar_prefill(*s.sess, 1, s.neg, lo, hi);
+    auto with_codec = [&](std::vector<int32_t> ids) {
+        for (int f = 0; f < codec_rows; ++f) ids.push_back(s.codec[f] + CODEC_OFFSET);
+        return ids;
+    };
+    m.ar_prefill(*s.sess, 0, with_codec(s.plan.prefix), lo, hi);
+    if (!s.neg.empty()) m.ar_prefill(*s.sess, 1, with_codec(s.neg), lo, hi);
 }
 
-}  // namespace
+void Yue2Stream::Impl::release_session(Song& s) {
+    if (!s.sess || &s == busy) return;
+    s.sess.reset();
+}
 
 void Yue2Stream::Impl::plan(Song& s) {
     Busy busy_guard(busy, &s);
@@ -78,8 +88,8 @@ void Yue2Stream::Impl::plan(Song& s) {
     if (!s.req.semantic.empty()) nf = static_cast<int>(s.req.semantic.size());
     if (!p.test_noise.empty()) nf = std::min<int>(nf, static_cast<int>(p.test_noise.size() / Yue2::kLatentDim));
     s.noise = song_noise(p, nf);
-    set_ar_steer(s, s.ar_scale);   // before the prefill: a whole-song arrangement steer covers the prompt too
-    open_session(I, s);
+    set_ar_steer(s, s.ar);   // before the prefill: a whole-song semantic steer covers the prompt too
+    open_session(s, 0);
     if (!s.req.semantic.empty()) {
         for (int32_t c : s.req.semantic)
             if (c < 0 || c >= CODEC_SIZE) fail("semantic ids must be 0..32767");
@@ -340,15 +350,17 @@ bool Yue2Stream::Impl::decode_tile(Song& s, int max_frames) {
     return true;
 }
 
-void Yue2Stream::Impl::set_ar_steer(Song& s, float scale) {
+void Yue2Stream::Impl::set_ar_steer(Song& s, const std::map<std::string, float>& scales) {
     const Model& m = core.model;
-    s.ar_scale = scale;
+    s.ar = scales;
     StageHooks& h = s.ar_hooks;
     h.hooks.steer.assign(m.config().layers, {});
     h.hooks.capture.assign(m.config().layers, 0);
     h.active = false;
-    if (scale != 0) {
-        h.hooks.steer[21].push_back(m.make_steer(opt.directions.ar_l21, scale, 0, false));
+    for (const auto& [name, scale] : scales) {
+        const Yue2SemanticAxis* a = opt.directions.axis(name);
+        if (!a || scale == 0 || a->layer < 0 || a->layer >= m.config().layers) continue;
+        h.hooks.steer[a->layer].push_back(m.make_steer(a->direction, scale, 0, false));
         h.active = true;
     }
     if (s.sess) m.ar_set_hooks(*s.sess, h.get());
@@ -359,7 +371,13 @@ void Yue2Stream::Impl::set_nar_steer(Song& s, float t21, float p9) {
     s.nar9 = p9;
 }
 
-void Yue2Stream::Impl::invalidate_audio(Song& s, int frame) { s.dec_frame = std::min(s.dec_frame, std::max(0, frame)); }
+void Yue2Stream::Impl::invalidate_audio(Song& s, int frame) {
+    const int f = std::max(0, frame);
+    if (f < s.dec_frame) {
+        s.dec_frame = f;
+        s.built_announced = false;
+    }
+}
 
 void Yue2Stream::Impl::set_offset(Song& s, int f0, float value, int ramp) {
     f0 = std::max(0, f0);
@@ -379,36 +397,47 @@ void Yue2Stream::Impl::set_offset(Song& s, int f0, float value, int ramp) {
 void Yue2Stream::Impl::resolve_from(Song& s, int f) {
     f = std::clamp(f, 0, s.lat_valid);
     ++s.gen;
+    s.built_announced = false;
     s.lat_valid = f;
     s.win_from = f;
     s.win_k = 0;   // the first (short) window again: the change is heard soonest
 }
 
-void Yue2Stream::Impl::continue_from(Song& s, int c, float scale) {
+int Yue2Stream::Impl::continue_from(Song& s, int c, const std::map<std::string, float>& scales) {
     if (!s.planned) {
-        s.ar_scale = scale;
-        return;
+        s.ar = scales;   // applied when it is planned
+        return -1;
     }
-    if (!s.req.semantic.empty()) return;   // given tokens: nothing to continue
+    if (!s.req.semantic.empty()) {   // given tokens: nothing to continue
+        s.ar = scales;
+        return -1;
+    }
+    Busy busy_guard(busy, &s);
     const Model& m = core.model;
     c = std::max(0, c);
     if (c > 0 && c >= static_cast<int>(s.codec.size()) && !s.sem_done) {
-        set_ar_steer(s, scale);   // not sampled that far yet: steer from here on
-        return;
+        set_ar_steer(s, scales);   // not sampled that far yet: steer from here on
+        return c;
     }
-    if (c > 0 && c >= static_cast<int>(s.codec.size())) return;   // past the song's end
+    if (c > 0 && c >= static_cast<int>(s.codec.size())) {   // past the song's end
+        s.ar = scales;
+        return -1;
+    }
     if (c == 0) {
         s.sess.reset();
-        set_ar_steer(s, scale);
-        open_session(core, s);
+        set_ar_steer(s, scales);
         s.codec.clear();
         s.tokens.clear();
+        open_session(s, 0);
     } else {
+        // A song built ahead released its session: rebuild it over the
+        // tokens before the cut (under the steer they were sampled with).
+        if (!s.sess) open_session(s, c - 1);
         // Re-feed the token before the cut under the new steer, which
         // recomputes the logits for the first continued position.
         m.ar_truncate(*s.sess, 0, s.P + c - 1);
         if (!s.neg.empty()) m.ar_truncate(*s.sess, 1, static_cast<int>(s.neg.size()) + c - 1);
-        set_ar_steer(s, scale);
+        set_ar_steer(s, scales);
         m.ar_step(*s.sess, s.codec[c - 1] + CODEC_OFFSET);
         s.codec.resize(c);
         s.tokens.resize(c);
@@ -418,14 +447,12 @@ void Yue2Stream::Impl::continue_from(Song& s, int c, float scale) {
     s.sem_done = false;
     s.natural = -1;
     s.cut = -1;
+    s.built_announced = false;
     resolve_from(s, c);
-    // A successor placed by the old length moves with the new one, unless it
-    // is already playing.
-    if (Song* nx = next_song(&s); nx && nx->start > emitted) {
-        nx->start = -1;
-        nx->fade_in = 0;
-        nx->start_announced = false;
-    }
+    // Successors placed by the old length move with the new one, unless
+    // they are already playing.
+    unplace_after(&s);
+    return c;
 }
 
 }  // namespace brosoundml

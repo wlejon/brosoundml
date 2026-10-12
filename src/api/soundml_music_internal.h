@@ -39,7 +39,7 @@ Value makeStereo(const brosoundml::StereoAudio& a);
 // model.stream(opts) -> YuE2Stream (native_soundml_music_stream.cpp)
 Value yue2Stream(Value self, std::span<const Value> a);
 void installStreamClass();
-// { energy, texture, percussion, arrangement: { min, max } }: the clamps
+// { energy, texture, percussion, arrangement, density, timbre: { min, max } }: the clamps
 // Yue2Knobs::clamp applies, as a stream's knobRanges and bro.music.knobRanges.
 Value knobRanges();
 

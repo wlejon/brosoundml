@@ -41,8 +41,8 @@ struct Song {
     std::vector<int32_t> tokens;       // sampled absolute ids (the sampler's history)
     std::vector<int32_t> codec;        // tokens - CODEC_OFFSET
     bool sem_done = false;
-    StageHooks ar_hooks;               // arrangement steer (semantic AR L21)
-    float ar_scale = 0;
+    StageHooks ar_hooks;               // the semantic steers
+    std::map<std::string, float> ar;   // their scales (Yue2Knobs::semantic, clamped, no zeros)
     int interrupts = 0;                // continuations so far (reseeds each)
 
     // ── NAR ──
@@ -66,16 +66,22 @@ struct Song {
     std::int64_t fade_in = 0;          // program samples it fades in over (its predecessor's overlap)
     std::int64_t cut = -1;             // song samples it plays (-1 = natural)
     bool start_announced = false, first_audio = false;
+    bool built_announced = false;
+    bool dropped = false;              // drop(): removed by step() once no long op runs on it
 
     int frames() const { return sem_done ? static_cast<int>(codec.size()) : -1; }   // final length, -1 unknown
+    // Tokens and latents complete: what a knob change would have to rebuild.
+    bool complete() const { return planned && !failed && sem_done && lat_valid >= static_cast<int>(codec.size()); }
+    bool built() const { return complete() && dec_frame >= static_cast<int>(codec.size()); }
     std::int64_t length() const { return cut >= 0 ? cut : natural; }               // song samples, -1 unknown
     std::int64_t end() const { return start >= 0 && length() >= 0 ? start + length() : -1; }
 };
 
 // Commands from the control side (any thread), applied by the worker.
 struct Command {
-    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Stop } kind;
+    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Drop, Stop } kind;
     Yue2Song song;
+    int index = -1;                    // NextPlan (-1 = the next song) / Drop: the song
     Yue2Knobs knobs;
     float amount = 0;
     std::string abc;
@@ -115,9 +121,12 @@ struct Yue2Stream::Impl {
     // deferred reactions (applied by step(), never inside a long op)
     bool skip_pending = false;
     yue2::StreamClock::time_point skip_at{};
-    bool knobs_pending = false;
-    Yue2Knobs knobs_applied;           // what the songs were last built / steered with
-    std::string next_plan;             // set_next_plan's ABC, pending
+    bool knobs_pending = false;        // texture / percussion / semantic moved: step() retunes the songs
+    std::vector<std::pair<int, std::string>> plan_edits;   // set_plan / set_next_plan (-1 = the next song), pending
+    // wants (ahead_songs)
+    int want_announced = 0;            // the last Want's value (0 = none outstanding)
+    yue2::StreamClock::time_point want_since{};            // when the pool first fell short
+    bool want_open = false;
     // interrupt bookkeeping
     yue2::StreamClock::time_point int_at{};
     float int_amount = 0;
@@ -147,8 +156,20 @@ struct Yue2Stream::Impl {
     void publish();
     yue2::Song* playing();
     yue2::Song* next_song(const yue2::Song* after);
-    void radio_refill();
+    void radio_refill(int n = 1);
     void do_skip();
+    bool on_air(const yue2::Song& s) const { return s.start >= 0 && s.start <= emitted; }
+    int pool() const;                  // live songs queued after the playing one
+    void check_want();                 // Want events, and the radio's fill after the grace
+    void announce();                   // SongStart / Built events
+    void unplace_after(const yue2::Song* s);   // songs after s are placed again
+    bool drop_marked();                // erase dropped songs no long op runs on
+    yue2::Song* to_build();            // the first song after the playing one, within ahead_songs, not built
+    // Knobs: apply the current ones to a song (see yue2_stream.h). A song not
+    // on air whose latents are complete is left for when it plays.
+    void retune(yue2::Song& s, bool on_air_now, bool* changed = nullptr);
+    void energy_before_air(yue2::Song& s);     // a built song about to play: its offset from frame 0
+    bool steer_current(const yue2::Song& s) const;
 
     // ── yue2_stream_song.cpp ──
     void start_song(yue2::Song& s, Yue2Song req);
@@ -164,11 +185,16 @@ struct Yue2Stream::Impl {
     double nar_spfs = 1.2e-4;          // NAR seconds per frame per ODE step (measured, the latest window)
     void solve_window(yue2::Song& s, int a, int b);
     bool decode_tile(yue2::Song& s, int max_frames);
-    void set_ar_steer(yue2::Song& s, float scale);
+    void set_ar_steer(yue2::Song& s, const std::map<std::string, float>& scales);
     void set_nar_steer(yue2::Song& s, float t21, float p9);
     void set_offset(yue2::Song& s, int f0, float value, int ramp);
     void resolve_from(yue2::Song& s, int f);
-    void continue_from(yue2::Song& s, int c, float ar_scale);
+    // Continue the song from frame c under `scales` (returns the cut used, -1
+    // when nothing was continued: given tokens, past its end); always records
+    // the scales.
+    int continue_from(yue2::Song& s, int c, const std::map<std::string, float>& scales);
+    void open_session(yue2::Song& s, int codec_rows);   // prompt (+ negative) + codec[0, codec_rows)
+    void release_session(yue2::Song& s);                // a song built ahead: its AR session's device memory
     void invalidate_audio(yue2::Song& s, int frame);
     int emitted_frame(const yue2::Song& s) const;   // song frame of the emit frontier
     CancelCheck servicing();                        // a cancel check that services instead

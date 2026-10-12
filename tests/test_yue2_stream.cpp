@@ -25,6 +25,12 @@
 //      out-of-range token, and the model stays usable.
 //   F. B2: an arrangement steer of 4 (the research's never-ending song) ends
 //      by the length guard's hard cap.
+//   G. Three songs built ahead, fed through Want events (paced, a simulated
+//      player): the pool fills with wholly decoded songs; a texture knob
+//      moved then leaves them ready; skip() to one cuts over and hands out
+//      its audio within a quarter second; that song catches the knob up on
+//      air; drop() removes the last and Want asks again. Device memory with
+//      the pool full, and the host memory the waiting songs take.
 // Peak device memory (device_mem_info, sampled) is reported per section.
 // Numbers are reported and asserted; nothing judges the audio by ear.
 
@@ -152,7 +158,8 @@ struct Capture {
             if (e.kind == Kind::Error) std::printf("  [error] song %d: %s\n", e.song, e.text.c_str());
             if (!verbose) return;
             static const char* names[] = {"plan",  "start",    "semantic", "window", "interrupt", "knobs",
-                                          "break", "song-end", "first",    "error",  "idle"};
+                                          "break", "song-end", "first",    "error",  "idle",      "want",
+                                          "built", "dropped"};
             if (e.kind == Kind::Window) return;
             std::printf("  [%7.2f] %-9s song %d sample %lld frames %d seconds %.2f value %.3f\n", now_s(),
                         names[static_cast<int>(e.kind)], e.song, static_cast<long long>(e.sample), e.frames,
@@ -601,7 +608,7 @@ void section_f(Env& E) {
     brosoundml::Yue2Steer s;
     s.layer = 21;
     s.plan = false;
-    s.delta = brosoundml::Yue2Directions::builtin().ar_l21;
+    s.delta = brosoundml::Yue2Directions::builtin_ref().axis("arrangement")->direction;
     s.scale = 4.0f;
     p.steer.push_back(s);
     const brosoundml::Yue2Plan plan = E.y.plan(p);
@@ -613,6 +620,162 @@ void section_f(Env& E) {
                 cap_frames, sem.size(), sem.size() / 25.0, now_s() - t);
     CHECK(est > 0, "F: no length estimate from the plan");
     CHECK(static_cast<int>(sem.size()) <= cap_frames, "F: %zu frames past the cap %d", sem.size(), cap_frames);
+}
+
+// ── G ──
+// Three songs kept built ahead, fed through Want events: the pool fills, each
+// built song waits as audio in host memory with its AR session released, a
+// skip to one is the skip fade alone, a knob moved meanwhile leaves the built
+// songs ready (the one skipped to catches up on air), and drop() takes one out
+// (Want asks again).
+void section_g(Env& E) {
+    constexpr int kAhead = 3;
+    std::printf("G. %d songs built ahead (Want-fed), skip to a built one, drop\n", kAhead);
+    const int max_tokens = std::atoi(env("YUE2_STREAM_G_TOKENS", "1200").c_str());   // 48 s songs
+    std::atomic<int> fed{0};
+    auto make = [&](int n) {
+        brosoundml::Yue2Song s;
+        s.params = E.req;
+        s.params.semantic_sampling.max_tokens = max_tokens;
+        s.params.seed = E.req.seed + 101 * static_cast<std::uint64_t>(n);
+        s.tag = "G" + std::to_string(n);
+        return s;
+    };
+    VramMeter vm;
+    vm.start();
+    Capture cap;
+    brosoundml::Yue2StreamOptions o;
+    o.paced = true;
+    o.radio = false;
+    o.ahead_songs = kAhead;
+    cap.hook(o);
+    std::unique_ptr<Yue2Stream> stp;
+    auto log = cap.event_fn(true);
+    std::vector<int> wants;
+    std::mutex wmu;
+    // The app's side of Want: a fresh request per song wanted.
+    auto on_event = [&](const Yue2StreamEvent& e) {
+        log(e);
+        if (e.kind != Kind::Want) return;
+        {
+            std::lock_guard<std::mutex> lk(wmu);
+            wants.push_back(static_cast<int>(e.value));
+        }
+        for (int i = 0; i < static_cast<int>(e.value); ++i) stp->enqueue(make(++fed));
+    };
+    stp = std::make_unique<Yue2Stream>(E.y, E.vae, o, cap.audio_fn(), on_event);
+    Yue2Stream& st = *stp;
+    st.enqueue(make(0));
+    std::thread worker([&] { st.run(); });
+
+    std::int64_t play = 0;
+    double last = -1, underrun = 0;
+    double pool_full_at = -1, pool_vram = 0, skip_wall = -1;
+    std::size_t pool_host = 0;
+    int skip_to = -1, knob_song = -1, dropped = -1, stage = 0;
+    brosoundml::Yue2StreamStats at_full;
+    const double t0 = now_s(), t_end = t0 + 420;
+    while (now_s() < t_end && stage < 4) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const double tn = now_s();
+        if (cap.first_audio_at >= 0) {
+            if (last < 0) last = tn;
+            const std::int64_t want = play + static_cast<std::int64_t>((tn - last) * kSr);
+            last = tn;
+            const std::int64_t have = cap.emitted;
+            if (want > have && stage > 0) underrun += double(want - have) / kSr;
+            play = std::min(want, have);
+            st.set_playhead(play);
+        }
+        if (cap.find(Kind::Error)) break;
+        const brosoundml::Yue2StreamStats s = st.stats();
+        bool all_built = true;
+        for (const auto& g : s.songs)
+            if (!g.on_air) all_built = all_built && g.built;
+        if (stage == 0 && s.ready_ahead >= kAhead && s.ahead >= kAhead && all_built) {
+            // Every song after the playing one is built: memory now, then a
+            // knob move (the built songs must stay ready) and a skip.
+            pool_full_at = tn - t0;
+            pool_vram = vm.stop_gb();
+            vm.start();
+            pool_host = s.host_bytes;
+            at_full = s;
+            std::printf("  pool full at %.1f s: %d ahead, %d ready, all built %d; host %.1f MB; peak device %.2f GB\n",
+                        pool_full_at, s.ahead, s.ready_ahead, all_built ? 1 : 0, s.host_bytes / 1e6, pool_vram);
+            brosoundml::Yue2Knobs k;
+            k.texture = 1.0f;
+            st.set_knobs(k);
+            stage = 1;
+        } else if (stage == 1 && tn - t0 > pool_full_at + 1.0) {
+            CHECK(s.ready_ahead == kAhead, "G: a knob move unready the built songs (%d ready)", s.ready_ahead);
+            for (const auto& g : s.songs)
+                if (!g.on_air && g.index >= 0) {
+                    skip_to = g.index;
+                    break;
+                }
+            {
+                std::lock_guard<std::mutex> lk(cap.mu);
+                knob_song = skip_to;
+            }
+            skip_wall = tn;
+            st.skip();
+            stage = 2;
+        } else if (stage == 2) {
+            std::lock_guard<std::mutex> lk(cap.mu);
+            const auto* fa = cap.find_last(Kind::FirstAudio, skip_to);
+            const auto* ss = cap.find_last(Kind::SongStart, skip_to);
+            if (fa && ss && fa->at >= skip_wall && play >= ss->e.sample + 3 * kSr) {
+                // Then drop the last song queued.
+                int last_idx = -1;
+                for (const auto& g : s.songs) last_idx = std::max(last_idx, g.index);
+                dropped = last_idx;
+                st.drop(last_idx);
+                stage = 3;
+            }
+        } else if (stage == 3) {
+            std::lock_guard<std::mutex> lk(cap.mu);
+            const auto* d = cap.find(Kind::Dropped, dropped);
+            if (d && st.stats().ahead >= kAhead) stage = 4;
+        }
+    }
+    st.stop();
+    worker.join();
+    const double peak_after = vm.stop_gb();
+    CHECK(!cap.find(Kind::Error), "G: the stream reported an error");
+    CHECK(stage == 4, "G: stopped at stage %d (pool full at %.1f s)", stage, pool_full_at);
+    CHECK(cap.contiguous, "G: program audio not contiguous");
+    {
+        std::lock_guard<std::mutex> lk(wmu);
+        std::string ws;
+        for (int w : wants) ws += std::to_string(w) + " ";
+        std::printf("  wants: %s(fed %d songs)\n", ws.c_str(), fed.load());
+        CHECK(!wants.empty() && wants.front() == kAhead, "G: the first Want asked for %d, want %d",
+              wants.empty() ? -1 : wants.front(), kAhead);
+        CHECK(wants.size() >= 3, "G: %zu Want events; one at start, after the skip and after the drop", wants.size());
+    }
+    if (skip_to >= 0) {
+        const auto* ss = cap.find_last(Kind::SongStart, skip_to);
+        const auto* fa = cap.find_last(Kind::FirstAudio, skip_to);
+        const double cut = ss ? ss->e.seconds : -1, first = fa ? fa->e.seconds : -1;
+        std::printf("  skip -> song %d: cut over %.3f s, first audio handed out %.3f s after the request "
+                    "(heard after the emit lead %.2f s + the %.2f s fade); click %.2f\n",
+                    skip_to, cut, first, o.emit_lead_seconds, o.skip_fade_seconds,
+                    ss ? click_ratio(cap.L, ss->e.sample) : -1.0);
+        CHECK(cut >= 0 && cut < 0.25, "G: skip to a built song took %.3f s to cut over", cut);
+        CHECK(first >= 0 && first < 0.35, "G: skip to a built song: first audio %.3f s after the request", first);
+        // The knob moved while it was built: it caught up once on air.
+        const Capture::Ev* kn = nullptr;
+        for (const auto& e : cap.events)
+            if (e.e.kind == Kind::Knobs && e.e.song == knob_song && e.at >= skip_wall) kn = &e;
+        CHECK(kn, "G: song %d (built before the knob moved) did not catch up on air", knob_song);
+        if (kn)
+            std::printf("  song %d caught up on air (%s) from frame %d, %.2f s after the skip\n", knob_song,
+                        kn->e.text.c_str(), kn->e.frame0, kn->at - skip_wall);
+    }
+    std::printf("  underrun %.2f s; peak device memory with the pool full %.2f GB, after %.2f GB; host %.1f MB "
+                "for %d songs\n",
+                underrun, pool_vram, peak_after, pool_host / 1e6, static_cast<int>(at_full.songs.size()));
+    CHECK(underrun < 1.0, "G: %.2f s of underrun", underrun);
 }
 
 }  // namespace
@@ -631,7 +794,7 @@ int main() {
         std::printf("SKIP: needs the YuE2-3B folder, $YUE2_VAE_DIR and %s\n", from.string().c_str());
         return 0;
     }
-    const std::string sections = env("YUE2_STREAM_SECTIONS", "ABCDEF");
+    const std::string sections = env("YUE2_STREAM_SECTIONS", "ABCDEFG");
     auto Env_ = std::make_unique<Env>();
     Env& E = *Env_;
 
@@ -667,6 +830,7 @@ int main() {
             case 'D': section_d(E); break;
             case 'E': section_e(E); break;
             case 'F': section_f(E); break;
+            case 'G': section_g(E); break;
             default: continue;
         }
         std::printf("  (%c: %.1f s, %d failures so far)\n", c, now_s() - t, failures);

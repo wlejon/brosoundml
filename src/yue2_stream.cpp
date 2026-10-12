@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <stdexcept>
 
 namespace brosoundml {
@@ -17,15 +18,29 @@ constexpr double kPi = 3.14159265358979323846;
 
 double since(StreamClock::time_point t) { return std::chrono::duration<double>(StreamClock::now() - t).count(); }
 
+float clampf(float v, float lo, float hi) { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; }
+
 }  // namespace
 
-Yue2Knobs Yue2Knobs::clamp(const Yue2Knobs& k) {
-    auto c = [](float v, float lo, float hi) { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
+float Yue2Knobs::get(const std::string& axis) const {
+    const auto it = semantic.find(axis);
+    return it == semantic.end() ? 0.0f : it->second;
+}
+
+void Yue2Knobs::set(const std::string& axis, float v) {
+    if (v == 0 || !std::isfinite(v)) semantic.erase(axis);
+    else semantic[axis] = v;
+}
+
+Yue2Knobs Yue2Knobs::clamp(const Yue2Knobs& k) { return clamp(k, Yue2Directions::builtin_ref()); }
+
+Yue2Knobs Yue2Knobs::clamp(const Yue2Knobs& k, const Yue2Directions& dirs) {
     Yue2Knobs o;
-    o.energy = c(k.energy, -2.0f, 1.0f);
-    o.texture = c(k.texture, -2.0f, 2.0f);
-    o.percussion = c(k.percussion, -6.0f, 6.0f);
-    o.arrangement = c(k.arrangement, -2.0f, 1.0f);
+    o.energy = clampf(k.energy, -2.0f, 1.0f);
+    o.texture = clampf(k.texture, -2.0f, 2.0f);
+    o.percussion = clampf(k.percussion, -6.0f, 6.0f);
+    for (const auto& [name, v] : k.semantic)
+        if (const Yue2SemanticAxis* a = dirs.axis(name)) o.set(name, clampf(v, a->min, a->max));
     return o;
 }
 
@@ -37,12 +52,20 @@ Yue2Stream::Impl::Impl(const Core& c, const Yue2Vae& v, Yue2StreamOptions o, Aud
     if (opt.left < 0 || opt.left > 250 || opt.right < 0 || opt.right > 250)
         throw std::runtime_error("brosoundml: Yue2Stream: left / right context must be 0..250 frames");
     const auto& d = opt.directions;
-    if (d.latent.size() != 64 || d.nar_l21.size() != 2048 || d.nar_l9.size() != 2048 || d.ar_l21.size() != 2048)
-        throw std::runtime_error("brosoundml: Yue2Stream: directions must be 64 / 2048 / 2048 / 2048 floats");
+    if (d.latent.size() != 64 || d.nar_l21.size() != 2048 || d.nar_l9.size() != 2048)
+        throw std::runtime_error("brosoundml: Yue2Stream: directions must be 64 / 2048 / 2048 floats");
+    std::set<std::string> names;
+    for (const auto& ax : d.semantic) {
+        if (ax.direction.size() != 2048 || ax.name.empty() || !names.insert(ax.name).second || !(ax.min <= ax.max))
+            throw std::runtime_error("brosoundml: Yue2Stream: a semantic axis needs a unique name, 2048 floats and min <= max");
+    }
+    if (opt.ahead_songs < 1 || opt.ahead_songs > 8)
+        throw std::runtime_error("brosoundml: Yue2Stream: ahead_songs must be 1..8");
     opt.crossfade_seconds = std::clamp(opt.crossfade_seconds, 2.0, 4.0);
     opt.skip_fade_seconds = std::clamp(opt.skip_fade_seconds, 0.05, 2.0);
+    opt.want_grace_seconds = std::max(0.0, opt.want_grace_seconds);
     R = v.config().downsampling_ratio;
-    knobs = knobs_applied = Yue2Knobs::clamp(opt.knobs);
+    knobs = Yue2Knobs::clamp(opt.knobs, opt.directions);
     snapshot.knobs = knobs;
 }
 
@@ -81,7 +104,7 @@ void Yue2Stream::set_playhead(std::int64_t s) {
 }
 void Yue2Stream::set_knobs(const Yue2Knobs& k) {
     Command c{Command::Kind::Knobs};
-    c.knobs = Yue2Knobs::clamp(k);
+    c.knobs = Yue2Knobs::clamp(k, impl_->opt.directions);
     push(*impl_, std::move(c));
 }
 void Yue2Stream::interrupt(float amount) {
@@ -90,9 +113,16 @@ void Yue2Stream::interrupt(float amount) {
     push(*impl_, std::move(c));
 }
 void Yue2Stream::skip() { push(*impl_, Command{Command::Kind::Skip}); }
-void Yue2Stream::set_next_plan(const std::string& abc) {
+void Yue2Stream::set_next_plan(const std::string& abc) { set_plan(-1, abc); }
+void Yue2Stream::set_plan(int song, const std::string& abc) {
     Command c{Command::Kind::NextPlan};
+    c.index = song;
     c.abc = abc;
+    push(*impl_, std::move(c));
+}
+void Yue2Stream::drop(int song) {
+    Command c{Command::Kind::Drop};
+    c.index = song;
     push(*impl_, std::move(c));
 }
 void Yue2Stream::stop() {
@@ -113,12 +143,42 @@ void Yue2Stream::Impl::event(Yue2StreamEvent e) {
     if (on_event) on_event(e);
 }
 
-Song* Yue2Stream::Impl::playing() { return songs.empty() ? nullptr : songs.front().get(); }
+Song* Yue2Stream::Impl::playing() {
+    for (auto& sp : songs)
+        if (!sp->dropped) return sp.get();
+    return nullptr;
+}
 
 Song* Yue2Stream::Impl::next_song(const Song* after) {
-    for (std::size_t i = 0; i + 1 < songs.size(); ++i)
-        if (songs[i].get() == after) return songs[i + 1].get();
+    bool seen = false;
+    for (auto& sp : songs) {
+        if (seen && !sp->dropped && !sp->failed) return sp.get();
+        if (sp.get() == after) seen = true;
+    }
     return nullptr;
+}
+
+int Yue2Stream::Impl::pool() const {
+    int live = 0;
+    for (const auto& sp : songs) live += !sp->dropped && !sp->failed;
+    return std::max(0, live - 1);
+}
+
+void Yue2Stream::Impl::unplace_after(const Song* s) {
+    bool seen = false;
+    for (auto& sp : songs) {
+        Song& x = *sp;
+        if (seen && x.start > emitted) {
+            x.start = -1;
+            x.fade_in = 0;
+            x.start_announced = false;
+        }
+        if (&x == s) seen = true;
+    }
+}
+
+bool Yue2Stream::Impl::steer_current(const Song& s) const {
+    return s.nar21 == knobs.texture && s.nar9 == knobs.percussion && s.ar == knobs.semantic;
 }
 
 void Yue2Stream::Impl::apply(Command& c) {
@@ -135,23 +195,32 @@ void Yue2Stream::Impl::apply(Command& c) {
         }
         case Command::Kind::Knobs: {
             // Energy acts on the latents at decode: applied at once (it is
-            // cheap and safe inside a long op). The rest re-solve or continue
-            // a song, which step() does.
-            const float e0 = knobs.energy;
+            // cheap and safe inside a long op) to the songs on air (from the
+            // emit frontier) and the songs not built yet (from their start).
+            // A song built ahead keeps its audio until it is about to play
+            // (energy_before_air). The rest re-solve or continue a song,
+            // which step() does.
+            const Yue2Knobs k0 = knobs;
             knobs = c.knobs;
-            if (knobs.energy != e0) {
+            if (knobs.energy != k0.energy) {
                 for (auto& sp : songs) {
                     Song& s = *sp;
-                    const bool on_air = s.start >= 0 && s.start <= emitted;
-                    set_offset(s, on_air ? emitted_frame(s) + 1 : 0, knobs.energy, on_air ? kHalo : 0);
+                    if (s.dropped) continue;
+                    if (on_air(s)) set_offset(s, emitted_frame(s) + 1, knobs.energy, kHalo);
+                    else if (!s.complete()) set_offset(s, 0, knobs.energy, 0);
                 }
-                knobs_applied.energy = knobs.energy;
                 Yue2StreamEvent e{Yue2StreamEvent::Kind::Knobs};
                 e.text = "energy";
                 e.sample = emitted;
+                if (const Song* p = playing()) {
+                    e.song = p->index;
+                    e.tag = p->req.tag;
+                    e.frame0 = emitted_frame(*p) + 1;
+                }
                 event(e);
             }
-            knobs_pending = !(knobs == knobs_applied);
+            if (knobs.texture != k0.texture || knobs.percussion != k0.percussion || knobs.semantic != k0.semantic)
+                knobs_pending = true;
             break;
         }
         case Command::Kind::Interrupt: {
@@ -176,7 +245,11 @@ void Yue2Stream::Impl::apply(Command& c) {
             skip_at = c.at;
             break;
         case Command::Kind::NextPlan:
-            next_plan = c.abc;
+            plan_edits.emplace_back(c.index, c.abc);
+            break;
+        case Command::Kind::Drop:
+            for (auto& sp : songs)
+                if (sp->index == c.index && !on_air(*sp)) sp->dropped = true;
             break;
         case Command::Kind::Stop:
             stopping.store(true);
@@ -206,7 +279,12 @@ int Yue2Stream::Impl::emitted_frame(const Song& s) const {
 std::int64_t Yue2Stream::Impl::decode_target(const Song& s) const {
     if (!opt.paced) return INT32_MAX;
     const std::int64_t lead = static_cast<std::int64_t>(opt.decode_lead_seconds * 48000.0);
-    if (s.start < 0) return lead / R + 1;   // prefetch the opening (a skip, the crossfade)
+    // Not on air: built ahead, the whole song waits as audio; until its
+    // latents are complete, the opening (a skip, the crossfade).
+    if (!on_air(s)) {
+        if (s.complete()) return s.frames();
+        if (s.start < 0) return lead / R + 1;
+    }
     const std::int64_t at = std::max(playhead.load(), emitted) + lead - s.start;
     return at <= 0 ? lead / R + 1 : at / R + 1;
 }
@@ -215,15 +293,18 @@ std::int64_t Yue2Stream::Impl::decode_target(const Song& s) const {
 // the successor starts `crossfade` before the end, fading in as the other
 // fades out.
 void Yue2Stream::Impl::place_next() {
-    for (std::size_t i = 0; i + 1 < songs.size(); ++i) {
-        Song& a = *songs[i];
-        Song& b = *songs[i + 1];
-        if (b.start >= 0 || a.start < 0 || a.length() < 0 || b.failed) continue;
-        const std::int64_t len = a.length();
-        const std::int64_t x =
-            std::min<std::int64_t>(static_cast<std::int64_t>(opt.crossfade_seconds * 48000.0), len / 3);
-        b.start = std::max(emitted, a.start + len - x);
-        b.fade_in = a.start + len - b.start;
+    Song* a = nullptr;
+    for (auto& sp : songs) {
+        Song& b = *sp;
+        if (b.dropped || b.failed) continue;
+        if (a && b.start < 0 && a->start >= 0 && a->length() >= 0) {
+            const std::int64_t len = a->length();
+            const std::int64_t x =
+                std::min<std::int64_t>(static_cast<std::int64_t>(opt.crossfade_seconds * 48000.0), len / 3);
+            b.start = std::max(emitted, a->start + len - x);
+            b.fade_in = a->start + len - b.start;
+        }
+        a = &b;
     }
 }
 
@@ -237,7 +318,7 @@ void Yue2Stream::Impl::emit() {
         bool any = false;
         for (std::size_t i = 0; i < songs.size(); ++i) {
             Song& s = *songs[i];
-            if (s.failed || s.start < 0) continue;
+            if (s.failed || s.dropped || s.start < 0) continue;
             if (s.start >= limit) {
                 limit = std::max(emitted, std::min(limit, s.start));
                 continue;
@@ -251,7 +332,7 @@ void Yue2Stream::Impl::emit() {
             limit = std::min(limit, s.start + avail);
             // A known end with nothing placed after it waits for the
             // successor's crossfade, unless no successor will come.
-            if (end >= 0 && i + 1 == songs.size() && opt.radio) {
+            if (end >= 0 && !next_song(&s) && opt.radio) {
                 const std::int64_t x = std::min<std::int64_t>(
                     static_cast<std::int64_t>(opt.crossfade_seconds * 48000.0), s.length() / 3);
                 limit = std::min(limit, end - x);
@@ -266,10 +347,10 @@ void Yue2Stream::Impl::emit() {
         chunk.samples.assign(static_cast<std::size_t>(2) * n, 0.0f);
         for (std::size_t i = 0; i < songs.size(); ++i) {
             Song& s = *songs[i];
-            if (s.failed || s.start < 0 || s.start >= limit) continue;
+            if (s.failed || s.dropped || s.start < 0 || s.start >= limit) continue;
             const std::int64_t end = s.end();
             if (end >= 0 && end <= emitted) continue;
-            const Song* nx = i + 1 < songs.size() ? songs[i + 1].get() : nullptr;
+            const Song* nx = next_song(&s);
             const std::int64_t out0 = nx && nx->start >= 0 && end >= 0 ? nx->start : -1;
             for (int k = 0; k < n; ++k) {
                 const std::int64_t t = emitted + k;
@@ -306,6 +387,7 @@ void Yue2Stream::Impl::emit() {
         Song& s = *songs.front();
         const std::int64_t end = s.end();
         if (&s == busy) break;   // a long op is running on it: freed after
+        if (s.dropped) break;    // drop_marked() erases it (with its event)
         if (!s.failed && (end < 0 || end > emitted)) break;
         if (!s.failed) {
             Yue2StreamEvent e{Yue2StreamEvent::Kind::SongEnd};
@@ -323,6 +405,15 @@ void Yue2Stream::Impl::service() {
     in_service = true;
     if (opt.cancel && opt.cancel()) stopping.store(true);
     drain_commands();
+    // A skip to a built song is a placement only: it happens here, inside
+    // whatever long op is running (building another song, or re-solving the
+    // playing one for a knob, whose work past the cut is then never heard),
+    // rather than after it.
+    if (skip_pending) {
+        Song* s = playing();
+        Song* nx = s ? next_song(s) : nullptr;
+        if (s && nx && nx != busy && s->start >= 0 && nx->built()) do_skip();
+    }
     emit();
     // Interrupt stages become audible as the player passes their samples:
     // request -> the moment the reported playhead reached the sample
@@ -373,19 +464,142 @@ CancelCheck Yue2Stream::Impl::servicing() {
 CancelCheck Yue2Stream::Impl::preemptible(bool whole) {
     return [this, whole]() {
         service();
-        return stopping.load() || int_stage2_pending || knobs_pending || (whole && skip_pending);
+        return stopping.load() || int_stage2_pending || knobs_pending || (whole && skip_pending) ||
+               (busy && busy->dropped);
     };
 }
 
-void Yue2Stream::Impl::radio_refill() {
-    if (!opt.radio || !have_last || songs.size() >= 2 || songs.empty()) return;
-    Yue2Song r = last_req;
-    r.semantic.clear();
-    r.params.abc.clear();
-    r.params.seed = last_req.params.seed + 1;
-    Command c{Command::Kind::Enqueue};
-    c.song = std::move(r);
-    apply(c);
+// The radio: n songs from the last request, each with the next seed.
+void Yue2Stream::Impl::radio_refill(int n) {
+    if (!opt.radio || !have_last) return;
+    for (int i = 0; i < n; ++i) {
+        Yue2Song r = last_req;
+        r.semantic.clear();
+        r.params.abc.clear();
+        r.params.seed = last_req.params.seed + 1;
+        Command c{Command::Kind::Enqueue};
+        c.song = std::move(r);
+        apply(c);
+    }
+}
+
+// Want events: the app is asked for songs whenever fewer than ahead_songs
+// wait after the playing one (again each time the shortfall grows). With
+// radio on, a shortfall the app leaves for want_grace_seconds is filled from
+// the last request.
+void Yue2Stream::Impl::check_want() {
+    int live = 0;
+    for (const auto& sp : songs) live += !sp->dropped && !sp->failed;
+    const int want = std::max(0, opt.ahead_songs + 1 - live);
+    if (want == 0) {
+        want_open = false;
+        want_announced = 0;
+        return;
+    }
+    if (!want_open) {
+        want_open = true;
+        want_since = StreamClock::now();
+    }
+    if (want > want_announced) {
+        Yue2StreamEvent e{Yue2StreamEvent::Kind::Want};
+        e.value = want;
+        e.frames = live;
+        event(e);
+    }
+    want_announced = want;
+    if (opt.radio && have_last && since(want_since) >= opt.want_grace_seconds) {
+        radio_refill(want);
+        want_since = StreamClock::now();
+    }
+}
+
+void Yue2Stream::Impl::announce() {
+    for (auto& sp : songs) {
+        Song& s = *sp;
+        if (s.dropped || s.failed) continue;
+        if (!s.start_announced && s.start >= 0) {
+            s.start_announced = true;
+            Yue2StreamEvent e{Yue2StreamEvent::Kind::SongStart};
+            e.song = s.index;
+            e.tag = s.req.tag;
+            e.sample = s.start;
+            event(e);
+        }
+        // Built ahead: its AR session's device memory goes (rebuilt from the
+        // tokens if it is continued on air).
+        if (s.complete() && !on_air(s)) release_session(s);
+        if (s.built() && !s.built_announced) {
+            s.built_announced = true;
+            Yue2StreamEvent e{Yue2StreamEvent::Kind::Built};
+            e.song = s.index;
+            e.tag = s.req.tag;
+            e.frames = s.frames();
+            e.seconds = since(s.queued_at);
+            event(e);
+        }
+    }
+}
+
+bool Yue2Stream::Impl::drop_marked() {
+    for (auto it = songs.begin(); it != songs.end(); ++it) {
+        Song& s = **it;
+        if (!s.dropped || &s == busy) continue;
+        unplace_after(&s);
+        Yue2StreamEvent e{Yue2StreamEvent::Kind::Dropped};
+        e.song = s.index;
+        e.tag = s.req.tag;
+        event(e);
+        songs.erase(it);
+        place_next();
+        return true;
+    }
+    return false;
+}
+
+Song* Yue2Stream::Impl::to_build() {
+    const Song* p = playing();
+    int pos = 0;
+    for (auto& sp : songs) {
+        Song& s = *sp;
+        if (s.dropped || s.failed) continue;
+        if (pos > opt.ahead_songs) break;
+        ++pos;
+        if (&s != p && !s.built()) return &s;
+    }
+    return nullptr;
+}
+
+void Yue2Stream::Impl::retune(Song& s, bool air, bool* changed) {
+    if (s.dropped || s.failed || steer_current(s)) return;
+    if (!air && s.complete()) return;   // built ahead: when it plays
+    const bool nar = s.nar21 != knobs.texture || s.nar9 != knobs.percussion;
+    const bool ar = s.ar != knobs.semantic;
+    int from = air ? INT32_MAX : 0;
+    if (nar) {
+        set_nar_steer(s, knobs.texture, knobs.percussion);
+        const int f = air ? emitted_frame(s) + static_cast<int>(opt.knob_latency_seconds * 25) : 0;
+        resolve_from(s, f);
+        from = std::min(from, std::min(f, s.lat_valid));
+    }
+    if (ar) {
+        const double lat = int_latency_est > 0 ? int_latency_est : opt.interrupt_latency_seconds;
+        const int c = air ? emitted_frame(s) + static_cast<int>(std::ceil(lat * 25)) : 0;
+        const int cut = continue_from(s, c, knobs.semantic);
+        if (cut >= 0) from = std::min(from, cut);
+    }
+    if (changed) *changed = true;
+    Yue2StreamEvent e{Yue2StreamEvent::Kind::Knobs};
+    e.song = s.index;
+    e.tag = s.req.tag;
+    e.text = std::string(nar ? "texture/percussion" : "") + (nar && ar ? "/" : "") + (ar ? "semantic" : "");
+    e.sample = emitted;
+    e.frame0 = from == INT32_MAX ? -1 : from;
+    event(e);
+}
+
+void Yue2Stream::Impl::energy_before_air(Song& s) {
+    if (s.dropped || s.failed || on_air(s) || !s.complete() || s.off_tail == knobs.energy) return;
+    set_offset(s, 0, knobs.energy, 0);
 }
 
 void Yue2Stream::Impl::do_skip() {
@@ -395,7 +609,7 @@ void Yue2Stream::Impl::do_skip() {
         return;
     }
     if (s->start < 0) {   // nothing on air yet: drop it
-        songs.pop_front();
+        s->dropped = true;
         skip_pending = false;
         return;
     }
@@ -407,12 +621,15 @@ void Yue2Stream::Impl::do_skip() {
             s->cut = std::max<std::int64_t>(0, emitted - s->start + static_cast<std::int64_t>(opt.skip_fade_seconds * 48000));
             if (s->natural >= 0) s->cut = std::min(s->cut, s->natural);
             skip_pending = false;
+            unplace_after(s);
         }
         return;
     }
-    // Wait until the next song's opening is decoded, then cut over.
+    // A built song takes the energy knob from its first sample; then wait
+    // until its opening is decoded (a built song's already is), and cut over.
+    energy_before_air(*nx);
     const std::int64_t x = static_cast<std::int64_t>(opt.skip_fade_seconds * 48000);
-    if (static_cast<std::int64_t>(nx->dec_frame) * R < x + 48000) {
+    if (static_cast<std::int64_t>(nx->dec_frame) * R < x + 48000 && !nx->built()) {
         decode_tile(*nx, 50);   // its opening as soon as its latents exist
         return;
     }
@@ -424,49 +641,44 @@ void Yue2Stream::Impl::do_skip() {
     nx->queued_at = skip_at;
     nx->first_audio = false;
     nx->start_announced = true;
+    unplace_after(nx);
     Yue2StreamEvent e{Yue2StreamEvent::Kind::SongStart};
     e.song = nx->index;
     e.tag = nx->req.tag;
     e.sample = nx->start;
+    e.seconds = since(skip_at);
     event(e);
     skip_pending = false;
 }
 
 // One unit of work, the playing song first. False when there is none.
 bool Yue2Stream::Impl::step() {
+    if (drop_marked()) return true;
+    check_want();
     if (skip_pending) do_skip();
     if (knobs_pending) {
-        // Texture / percussion: re-solve the playing song from a little past
-        // the emitted audio; arrangement: continue it from there. Songs not
-        // on air yet are rebuilt under the new knobs.
-        const Yue2Knobs k = knobs;
-        for (auto& sp : songs) {
-            Song& s = *sp;
-            const bool on_air = s.start >= 0 && s.start <= emitted;
-            if (k.texture != knobs_applied.texture || k.percussion != knobs_applied.percussion) {
-                set_nar_steer(s, k.texture, k.percussion);
-                resolve_from(s, on_air ? emitted_frame(s) + static_cast<int>(opt.knob_latency_seconds * 25) : 0);
-            }
-            if (k.arrangement != knobs_applied.arrangement && s.planned)
-                continue_from(s,
-                              on_air ? emitted_frame(s) + static_cast<int>(std::ceil(
-                                                              (int_latency_est > 0 ? int_latency_est
-                                                                                   : opt.interrupt_latency_seconds) *
-                                                              25))
-                                     : 0,
-                              k.arrangement);
-            else if (k.arrangement != knobs_applied.arrangement)
-                s.ar_scale = k.arrangement;   // applied when it is planned
-        }
-        Yue2StreamEvent e{Yue2StreamEvent::Kind::Knobs};
-        e.text = "texture/percussion/arrangement";
-        e.sample = emitted;
-        event(e);
-        knobs_applied = k;
+        // Texture / percussion: re-solve a song on air from a little past the
+        // emitted audio; the semantic steers: continue it from there. Songs
+        // not built yet are rebuilt under the new knobs; songs built ahead
+        // keep theirs until they play (below).
         knobs_pending = false;
+        for (auto& sp : songs) retune(*sp, on_air(*sp));
         place_next();
         return true;
     }
+    // A song built ahead under other knobs, now on air, catches up.
+    for (auto& sp : songs) {
+        Song& s = *sp;
+        if (!s.dropped && !s.failed && on_air(s) && !steer_current(s)) {
+            retune(s, true);
+            place_next();
+            return true;
+        }
+    }
+    // A song built ahead about to play takes the energy knob from its start.
+    const std::int64_t lead = static_cast<std::int64_t>(opt.decode_lead_seconds * 48000.0);
+    for (auto& sp : songs)
+        if (sp->start >= 0 && sp->start - emitted <= lead) energy_before_air(*sp);
     if (int_stage2_pending) {
         // Stage 2: an arrangement-steered continuation from where the audio
         // handed out ended at the request + the stage's latency (request ->
@@ -479,31 +691,41 @@ bool Yue2Stream::Impl::step() {
             const int c = std::max(int_frame + static_cast<int>(std::ceil(lat * 25)), emitted_frame(*s) + 25);
             const Song* nx = next_song(s);
             const bool room = s->frames() < 0 || c + opt.windows.front() < s->frames();
-            if (room && !(nx && nx->start >= 0 && nx->start <= emitted)) {
-                const float a = std::clamp(knobs.arrangement + int_amount, -2.0f, 1.0f);
-                knobs.arrangement = knobs_applied.arrangement = a;
-                continue_from(*s, c, a);
+            const Yue2SemanticAxis* ax = opt.directions.axis("arrangement");
+            if (ax && room && !(nx && on_air(*nx))) {
+                // The arrangement carries (a knob): songs not built yet take
+                // it from their start, songs built ahead when they play.
+                knobs.set("arrangement", std::clamp(knobs.get("arrangement") + int_amount, ax->min, ax->max));
+                continue_from(*s, c, knobs.semantic);
                 int_song = s->index;
                 int_cut = c;
+                knobs_pending = true;
             }
         }
         return true;
     }
-    if (!next_plan.empty()) {
-        // The next song's edited score: rebuild it from the plan on.
-        Song* s = playing();
-        Song* nx = s ? next_song(s) : nullptr;
-        if (nx && nx->start < 0) {
-            Yue2Song r = nx->req;
-            r.params.abc = next_plan;
+    if (!plan_edits.empty()) {
+        // An edited score: rebuild that song from the plan on (not on air).
+        const auto [idx, abc] = plan_edits.front();
+        plan_edits.erase(plan_edits.begin());
+        Song* p = playing();
+        Song* t = nullptr;
+        if (idx < 0) t = p ? next_song(p) : nullptr;
+        else
+            for (auto& sp : songs)
+                if (sp->index == idx && !sp->dropped) t = sp.get();
+        if (t && !on_air(*t) && t != busy) {
+            Yue2Song r = t->req;
+            r.params.abc = abc;
             r.semantic.clear();
-            const int idx = nx->index;
-            const auto at = nx->queued_at;
-            start_song(*nx, std::move(r));
-            nx->index = idx;
-            nx->queued_at = at;
+            const int i = t->index;
+            const auto at = t->queued_at;
+            start_song(*t, std::move(r));
+            --next_index;   // start_song took an index; the song keeps its own
+            t->index = i;
+            t->queued_at = at;
+            unplace_after(t);
         }
-        next_plan.clear();
         return true;
     }
 
@@ -512,7 +734,7 @@ bool Yue2Stream::Impl::step() {
     std::int64_t best = INT64_MAX;
     for (auto& sp : songs) {
         Song& s = *sp;
-        if (s.failed || s.dec_frame >= decode_target(s)) continue;
+        if (s.failed || s.dropped || s.dec_frame >= decode_target(s)) continue;
         const std::int64_t deadline = s.start >= 0 ? s.start + static_cast<std::int64_t>(s.dec_frame) * R
                                                    : INT64_MAX - 1;
         if (deadline < best) {
@@ -527,27 +749,15 @@ bool Yue2Stream::Impl::step() {
     }
     Song* p = playing();
     // The playing song's audio first when it is due within the decode lead.
-    if (urgent && (urgent == p || best <= emitted + static_cast<std::int64_t>(opt.decode_lead_seconds * 48000))) {
+    if (urgent && (urgent == p || best <= emitted + lead)) {
         if (decode_tile(*urgent, 50)) return true;
     }
-    // Then build songs in order: the playing one, then the next (the next
-    // first while a skip waits for its opening).
-    for (std::size_t k = 0; k < songs.size() && k < 2; ++k) {
-        const std::size_t i = skip_pending && songs.size() >= 2 && songs[0]->start >= 0 ? 1 - k : k;
-        Song& s = *songs[i];
-        if (s.failed) continue;
-        if (i == 0 && s.start < 0) {
-            s.start = emitted;   // the first song (or one after a gap) goes on air as soon as it has audio
-            s.fade_in = 0;
-        }
-        if (!s.start_announced && s.start >= 0) {
-            s.start_announced = true;
-            Yue2StreamEvent e{Yue2StreamEvent::Kind::SongStart};
-            e.song = s.index;
-            e.tag = s.req.tag;
-            e.sample = s.start;
-            event(e);
-        }
+    // Then build: the playing song, then (the next first while a skip waits
+    // for it) the first song after it, within ahead_songs, not built yet.
+    // One song at a time, so device memory holds one build beside the
+    // playing song.
+    auto build = [&](Song& s) -> bool {
+        if (s.failed || s.dropped) return false;
         try {
             if (!s.planned) {
                 plan(s);
@@ -559,10 +769,12 @@ bool Yue2Stream::Impl::step() {
                 return true;
             }
             if (!s.sem_done) {
-                semantic_step(s, i == 0 ? 25 : 50);
+                semantic_step(s, &s == p ? 25 : 50);
                 if (s.sem_done) place_next();
                 return true;
             }
+            // Built ahead: the whole song decoded, so it waits as audio.
+            if (&s != p && s.complete() && !s.built() && !on_air(s)) return decode_tile(s, 100);
         } catch (const std::exception& e) {
             s.failed = true;
             Yue2StreamEvent ev{Yue2StreamEvent::Kind::Error};
@@ -580,16 +792,26 @@ bool Yue2Stream::Impl::step() {
                 s.lat_valid = s.lat_extent = s.dec_frame;
                 s.codec.resize(std::min<std::size_t>(s.codec.size(), static_cast<std::size_t>(s.dec_frame)));
                 place_next();
+            } else {
+                unplace_after(&s);
             }
             return true;
         }
+        return false;
+    };
+    if (p) {
+        if (p->start < 0) {
+            p->start = emitted;   // the first song (or one after a gap) goes on air as soon as it has audio
+            p->fade_in = 0;
+        }
+        announce();
+        Song* nx = next_song(p);
+        if (skip_pending && p->start >= 0 && nx && build(*nx)) return true;
+        if (build(*p)) return true;
+        if (Song* t = to_build(); t && build(*t)) return true;
     }
+    announce();
     if (urgent && decode_tile(*urgent, 50)) return true;
-    if (songs.size() < 2) {
-        const std::size_t before = songs.size();
-        radio_refill();
-        if (songs.size() != before) return true;
-    }
     return false;
 }
 
@@ -600,8 +822,11 @@ void Yue2Stream::Impl::publish() {
     st.first_audio_seconds = first_audio_s;
     st.interrupt1_seconds = int1_s;
     st.interrupt2_seconds = int2_s;
+    const Song* p = playing();
+    const std::int64_t opening = static_cast<std::int64_t>(opt.skip_fade_seconds * 48000) + 48000;
     for (auto& sp : songs) {
         const Song& s = *sp;
+        if (s.dropped) continue;
         Yue2StreamStats::Song o;
         o.index = s.index;
         o.tag = s.req.tag;
@@ -613,6 +838,21 @@ void Yue2Stream::Impl::publish() {
         o.start = s.start;
         o.end = s.end();
         o.latent_norm = s.last_norm;
+        o.built = s.built();
+        o.ready = s.complete() && (s.built() || static_cast<std::int64_t>(s.dec_frame) * R >= opening);
+        o.on_air = s.start >= 0 && s.start <= emitted;
+        o.host_bytes = (s.L.capacity() + s.R.capacity() + s.lat.capacity() + s.noise.capacity() + s.off.capacity()) *
+                           sizeof(float) +
+                       (s.codec.capacity() + s.tokens.capacity()) * sizeof(int32_t);
+        o.knobs.energy = s.off_tail;
+        o.knobs.texture = s.nar21;
+        o.knobs.percussion = s.nar9;
+        o.knobs.semantic = s.ar;
+        if (&s != p && !s.failed) {
+            ++st.ahead;
+            st.ready_ahead += o.ready;
+        }
+        st.host_bytes += o.host_bytes;
         st.songs.push_back(o);
     }
     std::lock_guard<std::mutex> lk(mu);
