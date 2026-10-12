@@ -155,6 +155,13 @@ struct Yue2Stream::Impl {
     void plan(yue2::Song& s);
     void semantic_step(yue2::Song& s, int tokens);
     bool window_ready(const yue2::Song& s, int* a, int* b) const;
+    // Seconds until a song built ahead is needed (its program start, or its
+    // predecessor's end), +inf unpaced; 0 when it is on air or a skip waits
+    // for it (windows then).
+    double ahead_budget(const yue2::Song& s) const;
+    double whole_seconds(const yue2::Song& s, int frames) const;   // a one-chunk solve's estimate, with margin
+    static constexpr double kWholeWaitSeconds = 45.0;   // wait for all the tokens when this far ahead
+    double nar_spfs = 1.2e-4;          // NAR seconds per frame per ODE step (measured, the latest window)
     void solve_window(yue2::Song& s, int a, int b);
     bool decode_tile(yue2::Song& s, int max_frames);
     void set_ar_steer(yue2::Song& s, float scale);
@@ -168,8 +175,9 @@ struct Yue2Stream::Impl {
     // servicing(), and also cancels (the window re-runs later) when a
     // reaction step() must make first is pending: an interrupt's stage 2, a
     // knob change. A 500-frame window is ~2 s of GPU; stage 2 waiting it out
-    // would be heard that much later.
-    CancelCheck preemptible();
+    // would be heard that much later. A whole-song chunk (`whole`) also
+    // yields to a skip, which wants the song's opening in windows instead.
+    CancelCheck preemptible(bool whole);
 };
 
 }  // namespace brosoundml

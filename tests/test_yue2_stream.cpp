@@ -16,9 +16,11 @@
 //      and the time to first audio from the request (cot full).
 //   C. Paced, a simulated player: interrupt(+1) at 8 s; stage 1 and stage 2
 //      latencies, the RMS after each, no discontinuity where they land; then
-//      skip() to a queued second song.
+//      skip() to a queued second song, while a third is built ahead in one
+//      NAR chunk and crossfades in; no underrun.
 //   D. The radio's crossfade of two given-semantic songs: placement, program
-//      length, no power dip across the fade.
+//      length, no power dip across the fade; the second, built ahead, is the
+//      whole-song render (one chunk) and sets the peak device memory.
 //   E. B1: non-finite logits raise "non-finite logits" instead of sampling an
 //      out-of-range token, and the model stays usable.
 //   F. B2: an arrangement steer of 4 (the research's never-ending song) ends
@@ -277,6 +279,7 @@ struct Env {
     brosoundml::Yue2Params req;     // the request
     brosoundml::Yue2Params given;   // rock_gen_W0's plan (abc, style, lyrics, seed)
     std::vector<int32_t> given_sem;
+    std::string song;   // the given run's song name (rock_gen_W0 -> rock)
 };
 
 brosoundml::Yue2Song given_song(const Env& E, int f0, int frames, const std::string& tag) {
@@ -345,8 +348,9 @@ void section_a(Env& E) {
     CHECK(js <= 2.0 * jr + 0.5, "A: seam jump %.2f vs %.2f", js, jr);
 
     if (const std::string out = env("YUE2_STREAM_OUT"); !out.empty()) {
-        write_run(fs::path(out) / "rock_stream_W250", "rock_stream_W250", cap.lat[0], T, cap.L, cap.R, seams);
-        write_run(fs::path(out) / "rock_syn_W0", "rock_syn_W0", whole, T,
+        const std::string v = E.song + "_stream_W250", r = E.song + "_syn_W0";
+        write_run(fs::path(out) / v, v, cap.lat[0], T, cap.L, cap.R, seams);
+        write_run(fs::path(out) / r, r, whole, T,
                   std::vector<float>(wa.channel(0), wa.channel(0) + wa.frames),
                   std::vector<float>(wa.channel(1), wa.channel(1) + wa.frames), {});
         std::printf("  run dirs in %s (seams.py %s)\n", out.c_str(), out.c_str());
@@ -407,7 +411,8 @@ void section_c(Env& E) {
     s0.params = E.req;
     s0.params.semantic_sampling.max_tokens = 1000;
     s0.tag = "C0";
-    brosoundml::Yue2Song s1 = given_song(E, 1000, 300, "C1");
+    brosoundml::Yue2Song s1 = given_song(E, 1000, 400, "C1");
+    brosoundml::Yue2Song s2 = given_song(E, 0, 300, "C2");   // built ahead while song 1 plays
 
     VramMeter vm;
     vm.start();
@@ -419,6 +424,7 @@ void section_c(Env& E) {
     Yue2Stream st(E.y, E.vae, o, cap.audio_fn(), cap.event_fn(true));
     st.enqueue(s0);
     st.enqueue(s1);
+    st.enqueue(s2);
     std::thread worker([&] { st.run(); });
 
     // The player: plays from the first audio at real time; an underrun waits.
@@ -450,7 +456,7 @@ void section_c(Env& E) {
             skip_at = play;
             st.skip();
         }
-        if (const auto* e1 = cap.find(Kind::SongEnd, 1); e1 && play >= e1->e.sample) stopped = true;
+        if (const auto* e2 = cap.find(Kind::SongEnd, 2); e2 && play >= e2->e.sample) stopped = true;
         if (cap.find(Kind::Error)) stopped = true;
     }
     st.stop();
@@ -463,6 +469,12 @@ void section_c(Env& E) {
     const auto* i2 = cap.find(Kind::Interrupt, 0, 2);
     CHECK(i1 && i2, "C: interrupt stages missing (%d events)", cap.count(Kind::Interrupt));
     std::printf("  underrun after the interrupt %.2f s, peak %.2f GB\n", underrun, peak);
+    int windows2 = 0;
+    for (const auto& e : cap.events) windows2 += e.e.kind == Kind::Window && e.e.song == 2;
+    const auto* st2 = cap.find_last(Kind::SongStart, 2);
+    std::printf("  song 2 built ahead in %d window(s), on the program at %.2f s, click %.2f\n", windows2,
+                st2 ? st2->e.sample / double(kSr) : -1.0, st2 ? click_ratio(cap.L, st2->e.sample) : -1.0);
+    CHECK(windows2 == 1, "C: song 2 (built ahead) took %d windows, want one chunk", windows2);
     CHECK(underrun < 1.0, "C: %.2f s of underrun", underrun);
     if (i1 && i2) {
         const double r_before = rms(cap.L, cap.R, int_at - 2 * kSr, int_at);
@@ -506,8 +518,13 @@ void section_c(Env& E) {
 
 // ── D ──
 void section_d(Env& E) {
-    std::printf("D. radio crossfade of two given-semantic songs\n");
-    brosoundml::Yue2Song a = given_song(E, 0, 500, "D0"), b = given_song(E, 500, 500, "D1");    Capture cap;
+    // Song 1 is the rest of the song (built ahead: one chunk, the whole render).
+    std::printf("D. radio crossfade of two given-semantic songs, the second built ahead\n");
+    brosoundml::Yue2Song a = given_song(E, 0, 500, "D0"), b = given_song(E, 500, 1 << 20, "D1");
+    const int T1 = static_cast<int>(b.semantic.size());
+    VramMeter vm;
+    vm.start();
+    Capture cap;
     brosoundml::Yue2StreamOptions o;
     o.paced = false;
     o.radio = false;
@@ -519,8 +536,9 @@ void section_d(Env& E) {
         st.enqueue(b);
         st.run();
     }
+    const double peak = vm.stop_gb();
     CHECK(!cap.find(Kind::Error), "D: the stream reported an error");
-    const std::int64_t n0 = E.vae.output_length(500), n1 = E.vae.output_length(500), X = 3 * kSr;
+    const std::int64_t n0 = E.vae.output_length(500), n1 = E.vae.output_length(T1), X = 3 * kSr;
     const auto* s1 = cap.find(Kind::SongStart, 1);
     CHECK(s1 && s1->e.sample == n0 - X, "D: song 1 placed at %lld, want %lld", s1 ? (long long)s1->e.sample : -1LL,
           static_cast<long long>(n0 - X));
@@ -535,36 +553,17 @@ void section_d(Env& E) {
                 low, after, click_ratio(cap.L, f0));
     CHECK(low >= 0.5 * std::min(before, after), "D: power dip in the crossfade (%.4f)", low);
 
-    // Song 1's first window is exactly a whole render of its tokens + the
-    // lookahead. (Its tokens start mid-song: a short NAR window over them
-    // runs louder than the 500-frame render, ~10.3 against 8.4, which the
-    // break meter reports; a radio song starts at its start, section A.)
-    auto norm = [](const std::vector<float>& z) {
-        double s = 0;
-        const std::size_t n = z.size() / 64;
-        for (std::size_t t = 0; t < n; ++t) {
-            double q = 0;
-            for (int d = 0; d < 64; ++d) q += double(z[t * 64 + d]) * z[t * 64 + d];
-            s += std::sqrt(q);
-        }
-        return s / std::max<std::size_t>(1, n);
-    };
+    // Song 1, built ahead, is the whole-song render of its tokens: one chunk.
+    int windows1 = 0;
+    for (const auto& e : cap.events) windows1 += e.e.kind == Kind::Window && e.e.song == 1;
     brosoundml::Yue2Params p = b.params;
     const std::vector<float> whole = E.y.synthesize(p, E.y.plan(p), b.semantic);
-    if (cap.lat.size() == 2) {
-        const double ns = norm(cap.lat[1]), nw = norm(whole);
-        std::printf("  song 1 latent norm: stream %.2f, whole render %.2f; cosine %.3f\n", ns, nw,
-                    mean_cos(cap.lat[1], whole, static_cast<int>(whole.size() / 64)));
-        const std::vector<int32_t> head(b.semantic.begin(), b.semantic.begin() + 275);
-        const std::vector<float> wh = E.y.synthesize(p, E.y.plan(p), head);
-        const std::vector<float> s250(cap.lat[1].begin(), cap.lat[1].begin() + 250 * 64);
-        const std::vector<float> w250(whole.begin(), whole.begin() + 250 * 64);
-        const std::vector<float> h250(wh.begin(), wh.begin() + 250 * 64);
-        const double c275 = mean_cos(s250, h250, 250);
-        std::printf("  first 250 frames: stream %.2f, whole-500 %.2f, whole-275 %.2f; cos stream/whole-275 %.4f\n",
-                    norm(s250), norm(w250), norm(h250), c275);
-        CHECK(c275 > 0.99, "D: the first window is not the 275-frame render (cos %.4f)", c275);
-    }
+    const double c1 = cap.lat.size() == 2 && cap.lat[1].size() == whole.size()
+                          ? mean_cos(cap.lat[1], whole, T1) : 0.0;
+    std::printf("  song 1: %d frames in %d window(s), cosine to the whole render %.4f; peak device memory %.2f GB\n",
+                T1, windows1, c1, peak);
+    CHECK(windows1 == 1, "D: song 1 built ahead in %d windows, want one chunk", windows1);
+    CHECK(c1 > 0.99, "D: song 1 is not the whole render (cosine %.4f)", c1);
 }
 
 // ── E ──
@@ -648,6 +647,8 @@ int main() {
     E.given.cot = brosoundml::Yue2Cot::Full;
     E.given.seed = static_cast<std::uint64_t>(pj.get_int("seed", 831001));
     E.given_sem = read_raw<int32_t>(from / "semantic.i32");
+    E.song = from.filename().string();
+    E.song = E.song.substr(0, E.song.find('_'));
 
     VramMeter::base = VramMeter::used();
     const double base = VramMeter::base / 1e9;

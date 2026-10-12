@@ -155,6 +155,19 @@ bool Yue2Stream::Impl::window_ready(const Song& s, int* a_out, int* b_out) const
     if (!s.planned || s.failed) return false;
     const int a = s.lat_valid, T = s.frames();
     if (T >= 0 && a >= T) return false;
+    // A song built ahead (not on air, no skip waiting for it) is solved in
+    // one chunk once its tokens are all there, the whole-song render itself,
+    // when that fits before it is needed. Windows are for audio someone is
+    // waiting for.
+    const double budget = ahead_budget(s);
+    if (budget > 0) {
+        if (T < 0 && budget > kWholeWaitSeconds) return false;   // the semantic stage first
+        if (T >= 0 && whole_seconds(s, T - a) < budget) {
+            *a_out = a;
+            *b_out = T;
+            return true;
+        }
+    }
     const int size = opt.windows[std::min<std::size_t>(s.win_k, opt.windows.size() - 1)];
     int b = a + size;
     if (T >= 0) {
@@ -166,6 +179,24 @@ bool Yue2Stream::Impl::window_ready(const Song& s, int* a_out, int* b_out) const
     *a_out = a;
     *b_out = b;
     return true;
+}
+
+double Yue2Stream::Impl::ahead_budget(const Song& s) const {
+    const Song* prev = nullptr;
+    for (std::size_t i = 1; i < songs.size(); ++i)
+        if (songs[i].get() == &s) prev = songs[i - 1].get();
+    if (!prev) return 0;                                 // the first song: someone waits for it
+    if (skip_pending && songs.size() >= 2 && songs[1].get() == &s) return 0;
+    if (!opt.paced) return 1e30;                         // offline: nobody waits, after the first song
+    if (s.start >= 0 && s.start <= emitted) return 0;   // on air
+    std::int64_t need = s.start;
+    if (need < 0) need = prev->end();                    // not placed yet: by its predecessor's end
+    if (need < 0) return 1e30;                           // its predecessor's length is not known yet
+    return static_cast<double>(need - std::max(emitted, playhead.load())) / 48000.0;
+}
+
+double Yue2Stream::Impl::whole_seconds(const Song& s, int frames) const {
+    return 1.5 * nar_spfs * (frames + opt.left) * std::max(1, s.p.ode_steps) + 2.0;   // + the opening's decode
 }
 
 void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
@@ -201,7 +232,8 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     std::vector<float> out;
     {
         auto chunk = m.nar_chunk(ar, F, o);
-        out = m.nar_solve(*chunk, s.noise.data() + static_cast<std::size_t>(lo) * D, s.p.ode_steps, preemptible(),
+        const bool whole = b - a > *std::max_element(opt.windows.begin(), opt.windows.end()) + 25;
+        out = m.nar_solve(*chunk, s.noise.data() + static_cast<std::size_t>(lo) * D, s.p.ode_steps, preemptible(whole),
                           {}, a > lo ? s.lat.data() + static_cast<std::size_t>(lo) * D : nullptr, a - lo);
     }
     if (out.empty()) return;   // stopping, or preempted (re-solved later)
@@ -247,6 +279,8 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     e.frames = b - a;
     e.seconds = since(t0);
     e.value = norm;
+    // Service work done inside the solve is counted too (a conservative rate).
+    nar_spfs = e.seconds / (static_cast<double>(F) * std::max(1, s.p.ode_steps));
     event(e);
     if (norm < 6.5 || norm > 9.5) {
         Yue2StreamEvent w{Yue2StreamEvent::Kind::BreakWarning};

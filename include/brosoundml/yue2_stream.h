@@ -17,7 +17,12 @@
 //             that acts on the latents is heard as soon as the audio already
 //             handed out has played.
 // The playing song comes first; the next one is built whole meanwhile (about
-// 22% of a 4090) and crossfades in at the outro (equal power, 2-4 s).
+// 22% of a 4090) and crossfades in at the outro (equal power, 2-4 s). A song
+// built ahead waits for all its tokens and is solved in one NAR chunk, so it
+// is the whole-song render itself, whenever that fits before it is needed
+// (measured rate, 1.5x margin); else, and for the first song or one a skip
+// waits for, it takes the windows. Unpaced, every song after the first is
+// one chunk.
 //
 // Steering (Yue2Knobs, each clamped below where the research found the music
 // breaks): energy is a latent offset (re-decoded, heard within the emit lead);

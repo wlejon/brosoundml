@@ -370,10 +370,10 @@ CancelCheck Yue2Stream::Impl::servicing() {
     };
 }
 
-CancelCheck Yue2Stream::Impl::preemptible() {
-    return [this]() {
+CancelCheck Yue2Stream::Impl::preemptible(bool whole) {
+    return [this, whole]() {
         service();
-        return stopping.load() || int_stage2_pending || knobs_pending;
+        return stopping.load() || int_stage2_pending || knobs_pending || (whole && skip_pending);
     };
 }
 
