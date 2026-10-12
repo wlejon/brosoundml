@@ -983,6 +983,9 @@ void installMusic(ObjectBuilder& bro) {
     music.def("loadVae", 2, loadVae);
     music.set("YuE2", g_yue2Class.constructor());
     music.set("YuE2Vae", g_yue2VaeClass.constructor());
+    // A stream's knob clamps with no model or stream: a fresh object each
+    // read, the one a running stream's knobRanges gives.
+    music.accessor("knobRanges", [](Value, std::span<const Value>) -> Value { return music::knobRanges(); });
     bro.set("music", music.get());
 }
 

@@ -311,25 +311,27 @@ void decorateStream(ObjectBuilder& b) {
         return ev::fromBool(j && j->running.load());
     });
     // The clamps (the research's break points stay outside them).
-    b.accessor("knobRanges", [](Value, std::span<const Value>) -> Value {
-        const auto lo = brosoundml::Yue2Knobs::clamp({-1e9f, -1e9f, -1e9f, -1e9f});
-        const auto hi = brosoundml::Yue2Knobs::clamp({1e9f, 1e9f, 1e9f, 1e9f});
-        ObjectBuilder o;
-        auto range = [&](const char* name, float l, float h) {
-            ObjectBuilder r;
-            r.set("min", static_cast<double>(l));
-            r.set("max", static_cast<double>(h));
-            o.set(name, r.get());
-        };
-        range("energy", lo.energy, hi.energy);
-        range("texture", lo.texture, hi.texture);
-        range("percussion", lo.percussion, hi.percussion);
-        range("arrangement", lo.arrangement, hi.arrangement);
-        return o.get();
-    });
+    b.accessor("knobRanges", [](Value, std::span<const Value>) -> Value { return knobRanges(); });
 }
 
 }  // namespace
+
+Value knobRanges() {
+    const auto lo = brosoundml::Yue2Knobs::clamp({-1e9f, -1e9f, -1e9f, -1e9f});
+    const auto hi = brosoundml::Yue2Knobs::clamp({1e9f, 1e9f, 1e9f, 1e9f});
+    ObjectBuilder o;
+    auto range = [&](const char* name, float l, float h) {
+        ObjectBuilder r;
+        r.set("min", static_cast<double>(l));
+        r.set("max", static_cast<double>(h));
+        o.set(name, r.get());
+    };
+    range("energy", lo.energy, hi.energy);
+    range("texture", lo.texture, hi.texture);
+    range("percussion", lo.percussion, hi.percussion);
+    range("arrangement", lo.arrangement, hi.arrangement);
+    return o.get();
+}
 
 void installStreamClass() { g_streamClass.install("YuE2Stream", 0, nullptr, decorateStream); }
 
