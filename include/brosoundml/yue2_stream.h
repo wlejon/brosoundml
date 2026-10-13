@@ -45,19 +45,15 @@
 // then the rest of it. `auto_full` does that for each song as it goes on air.
 //
 // Steering (Yue2Knobs, each clamped below where the research found the music
-// breaks): energy is a latent offset (re-decoded, heard within the emit lead);
-// texture and percussion are NAR steers (windows re-solved from ~1.5 s ahead);
-// the semantic steers (Yue2Directions::semantic: arrangement, and the style
-// axes) steer the AR stage (the song continues from ~2.5 s ahead under them).
-// interrupt() is the two-stage "make it energetic": an instant latent offset
-// with a 0.5 s ramp, then an arrangement-steered continuation from the
-// playing frame + the stage's latency, joined at a window edge (inpainted),
-// after which the offset ramps back to the energy knob. The knobs carry into
-// every song built after the change. A song already built when a knob moves
-// keeps what it was built with until it plays (so a skip to it stays
-// instant), then catches up as the playing song does: energy from its first
-// sample (re-decoded just before it starts), the others from ~1.5-2.5 s in.
-// A song being built, or not started, takes the change from its start.
+// breaks): energy is a latent offset added at decode; texture and percussion
+// are NAR steers; the semantic steers (Yue2Directions::semantic: arrangement,
+// and the style axes) steer the AR stage. A song takes the knobs when it is
+// queued and keeps them: a change applies to the songs queued after it, and
+// every song that exists (on air, built ahead, being built, a preview made
+// full) stays as it was started. To hear a change sooner, skip to the next
+// song. So nothing on air changes once it is solved, and a song on air whose
+// latents are complete is decoded to its end at once rather than a lead
+// ahead of the playhead.
 //
 // Audio comes out as one program timeline (crossfades mixed in), contiguous
 // from sample 0, 48 kHz planar stereo. Paced (the default), the stream hands
@@ -137,12 +133,6 @@ struct Yue2StreamOptions {
     double decode_lead_seconds = 6.0;     // paced: audio decoded ahead of the playhead
     double crossfade_seconds = 3.0;       // song to song, equal power (clamped to 2..4)
     double skip_fade_seconds = 0.5;       // skip()'s crossfade
-    // Interrupt stage 2 cuts at the audio handed out at the request + this
-    // (its own latency, request -> landed: continuation tokens + one
-    // 250-frame window), then measured and adapted. Heard about
-    // emit_lead_seconds + this after the request.
-    double interrupt_latency_seconds = 1.75;
-    double knob_latency_seconds = 1.5;    // texture / percussion re-solve from this far ahead
     bool radio = true;                    // a want unanswered: continue with the last song's request, next seed
     int ahead_songs = 1;                  // songs kept built after the playing one (1..8)
     double want_grace_seconds = 10.0;     // radio: how long a Want waits for the app before the radio fills it
@@ -193,9 +183,7 @@ struct Yue2StreamEvent {
         SongStart,     // a song is placed on the program: sample = its first program sample
         SemanticDone,  // frames = the song's length in frames
         Window,        // a NAR window landed: frame0, frames, seconds = its solve time, value = mean latent norm
-        Interrupt,     // stage 1 (value = 1) or 2 (value = 2) audible from `sample`; seconds = request -> audible
-        Knobs,         // knobs applied to `song` (text = which); sample = the emit frontier then, frame0 = the
-                       // song frame it changes from (a continuation's or re-solve's cut; 0 = the whole song)
+        Knobs,         // set_knobs() took effect (text = which moved): songs queued from now take them
         BreakWarning,  // a window's latent norm left the corpus range (6.5 .. 9.5): value = the norm
         SongEnd,       // sample = the song's last program sample + 1
         FirstAudio,    // seconds = request -> first audio handed out (time to first audio)
@@ -234,7 +222,7 @@ struct Yue2StreamStats {
         bool ready = false;                    // latents complete and the opening decoded: a skip to it is instant
         bool on_air = false;
         std::size_t host_bytes = 0;            // audio + latents + noise held for it in host memory
-        Yue2Knobs knobs;                       // what it is built / steered with (energy: its offset now)
+        Yue2Knobs knobs;                       // what it was started with, and keeps
         bool preview = false;                  // still a preview (preview_frames long)
         int preview_frames = 0;
         int estimate_frames = 0;               // the plan's length estimate (its ABC), 0 = none
@@ -246,7 +234,6 @@ struct Yue2StreamStats {
     std::size_t host_bytes = 0;                // all songs'
     Yue2Knobs knobs;
     double first_audio_seconds = 0;            // the latest song's request -> first audio
-    double interrupt1_seconds = 0, interrupt2_seconds = 0;   // request -> audible, the last interrupt
     // Service gaps: the worker hands out audio (and decodes the playing
     // song's when it is about to run out) only between pieces of work, so a
     // piece longer than the emit lead starves the player. Each gap of 0.2 s or
@@ -254,7 +241,7 @@ struct Yue2StreamStats {
     struct Gap {
         double seconds = 0;
         // The piece of work last begun when it ended (plan / semantic /
-        // window: prefill|step|readback / make_full / retune / decode / save
+        // window: prefill|step|readback / make_full / decode / save
         // ...); device work queued by an earlier piece can land in a later one.
         std::string what;
         int song = -1;           // the song it worked on (-1 = none)
@@ -263,6 +250,14 @@ struct Yue2StreamStats {
     };
     std::vector<Gap> gaps;
     double worst_gap_seconds = 0;
+    // The worker's seconds since the stream opened, per piece of work (the
+    // labels of Gap::what, each timed from its start to the next one's);
+    // "idle" is the time it waited with nothing to do.
+    struct Work {
+        std::string what;
+        double seconds = 0;
+    };
+    std::vector<Work> work;
 };
 
 class Yue2Stream {
@@ -280,9 +275,7 @@ public:
     // Controls: any thread, never block on the model.
     void enqueue(Yue2Song song);
     void set_playhead(std::int64_t program_sample);   // samples the player has played
-    void set_knobs(const Yue2Knobs& knobs);
-    // Two-stage interrupt: +1 = energetic, -1 = calm (scaled, |amount| <= 1).
-    void interrupt(float amount = 1.0f);
+    void set_knobs(const Yue2Knobs& knobs);           // for the songs queued after it
     void skip();                                     // to the next song (built, or as soon as it is)
     void set_next_plan(const std::string& abc);      // the next song's score (an edited Plan event)
     // A queued song's score (by index, an edited Plan event): it is rebuilt

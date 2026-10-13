@@ -6,7 +6,7 @@
 // Audio chunks, events and (optionally) latents cross to the JS thread
 // through a mutex-guarded queue, which each tick's poll drains. The data is
 // paced by the player (emitLeadSeconds ahead), so it stays small.
-// Controls (enqueue, setPlayhead, setKnobs, interrupt, skip, setNextPlan,
+// Controls (enqueue, setPlayhead, setKnobs, skip, setNextPlan,
 // setPlan, drop, makeFull, setAutoFull, saveSong, stop) are Yue2Stream's own thread-safe calls, so they never block on the
 // model. While the stream runs, the job roots the stream object, so a
 // stream nobody references keeps playing until stop().
@@ -72,7 +72,6 @@ const char* kindName(brosoundml::Yue2StreamEvent::Kind k) {
         case K::SongStart: return "songStart";
         case K::SemanticDone: return "semanticDone";
         case K::Window: return "window";
-        case K::Interrupt: return "interrupt";
         case K::Knobs: return "knobs";
         case K::BreakWarning: return "breakWarning";
         case K::SongEnd: return "songEnd";
@@ -168,8 +167,6 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
     readSeconds(r.get(), "decodeLeadSeconds", o.decode_lead_seconds);
     readSeconds(r.get(), "crossfadeSeconds", o.crossfade_seconds);
     readSeconds(r.get(), "skipFadeSeconds", o.skip_fade_seconds);
-    readSeconds(r.get(), "interruptLatencySeconds", o.interrupt_latency_seconds);
-    readSeconds(r.get(), "knobLatencySeconds", o.knob_latency_seconds);
     readSeconds(r.get(), "wantGraceSeconds", o.want_grace_seconds);
     getIntOpt(r.get(), "aheadSongs", o.ahead_songs);
     if (o.ahead_songs < 1 || o.ahead_songs > 8) {
@@ -251,8 +248,6 @@ Value makeStats(const brosoundml::Yue2StreamStats& s) {
         o.set("knobs", k.get());
     }
     o.set("firstAudioSeconds", s.first_audio_seconds);
-    o.set("interrupt1Seconds", s.interrupt1_seconds);
-    o.set("interrupt2Seconds", s.interrupt2_seconds);
     o.set("worstGapSeconds", s.worst_gap_seconds);
     ev::Persistent gaps(hostArrayOf(s.gaps.size(), [&](size_t i) -> Value {
         const auto& g = s.gaps[i];
@@ -265,6 +260,11 @@ Value makeStats(const brosoundml::Yue2StreamStats& s) {
         return go.get();
     }));
     o.set("gaps", gaps.get());
+    {
+        ObjectBuilder wo;
+        for (const auto& w : s.work) wo.set(w.what.c_str(), w.seconds);
+        o.set("work", wo.get());
+    }
     ev::Persistent songs(hostArrayOf(s.songs.size(), [&](size_t i) -> Value {
         const auto& g = s.songs[i];
         ObjectBuilder so;
@@ -360,13 +360,6 @@ void decorateStream(ObjectBuilder& b) {
             j.knobs = brosoundml::Yue2Knobs::clamp(j.knobs);
             j.stream->set_knobs(j.knobs);
             return makeKnobs(j.knobs);
-        });
-    });
-    b.def("interrupt", 1, [](Value self, std::span<const Value> a) -> Value {
-        const double amt = hasArg(a, 0) ? numAt(a, 0, 1.0) : 1.0;
-        return streamControl(self, "interrupt", [&](StreamJob& j) -> Value {
-            j.stream->interrupt(static_cast<float>(std::clamp(amt, -1.0, 1.0)));
-            return ev::undefined();
         });
     });
     b.def("skip", 0, [](Value self, std::span<const Value>) -> Value {

@@ -127,9 +127,9 @@ struct Capture {
             }
             if (e.kind == Kind::Error) std::printf("  [error] song %d: %s\n", e.song, e.text.c_str());
             if (!verbose) return;
-            static const char* names[] = {"plan",  "start",    "semantic", "window", "interrupt", "knobs",
-                                          "break", "song-end", "first",    "error",  "idle",      "want",
-                                          "built", "dropped",  "full"};
+            static const char* names[] = {"plan",  "start",    "semantic", "window",  "knobs", "break",
+                                          "song-end", "first", "error",    "idle",    "want",  "built",
+                                          "dropped",  "full",  "saved"};
             if (e.kind == Kind::Window) return;
             std::printf("  [%7.2f] %-9s song %d sample %lld frames %d frame0 %d seconds %.2f value %.3f\n", now_s(),
                         names[static_cast<int>(e.kind)], e.song, static_cast<long long>(e.sample), e.frames, e.frame0,

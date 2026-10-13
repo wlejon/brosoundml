@@ -353,15 +353,6 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     norm /= std::max(1, b - a);
     s.last_norm = norm;
     invalidate_audio(s, a - kHalo);
-    // Stage 2 of an interrupt landed: the offset ramps back to the knob at the cut.
-    if (int_song == s.index && int_cut >= a && int_cut < b) {
-        set_offset(s, int_cut, knobs.energy, kHalo);
-        if (s.start >= 0) int_audible2 = s.start + static_cast<std::int64_t>(int_cut) * R;
-        const double took = since(int_at);
-        int_latency_est = std::clamp(1.15 * took, 1.0, 6.0);
-        int_song = -1;
-        int_cut = -1;
-    }
     if (opt.on_latents) opt.on_latents(s.index, a, b - a, s.lat.data() + static_cast<std::size_t>(a) * D);
     Yue2StreamEvent e{Yue2StreamEvent::Kind::Window};
     e.song = s.index;
@@ -447,32 +438,12 @@ void Yue2Stream::Impl::set_ar_steer(Song& s, const std::map<std::string, float>&
     if (s.sess) m.ar_set_hooks(*s.sess, h.get());
 }
 
-void Yue2Stream::Impl::set_nar_steer(Song& s, float t21, float p9) {
-    s.nar21 = t21;
-    s.nar9 = p9;
-}
-
 void Yue2Stream::Impl::invalidate_audio(Song& s, int frame) {
     const int f = std::max(0, frame);
     if (f < s.dec_frame) {
         s.dec_frame = f;
         s.built_announced = false;
     }
-}
-
-void Yue2Stream::Impl::set_offset(Song& s, int f0, float value, int ramp) {
-    f0 = std::max(0, f0);
-    if (static_cast<int>(s.off.size()) < s.lat_extent) s.off.resize(s.lat_extent, s.off_tail);
-    const int n = static_cast<int>(s.off.size());
-    const float from = f0 == 0 ? (ramp > 0 ? s.off_tail : value) : (f0 - 1 < n ? s.off[f0 - 1] : s.off_tail);
-    for (int f = f0; f < n; ++f) {
-        const float w = ramp > 0 ? std::min(1.0f, static_cast<float>(f - f0 + 1) / static_cast<float>(ramp)) : 1.0f;
-        s.off[f] = from + (value - from) * w;
-    }
-    // Frames past the solved ones take the target (a ramp still in progress
-    // at the frontier finishes there).
-    s.off_tail = value;
-    invalidate_audio(s, f0 - kHalo);
 }
 
 void Yue2Stream::Impl::resolve_from(Song& s, int f) {
@@ -482,58 +453,6 @@ void Yue2Stream::Impl::resolve_from(Song& s, int f) {
     s.lat_valid = f;
     s.win_from = f;
     s.win_k = 0;   // the first (short) window again: the change is heard soonest
-}
-
-int Yue2Stream::Impl::continue_from(Song& s, int c, const std::map<std::string, float>& scales) {
-    if (!s.planned) {
-        s.ar = scales;   // applied when it is planned
-        return -1;
-    }
-    if (!s.req.semantic.empty()) {   // given tokens: nothing to continue
-        s.ar = scales;
-        return -1;
-    }
-    Busy busy_guard(busy, &s);
-    const Model& m = core.model;
-    c = std::max(0, c);
-    if (c > 0 && c >= static_cast<int>(s.codec.size()) && !s.sem_done) {
-        set_ar_steer(s, scales);   // not sampled that far yet: steer from here on
-        return c;
-    }
-    if (c > 0 && c >= static_cast<int>(s.codec.size())) {   // past the song's end
-        s.ar = scales;
-        return -1;
-    }
-    if (c == 0) {
-        s.sess.reset();
-        set_ar_steer(s, scales);
-        s.codec.clear();
-        s.tokens.clear();
-        open_session(s, 0);
-    } else {
-        // A song built ahead released its session: rebuild it over the
-        // tokens before the cut (under the steer they were sampled with).
-        if (!s.sess) open_session(s, c - 1);
-        // Re-feed the token before the cut under the new steer, which
-        // recomputes the logits for the first continued position.
-        m.ar_truncate(*s.sess, 0, s.P + c - 1);
-        if (!s.neg.empty()) m.ar_truncate(*s.sess, 1, static_cast<int>(s.neg.size()) + c - 1);
-        set_ar_steer(s, scales);
-        m.ar_step(*s.sess, s.codec[c - 1] + CODEC_OFFSET);
-        s.codec.resize(c);
-        s.tokens.resize(c);
-    }
-    ++s.interrupts;
-    s.uniform = make_uniform(s.p.seed + 1000003ull * static_cast<std::uint64_t>(s.interrupts));
-    s.sem_done = false;
-    s.natural = -1;
-    s.cut = -1;
-    s.built_announced = false;
-    resolve_from(s, c);
-    // Successors placed by the old length move with the new one, unless
-    // they are already playing.
-    unplace_after(&s);
-    return c;
 }
 
 }  // namespace brosoundml

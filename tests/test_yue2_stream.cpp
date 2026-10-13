@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 // Yue2Stream on the GPU (minutes; runs only with YUE2_E2E=1): the streaming
-// player, the radio's crossfade, the two-stage interrupt and the bug guards.
+// player, the radio's crossfade, knobs that change only songs queued after
+// them, and the bug guards.
 // The request is ../YuE2-3B/examples/tonight-awake.json (or $YUE2_REQUEST);
 // the given-semantic sections read yue2-research's rock_gen_W0 run (or
 // $YUE2_STREAM_FROM: plan.json + semantic.i32). $YUE2_STREAM_SECTIONS picks
@@ -14,10 +15,11 @@
 //      stream_syn_W0: latents.f32, audio.f32 planar, run.json with the seams).
 //   B. The stream's own semantic tokens equal Yue2::generate's (same seed),
 //      and the time to first audio from the request (cot full).
-//   C. Paced, a simulated player: interrupt(+1) at 8 s; stage 1 and stage 2
-//      latencies, the RMS after each, no discontinuity where they land; then
-//      skip() to a queued second song, while a third is built ahead in one
-//      NAR chunk and crossfades in; no underrun.
+//   C. Paced, a simulated player: knobs moved at 8 s change no song that
+//      exists (one Knobs event, every song keeps its own) and a song queued
+//      after takes them; then skip() to a queued second song, which on air is
+//      decoded whole as soon as its latents are, while a third is built ahead
+//      in one NAR chunk and crossfades in; no underrun.
 //   D. The radio's crossfade of two given-semantic songs: placement, program
 //      length, no power dip across the fade; the second, built ahead, is the
 //      whole-song render (one chunk) and sets the peak device memory.
@@ -28,8 +30,9 @@
 //   G. Three songs built ahead, fed through Want events (paced, a simulated
 //      player): the pool fills with wholly decoded songs; a texture knob
 //      moved then leaves them ready; skip() to one cuts over and hands out
-//      its audio within a quarter second; that song catches the knob up on
-//      air; drop() removes the last and Want asks again. Device memory with
+//      its audio within a quarter second and it plays as built; the songs
+//      fed after the move take the knob; drop() removes the last and Want
+//      asks again. Device memory with
 //      the pool full, and the host memory the waiting songs take.
 // Peak device memory (device_mem_info, sampled) is reported per section.
 // Numbers are reported and asserted; nothing judges the audio by ear.
@@ -218,7 +221,7 @@ void section_b(Env& E) {
 
 // ── C ──
 void section_c(Env& E) {
-    std::printf("C. paced: interrupt(+1) at 8 s, then skip to a queued song\n");
+    std::printf("C. paced: a knob moved at 8 s changes no song that exists, then skip to a queued song\n");
     brosoundml::Yue2Song s0;
     s0.params = E.req;
     s0.params.semantic_sampling.max_tokens = 1000;
@@ -240,11 +243,14 @@ void section_c(Env& E) {
     std::thread worker([&] { st.run(); });
 
     // The player: plays from the first audio at real time; an underrun waits.
-    std::int64_t play = 0, int_at = -1, skip_at = -1;
-    double underrun = 0, last = -1, int_wall = 0;
-    std::vector<std::pair<double, std::int64_t>> hist;   // (wall, playhead) as reported
+    std::int64_t play = 0, knob_at = -1, skip_at = -1;
+    double underrun = 0, last = -1;
     const double t_end = now_s() + 150;
-    bool stopped = false;
+    bool stopped = false, queued_after = false;
+    // Song 1 (given tokens) on air: decoded whole as soon as its latents are,
+    // not a lead ahead of the playhead; the program sample it was seen built.
+    std::int64_t built1_at = -1, start1 = -1;
+    brosoundml::Yue2StreamStats after_knob;
     while (!stopped && now_s() < t_end) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         const double tn = now_s();
@@ -253,34 +259,58 @@ void section_c(Env& E) {
         const std::int64_t want = play + static_cast<std::int64_t>((tn - last) * kSr);
         last = tn;
         const std::int64_t have = cap.emitted;
-        if (want > have && int_at >= 0) underrun += double(want - have) / kSr;
+        if (want > have && knob_at >= 0) underrun += double(want - have) / kSr;
         play = std::min(want, have);
         st.set_playhead(play);
-        hist.emplace_back(tn, play);
-        std::lock_guard<std::mutex> lk(cap.mu);
-        if (int_at < 0 && play >= 8 * kSr) {
-            int_at = play;
-            int_wall = tn;
-            st.interrupt(1.0f);
+        if (knob_at < 0 && play >= 8 * kSr) {
+            knob_at = play;
+            brosoundml::Yue2Knobs k;
+            k.texture = 1.0f;
+            k.energy = 0.5f;
+            st.set_knobs(k);
         }
-        const auto* i2 = cap.find(Kind::Interrupt, 0, 2);
-        if (skip_at < 0 && i2 && play >= i2->e.sample + 4 * kSr) {
+        if (knob_at >= 0 && !queued_after && play >= knob_at + kSr) {
+            after_knob = st.stats();   // the knob landed a second ago
+            st.enqueue(given_song(E, 1400, 200, "C3"));
+            queued_after = true;
+        }
+        if (start1 >= 0 && built1_at < 0)
+            for (const auto& g : st.stats().songs)
+                if (g.index == 1 && g.on_air && g.built) built1_at = play;
+        std::lock_guard<std::mutex> lk(cap.mu);
+        if (skip_at < 0 && queued_after && play >= knob_at + 4 * kSr) {
             skip_at = play;
             st.skip();
         }
+        if (const auto* ss1 = cap.find_last(Kind::SongStart, 1); ss1 && skip_at >= 0) start1 = ss1->e.sample;
         if (const auto* e2 = cap.find(Kind::SongEnd, 2); e2 && play >= e2->e.sample) stopped = true;
         if (cap.find(Kind::Error)) stopped = true;
     }
+    const brosoundml::Yue2StreamStats end_stats = st.stats();
     st.stop();
     worker.join();
     const double peak = vm.stop_gb();
     CHECK(stopped, "C: did not play out within 150 s");
     CHECK(!cap.find(Kind::Error), "C: the stream reported an error");
     CHECK(cap.contiguous, "C: program audio not contiguous");
-    const auto* i1 = cap.find(Kind::Interrupt, 0, 1);
-    const auto* i2 = cap.find(Kind::Interrupt, 0, 2);
-    CHECK(i1 && i2, "C: interrupt stages missing (%d events)", cap.count(Kind::Interrupt));
-    std::printf("  underrun after the interrupt %.2f s, peak %.2f GB\n", underrun, peak);
+    std::printf("  underrun after the knob %.2f s, peak %.2f GB\n", underrun, peak);
+    // The knob: one Knobs event naming no song, every song then existing keeps
+    // what it was started with, the song queued after takes the new ones.
+    const auto* kn = cap.find(Kind::Knobs);
+    CHECK(kn && kn->e.song == -1 && kn->e.text == "energy/texture", "C: Knobs event %s (song %d)",
+          kn ? kn->e.text.c_str() : "missing", kn ? kn->e.song : -2);
+    CHECK(cap.count(Kind::Knobs) == 1, "C: %d Knobs events, want 1", cap.count(Kind::Knobs));
+    for (const auto& g : after_knob.songs)
+        CHECK(g.knobs.texture == 0.0f && g.knobs.energy == 0.0f, "C: song %d took the knob (texture %.2f, energy %.2f)",
+              g.index, g.knobs.texture, g.knobs.energy);
+    bool c3 = false;
+    for (const auto& g : end_stats.songs)
+        if (g.tag == "C3") {
+            c3 = true;
+            CHECK(g.knobs.texture == 1.0f && g.knobs.energy == 0.5f, "C: the song queued after the knob has texture %.2f, "
+                  "energy %.2f", g.knobs.texture, g.knobs.energy);
+        }
+    CHECK(c3, "C: the song queued after the knob is not in the stats");
     int windows2 = 0;
     for (const auto& e : cap.events) windows2 += e.e.kind == Kind::Window && e.e.song == 2;
     const auto* st2 = cap.find_last(Kind::SongStart, 2);
@@ -288,29 +318,10 @@ void section_c(Env& E) {
                 st2 ? st2->e.sample / double(kSr) : -1.0, st2 ? click_ratio(cap.L, st2->e.sample) : -1.0);
     CHECK(windows2 == 1, "C: song 2 (built ahead) took %d windows, want one chunk", windows2);
     CHECK(underrun < 1.0, "C: %.2f s of underrun", underrun);
-    if (i1 && i2) {
-        const double r_before = rms(cap.L, cap.R, int_at - 2 * kSr, int_at);
-        const double r1 = rms(cap.L, cap.R, i1->e.sample + kSr / 2, i1->e.sample + 2 * kSr);
-        const double r2 = rms(cap.L, cap.R, i2->e.sample, i2->e.sample + 3 * kSr);
-        // The player's own clock: when its playhead crossed each stage's sample.
-        auto crossed = [&](std::int64_t sample) {
-            for (const auto& [w, ph] : hist)
-                if (ph >= sample) return w - double(ph - sample) / kSr - int_wall;
-            return -1.0;
-        };
-        const double p1 = crossed(i1->e.sample), p2 = crossed(i2->e.sample);
-        std::printf("  stage 1 %.2f s, stage 2 %.2f s (request -> audible; the player's clock %.2f / %.2f s); "
-                    "RMS before %.4f, after 1 %.4f, after 2 %.4f\n",
-                    i1->e.seconds, i2->e.seconds, p1, p2, r_before, r1, r2);
-        CHECK(p1 >= 0 && p1 <= 1.0, "C: stage 1 took %.2f s", p1);
-        CHECK(p2 >= 0 && p2 <= 3.0, "C: stage 2 took %.2f s", p2);
-        CHECK(std::fabs(p1 - i1->e.seconds) < 0.1 && std::fabs(p2 - i2->e.seconds) < 0.1,
-              "C: the stream's interrupt timings (%.2f, %.2f) are not the player's", i1->e.seconds, i2->e.seconds);
-        CHECK(r1 > r_before, "C: RMS did not rise after stage 1 (%.4f -> %.4f)", r_before, r1);
-        const double c1 = click_ratio(cap.L, i1->e.sample), c2 = click_ratio(cap.L, i2->e.sample);
-        std::printf("  click ratio at stage 1 %.2f, stage 2 %.2f\n", c1, c2);
-        CHECK(c1 < 3.0 && c2 < 3.0, "C: discontinuity (%.2f, %.2f)", c1, c2);
-    }
+    // Song 1 is 16 s; decoded only a lead (6 s) ahead it would be whole near its end.
+    std::printf("  song 1 decoded whole %.2f s into it\n", built1_at >= 0 && start1 >= 0 ? (built1_at - start1) / double(kSr) : -1.0);
+    CHECK(built1_at >= 0 && start1 >= 0 && built1_at - start1 < 8 * kSr,
+          "C: song 1 on air was not decoded whole within 8 s of its start");
     const auto* st1 = cap.find_last(Kind::SongStart, 1);   // a skip re-places it
     CHECK(skip_at >= 0 && st1, "C: skip did not start song 1");
     if (skip_at >= 0 && st1) {
@@ -477,8 +488,8 @@ void section_g(Env& E) {
     double last = -1, underrun = 0;
     double pool_full_at = -1, pool_vram = 0, skip_wall = -1;
     std::size_t pool_host = 0;
-    int skip_to = -1, knob_song = -1, dropped = -1, stage = 0;
-    brosoundml::Yue2StreamStats at_full;
+    int skip_to = -1, knob_song = -1, dropped = -1, stage = 0, last_before_knob = -1;
+    brosoundml::Yue2StreamStats at_full, at_drop;
     const double t0 = now_s(), t_end = t0 + 420;
     while (now_s() < t_end && stage < 4) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -507,6 +518,7 @@ void section_g(Env& E) {
             at_full = s;
             std::printf("  pool full at %.1f s: %d ahead, %d ready, all built %d; host %.1f MB; peak device %.2f GB\n",
                         pool_full_at, s.ahead, s.ready_ahead, all_built ? 1 : 0, s.host_bytes / 1e6, pool_vram);
+            for (const auto& g : s.songs) last_before_knob = std::max(last_before_knob, g.index);
             brosoundml::Yue2Knobs k;
             k.texture = 1.0f;
             st.set_knobs(k);
@@ -540,7 +552,10 @@ void section_g(Env& E) {
         } else if (stage == 3) {
             std::lock_guard<std::mutex> lk(cap.mu);
             const auto* d = cap.find(Kind::Dropped, dropped);
-            if (d && st.stats().ahead >= kAhead) stage = 4;
+            if (d && st.stats().ahead >= kAhead) {
+                at_drop = st.stats();
+                stage = 4;
+            }
         }
     }
     st.stop();
@@ -568,14 +583,21 @@ void section_g(Env& E) {
                     ss ? click_ratio(cap.L, ss->e.sample) : -1.0);
         CHECK(cut >= 0 && cut < 0.25, "G: skip to a built song took %.3f s to cut over", cut);
         CHECK(first >= 0 && first < 0.35, "G: skip to a built song: first audio %.3f s after the request", first);
-        // The knob moved while it was built: it caught up once on air.
-        const Capture::Ev* kn = nullptr;
-        for (const auto& e : cap.events)
-            if (e.e.kind == Kind::Knobs && e.e.song == knob_song && e.at >= skip_wall) kn = &e;
-        CHECK(kn, "G: song %d (built before the knob moved) did not catch up on air", knob_song);
-        if (kn)
-            std::printf("  song %d caught up on air (%s) from frame %d, %.2f s after the skip\n", knob_song,
-                        kn->e.text.c_str(), kn->e.frame0, kn->at - skip_wall);
+        // Built before the knob moved, it plays as it was built; the songs
+        // fed after the move take the knob.
+        int fed_after = 0;
+        for (const auto& g : at_drop.songs) {
+            if (g.index == knob_song)
+                CHECK(g.knobs.texture == 0.0f, "G: song %d (built before the knob) has texture %.2f on air", knob_song,
+                      g.knobs.texture);
+            if (g.index > last_before_knob) {
+                ++fed_after;
+                CHECK(g.knobs.texture == 1.0f, "G: song %d (fed after the knob) has texture %.2f", g.index,
+                      g.knobs.texture);
+            }
+        }
+        CHECK(fed_after > 0, "G: no song was fed after the knob moved");
+        std::printf("  song %d played as built; %d song(s) fed after the knob took it\n", knob_song, fed_after);
     }
     std::printf("  underrun %.2f s; peak device memory with the pool full %.2f GB, after %.2f GB; host %.1f MB "
                 "for %d songs\n",

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 
@@ -100,18 +101,12 @@ void Yue2Stream::enqueue(Yue2Song song) {
     push(*impl_, std::move(c));
 }
 void Yue2Stream::set_playhead(std::int64_t s) {
-    impl_->playhead_at.store(StreamClock::now().time_since_epoch().count());
     impl_->playhead.store(s);
     impl_->cv.notify_all();
 }
 void Yue2Stream::set_knobs(const Yue2Knobs& k) {
     Command c{Command::Kind::Knobs};
     c.knobs = Yue2Knobs::clamp(k, impl_->opt.directions);
-    push(*impl_, std::move(c));
-}
-void Yue2Stream::interrupt(float amount) {
-    Command c{Command::Kind::Interrupt};
-    c.amount = std::isfinite(amount) ? std::clamp(amount, -1.0f, 1.0f) : 0.0f;
     push(*impl_, std::move(c));
 }
 void Yue2Stream::skip() { push(*impl_, Command{Command::Kind::Skip}); }
@@ -195,10 +190,6 @@ void Yue2Stream::Impl::unplace_after(const Song* s) {
     }
 }
 
-bool Yue2Stream::Impl::steer_current(const Song& s) const {
-    return s.nar21 == knobs.texture && s.nar9 == knobs.percussion && s.ar == knobs.semantic;
-}
-
 void Yue2Stream::Impl::apply(Command& c) {
     switch (c.kind) {
         case Command::Kind::Enqueue: {
@@ -212,50 +203,24 @@ void Yue2Stream::Impl::apply(Command& c) {
             break;
         }
         case Command::Kind::Knobs: {
-            // Energy acts on the latents at decode: applied at once (it is
-            // cheap and safe inside a long op) to the songs on air (from the
-            // emit frontier) and the songs not built yet (from their start).
-            // A song built ahead keeps its audio until it is about to play
-            // (energy_before_air). The rest re-solve or continue a song,
-            // which step() does.
+            // For the songs queued from now (start_song takes them); every
+            // song that exists keeps what it was started with.
             const Yue2Knobs k0 = knobs;
             knobs = c.knobs;
-            if (knobs.energy != k0.energy) {
-                for (auto& sp : songs) {
-                    Song& s = *sp;
-                    if (s.dropped) continue;
-                    if (on_air(s)) set_offset(s, emitted_frame(s) + 1, knobs.energy, kHalo);
-                    else if (!s.complete()) set_offset(s, 0, knobs.energy, 0);
-                }
+            std::string moved;
+            auto note = [&](bool m, const char* name) {
+                if (m) moved += (moved.empty() ? "" : "/") + std::string(name);
+            };
+            note(knobs.energy != k0.energy, "energy");
+            note(knobs.texture != k0.texture, "texture");
+            note(knobs.percussion != k0.percussion, "percussion");
+            note(knobs.semantic != k0.semantic, "semantic");
+            if (!moved.empty()) {
                 Yue2StreamEvent e{Yue2StreamEvent::Kind::Knobs};
-                e.text = "energy";
+                e.text = moved;
                 e.sample = emitted;
-                if (const Song* p = playing()) {
-                    e.song = p->index;
-                    e.tag = p->req.tag;
-                    e.frame0 = emitted_frame(*p) + 1;
-                }
                 event(e);
             }
-            if (knobs.texture != k0.texture || knobs.percussion != k0.percussion || knobs.semantic != k0.semantic)
-                knobs_pending = true;
-            break;
-        }
-        case Command::Kind::Interrupt: {
-            // Stage 1, now: the latent offset (at most +1 over the knob, 0.5 s
-            // ramp) on what is not handed out yet.
-            Song* s = playing();
-            if (!s || s->start < 0 || c.amount == 0) break;
-            int_at = c.at;
-            int_amount = c.amount;
-            const float target = std::clamp(knobs.energy + c.amount, -2.0f, 1.0f);
-            const int f0 = emitted_frame(*s) + 1;
-            set_offset(*s, f0, target, kHalo);
-            int_audible1 = s->start + static_cast<std::int64_t>(f0) * R;
-            int_audible2 = -1;
-            int_ev_song = s->index;
-            int_frame = f0;
-            int_stage2_pending = true;
             break;
         }
         case Command::Kind::Skip:
@@ -306,14 +271,19 @@ int Yue2Stream::Impl::emitted_frame(const Song& s) const {
 std::int64_t Yue2Stream::Impl::decode_target(const Song& s) const {
     if (!opt.paced) return INT32_MAX;
     const std::int64_t lead = static_cast<std::int64_t>(opt.decode_lead_seconds * 48000.0);
-    // Not on air: built ahead, the whole song waits as audio; until its
-    // latents are complete, the opening (a skip, the crossfade).
-    if (!on_air(s)) {
-        if (s.complete()) return s.frames();
-        if (s.start < 0) return lead / R + 1;
-    }
+    // Latents complete: nothing changes a song once it exists, so the whole
+    // of it is decoded (built ahead, it waits as audio; on air, the decoder
+    // is done with it until the next song). Until then a song not placed
+    // decodes its opening (a skip, the crossfade), one on air a lead ahead.
+    if (s.complete()) return s.frames();
+    if (!on_air(s) && s.start < 0) return lead / R + 1;
+    // Up to the lead past the playhead, rounded up to a whole block: decoded
+    // a block at a time, each tile carries kHalo frames either side, so
+    // following the playhead a frame at a time cost the VAE ~25 frames per
+    // frame of audio (the GPU held at half load while a song played).
     const std::int64_t at = std::max(playhead.load(), emitted) + lead - s.start;
-    return at <= 0 ? lead / R + 1 : at / R + 1;
+    const std::int64_t f = at <= 0 ? lead / R + 1 : at / R + 1;
+    return (f + kDecodeBlock - 1) / kDecodeBlock * kDecodeBlock;
 }
 
 // Place each song after its predecessor once that one's length is known:
@@ -438,6 +408,14 @@ void Yue2Stream::Impl::emit() {
 }
 
 void Yue2Stream::Impl::work(const char* what, const yue2::Song* s) {
+    const auto now = StreamClock::now();
+    if (doing_since.time_since_epoch().count() != 0) {
+        const double d = std::chrono::duration<double>(now - doing_since).count();
+        auto it = std::find_if(work_s.begin(), work_s.end(), [&](const auto& w) { return std::strcmp(w.first, doing) == 0; });
+        if (it == work_s.end()) work_s.emplace_back(doing, d);
+        else it->second += d;
+    }
+    doing_since = now;
     doing = what;
     doing_song = s ? s->index : -1;
 }
@@ -473,36 +451,6 @@ void Yue2Stream::Impl::service() {
         if (s && nx && nx != busy && s->start >= 0 && nx->built()) do_skip();
     }
     emit();
-    // Interrupt stages become audible as the player passes their samples:
-    // request -> the moment the reported playhead reached the sample
-    // (extrapolated back from the latest report, not when this noticed).
-    const std::int64_t ph = opt.paced ? playhead.load() : emitted;
-    auto heard = [&](std::int64_t sample) {
-        if (!opt.paced) return since(int_at);
-        const StreamClock::time_point at{StreamClock::duration{playhead_at.load()}};
-        const double t = std::chrono::duration<double>(at - int_at).count() - double(ph - sample) / 48000.0;
-        return std::max(0.0, t);
-    };
-    if (int_audible1 >= 0 && ph >= int_audible1) {
-        int1_s = heard(int_audible1);
-        Yue2StreamEvent e{Yue2StreamEvent::Kind::Interrupt};
-        e.value = 1;
-        e.song = int_ev_song;
-        e.sample = int_audible1;
-        e.seconds = int1_s;
-        event(e);
-        int_audible1 = -1;
-    }
-    if (int_audible2 >= 0 && ph >= int_audible2) {
-        int2_s = heard(int_audible2);
-        Yue2StreamEvent e{Yue2StreamEvent::Kind::Interrupt};
-        e.value = 2;
-        e.song = int_ev_song;
-        e.sample = int_audible2;
-        e.seconds = int2_s;
-        event(e);
-        int_audible2 = -1;
-    }
     // An urgent decode: the playing song's audio about to run out.
     if (Song* s = playing(); s && s->start >= 0 && opt.paced) {
         const std::int64_t need = emit_target() + 24000 - s->start;
@@ -524,7 +472,7 @@ CancelCheck Yue2Stream::Impl::servicing() {
 CancelCheck Yue2Stream::Impl::preemptible(bool whole) {
     return [this, whole]() {
         service();
-        return stopping.load() || int_stage2_pending || knobs_pending || (whole && skip_pending) ||
+        return stopping.load() || (whole && skip_pending) ||
                (busy && busy->dropped) || !full_pending.empty();
     };
 }
@@ -627,39 +575,6 @@ Song* Yue2Stream::Impl::to_build() {
         if (&s != p && !s.built()) return &s;
     }
     return nullptr;
-}
-
-void Yue2Stream::Impl::retune(Song& s, bool air, bool* changed) {
-    if (s.dropped || s.failed || steer_current(s)) return;
-    if (!air && s.complete()) return;   // built ahead: when it plays
-    const bool nar = s.nar21 != knobs.texture || s.nar9 != knobs.percussion;
-    const bool ar = s.ar != knobs.semantic;
-    int from = air ? INT32_MAX : 0;
-    if (nar) {
-        set_nar_steer(s, knobs.texture, knobs.percussion);
-        const int f = air ? emitted_frame(s) + static_cast<int>(opt.knob_latency_seconds * 25) : 0;
-        resolve_from(s, f);
-        from = std::min(from, std::min(f, s.lat_valid));
-    }
-    if (ar) {
-        const double lat = int_latency_est > 0 ? int_latency_est : opt.interrupt_latency_seconds;
-        const int c = air ? emitted_frame(s) + static_cast<int>(std::ceil(lat * 25)) : 0;
-        const int cut = continue_from(s, c, knobs.semantic);
-        if (cut >= 0) from = std::min(from, cut);
-    }
-    if (changed) *changed = true;
-    Yue2StreamEvent e{Yue2StreamEvent::Kind::Knobs};
-    e.song = s.index;
-    e.tag = s.req.tag;
-    e.text = std::string(nar ? "texture/percussion" : "") + (nar && ar ? "/" : "") + (ar ? "semantic" : "");
-    e.sample = emitted;
-    e.frame0 = from == INT32_MAX ? -1 : from;
-    event(e);
-}
-
-void Yue2Stream::Impl::energy_before_air(Song& s) {
-    if (s.dropped || s.failed || on_air(s) || !s.complete() || s.off_tail == knobs.energy) return;
-    set_offset(s, 0, knobs.energy, 0);
 }
 
 std::shared_ptr<const Yue2StreamTake> Yue2Stream::Impl::make_take(const Song& s, int frames) const {
@@ -773,9 +688,7 @@ void Yue2Stream::Impl::do_skip() {
         }
         return;
     }
-    // A built song takes the energy knob from its first sample; then wait
-    // until its opening is decoded (a built song's already is), and cut over.
-    energy_before_air(*nx);
+    // Wait until its opening is decoded (a built song's already is), and cut over.
     const std::int64_t x = static_cast<std::int64_t>(opt.skip_fade_seconds * 48000);
     if (static_cast<std::int64_t>(nx->dec_frame) * R < x + 48000 && !nx->built()) {
         decode_tile(*nx, 50);   // its opening as soon as its latents exist
@@ -841,58 +754,7 @@ bool Yue2Stream::Impl::step() {
         }
         return true;
     }
-    if (knobs_pending) {
-        // Texture / percussion: re-solve a song on air from a little past the
-        // emitted audio; the semantic steers: continue it from there. Songs
-        // not built yet are rebuilt under the new knobs; songs built ahead
-        // keep theirs until they play (below).
-        knobs_pending = false;
-        work("retune (knobs)", nullptr);
-        for (auto& sp : songs) retune(*sp, on_air(*sp));
-        place_next();
-        return true;
-    }
-    // A song built ahead under other knobs, now on air, catches up.
-    for (auto& sp : songs) {
-        Song& s = *sp;
-        if (!s.dropped && !s.failed && on_air(s) && !steer_current(s)) {
-            work("retune (on air)", &s);
-            retune(s, true);
-            place_next();
-            return true;
-        }
-    }
-    // A song built ahead about to play takes the energy knob from its start.
     const std::int64_t lead = static_cast<std::int64_t>(opt.decode_lead_seconds * 48000.0);
-    work("energy before air", nullptr);
-    for (auto& sp : songs)
-        if (sp->start >= 0 && sp->start - emitted <= lead) energy_before_air(*sp);
-    if (int_stage2_pending) {
-        // Stage 2: an arrangement-steered continuation from where the audio
-        // handed out ended at the request + the stage's latency (request ->
-        // landed), so the cut is handed out about when its window lands; at
-        // least a second past the frontier now (a long op may have run since).
-        int_stage2_pending = false;
-        work("interrupt stage 2", nullptr);
-        Song* s = playing();
-        if (s && s->planned && s->start >= 0 && s->index == int_ev_song) {
-            const double lat = int_latency_est > 0 ? int_latency_est : opt.interrupt_latency_seconds;
-            const int c = std::max(int_frame + static_cast<int>(std::ceil(lat * 25)), emitted_frame(*s) + 25);
-            const Song* nx = next_song(s);
-            const bool room = s->frames() < 0 || c + opt.windows.front() < s->frames();
-            const Yue2SemanticAxis* ax = opt.directions.axis("arrangement");
-            if (ax && room && !(nx && on_air(*nx))) {
-                // The arrangement carries (a knob): songs not built yet take
-                // it from their start, songs built ahead when they play.
-                knobs.set("arrangement", std::clamp(knobs.get("arrangement") + int_amount, ax->min, ax->max));
-                continue_from(*s, c, knobs.semantic);
-                int_song = s->index;
-                int_cut = c;
-                knobs_pending = true;
-            }
-        }
-        return true;
-    }
     if (!plan_edits.empty()) {
         // An edited score: rebuild that song from the plan on (not on air).
         const auto [idx, abc] = plan_edits.front();
@@ -1027,10 +889,9 @@ void Yue2Stream::Impl::publish() {
     st.emitted = emitted;
     st.knobs = knobs;
     st.first_audio_seconds = first_audio_s;
-    st.interrupt1_seconds = int1_s;
-    st.interrupt2_seconds = int2_s;
     st.gaps.assign(gaps.begin(), gaps.end());
     st.worst_gap_seconds = worst_gap;
+    for (const auto& w : work_s) st.work.push_back({w.first, w.second});
     const Song* p = playing();
     const std::int64_t opening = static_cast<std::int64_t>(opt.skip_fade_seconds * 48000) + 48000;
     for (auto& sp : songs) {
