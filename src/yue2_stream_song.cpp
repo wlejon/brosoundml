@@ -344,7 +344,7 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     }
 }
 
-bool Yue2Stream::Impl::decode_tile(Song& s, int max_frames) {
+bool Yue2Stream::Impl::decode_tile(Song& s, int max_frames, bool whole) {
     if (s.failed || !s.planned) return false;
     const int D = Yue2::kLatentDim;
     const int T = s.frames();
@@ -354,7 +354,7 @@ bool Yue2Stream::Impl::decode_tile(Song& s, int max_frames) {
     if (s.cut >= 0) limit = std::min<int>(limit, static_cast<int>((s.cut + R - 1) / R));
     const int f = s.dec_frame;
     const int e = static_cast<int>(std::min<std::int64_t>({static_cast<std::int64_t>(f) + max_frames, limit,
-                                                           decode_target(s)}));
+                                                           whole ? INT32_MAX : decode_target(s)}));
     if (e <= f) return false;
     const int l0 = std::max(0, f - kHalo), h0 = std::min(top, e + kHalo);
     // Effective latents: z + offset * the energy direction.

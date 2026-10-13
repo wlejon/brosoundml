@@ -15,7 +15,10 @@
 //      flux at the join against the flux around it, the research's switch
 //      measure, and the click ratio), and the song plays on past 30 s;
 //   4. skip() during the full song cuts over to the next built preview in
-//      well under a quarter second.
+//      well under a quarter second;
+//   5. save_song(): song 0 saved after it played (its 30 s, as it played),
+//      the full song saved at the press and written once the skip has
+//      played it out (past its preview), an unknown song refused.
 // Numbers are reported and asserted; nothing judges the audio by ear.
 
 #include "test_yue2_stream_common.h"
@@ -116,6 +119,9 @@ void section_previews(Env& E) {
     std::int64_t press_play = 0, past_preview_play = 0;
     int full_song = -1, skip_to = -1, stage = 0, best_ahead = 0;
     std::int64_t full_start = -1;
+    const fs::path tmp = fs::temp_directory_path();
+    const fs::path wav0 = tmp / "yue2_stream_save0.wav", wavf = tmp / "yue2_stream_savefull.wav";
+    bool saved0 = false;
     const double t0 = now_s(), t_end = t0 + 400;
     while (now_s() < t_end && stage < 5) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -148,6 +154,12 @@ void section_previews(Env& E) {
                         s.ahead, pool_at, play / double(kSr), s.host_bytes / 1e6);
         }
         if (stage == 0) stage = 1;
+        // 5. Song 0 has played: its audio is held for a save.
+        if (!saved0 && cap.find(Kind::SongEnd, 0)) {
+            saved0 = true;
+            st.save_song(0, wav0.string());
+            st.save_song(999, (tmp / "yue2_stream_save999.wav").string());
+        }
         // 3. 15 s into the third song (two played out as previews).
         if (stage == 1 && air && air->index == 2 && air->start >= 0 && play >= air->start + 15 * kSr) {
             full_song = 2;
@@ -155,6 +167,7 @@ void section_previews(Env& E) {
             press_wall = tn;
             press_play = play;
             st.make_full(-1);
+            st.save_song(full_song, wavf.string());
             stage = 2;
         }
         if (stage == 2) {
@@ -179,7 +192,8 @@ void section_previews(Env& E) {
         if (stage == 4) {
             std::lock_guard<std::mutex> lk(cap.mu);
             const auto* ss = cap.find_last(Kind::SongStart, skip_to);
-            if (ss && ss->at >= skip_wall && play >= ss->e.sample + 2 * kSr) stage = 5;
+            if (ss && ss->at >= skip_wall && play >= ss->e.sample + 2 * kSr && cap.find(Kind::Saved, full_song))
+                stage = 5;
         }
     }
     st.stop();
@@ -278,6 +292,26 @@ void section_previews(Env& E) {
         std::printf("  skip during the full song -> preview %d: cut over %.3f s\n", skip_to, cut);
         CHECK(cut >= 0 && cut < 0.25, "previews: skip to a built preview took %.3f s", cut);
     }
+    // 5. Saves: the file holds exactly the frames the event reports.
+    auto saved = [&](int song, const fs::path& p, const char* what) {
+        const auto* e = cap.find(Kind::Saved, song);
+        CHECK(e && e->e.value >= 0 && e->e.text == p.string(), "previews: %s not saved (%s)", what,
+              e ? e->e.text.c_str() : "no Saved event");
+        if (!e || e->e.value < 0) return 0.0;
+        const auto bytes = fs::exists(p) ? fs::file_size(p) : 0;
+        CHECK(bytes == 44 + static_cast<std::uintmax_t>(e->e.frames) * 4, "previews: %s: %llu bytes for %d frames", what,
+              static_cast<unsigned long long>(bytes), e->e.frames);
+        fs::remove(p);
+        return e->e.frames / double(kSr);
+    };
+    const double len0 = saved(0, wav0, "song 0 (played)");
+    const double lenf = saved(full_song, wavf, "the full song (saved at the press, cut by the skip)");
+    const auto* none = cap.find(Kind::Saved, 999);
+    std::printf("  saved: song 0 %.2f s, the full song %.2f s; an unknown song: %s\n", len0, lenf,
+                none ? none->e.text.c_str() : "no event");
+    CHECK(len0 > kPreview - 1 && len0 < kPreview + 1, "previews: song 0 saved %.2f s", len0);
+    CHECK(lenf > kPreview + 5, "previews: the full song saved %.2f s, not past its preview", lenf);
+    CHECK(none && none->e.value < 0, "previews: a save of an unknown song was not refused");
     std::printf("  underrun %.2f s; peak device memory %.2f GB\n", underrun, peak);
     CHECK(underrun < 0.5, "previews: %.2f s of underrun", underrun);
 }

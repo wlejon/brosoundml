@@ -132,6 +132,12 @@ void Yue2Stream::make_full(int song) {
     c.index = song;
     push(*impl_, std::move(c));
 }
+void Yue2Stream::save_song(int song, const std::string& path) {
+    Command c{Command::Kind::Save};
+    c.index = song;
+    c.abc = path;
+    push(*impl_, std::move(c));
+}
 void Yue2Stream::set_auto_full(bool on) {
     Command c{Command::Kind::AutoFull};
     c.amount = on ? 1.0f : 0.0f;
@@ -268,6 +274,9 @@ void Yue2Stream::Impl::apply(Command& c) {
             break;
         case Command::Kind::AutoFull:
             opt.auto_full = c.amount != 0;
+            break;
+        case Command::Kind::Save:
+            save_pending.emplace_back(c.index, c.abc);
             break;
         case Command::Kind::Stop:
             stopping.store(true);
@@ -413,6 +422,15 @@ void Yue2Stream::Impl::emit() {
             e.tag = s.req.tag;
             e.sample = end;
             event(e);
+            // Its audio stays a while, for save_song().
+            if (opt.keep_played > 0) {
+                const std::size_t n = std::min<std::size_t>(s.L.size(), static_cast<std::size_t>(std::max<std::int64_t>(0, end - s.start)));
+                Played p{s.index, s.req.tag, std::move(s.L), std::move(s.R)};
+                p.L.resize(n);
+                p.R.resize(n);
+                played.push_back(std::move(p));
+                while (static_cast<int>(played.size()) > opt.keep_played) played.pop_front();
+            }
         }
         songs.pop_front();
     }
@@ -620,6 +638,78 @@ void Yue2Stream::Impl::energy_before_air(Song& s) {
     set_offset(s, 0, knobs.energy, 0);
 }
 
+void Yue2Stream::Impl::save_song(int index, const std::string& path) {
+    Yue2StreamEvent e{Yue2StreamEvent::Kind::Saved};
+    e.song = index;
+    e.value = -1;
+    const std::vector<float>* L = nullptr;
+    const std::vector<float>* Rc = nullptr;
+    std::size_t n = 0;
+    bool whole = false;
+    for (auto& sp : songs) {
+        const Song& s = *sp;
+        if (s.index != index || s.dropped || s.failed) continue;
+        e.tag = s.req.tag;
+        // What is decoded under the current latents, to its length once known.
+        n = std::min<std::size_t>(s.L.size(), static_cast<std::size_t>(s.dec_frame) * R);
+        if (s.length() >= 0) n = std::min<std::size_t>(n, static_cast<std::size_t>(s.length()));
+        whole = s.limit < 0 && s.built();
+        L = &s.L;
+        Rc = &s.R;
+    }
+    for (const auto& p : played)
+        if (p.index == index) {
+            e.tag = p.tag;
+            n = p.L.size();
+            whole = true;   // as it played (a preview ends at its preview)
+            L = &p.L;
+            Rc = &p.R;
+        }
+    if (!L) {
+        e.text = "song " + std::to_string(index) + " is not held (played too long ago, dropped, or unknown)";
+    } else if (n == 0) {
+        e.text = "song " + std::to_string(index) + " has no audio yet";
+    } else {
+        StereoAudio a;
+        a.frames = static_cast<int>(n);
+        a.samples.resize(2 * n);
+        std::copy_n(L->begin(), n, a.samples.begin());
+        std::copy_n(Rc->begin(), n, a.samples.begin() + static_cast<std::ptrdiff_t>(n));
+        try {
+            a.write_wav(path);
+            e.text = path;
+            e.frames = a.frames;
+            e.seconds = double(n) / 48000.0;
+            e.value = whole ? 1 : 0;
+        } catch (const std::exception& ex) {
+            e.text = ex.what();
+        }
+    }
+    event(e);
+}
+
+bool Yue2Stream::Impl::step_saves() {
+    for (auto it = save_pending.begin(); it != save_pending.end(); ++it) {
+        const int index = it->first;
+        Song* s = nullptr;
+        for (auto& sp : songs)
+            if (sp->index == index) s = sp.get();
+        if (s && !s->dropped && !s->failed) {
+            if (!s->complete()) continue;   // still building: its build completes it
+            if (s->dec_frame < s->frames()) {
+                if (decode_tile(*s, 100, true)) return true;
+                continue;                   // cut by a skip: written once it has played
+            }
+        }
+        // Complete and decoded, played (its audio held), or gone: write what there is.
+        const std::string path = it->second;
+        save_pending.erase(it);
+        save_song(index, path);
+        return true;
+    }
+    return false;
+}
+
 void Yue2Stream::Impl::do_skip() {
     Song* s = playing();
     if (!s) {
@@ -684,10 +774,13 @@ bool Yue2Stream::Impl::step() {
     if (!full_pending.empty()) {
         const int idx = full_pending.front();
         full_pending.erase(full_pending.begin());
-        Song* p = playing();
-        Song* t = idx < 0 ? p : nullptr;
-        for (auto& sp : songs)
-            if (idx >= 0 && sp->index == idx && !sp->dropped) t = sp.get();
+        // -1 = the song heard now: the newest on air, so during a crossfade the
+        // one coming in, not the one going out (playing() until it ends).
+        Song* t = idx < 0 ? playing() : nullptr;
+        for (auto& sp : songs) {
+            if (sp->dropped || sp->failed) continue;
+            if (idx >= 0 ? sp->index == idx : on_air(*sp)) t = sp.get();
+        }
         if (t && t->limit >= 0) {
             Yue2StreamEvent e{Yue2StreamEvent::Kind::Full};
             e.song = t->index;
@@ -802,6 +895,8 @@ bool Yue2Stream::Impl::step() {
     if (urgent && (urgent == p || best <= emitted + lead)) {
         if (decode_tile(*urgent, 50)) return true;
     }
+    // A save whose song is whole: decode the rest of it, then write it.
+    if (step_saves()) return true;
     // Then build: the playing song, then (the next first while a skip waits
     // for it) the first song after it, within ahead_songs, not built yet.
     // One song at a time, so device memory holds one build beside the

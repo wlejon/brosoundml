@@ -159,6 +159,8 @@ struct Yue2StreamOptions {
     // (so a skip has somewhere to go), then the rest of it. 0 = the playing
     // song always first.
     double air_margin_seconds = 20.0;
+    // Played songs whose audio is kept for save_song() (0..16).
+    int keep_played = 3;
     Yue2Knobs knobs;                      // initial
     Yue2Directions directions = Yue2Directions::builtin();
     // Oracle / test seams (run()'s thread): each landed window's core
@@ -191,6 +193,9 @@ struct Yue2StreamEvent {
         Dropped,       // a queued song was removed (drop()); songs after it are placed again
         Full,          // make_full(): value 1 = the preview continues into the whole song, re-solved from
                        // frame0 (the join); 0 = too late (its successor is on air) or its song had ended
+        Saved,         // save_song(): text = the path written, frames = the samples (48 kHz), value 1 = the
+                       // whole song (a played one: as it played), 0 = a preview; -1 = nothing written,
+                       // text = why
     };
     Kind kind = Kind::Idle;
     int song = -1;                 // song index (queue order from 0)
@@ -256,13 +261,20 @@ public:
     // Remove a queued song that is not on air (built or not); the songs after
     // it move up. A Dropped event follows; an on-air or unknown index is ignored.
     void drop(int song);
-    // A preview continues into the whole song (song -1 = the playing one):
+    // A preview continues into the whole song (song -1 = the one heard now:
+    // the newest on air, so during a crossfade the one coming in):
     // its semantic stage resumes after the preview's tokens, and its last
     // two seconds not yet handed out are re-solved with the continuation as
     // their lookahead, joined inpainted like a window edge. A Full event
     // follows. It builds before anything else when that song is on air.
     void make_full(int song = -1);
     void set_auto_full(bool on);
+    // Write a song's own audio (no crossfade into its neighbours) to `path` as
+    // a 16-bit stereo 48 kHz WAV, once it is whole: a song still building is
+    // written when its latents are complete (the rest decoded for it; a
+    // preview is its preview), one that plays out first as it played. The
+    // last `keep_played` played songs can be saved too. A Saved event follows.
+    void save_song(int song, const std::string& path);
     void stop();                                    // run() returns soon after
 
     // The worker: blocks until stop(), or (unpaced, radio off) until the

@@ -91,12 +91,12 @@ struct Song {
 
 // Commands from the control side (any thread), applied by the worker.
 struct Command {
-    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Drop, Full, AutoFull, Stop } kind;
+    enum class Kind { Enqueue, Knobs, Interrupt, Skip, NextPlan, Drop, Full, AutoFull, Save, Stop } kind;
     Yue2Song song;
     int index = -1;                    // NextPlan (-1 = the next song) / Drop / Full (-1 = the playing one): the song
     Yue2Knobs knobs;
     float amount = 0;
-    std::string abc;
+    std::string abc;                   // NextPlan: the score; Save: the path
     StreamClock::time_point at = StreamClock::now();
 };
 
@@ -122,6 +122,12 @@ struct Yue2Stream::Impl {
 
     // worker side
     std::deque<std::unique_ptr<yue2::Song>> songs;   // playing first; finished ones popped
+    struct Played {                    // a finished song's audio, for save_song()
+        int index = -1;
+        std::string tag;
+        std::vector<float> L, R;
+    };
+    std::deque<Played> played;         // the last keep_played, oldest first
     int next_index = 0;
     Yue2Knobs knobs;
     std::int64_t emitted = 0;          // program samples handed out
@@ -136,6 +142,7 @@ struct Yue2Stream::Impl {
     bool knobs_pending = false;        // texture / percussion / semantic moved: step() retunes the songs
     std::vector<std::pair<int, std::string>> plan_edits;   // set_plan / set_next_plan (-1 = the next song), pending
     std::vector<int> full_pending;     // make_full (-1 = the playing song), pending
+    std::vector<std::pair<int, std::string>> save_pending;   // save_song: (song, path) until it is whole
     // wants (ahead_songs)
     int want_announced = 0;            // the last Want's value (0 = none outstanding)
     yue2::StreamClock::time_point want_since{};            // when the pool first fell short
@@ -182,6 +189,10 @@ struct Yue2Stream::Impl {
     // on air whose latents are complete is left for when it plays.
     void retune(yue2::Song& s, bool on_air_now, bool* changed = nullptr);
     void energy_before_air(yue2::Song& s);     // a built song about to play: its offset from frame 0
+    // Write a song's audio as held now (a Saved event); step_saves() calls it
+    // once a pending save's song is complete and decoded, or has played.
+    void save_song(int index, const std::string& path);
+    bool step_saves();                 // one unit of a pending save's work; false = none
     bool steer_current(const yue2::Song& s) const;
 
     // ── yue2_stream_song.cpp ──
@@ -197,7 +208,8 @@ struct Yue2Stream::Impl {
     static constexpr double kWholeWaitSeconds = 45.0;   // wait for all the tokens when this far ahead
     double nar_spfs = 1.2e-4;          // NAR seconds per frame per ODE step (measured, the latest window)
     void solve_window(yue2::Song& s, int a, int b);
-    bool decode_tile(yue2::Song& s, int max_frames);
+    // `whole`: past the paced decode lead (a save decodes the whole song).
+    bool decode_tile(yue2::Song& s, int max_frames, bool whole = false);
     void set_ar_steer(yue2::Song& s, const std::map<std::string, float>& scales);
     void set_nar_steer(yue2::Song& s, float t21, float p9);
     void set_offset(yue2::Song& s, int f0, float value, int ramp);

@@ -7,7 +7,7 @@
 // through a mutex-guarded queue, which each tick's poll drains. The data is
 // paced by the player (emitLeadSeconds ahead), so it stays small.
 // Controls (enqueue, setPlayhead, setKnobs, interrupt, skip, setNextPlan,
-// setPlan, drop, makeFull, setAutoFull, stop) are Yue2Stream's own thread-safe calls, so they never block on the
+// setPlan, drop, makeFull, setAutoFull, saveSong, stop) are Yue2Stream's own thread-safe calls, so they never block on the
 // model. While the stream runs, the job roots the stream object, so a
 // stream nobody references keeps playing until stop().
 #include "soundml_music_internal.h"
@@ -83,6 +83,7 @@ const char* kindName(brosoundml::Yue2StreamEvent::Kind k) {
         case K::Built: return "built";
         case K::Dropped: return "dropped";
         case K::Full: return "full";
+        case K::Saved: return "saved";
     }
     return "idle";
 }
@@ -182,6 +183,11 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
     }
     getBoolOpt(r.get(), "autoFull", o.auto_full);
     readSeconds(r.get(), "airMarginSeconds", o.air_margin_seconds);
+    getIntOpt(r.get(), "keepPlayed", o.keep_played);
+    if (o.keep_played < 0 || o.keep_played > 16) {
+        err = "keepPlayed must be 0..16";
+        return false;
+    }
     ev::Persistent k(ev::getProperty(r.get(), "knobs"));
     readKnobs(k.get(), o.knobs);
     o.knobs = brosoundml::Yue2Knobs::clamp(o.knobs);
@@ -352,6 +358,16 @@ void decorateStream(ObjectBuilder& b) {
         const int song = hasArg(a, 0) ? static_cast<int>(numAt(a, 0, -1)) : -1;
         return streamControl(self, "makeFull", [&](StreamJob& j) -> Value {
             j.stream->make_full(song);
+            return ev::undefined();
+        });
+    });
+    b.def("saveSong", 2, [](Value self, std::span<const Value> a) -> Value {
+        if (!hasArg(a, 0) || !isStringArg(a, 1))
+            return ev::throwTypeError("saveSong(song, path): a song index and a file path required");
+        const int song = static_cast<int>(numAt(a, 0, -1));
+        const std::string path = strAt(a, 1);
+        return streamControl(self, "saveSong", [&](StreamJob& j) -> Value {
+            j.stream->save_song(song, path);
             return ev::undefined();
         });
     });
