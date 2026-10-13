@@ -66,6 +66,8 @@ void readSampling(Value obj, brosoundml::Yue2Sampling& s) {
     getIntOpt(o.get(), "penaltyWindow", s.penalty_window);
     getIntOpt(o.get(), "minTokens", s.min_tokens);
     getIntOpt(o.get(), "maxTokens", s.max_tokens);
+    getIntOpt(o.get(), "endBiasAfter", s.end_bias_after);
+    getFloatOpt(o.get(), "endBiasPerToken", s.end_bias_per_token);
 }
 
 std::vector<int> readIntList(Value v) {
