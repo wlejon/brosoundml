@@ -32,7 +32,7 @@ brosoundml_add_test(brosoundml_test_rave     test_rave.cpp)
 brosoundml_add_test(brosoundml_test_yue2_vae test_yue2_vae.cpp)
 target_compile_definitions(brosoundml_test_yue2_vae PRIVATE
     BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")
-foreach(t yue2_protocol yue2_model yue2_e2e yue2_quant yue2_spec yue2_stream yue2_stream_preview yue2_stream_continue)
+foreach(t yue2_protocol yue2_model yue2_e2e yue2_quant yue2_spec yue2_stream yue2_stream_preview yue2_stream_continue yue2_edit)
     brosoundml_add_test(brosoundml_test_${t} test_${t}.cpp)
     target_compile_definitions(brosoundml_test_${t} PRIVATE
         BROSOUNDML_REPO_DIR="${CMAKE_SOURCE_DIR}")

@@ -38,6 +38,14 @@ Value makeStereo(const brosoundml::StereoAudio& a);
 // { abc, abcIds (Int32Array), prefix (Int32Array), truncated }
 Value makePlan(const brosoundml::Yue2Plan& plan);
 
+// { abc, abcIds, prefix, truncated } -> Yue2Plan; false + err on a shape error.
+bool readPlan(Value v, brosoundml::Yue2Plan& plan, std::string& err);
+
+// model.splice(plan, opts) / model.inpaint(plan, semantic, latents, a, b, opts)
+// -> AsyncHandle (native_soundml_music_edit.cpp)
+Value yue2Splice(Value self, std::span<const Value> a);
+Value yue2Inpaint(Value self, std::span<const Value> a);
+
 // model.stream(opts) -> YuE2Stream (native_soundml_music_stream.cpp)
 Value yue2Stream(Value self, std::span<const Value> a);
 void installStreamClass();

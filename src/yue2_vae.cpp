@@ -16,6 +16,7 @@
 #include "brosoundml/yue2_vae.h"
 
 #include "brotensor/json.h"
+#include "u8path.h"
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -580,7 +581,7 @@ bt::Device Yue2Vae::device() const { return impl_ ? impl_->dev : bt::Device::CPU
 // ─── StereoAudio ─────────────────────────────────────────────────────────────
 
 void StereoAudio::write_wav(const std::string& path) const {
-    std::ofstream out(path, std::ios::binary);
+    std::ofstream out(u8path(path), std::ios::binary);
     if (!out) fail("write_wav: cannot open '" + path + "'");
     auto u32 = [&](std::uint32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
     auto u16 = [&](std::uint16_t v) { out.write(reinterpret_cast<const char*>(&v), 2); };

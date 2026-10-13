@@ -29,15 +29,15 @@ const std::vector<std::string>& specials() {
     return s;
 }
 
+}  // namespace
+
+namespace yue2 {
+
 void check_plan(const Core& I, const Yue2Params& p, const Yue2Plan& plan) {
     const Encode enc = [&](const std::string& s) { return I.encode(s); };
     const auto expect = p.cot == Yue2Cot::Off ? token_prefix(p, enc, nullptr) : token_prefix(p, enc, &plan.abc_ids);
     if (expect != plan.prefix) fail("plan prefix disagrees with the request / exact ABC ids");
 }
-
-}  // namespace
-
-namespace yue2 {
 
 PlanOut plan_impl(const Core& I, const Yue2Params& p, const Yue2Callbacks& cb,
                   const CancelCheck& cancel, const UniformFn& uniform) {

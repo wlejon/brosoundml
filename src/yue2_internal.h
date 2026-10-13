@@ -124,6 +124,9 @@ struct PlanOut {
 PlanOut plan_impl(const Core& I, const Yue2Params& p, const Yue2Callbacks& cb, const CancelCheck& cancel,
                   const UniformFn& uniform);
 
+// Throws unless plan.prefix is the one p's request and the plan's ABC make.
+void check_plan(const Core& I, const Yue2Params& p, const Yue2Plan& plan);
+
 // Valid UTF-8 with each invalid sequence replaced by U+FFFD (Python's
 // errors="replace").
 std::string utf8_replace(const std::string& s);

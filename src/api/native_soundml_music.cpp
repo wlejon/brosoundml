@@ -12,6 +12,7 @@
 #include "soundml_music_internal.h"
 
 #include <brosoundml/yue2.h>
+#include <brosoundml/yue2_stream.h>
 #include <brosoundml/yue2_vae.h>
 
 #include <algorithm>
@@ -644,6 +645,8 @@ void decorateYue2(ObjectBuilder& b) {
     b.def("semantic", 2, yue2Semantic);
     b.def("synthesize", 3, yue2Synthesize);
     b.def("stream", 1, music::yue2Stream);
+    b.def("splice", 2, music::yue2Splice);
+    b.def("inpaint", 6, music::yue2Inpaint);
     b.def("tokenize", 1, [](Value self, std::span<const Value> a) -> Value {
         auto* w = yue2Of(self);
         if (!w || !w->model || !w->model->loaded()) return ev::throwError("tokenize: model is not loaded");
@@ -986,6 +989,11 @@ void installMusic(ObjectBuilder& bro) {
     // A stream's knob clamps with no model or stream: a fresh object each
     // read, the one a running stream's knobRanges gives.
     music.accessor("knobRanges", [](Value, std::span<const Value>) -> Value { return music::knobRanges(); });
+    // The energy knob's latent direction (64 floats): a stream decodes
+    // latents + energy[f] * direction, so a take's audio is that sum.
+    music.accessor("energyDirection", [](Value, std::span<const Value>) -> Value {
+        return makeFloat32Array(brosoundml::Yue2Directions::builtin_ref().latent);
+    });
     bro.set("music", music.get());
 }
 

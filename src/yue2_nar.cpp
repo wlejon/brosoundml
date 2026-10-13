@@ -226,12 +226,14 @@ std::vector<float> Model::nar_velocity(NarChunk& c, const std::vector<float>& x,
 
 std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, const CancelCheck& cancel,
                                     const std::function<void(int)>& on_step, const float* known,
-                                    int known_frames) const {
+                                    int known_frames, const float* known_right, int known_right_frames) const {
     const ModelWeights& w = *w_;
     bt::DeviceScope scope(w.dev);
     if (steps < 1) model_fail("ode_steps must be positive");
     const int F = c.frames, D = w.cfg.latent;
     if (known_frames < 0 || known_frames > F || (known_frames > 0 && !known)) model_fail("bad inpainting span");
+    if (known_right_frames < 0 || known_frames + known_right_frames > F || (known_right_frames > 0 && !known_right))
+        model_fail("bad inpainting span");
     upload_rows(w, noise, F, c.xpad, 1);
     bt::Tensor S = rows_view(c.xpad, 1, F), M = rows_view(c.mpad, 1, F);
     // Inpainting (lab.nar's clamp): the known frames are replaced by the
@@ -239,22 +241,33 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
     // does them on the BF16 state: bf(bf(t * n) + bf((1 - t) * k)).
     const bool bf = w.dt != bt::Dtype::FP32;
     auto R = [&](float v) { return bf ? bf16r(v) : v; };
-    std::vector<float> kn, kk, kv;
-    if (known_frames > 0) {
-        const std::size_t n = static_cast<std::size_t>(known_frames) * D;
-        kn.resize(n);
-        kk.resize(n);
-        kv.resize(n);
+    struct Side {
+        int row0 = 0, frames = 0;
+        std::vector<float> kn, kk, kv;
+    };
+    Side sides[2];
+    auto prepare = [&](Side& s, const float* k, int frames, int row0) {
+        s.row0 = row0;
+        s.frames = frames;
+        const std::size_t n = static_cast<std::size_t>(frames) * D;
+        const float* nz = noise + static_cast<std::size_t>(row0) * D;
+        s.kn.resize(n);
+        s.kk.resize(n);
+        s.kv.resize(n);
         for (std::size_t i = 0; i < n; ++i) {
-            kn[i] = R(noise[i]);
-            kk[i] = R(known[i]);
+            s.kn[i] = R(nz[i]);
+            s.kk[i] = R(k[i]);
         }
-    }
+    };
+    if (known_frames > 0) prepare(sides[0], known, known_frames, 0);
+    if (known_right_frames > 0) prepare(sides[1], known_right, known_right_frames, F - known_right_frames);
     auto clamp = [&](bt::Tensor& pad, double t) {
-        if (known_frames == 0) return;
         const float tf = static_cast<float>(t), sf = static_cast<float>(1.0 - t);
-        for (std::size_t i = 0; i < kv.size(); ++i) kv[i] = R(R(tf * kn[i]) + R(sf * kk[i]));
-        upload_rows(w, kv.data(), known_frames, pad, 1);
+        for (Side& s : sides) {
+            if (s.frames == 0) continue;
+            for (std::size_t i = 0; i < s.kv.size(); ++i) s.kv[i] = R(R(tf * s.kn[i]) + R(sf * s.kk[i]));
+            upload_rows(w, s.kv.data(), s.frames, pad, 1 + s.row0);
+        }
     };
     const double dt = 1.0 / steps;
     for (int step = 0; step < steps; ++step) {
@@ -280,7 +293,8 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
     to_host_f32(w, S, out);
     for (float v : out)
         if (!std::isfinite(v)) model_fail("acoustic flow matching produced non-finite latents");
-    for (std::size_t i = 0; i < kk.size(); ++i) out[i] = kk[i];   // clamp(state, 0)
+    for (const Side& s : sides)   // clamp(state, 0)
+        std::copy(s.kk.begin(), s.kk.end(), out.begin() + static_cast<std::ptrdiff_t>(s.row0) * D);
     return out;
 }
 

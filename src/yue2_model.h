@@ -171,10 +171,13 @@ public:
     // known_frames frames: before every velocity evaluation at time t they are
     // set to the flow interpolant t * noise + (1 - t) * known (each op rounded
     // like the reference's BF16 state), and they come back as `known`.
+    // `known_right` (known_right_frames * 64) does the same for the last
+    // known_right_frames frames: a span re-solved between two kept sides.
     std::vector<float> nar_solve(NarChunk& c, const float* noise, int steps,
                                  const CancelCheck& cancel,
                                  const std::function<void(int)>& on_step,
-                                 const float* known = nullptr, int known_frames = 0) const;
+                                 const float* known = nullptr, int known_frames = 0,
+                                 const float* known_right = nullptr, int known_right_frames = 0) const;
 
 private:
     std::unique_ptr<ModelWeights> w_;

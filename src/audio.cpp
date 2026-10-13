@@ -1,5 +1,7 @@
 #include "brosoundml/audio.h"
 
+#include "u8path.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -69,7 +71,7 @@ void AudioBuffer::normalize(float target) {
 }
 
 void AudioBuffer::write_wav(const std::string& path) const {
-    std::ofstream f(path, std::ios::binary);
+    std::ofstream f(u8path(path), std::ios::binary);
     if (!f) {
         throw std::runtime_error("brosoundml: write_wav: cannot open '" + path + "'");
     }
@@ -106,7 +108,7 @@ void AudioBuffer::write_wav(const std::string& path) const {
 }
 
 AudioBuffer read_wav(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(u8path(path), std::ios::binary | std::ios::ate);
     if (!f) {
         throw std::runtime_error("brosoundml: read_wav: cannot open '" + path + "'");
     }

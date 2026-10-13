@@ -215,6 +215,41 @@ struct Yue2Result {
     bool                 cancelled = false;
 };
 
+// ── Editing a song (yue2_edit.cpp) ──────────────────────────────────────────
+// A song is its semantic tokens and its latents, both one per frame (25 fps),
+// so an edit is two steps: splice() makes the new tokens, inpaint() the new
+// latents for the frames that changed, every other frame's kept.
+//
+// splice: the song is A + M + B (+ C). A is kept (fed as the song's opening:
+// it is what the model has heard), M is sampled new for exactly
+// `middle_frames`, B is kept and must follow M, C is sampled on until the song
+// ends. Several Ms are drawn (seeds seed, seed + 1, ...) and each is scored by
+// how likely the model finds B's opening after it (B's first score_frames,
+// teacher-forced): the one B follows best is kept. Every editing move is one:
+//   regenerate a span     A = song[0, a), M = b - a frames, B = song[b, T)
+//   cut a span out        A = song[0, a), M = 0 (or a short bridge), B = song[b, T)
+//   extend / "like this"  A = a clip, M = 0, no B, continue: a song from it
+//   a clip in a new song  no A, M = where it goes, B = the clip, continue
+struct Yue2Splice {
+    std::vector<int32_t> before;       // A: codec ids (0..32767)
+    std::vector<int32_t> after;        // B: codec ids (may be empty)
+    int  middle_frames = 0;            // M's length (0 = A then B directly)
+    int  candidates = 4;               // Ms drawn (1 with no B to score them by, or M = 0)
+    int  score_frames = 125;           // B's frames scored (5 s)
+    bool continue_after = false;       // sample C after A + M + B until the song ends
+};
+
+struct Yue2SpliceResult {
+    std::vector<int32_t> semantic;     // A + M + B (+ C)
+    int middle0 = 0;                   // M = [middle0, after0)
+    int after0 = 0;                    // B = [after0, after0 + B), C after it
+    int chosen = 0;                    // the M kept
+    std::vector<float> scores;         // per M: mean NLL of B's scored frames (nats; lower = B follows better)
+    std::vector<std::vector<int32_t>> middles;   // every M drawn, by candidate
+    bool truncated = false;            // C hit the token budget without ending
+    bool cancelled = false;            // cancel() stopped it (semantic then holds nothing)
+};
+
 struct Yue2Callbacks {
     // Residual blocks requested by Yue2Params::capture. Yue2Hidden::data is
     // valid only during the call; copy what you keep.
@@ -270,6 +305,23 @@ public:
                                   const std::vector<int32_t>& semantic,
                                   const Yue2Callbacks& callbacks = {},
                                   const CancelCheck& cancel = {}) const;
+
+    // Editing (see Yue2Splice). splice() samples with the plan's semantic
+    // prefix and p's semantic sampling, CFG and steers; on_semantic reports
+    // every token it samples (all candidates), on_progress tokens done / the
+    // M + score budget (C counts on past it).
+    Yue2SpliceResult splice(const Yue2Params& params, const Yue2Plan& plan, const Yue2Splice& splice,
+                            const Yue2Callbacks& callbacks = {}, const CancelCheck& cancel = {}) const;
+    // Re-synthesize latent frames [a, b) of a song whose other frames are
+    // kept: `latents` holds all semantic.size() frames (frame-major * 64;
+    // those in [a, b) are ignored) and comes back with [a, b) solved. Each
+    // window is inpainted between the kept frames around it, with enough of
+    // them (up to 1000 frames a window) that a short span solves at the
+    // loudness a whole song does; a span over 975 frames is tiled. Noise is
+    // p.seed's. on_progress counts ODE steps; on_latents / on_done are not called.
+    std::vector<float> inpaint(const Yue2Params& params, const Yue2Plan& plan, const std::vector<int32_t>& semantic,
+                               std::vector<float> latents, int a, int b, const Yue2Callbacks& callbacks = {},
+                               const CancelCheck& cancel = {}) const;
 
     std::vector<int32_t> tokenize(const std::string& text) const;
     std::string detokenize(const std::vector<int32_t>& ids) const;
