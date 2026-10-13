@@ -253,6 +253,18 @@ Value makeStats(const brosoundml::Yue2StreamStats& s) {
     o.set("firstAudioSeconds", s.first_audio_seconds);
     o.set("interrupt1Seconds", s.interrupt1_seconds);
     o.set("interrupt2Seconds", s.interrupt2_seconds);
+    o.set("worstGapSeconds", s.worst_gap_seconds);
+    ev::Persistent gaps(hostArrayOf(s.gaps.size(), [&](size_t i) -> Value {
+        const auto& g = s.gaps[i];
+        ObjectBuilder go;
+        go.set("seconds", g.seconds);
+        go.set("what", g.what);
+        go.set("song", static_cast<double>(g.song));
+        go.set("emitted", static_cast<double>(g.emitted));
+        go.set("lead", g.lead);
+        return go.get();
+    }));
+    o.set("gaps", gaps.get());
     ev::Persistent songs(hostArrayOf(s.songs.size(), [&](size_t i) -> Value {
         const auto& g = s.songs[i];
         ObjectBuilder so;

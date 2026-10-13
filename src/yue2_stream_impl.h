@@ -135,6 +135,15 @@ struct Yue2Stream::Impl {
     Yue2Knobs knobs;
     std::int64_t emitted = 0;          // program samples handed out
     bool in_service = false;
+    // Service gaps (Yue2StreamStats::gaps): when service() last ended, what
+    // step() is doing (set per branch), and the gaps of 0.2 s or more.
+    yue2::StreamClock::time_point service_end{};
+    double service_end_lead = 0;
+    const char* doing = "idle";
+    int doing_song = -1;
+    std::deque<Yue2StreamStats::Gap> gaps;
+    double worst_gap = 0;
+    void work(const char* what, const yue2::Song* s);
     const yue2::Song* busy = nullptr;  // the song a long op is running on (never freed under it)
     Yue2Song last_req;                 // the radio's template
     bool have_last = false;

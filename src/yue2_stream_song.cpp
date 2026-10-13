@@ -317,10 +317,15 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     if (s.nar21 != 0 || s.nar9 != 0) o.hooks = &h;
     std::vector<float> out;
     {
+        work("window: prefill", &s);
         auto chunk = m.nar_chunk(ar, F, o);
+        work("window: step", &s);
         const bool whole = b - a > *std::max_element(opt.windows.begin(), opt.windows.end()) + 25;
-        out = m.nar_solve(*chunk, s.noise.data() + static_cast<std::size_t>(lo) * D, s.p.ode_steps, preemptible(whole),
-                          {}, a > lo ? s.lat.data() + static_cast<std::size_t>(lo) * D : nullptr, a - lo);
+        const int steps = s.p.ode_steps;
+        out = m.nar_solve(*chunk, s.noise.data() + static_cast<std::size_t>(lo) * D, steps, preemptible(whole),
+                          [&](int done) { if (done == steps) work("window: readback", &s); },
+                          a > lo ? s.lat.data() + static_cast<std::size_t>(lo) * D : nullptr, a - lo);
+        work("window: after", &s);
     }
     if (out.empty()) return;   // stopping, or preempted (re-solved later)
     // The conditions may have moved while it solved (a knob re-solve from

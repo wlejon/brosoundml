@@ -14,9 +14,11 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace brosoundml::yue2 {
 
@@ -60,7 +62,8 @@ float shifted_t(const ModelWeights& w, double raw) {
 
 void layers(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin, bool capture);
 
-void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
+// `drain` (may be null) waits for the device in place of a blocking sync.
+void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin, const std::function<void()>& drain = {}) {
     // Time embedding (TimestepEmbedder): FP32 sinusoid on the host, cast; the
     // MLP runs with the layers.
     {
@@ -93,6 +96,7 @@ void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin) {
             c.graph[slot].launch();
         } else {
             layers(w, c, xin, false);  // warm-up: sizes every buffer and computes this evaluation
+            if (drain) drain();
             bt::sync_all();
             bt::CudaGraphCapture cap;
             layers(w, c, xin, false);
@@ -234,6 +238,32 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
     if (known_frames < 0 || known_frames > F || (known_frames > 0 && !known)) model_fail("bad inpainting span");
     if (known_right_frames < 0 || known_frames + known_right_frames > F || (known_right_frames > 0 && !known_right))
         model_fail("bad inpainting span");
+    // Device work is queued and runs on for a while: the chunk's prefill
+    // before the first upload, each evaluation (a graph replay on CUDA)
+    // after it is queued, and a chunk's first evaluation per state buffer,
+    // which runs eagerly and syncs before its graph is captured. Each wait
+    // polls `cancel` until the device is done rather than block in the next
+    // upload, download or sync (a cancel during the warm-up is seen at the
+    // next check). It spins as a device sync does (a sleep rounds up to the
+    // OS timer tick, ~16 ms on Windows, as long as a whole evaluation), with
+    // `cancel` every 2 ms.
+    bool cancelled = false;
+    auto settle = [&]() {
+        if (!cancel) return false;
+        auto next = std::chrono::steady_clock::now();
+        while (!cancelled && !bt::idle(w.dev)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next) {
+                if (cancel()) cancelled = true;
+                next = now + std::chrono::milliseconds(2);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        return cancelled;
+    };
+    const std::function<void()> drain = [&]() { settle(); };
+    if (settle()) return {};
     upload_rows(w, noise, F, c.xpad, 1);
     bt::Tensor S = rows_view(c.xpad, 1, F), M = rows_view(c.mpad, 1, F);
     // Inpainting (lab.nar's clamp): the known frames are replaced by the
@@ -275,7 +305,8 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
         const double t = 1.0 - step * dt;
         clamp(c.xpad, t);
         c.cur_raw = raw_t(t);
-        velocity(w, c, c.xpad);
+        velocity(w, c, c.xpad, drain);
+        if (settle()) return {};
         // mid = state - v * (dt / 2), each op rounded to the state dtype.
         bt::copy_d2d(c.vel, 0, c.tmp, 0, F * D);
         bt::scale_inplace(c.tmp, static_cast<float>(-(dt / 2)));
@@ -284,7 +315,8 @@ std::vector<float> Model::nar_solve(NarChunk& c, const float* noise, int steps, 
         clamp(c.mpad, t - dt / 2);
         if (cancel && cancel()) return {};
         c.cur_raw = raw_t(t - dt / 2);
-        velocity(w, c, c.mpad);
+        velocity(w, c, c.mpad, drain);
+        if (settle()) return {};
         bt::scale_inplace(c.vel, static_cast<float>(-dt));
         bt::add_inplace(S, c.vel);
         if (on_step) on_step(step + 1);

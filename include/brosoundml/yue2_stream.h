@@ -247,6 +247,22 @@ struct Yue2StreamStats {
     Yue2Knobs knobs;
     double first_audio_seconds = 0;            // the latest song's request -> first audio
     double interrupt1_seconds = 0, interrupt2_seconds = 0;   // request -> audible, the last interrupt
+    // Service gaps: the worker hands out audio (and decodes the playing
+    // song's when it is about to run out) only between pieces of work, so a
+    // piece longer than the emit lead starves the player. Each gap of 0.2 s or
+    // more, the last 16, with what ran in it.
+    struct Gap {
+        double seconds = 0;
+        // The piece of work last begun when it ended (plan / semantic /
+        // window: prefill|step|readback / make_full / retune / decode / save
+        // ...); device work queued by an earlier piece can land in a later one.
+        std::string what;
+        int song = -1;           // the song it worked on (-1 = none)
+        std::int64_t emitted = 0;   // the emit frontier when it ended
+        double lead = 0;         // seconds handed out ahead of the playhead when it began
+    };
+    std::vector<Gap> gaps;
+    double worst_gap_seconds = 0;
 };
 
 class Yue2Stream {

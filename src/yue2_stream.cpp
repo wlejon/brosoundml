@@ -437,9 +437,30 @@ void Yue2Stream::Impl::emit() {
     }
 }
 
+void Yue2Stream::Impl::work(const char* what, const yue2::Song* s) {
+    doing = what;
+    doing_song = s ? s->index : -1;
+}
+
 void Yue2Stream::Impl::service() {
     if (in_service) return;
     in_service = true;
+    {
+        const auto now = StreamClock::now();
+        if (service_end.time_since_epoch().count() != 0) {
+            const double gap = std::chrono::duration<double>(now - service_end).count();
+            if (gap >= 0.2) {
+                Yue2StreamStats::Gap g;
+                g.seconds = gap;
+                g.what = doing;
+                g.song = doing_song;
+                g.emitted = emitted;
+                g.lead = service_end_lead;
+                gaps.push_back(std::move(g));
+                while (gaps.size() > 16) gaps.pop_front();
+                worst_gap = std::max(worst_gap, gap);            }
+        }
+    }
     if (opt.cancel && opt.cancel()) stopping.store(true);
     drain_commands();
     // A skip to a built song is a placement only: it happens here, inside
@@ -488,6 +509,8 @@ void Yue2Stream::Impl::service() {
         if (static_cast<std::int64_t>(s->dec_frame) * R < need) decode_tile(*s, 25);
     }
     publish();
+    service_end = StreamClock::now();
+    service_end_lead = opt.paced ? static_cast<double>(emitted - playhead.load()) / 48000.0 : 0.0;
     in_service = false;
 }
 
@@ -779,6 +802,7 @@ void Yue2Stream::Impl::do_skip() {
 // One unit of work, the playing song first while it is short of the air
 // margin. False when there is none.
 bool Yue2Stream::Impl::step() {
+    work("drop / want / skip", nullptr);
     if (drop_marked()) return true;
     check_want();
     if (skip_pending) do_skip();
@@ -807,6 +831,7 @@ bool Yue2Stream::Impl::step() {
             if (t->cut >= 0 || (nx && on_air(*nx))) {
                 e.value = 0;
             } else {
+                work("make_full", t);
                 const int join = make_full(*t);
                 e.value = join >= 0 ? 1 : 0;
                 e.frame0 = std::max(0, join);
@@ -822,6 +847,7 @@ bool Yue2Stream::Impl::step() {
         // not built yet are rebuilt under the new knobs; songs built ahead
         // keep theirs until they play (below).
         knobs_pending = false;
+        work("retune (knobs)", nullptr);
         for (auto& sp : songs) retune(*sp, on_air(*sp));
         place_next();
         return true;
@@ -830,6 +856,7 @@ bool Yue2Stream::Impl::step() {
     for (auto& sp : songs) {
         Song& s = *sp;
         if (!s.dropped && !s.failed && on_air(s) && !steer_current(s)) {
+            work("retune (on air)", &s);
             retune(s, true);
             place_next();
             return true;
@@ -837,6 +864,7 @@ bool Yue2Stream::Impl::step() {
     }
     // A song built ahead about to play takes the energy knob from its start.
     const std::int64_t lead = static_cast<std::int64_t>(opt.decode_lead_seconds * 48000.0);
+    work("energy before air", nullptr);
     for (auto& sp : songs)
         if (sp->start >= 0 && sp->start - emitted <= lead) energy_before_air(*sp);
     if (int_stage2_pending) {
@@ -845,6 +873,7 @@ bool Yue2Stream::Impl::step() {
         // landed), so the cut is handed out about when its window lands; at
         // least a second past the frontier now (a long op may have run since).
         int_stage2_pending = false;
+        work("interrupt stage 2", nullptr);
         Song* s = playing();
         if (s && s->planned && s->start >= 0 && s->index == int_ev_song) {
             const double lat = int_latency_est > 0 ? int_latency_est : opt.interrupt_latency_seconds;
@@ -868,6 +897,7 @@ bool Yue2Stream::Impl::step() {
         // An edited score: rebuild that song from the plan on (not on air).
         const auto [idx, abc] = plan_edits.front();
         plan_edits.erase(plan_edits.begin());
+        work("plan edit", nullptr);
         Song* p = playing();
         Song* t = nullptr;
         if (idx < 0) t = p ? next_song(p) : nullptr;
@@ -910,9 +940,11 @@ bool Yue2Stream::Impl::step() {
     Song* p = playing();
     // The playing song's audio first when it is due within the decode lead.
     if (urgent && (urgent == p || best <= emitted + lead)) {
+        work("decode (due)", urgent);
         if (decode_tile(*urgent, 50)) return true;
     }
     // A save whose song is whole: decode the rest of it, then write it.
+    work("save", nullptr);
     if (step_saves()) return true;
     // Then build: the playing song, then (the next first while a skip waits
     // for it) the first song after it, within ahead_songs, not built yet.
@@ -922,20 +954,24 @@ bool Yue2Stream::Impl::step() {
         if (s.failed || s.dropped) return false;
         try {
             if (!s.planned) {
+                work("plan", &s);
                 plan(s);
                 return true;
             }
             int a = 0, b = 0;
             if (window_ready(s, &a, &b)) {
+                work(&s == p ? "window (on air)" : "window", &s);
                 solve_window(s, a, b);
                 return true;
             }
             if (!s.sem_done) {
+                work(&s == p ? "semantic (on air)" : "semantic", &s);
                 semantic_step(s, &s == p ? 25 : 50);
                 if (s.sem_done) place_next();
                 return true;
             }
             // Built ahead: the whole song decoded, so it waits as audio.
+            work("decode ahead", &s);
             if (&s != p && s.complete() && !s.built() && !on_air(s)) return decode_tile(s, 100);
         } catch (const std::exception& e) {
             s.failed = true;
@@ -980,7 +1016,9 @@ bool Yue2Stream::Impl::step() {
         if (Song* t = to_build(); t && build(*t)) return true;
     }
     announce();
+    work("decode", urgent);
     if (urgent && decode_tile(*urgent, 50)) return true;
+    work("idle", nullptr);
     return false;
 }
 
@@ -991,6 +1029,8 @@ void Yue2Stream::Impl::publish() {
     st.first_audio_seconds = first_audio_s;
     st.interrupt1_seconds = int1_s;
     st.interrupt2_seconds = int2_s;
+    st.gaps.assign(gaps.begin(), gaps.end());
+    st.worst_gap_seconds = worst_gap;
     const Song* p = playing();
     const std::int64_t opening = static_cast<std::int64_t>(opt.skip_fade_seconds * 48000) + 48000;
     for (auto& sp : songs) {
@@ -1037,6 +1077,7 @@ void Yue2Stream::run() {
     int stalls = 0;
     while (!I.stopping.load()) {
         I.service();
+        I.work("place", nullptr);
         I.place_next();   // songs go on the program as their predecessors' lengths become known
         if (I.step()) {
             stalls = 0;

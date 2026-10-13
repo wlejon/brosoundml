@@ -163,8 +163,11 @@ public:
     std::vector<float> nar_velocity(NarChunk& c, const std::vector<float>& x, double raw_t) const;
     // The midpoint ODE from `noise` (frames * 64, FP32, rounded to BF16 like
     // the reference's state) over `steps` steps; returns FP32 latents.
-    // `on_step(done)` after each step; `cancel` polled twice per step
-    // (returns an empty vector when cancelled). On CUDA an evaluation replays
+    // `on_step(done)` after each step; `cancel` polled twice per step and,
+    // while each evaluation runs on the device, every few milliseconds until
+    // it finishes (returns an empty vector when cancelled): a caller that
+    // services real-time work from `cancel` keeps doing so through a long
+    // evaluation instead of waiting it out in the next sync. On CUDA an evaluation replays
     // as a graph (one per chunk and state buffer, captured at its first use)
     // unless it is in capture_evals; BROSOUNDML_YUE2_NO_GRAPH=1 runs all eager.
     // `known` (known_frames * 64, may be null): inpainting of the first
