@@ -222,7 +222,7 @@ struct Yue2Stream::Impl {
     // re-solve's start), -1 = nothing to continue (its song had ended).
     int make_full(yue2::Song& s);
     static constexpr int kJoinFrames = 50;   // a preview's tail re-solved with the continuation as lookahead
-    void open_session(yue2::Song& s, int codec_rows);   // prompt (+ negative) + codec[0, codec_rows)
+    void open_session(yue2::Song& s, int codec_rows, bool stepped = false);   // prompt (+ negative) + codec[0, codec_rows)
     void release_session(yue2::Song& s);                // a song built ahead: its AR session's device memory
     void invalidate_audio(yue2::Song& s, int frame);
     int emitted_frame(const yue2::Song& s) const;   // song frame of the emit frontier

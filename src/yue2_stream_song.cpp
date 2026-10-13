@@ -63,7 +63,7 @@ int Yue2Stream::Impl::make_full(Song& s) {
         // The session holds the prompt and every token so far (a preview
         // built ahead released it: rebuilt over them), so sampling resumes
         // after the lookahead tokens.
-        if (!s.sess) open_session(s, static_cast<int>(s.codec.size()));
+        if (!s.sess) open_session(s, static_cast<int>(s.codec.size()), true);
         s.sem_done = false;
         s.natural = -1;
     }
@@ -74,6 +74,10 @@ int Yue2Stream::Impl::make_full(Song& s) {
     // continuation as their lookahead, inpainted against what precedes.
     const int join = std::min(s.lat_valid, std::max(L - kJoinFrames, emitted_frame(s) + 25));
     resolve_from(s, join);
+    // The long window from the join: the short first window is for audio
+    // someone is waiting for, and a 250-frame window solves loud (mean latent
+    // norm ~9.4 against the whole render's ~8.0, past the corpus range).
+    s.win_k = static_cast<int>(opt.windows.size()) - 1;
     unplace_after(&s);
     return join;
 }
@@ -81,19 +85,29 @@ int Yue2Stream::Impl::make_full(Song& s) {
 // The semantic session over the prompt (and the CFG negative), then the
 // song's first `codec_rows` codec tokens: a fresh song (0), or one whose
 // session was released when it was built ahead and is continued on air.
-void Yue2Stream::Impl::open_session(Song& s, int codec_rows) {
+// `stepped`: the tokens go in one decode step at a time, as they were
+// sampled, so the cache is the one sampling built and the song continues
+// with the tokens one uninterrupted run gives (a batched prefill rounds
+// differently and the next token can differ). A preview's tokens take
+// about 2 s; a steer's continuation (latency first) prefills.
+void Yue2Stream::Impl::open_session(Song& s, int codec_rows, bool stepped) {
     const Model& m = core.model;
     const auto [lo, hi] = logit_range(Phase::Semantic);
     codec_rows = std::clamp(codec_rows, 0, static_cast<int>(s.codec.size()));
     const int longest = std::max<int>(s.P, static_cast<int>(s.neg.size())) + codec_rows;
     s.sess.reset();
     s.sess = m.ar_session(s.neg.empty() ? 1 : 2, std::min(CONTEXT, longest + 1024), s.ar_hooks.get(), CONTEXT);
+    const int prefilled = stepped ? 0 : codec_rows;
     auto with_codec = [&](std::vector<int32_t> ids) {
-        for (int f = 0; f < codec_rows; ++f) ids.push_back(s.codec[f] + CODEC_OFFSET);
+        for (int f = 0; f < prefilled; ++f) ids.push_back(s.codec[f] + CODEC_OFFSET);
         return ids;
     };
     m.ar_prefill(*s.sess, 0, with_codec(s.plan.prefix), lo, hi);
     if (!s.neg.empty()) m.ar_prefill(*s.sess, 1, with_codec(s.neg), lo, hi);
+    for (int f = prefilled; f < codec_rows; ++f) {
+        m.ar_step(*s.sess, s.codec[f] + CODEC_OFFSET);
+        if (f % 32 == 31) service();
+    }
 }
 
 void Yue2Stream::Impl::release_session(Song& s) {
@@ -204,7 +218,8 @@ void Yue2Stream::Impl::semantic_step(Song& s, int n) {
 
 bool Yue2Stream::Impl::window_ready(const Song& s, int* a_out, int* b_out) const {
     if (!s.planned || s.failed) return false;
-    const int a = s.lat_valid, T = s.frames();
+    int a = s.lat_valid;
+    const int T = s.frames();
     if (T >= 0 && a >= T) return false;
     // A song built ahead (not on air, no skip waiting for it) is solved in
     // one chunk once its tokens are all there, the whole-song render itself,
@@ -212,7 +227,16 @@ bool Yue2Stream::Impl::window_ready(const Song& s, int* a_out, int* b_out) const
     // waiting for.
     const double budget = ahead_budget(s);
     if (budget > 0) {
-        if (T < 0 && budget > kWholeWaitSeconds) return false;   // the semantic stage first
+        // The semantic stage first, when the rest of it and the one chunk
+        // fit in the time left: always that far ahead, else by the tokens
+        // left (a preview's ~2 s; a whole song's by the plan's estimate, at
+        // a conservative 200 tokens/s).
+        if (T < 0) {
+            const int end = s.limit >= 0 ? s.limit + opt.right : std::max(s.est_frames, static_cast<int>(s.codec.size()));
+            const int left = std::max(0, end - static_cast<int>(s.codec.size()));
+            if (budget > kWholeWaitSeconds || (end > 0 && budget > left / 200.0 + whole_seconds(s, end - a) + 2.0))
+                return false;
+        }
         if (T >= 0 && whole_seconds(s, T - a) < budget) {
             *a_out = a;
             *b_out = T;
@@ -222,8 +246,19 @@ bool Yue2Stream::Impl::window_ready(const Song& s, int* a_out, int* b_out) const
     const int size = opt.windows[std::min<std::size_t>(s.win_k, opt.windows.size() - 1)];
     int b = a + size;
     if (T >= 0) {
+        // A short window solves loud (a 250-frame one: mean latent norm ~9.4
+        // against the whole render's ~8.0; a 50-frame end ~11.5), so the
+        // end never gets a short window of its own: the window before it
+        // runs to the end, and a short last window (the end came after the
+        // window before it was cut) starts earlier, re-solving frames not
+        // handed out yet.
+        const int full = *std::max_element(opt.windows.begin(), opt.windows.end());
         b = std::min(b, T);
-        if (T - b < 25) b = T;   // no sliver of a last window
+        if (T - b < full) b = T;
+        if (T - a < full) {
+            const int earliest = s.start >= 0 ? std::max(0, emitted_frame(s) + 25) : 0;
+            a = std::min(a, std::max(T - full, earliest));
+        }
     } else if (static_cast<int>(s.codec.size()) < b + opt.right) {
         return false;
     }
@@ -254,7 +289,7 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     Busy busy_guard(busy, &s);
     const Model& m = core.model;
     const auto t0 = StreamClock::now();
-    const int gen0 = s.gen;
+    const int gen0 = s.gen, valid0 = s.lat_valid;   // a <= valid0: a last window may re-solve unheard frames
     const int lo = std::max(0, a - opt.left);
     const int hi = std::min(static_cast<int>(s.codec.size()), b + opt.right);
     const int F = hi - lo, D = Yue2::kLatentDim, H = m.config().hidden;
@@ -290,7 +325,7 @@ void Yue2Stream::Impl::solve_window(Song& s, int a, int b) {
     if (out.empty()) return;   // stopping, or preempted (re-solved later)
     // The conditions may have moved while it solved (a knob re-solve from
     // earlier than a): then this window is stale.
-    if (s.gen != gen0 || s.lat_valid != a) return;
+    if (s.gen != gen0 || s.lat_valid != valid0) return;
     if (static_cast<int>(s.lat.size() / D) < b) {
         s.lat.resize(static_cast<std::size_t>(b) * D, 0.0f);
         s.off.resize(b, s.off_tail);
