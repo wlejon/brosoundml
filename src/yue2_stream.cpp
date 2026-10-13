@@ -425,7 +425,8 @@ void Yue2Stream::Impl::emit() {
             // Its audio stays a while, for save_song().
             if (opt.keep_played > 0) {
                 const std::size_t n = std::min<std::size_t>(s.L.size(), static_cast<std::size_t>(std::max<std::int64_t>(0, end - s.start)));
-                Played p{s.index, s.req.tag, std::move(s.L), std::move(s.R)};
+                Played p{s.index, s.req.tag, std::move(s.L), std::move(s.R),
+                         make_take(s, static_cast<int>((n + R - 1) / R))};
                 p.L.resize(n);
                 p.R.resize(n);
                 played.push_back(std::move(p));
@@ -638,6 +639,20 @@ void Yue2Stream::Impl::energy_before_air(Song& s) {
     set_offset(s, 0, knobs.energy, 0);
 }
 
+std::shared_ptr<const Yue2StreamTake> Yue2Stream::Impl::make_take(const Song& s, int frames) const {
+    auto t = std::make_shared<Yue2StreamTake>();
+    t->plan = s.plan;
+    t->params = s.req.params;
+    const int D = Yue2::kLatentDim;
+    const int lat = std::min(s.lat_valid, static_cast<int>(s.lat.size() / D));
+    const int n = std::max(0, std::min({frames, static_cast<int>(s.codec.size()), lat}));
+    t->semantic.assign(s.codec.begin(), s.codec.begin() + n);
+    t->latents.assign(s.lat.begin(), s.lat.begin() + static_cast<std::size_t>(n) * D);
+    t->energy.resize(n);
+    for (int f = 0; f < n; ++f) t->energy[f] = f < static_cast<int>(s.off.size()) ? s.off[f] : s.off_tail;
+    return t;
+}
+
 void Yue2Stream::Impl::save_song(int index, const std::string& path) {
     Yue2StreamEvent e{Yue2StreamEvent::Kind::Saved};
     e.song = index;
@@ -656,6 +671,7 @@ void Yue2Stream::Impl::save_song(int index, const std::string& path) {
         whole = s.limit < 0 && s.built();
         L = &s.L;
         Rc = &s.R;
+        e.take = make_take(s, static_cast<int>((n + R - 1) / R));
     }
     for (const auto& p : played)
         if (p.index == index) {
@@ -664,6 +680,7 @@ void Yue2Stream::Impl::save_song(int index, const std::string& path) {
             whole = true;   // as it played (a preview ends at its preview)
             L = &p.L;
             Rc = &p.R;
+            e.take = p.take;
         }
     if (!L) {
         e.text = "song " + std::to_string(index) + " is not held (played too long ago, dropped, or unknown)";

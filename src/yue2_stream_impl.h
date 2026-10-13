@@ -122,11 +122,14 @@ struct Yue2Stream::Impl {
 
     // worker side
     std::deque<std::unique_ptr<yue2::Song>> songs;   // playing first; finished ones popped
-    struct Played {                    // a finished song's audio, for save_song()
+    struct Played {                    // a finished song's audio and take, for save_song()
         int index = -1;
         std::string tag;
         std::vector<float> L, R;
+        std::shared_ptr<const Yue2StreamTake> take;
     };
+    // A song's take over its first `frames` frames (its plan, tokens, latents).
+    std::shared_ptr<const Yue2StreamTake> make_take(const yue2::Song& s, int frames) const;
     std::deque<Played> played;         // the last keep_played, oldest first
     int next_index = 0;
     Yue2Knobs knobs;

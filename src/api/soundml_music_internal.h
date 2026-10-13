@@ -35,6 +35,8 @@ HostYue2Vae* vaeOf(Value v);
 bool readParams(Value opts, brosoundml::Yue2Params& p, std::string& err);
 // { samples (planar Float32Array), channels, frames, sampleRate }
 Value makeStereo(const brosoundml::StereoAudio& a);
+// { abc, abcIds (Int32Array), prefix (Int32Array), truncated }
+Value makePlan(const brosoundml::Yue2Plan& plan);
 
 // model.stream(opts) -> YuE2Stream (native_soundml_music_stream.cpp)
 Value yue2Stream(Value self, std::span<const Value> a);

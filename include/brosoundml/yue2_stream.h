@@ -174,6 +174,19 @@ struct Yue2StreamOptions {
     CancelCheck cancel;
 };
 
+// A song as the stream built it, enough to render it again or edit it: its
+// plan, its codec tokens, its latents as the NAR solved them (the energy knob
+// is an offset added at decode: `energy` per frame, along the stream's
+// latent direction) and its request. Frames cover what the saved audio holds
+// (a preview's own frames, a played song's as it played).
+struct Yue2StreamTake {
+    Yue2Plan plan;
+    std::vector<int32_t> semantic;   // codec ids, one per frame
+    std::vector<float> latents;      // frames x 64, frame-major
+    std::vector<float> energy;       // per frame: the offset decoded with it (0 = none)
+    Yue2Params params;               // the request (seed, style, lyrics, sampling)
+};
+
 struct Yue2StreamEvent {
     enum class Kind {
         Plan,          // a song's score is ready: text = ABC (the next song's: editable, set_next_plan)
@@ -195,7 +208,7 @@ struct Yue2StreamEvent {
                        // frame0 (the join); 0 = too late (its successor is on air) or its song had ended
         Saved,         // save_song(): text = the path written, frames = the samples (48 kHz), value 1 = the
                        // whole song (a played one: as it played), 0 = a preview; -1 = nothing written,
-                       // text = why
+                       // text = why. `take` = the song's take (its plan, tokens and latents)
     };
     Kind kind = Kind::Idle;
     int song = -1;                 // song index (queue order from 0)
@@ -204,6 +217,7 @@ struct Yue2StreamEvent {
     int frame0 = 0, frames = 0;
     double seconds = 0, value = 0;
     std::string text;
+    std::shared_ptr<const Yue2StreamTake> take;   // Saved
 };
 
 // A snapshot for meters.

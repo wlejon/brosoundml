@@ -301,6 +301,12 @@ void section_previews(Env& E) {
         const auto bytes = fs::exists(p) ? fs::file_size(p) : 0;
         CHECK(bytes == 44 + static_cast<std::uintmax_t>(e->e.frames) * 4, "previews: %s: %llu bytes for %d frames", what,
               static_cast<unsigned long long>(bytes), e->e.frames);
+        // Its take covers the audio written: a token, 64 latents and an energy per frame.
+        const auto& t = e->e.take;
+        const int tf = t ? static_cast<int>(t->semantic.size()) : 0;
+        CHECK(t && !t->plan.prefix.empty() && t->latents.size() == static_cast<std::size_t>(tf) * 64 &&
+                  t->energy.size() == static_cast<std::size_t>(tf) && std::abs(tf * kHop - e->e.frames) <= 2 * kHop,
+              "previews: %s: take of %d frames for %d samples", what, tf, e->e.frames);
         fs::remove(p);
         return e->e.frames / double(kSr);
     };

@@ -194,6 +194,36 @@ bool readStreamOptions(Value v, brosoundml::Yue2StreamOptions& o, std::string& e
     return true;
 }
 
+// A saved song's take: { plan, semantic: Int32Array, latents: Float32Array
+// (frames x 64), energy: Float32Array (per frame), seed, style, lyrics, cot,
+// cfgScale }, enough to render it again or edit it.
+Value makeTake(const brosoundml::Yue2StreamTake& t) {
+    ObjectBuilder o;
+    {
+        ev::Persistent p(makePlan(t.plan));
+        o.set("plan", p.get());
+    }
+    {
+        ev::Persistent a(makeInt32Array(t.semantic));
+        o.set("semantic", a.get());
+    }
+    {
+        ev::Persistent a(makeFloat32Array(t.latents));
+        o.set("latents", a.get());
+    }
+    {
+        ev::Persistent a(makeFloat32Array(t.energy));
+        o.set("energy", a.get());
+    }
+    o.set("frames", static_cast<double>(t.semantic.size()));
+    o.set("seed", static_cast<double>(t.params.seed));
+    o.set("style", t.params.style);
+    o.set("lyrics", t.params.lyrics);
+    o.set("cot", t.params.cot == brosoundml::Yue2Cot::Full ? "full" : t.params.cot == brosoundml::Yue2Cot::Melody ? "melody" : "off");
+    o.set("cfgScale", static_cast<double>(t.params.cfg_scale));
+    return o.get();
+}
+
 Value makeEvent(const brosoundml::Yue2StreamEvent& e) {
     ObjectBuilder o;
     o.set("kind", kindName(e.kind));
@@ -205,6 +235,10 @@ Value makeEvent(const brosoundml::Yue2StreamEvent& e) {
     o.set("seconds", e.seconds);
     o.set("value", e.value);
     o.set("text", e.text);
+    if (e.take) {
+        ev::Persistent t(makeTake(*e.take));
+        o.set("take", t.get());
+    }
     return o.get();
 }
 
