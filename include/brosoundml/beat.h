@@ -13,6 +13,12 @@
 // Determinism: every step is done in the order and precision endless.js does
 // it (doubles, the envelope stored as float), so the same audio gives the
 // same envelope and the same fit as the harness.
+//
+// Absolute time: the spectral flux sees an onset coming as it enters its
+// 85 ms window, so its beats read ~40 ms early (a click track at 90 bpm:
+// 0.0625 beats); the energy flux is on time. Phases from one sensor compare
+// exactly (the bridge uses only their difference); add ~0.04 s to a spectral
+// first beat to place it in the audio.
 
 #include <cstddef>
 #include <vector>
