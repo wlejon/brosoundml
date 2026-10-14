@@ -36,6 +36,13 @@ noted) and back the `bro.tts` / `bro.stt` / `bro.wake` JS bindings in bro:
   in-context voice cloning, voice-design instructs, rule-based duration. CUDA
   (the LM is not run on CPU); codes + unmask order 100% against the upstream
   model on the deterministic fixtures, ~0.5 s for 10 s of speech in BF16.
+- **HTDemucs** — music source separation (Demucs v4 `htdemucs_ft`, Meta, MIT):
+  drums / bass / other / vocals from four per-stem hybrid-transformer networks
+  (spectral + temporal branches, cross transformer), segmented and resampled as
+  `demucs.apply.apply_model` does under sep.py. FP32 on any device, GPU by
+  default; stems match the reference to ~100 dB SDR (strict FP32), 10 s of
+  48 kHz audio in ~0.3 s for all four stems / ~80 ms for vocals on a 4090.
+  Weights from `tools/htdemucs_convert.py`.
 - **Wake-word** — a 2D BC-ResNet (PCEN) streaming single-keyword spotter + its
   training toolchain. (The legacy 1D `bc_resnet` is retained for tests only; the
   runtime requires the 2D 'BWK2' model.)
@@ -78,6 +85,9 @@ include/brosoundml/
   qwen_asr.h         Qwen3-ASR: QwenAsrConfig + AuT encoder / Qwen3 decoder
                      (src/qwen_asr_encoder.h + qwen_asr_decoder.h)
   rave.h             RAVE: encode/decode, stereo decode_multi, noise synth
+  htdemucs.h         HTDemucs (htdemucs_ft) source separation: load / separate
+                     (src/htdemucs_model.h is one network; htdemucs.cpp the bag,
+                     segmenting and resampling)
   wake.h             WakeWord streaming detector (front-end + model + policy)
   bc_resnet2d.h      2D BC-ResNet (freq×time) — the shipped wake model
   bc_resnet.h        legacy 1D BC-ResNet (tests only; not the runtime model)
@@ -237,6 +247,8 @@ CLI drivers, built when brosoundml is the top-level project
 - `brosoundml_omnivoice_say` — OmniVoice text → WAV (language, instruct, reference
   clip or saved .ovcp prompt, schedule knobs, `--trace` unmask-order heatmap).
 - `brosoundml_higgs_codec_roundtrip` — HiggsAudio v2 encode↔decode round-trip.
+- `brosoundml_separate` — HTDemucs: planar f32 audio → one `<stem>.f32` per stem
+  (`--stems`, `--offset` / `--seconds` window, `--repeat` for timing).
 - `brosoundml_wake_synth` / `_inspect` / `_train` / `_test` / `_probe` /
   `_melcmp` — the wake-word training toolchain (Kokoro-driven dataset builder,
   validator, trainer, evaluator, front-end diagnostics).

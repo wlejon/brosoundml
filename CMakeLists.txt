@@ -183,6 +183,10 @@ target_sources(brosoundml PRIVATE
     src/clap.cpp
     src/clap_audio.cpp
     src/clap_text.cpp
+    src/htdemucs.cpp
+    src/htdemucs_net.cpp
+    src/htdemucs_ops.cpp
+    src/htdemucs_transformer.cpp
     src/g2p/pos_tagger.cpp
     src/g2p/pos_tagger_load.cpp
     src/g2p/lexicon.cpp
@@ -289,6 +293,9 @@ if(BROSOUNDML_TOOLS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     add_executable(brosoundml_higgs_codec_roundtrip tools/higgs_codec_roundtrip.cpp)
     target_link_libraries(brosoundml_higgs_codec_roundtrip PRIVATE brosoundml)
+
+    add_executable(brosoundml_separate tools/htdemucs_separate.cpp)
+    target_link_libraries(brosoundml_separate PRIVATE brosoundml)
 
     add_executable(brosoundml_omnivoice_say tools/omnivoice_say.cpp)
     target_link_libraries(brosoundml_omnivoice_say PRIVATE brosoundml)

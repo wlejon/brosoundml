@@ -43,6 +43,7 @@ checked against the CPU result.
 | [HiggsAudio v2 codec](docs/higgs-codec.md) | waveform ⇄ codes | CPU + CUDA | 25 Hz x 8-codebook RVQ (OmniVoice's audio tokenizer); DAC encoder/decoder + HuBERT semantic branch; codes bit-exact vs the reference |
 | [RAVE](docs/rave.md) | waveform ⇄ latent | CPU + CUDA + Metal | ACIDS/IRCAM v2 neural audio autoencoder; editable PCA latent |
 | [CLAP](docs/clap.md) | audio ⇄ text scoring | CPU + CUDA | laion/larger_clap_general: HTSAT Swin + RoBERTa into one 512-d space; scores a clip against text prompts (`bro.ear.loadClap`) |
+| [HTDemucs](include/brosoundml/htdemucs.h) | music → stems | CUDA | Demucs v4 htdemucs_ft: drums / bass / other / vocals, one fine-tuned hybrid-transformer network per stem; apply_model's segmenting + torchaudio resampling; ~100 dB SDR against the reference |
 | [Wake-word](docs/wake-word.md) | keyword spotting | CPU + CUDA | 2D BC-ResNet (PCEN) single-keyword streaming spotter + training toolchain |
 | [Phoneme spotter](docs/phoneme-spotter.md) | open-vocab spotting | CPU + CUDA | PhonemeNet posteriors + streaming template matcher; "type a word, spot it" |
 
