@@ -21,6 +21,7 @@ set(BROSOUNDML_API_SOURCES
     native_soundml_music_edit.cpp
     native_soundml_music_endless.cpp
     native_soundml_music_endless_js.cpp
+    native_soundml_music_separate.cpp
     native_soundml_ear.cpp
     soundml_listen_host.cpp
     native_soundml_wake.cpp

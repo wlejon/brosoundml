@@ -173,46 +173,6 @@ Value makePlan(const brosoundml::Yue2Plan& plan) {
     return o.get();
 }
 
-Value makeStereo(const brosoundml::StereoAudio& a) {
-    ObjectBuilder o;
-    {
-        ev::Persistent s(makeFloat32Array(a.samples));
-        o.set("samples", s.get());
-    }
-    o.set("channels", ev::fromDouble(a.channels));
-    o.set("frames", ev::fromDouble(a.frames));
-    o.set("sampleRate", ev::fromDouble(a.sample_rate));
-    return o.get();
-}
-
-// Audio argument for encode: { samples (planar), channels, sampleRate } or a
-// mono Float32Array / { samples, sampleRate } (48 kHz default).
-bool readStereo(Value v, brosoundml::StereoAudio& out, std::string& err) {
-    if (ev::isObject(v) && !ev::isTypedArray(v) && !ev::isFunction(v)) {
-        ev::Persistent o(v);
-        const int ch = getPropertyInt(o.get(), "channels", 1);
-        brosoundml::AudioBuffer flat;
-        if (!readAudioBuffer(o.get(), flat, err, 48000)) return false;
-        if (ch < 1 || flat.samples.size() % static_cast<size_t>(ch) != 0) {
-            err = "audio.samples.length must be a multiple of audio.channels";
-            return false;
-        }
-        out.channels = ch;
-        out.frames = static_cast<int>(flat.samples.size() / static_cast<size_t>(ch));
-        out.sample_rate = flat.sample_rate;
-        out.samples = std::move(flat.samples);
-    } else {
-        brosoundml::AudioBuffer flat;
-        if (!readAudioBuffer(v, flat, err, 48000)) return false;
-        out.channels = 1;
-        out.frames = static_cast<int>(flat.samples.size());
-        out.sample_rate = flat.sample_rate;
-        out.samples = std::move(flat.samples);
-    }
-    if (out.frames <= 0 || out.sample_rate <= 0) { err = "audio is empty"; return false; }
-    return true;
-}
-
 }  // namespace music
 
 using namespace music;
@@ -983,12 +943,14 @@ void installMusic(ObjectBuilder& bro) {
     g_yue2VaeClass.install("YuE2Vae", 0, nullptr, decorateYue2Vae);
     music::installStreamClass();
     music::installEndlessClass();
+    music::installSeparatorClass();
 
     ObjectBuilder music;
     music.def("init", 0, musicInit);
     music.def("beat", 2, music::musicBeat);
     music.def("loadYuE2", 2, loadYuE2);
     music.def("loadVae", 2, loadVae);
+    music.def("loadSeparator", 2, music::loadSeparator);
     music.set("YuE2", g_yue2Class.constructor());
     music.set("YuE2Vae", g_yue2VaeClass.constructor());
     // A stream's knob clamps with no model or stream: a fresh object each

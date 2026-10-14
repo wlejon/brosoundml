@@ -35,7 +35,11 @@ HostYue2Vae* vaeOf(Value v);
 // Params common to every entry point; false + err on a shape error.
 bool readParams(Value opts, brosoundml::Yue2Params& p, std::string& err);
 // { samples (planar Float32Array), channels, frames, sampleRate }
+// (makeStereo / readStereo live in native_soundml_music_separate.cpp)
 Value makeStereo(const brosoundml::StereoAudio& a);
+// { samples (planar), channels, sampleRate } or a mono Float32Array /
+// { samples, sampleRate }; `default_rate` when no sampleRate is given.
+bool readStereo(Value v, brosoundml::StereoAudio& out, std::string& err, int default_rate = 48000);
 // { abc, abcIds (Int32Array), prefix (Int32Array), truncated }
 Value makePlan(const brosoundml::Yue2Plan& plan);
 
@@ -61,6 +65,10 @@ Value makeKnobs(const brosoundml::Yue2Knobs& k);
 Value yue2Endless(Value self, std::span<const Value> a);
 void installEndlessClass();
 Value musicBeat(Value self, std::span<const Value> a);
+// bro.music.loadSeparator(dir, opts?) -> Separator | AsyncHandle: HTDemucs
+// source separation (native_soundml_music_separate.cpp).
+Value loadSeparator(Value self, std::span<const Value> a);
+void installSeparatorClass();
 // { energy, texture, percussion, arrangement, density, timbre: { min, max } }: the clamps
 // Yue2Knobs::clamp applies, as a stream's knobRanges and bro.music.knobRanges.
 Value knobRanges();
