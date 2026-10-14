@@ -265,6 +265,9 @@ void AudioTower::forward(const std::vector<float>& mel, const ClapConfig& cfg, b
     // reshape_mel2img: four 256-frame chunks, each transposed to (M, 256) and
     // stacked -> the (256, 256) image. As NCHW (N=4, C=256, H=1, W=M) that is
     // exactly nchw_to_sequence: Y[chunk*M + f, t] = X[chunk, t, f].
+    // brotensor checks X is (N, C*H*W): st is (spec_w, M) or the interp's (1, spec_w*M).
+    st.rows = freq_ratio;
+    st.cols = cfg.spec_size * M;
     bt::Tensor img;
     bt::nchw_to_sequence(st, /*N=*/freq_ratio, /*C=*/cfg.spec_size, /*H=*/1, /*W=*/M, img);   // (256, 256)
     img.rows = 1;
