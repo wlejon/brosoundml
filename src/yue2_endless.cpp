@@ -225,6 +225,22 @@ bool Yue2Endless::Impl::step() {
                              playhead.load() + static_cast<std::int64_t>((opt.emit_lead_seconds + 1.5) * kSr) &&
             decode_tile(2 * kBlock))
             return true;
+        // A branch being committed comes before the main line: it has to
+        // reach a chunk boundary ahead of the program, and the main line's
+        // work past that boundary is thrown away.
+        for (auto& bp : branches) {
+            Line& b = *bp;
+            if (!b.committing || b.failed) continue;
+            sync_branch(b);
+            if (can_render(b)) {
+                render(b);
+                return true;
+            }
+            if (sample_due(b)) {
+                sample(b);
+                return true;
+            }
+        }
         if (can_render(m)) {
             render(m);
             return true;

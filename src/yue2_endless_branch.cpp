@@ -137,6 +137,7 @@ bool Yue2Endless::Impl::try_commit() {
     const std::int64_t lead = static_cast<std::int64_t>((opt.emit_lead_seconds + 0.25) * kSr);
     int g = f;
     double fade = 0;
+    std::int64_t at = static_cast<std::int64_t>(f) * C * kR;   // the program sample the branch is heard alone from
     if (emitted + lead <= static_cast<std::int64_t>(f * C - kHalo) * kR &&
         (b.rendered > f || seconds_until(static_cast<std::int64_t>(f) * C * kR) > 1.5 * est_render + est_splice)) {
         // Seamless: the branch shares the history up to its fork, and the
@@ -144,14 +145,19 @@ bool Yue2Endless::Impl::try_commit() {
         // same latents; their right halo is the branch's now).
         redecode_from(f * C - kHalo);
     } else {
+        // The fade ends a decoder halo before boundary g, so both sides
+        // decode exactly from their chunks before g: the main line's audio
+        // up to there needs only its chunk g-1 rendered, the branch's too.
         const std::int64_t x = static_cast<std::int64_t>(opt.branch_fade_seconds * kSr);
         const std::int64_t per = static_cast<std::int64_t>(C) * kR;
-        g = static_cast<int>(std::max<std::int64_t>(f + 1, (emitted + lead + x + per - 1) / per));
-        if (b.rendered < g + 1) return false;             // it keeps building; the boundary moves on
-        if (dec_frame < g * C) return decode_tile(2 * kBlock);   // the main line's audio up to the boundary
+        const std::int64_t halo = static_cast<std::int64_t>(kHalo) * kR;
+        g = static_cast<int>(std::max<std::int64_t>(f + 1, (emitted + lead + x + halo + per - 1) / per));
+        if (b.rendered < g) return false;                  // it keeps building; the boundary moves on
+        const int fb = g * C - kHalo;
+        if (dec_frame < fb) return decode_tile(std::min(2 * kBlock, fb - dec_frame));   // the main line up to the fade's end
         // The branch's audio under the fade, from its own latents.
-        const std::int64_t gS = static_cast<std::int64_t>(g) * per, xs = gS - x;
-        const int fa = static_cast<int>(xs / kR), fb = g * C;
+        const std::int64_t gS = static_cast<std::int64_t>(fb) * kR, xs = gS - x;
+        const int fa = static_cast<int>(xs / kR);
         const int l0 = std::max(b.lat_base, fa - kHalo), h0 = std::min(b.rendered * C, fb + kHalo);
         std::vector<float> z(static_cast<std::size_t>(h0 - l0) * kD);
         for (int fr = l0; fr < h0; ++fr) {
@@ -161,7 +167,7 @@ bool Yue2Endless::Impl::try_commit() {
         }
         work("commit: fade", g);
         in_decode = true;
-        const StereoAudio a = vae.decode_span(z.data(), h0 - l0, fa - l0, fb - l0);
+        const StereoAudio a = vae.decode_span(z.data(), h0 - l0, fa - l0, fb - l0, false, 0, waiting());
         in_decode = false;
         for (std::int64_t j = xs; j < gS; ++j) {
             const double w = (static_cast<double>(j - xs) + 0.5) / static_cast<double>(x);
@@ -173,9 +179,10 @@ bool Yue2Endless::Impl::try_commit() {
         }
         L.resize(static_cast<std::size_t>(gS - prog_base));
         R.resize(static_cast<std::size_t>(gS - prog_base));
-        dec_frame = g * C;
+        dec_frame = fb;
         xf_at = -1;
         fade = opt.branch_fade_seconds;
+        at = gS;
     }
     // The branch is the main line.
     const int id = b.id;
@@ -200,7 +207,7 @@ bool Yue2Endless::Impl::try_commit() {
     e.branch = id;
     e.chunk = g;
     e.value = fade;
-    e.sample = static_cast<std::int64_t>(g) * C * kR;
+    e.sample = at;
     event(e);
     return true;
 }

@@ -86,7 +86,7 @@ bool Yue2Endless::Impl::decode_tile(int max_frames) {
     }
     in_decode = true;
     const auto t0 = Clock::now();
-    const StereoAudio a = vae.decode_span(z.data(), h0 - l0, f - l0, e - l0, end && h0 == top);
+    const StereoAudio a = vae.decode_span(z.data(), h0 - l0, f - l0, e - l0, end && h0 == top, 0, waiting());
     in_decode = false;
     const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
     est_decode = 0.9 * est_decode + 0.1 * sec * (static_cast<double>(C) / std::max(1, e - f));
@@ -186,7 +186,7 @@ void Yue2Endless::Impl::trim() {
 
 // ─── service ────────────────────────────────────────────────────────────────
 
-void Yue2Endless::Impl::service() {
+void Yue2Endless::Impl::service(bool light) {
     if (in_service) return;
     in_service = true;
     const auto now = Clock::now();
@@ -205,9 +205,9 @@ void Yue2Endless::Impl::service() {
         }
     }
     if (opt.cancel && opt.cancel()) stopping.store(true);
-    drain_commands();
+    if (!light) drain_commands();
     // A splice making a chunk whose target just changed stops, to be made again.
-    if (sampling && !preempt) {
+    if (!light && sampling && !preempt) {
         const Yue2EndlessTarget& t = target_for(*sampling, sampling_k);
         if (!t.same_music(sampling_target) || t.lyrics != sampling_target.lyrics || t.roll != sampling_target.roll ||
             t.knobs.semantic != sampling_target.knobs.semantic || sampling->failed)

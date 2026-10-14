@@ -101,8 +101,9 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     const int b0 = k * C - s0;
     work("bridge: beat", k);
     in_decode = true;
-    const StereoAudio bd = vae.decode(pr.data() + static_cast<std::size_t>(b0) * kD, C);
+    const StereoAudio bd = vae.decode(pr.data() + static_cast<std::size_t>(b0) * kD, C, waiting());
     in_decode = false;
+    service();
     const auto bm = beat_mono(bd.samples.data(), static_cast<std::size_t>(bd.frames), 0, static_cast<std::size_t>(C) * kR);
     const BeatFit sb = fit_beat(beat_onsets(bm.data(), bm.size(), BeatSensor::Spectral), static_cast<double>(k) * C * 4,
                                 P0 * 4, false);
@@ -116,8 +117,9 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     if (probe.empty()) return false;
     work("bridge: beat", k + 1);
     in_decode = true;
-    const StereoAudio pd = vae.decode(probe.data(), static_cast<int>(F.size()));
+    const StereoAudio pd = vae.decode(probe.data(), static_cast<int>(F.size()), waiting());
     in_decode = false;
+    service();
     const auto pm = beat_mono(pd.samples.data(), static_cast<std::size_t>(pd.frames), 0, F.size() * kR);
     const BeatFit fb = fit_beat(beat_onsets(pm.data(), pm.size(), BeatSensor::Spectral), 0, P0 * 4, false);
     double dd = std::fmod((k + 1) * C + fb.phase * P0 - sb.phase * P0, P0);

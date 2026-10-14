@@ -126,7 +126,7 @@ void Yue2Endless::Impl::hear(Line& l, int k) {
     const int c0 = k * C, c1 = c0 + C, h0 = std::max(0, c0 - kHalo);
     work(l.id ? "branch: listen" : "listen", k);
     in_decode = true;
-    const StereoAudio d = vae.decode(l.lat_at(h0), c1 - h0);
+    const StereoAudio d = vae.decode(l.lat_at(h0), c1 - h0, waiting());
     in_decode = false;
     service();
     const int n = d.frames, o = (c0 - h0) * kR, len = std::min(C * kR, n - o);

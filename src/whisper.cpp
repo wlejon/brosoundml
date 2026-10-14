@@ -8,11 +8,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace brosoundml {
@@ -318,13 +320,36 @@ int Whisper::Impl::decode_window(WhisperKVCache& cache,
     // crash brotensor's CUDA dispatch.
     brotensor::Tensor hidden = brotensor::Tensor::empty_on(
         device, 0, 0, brotensor::Dtype::FP32);
+    // With `cancel`, the queued encoder and prefill are waited out polling it
+    // every 2 ms rather than blocking in the next call that syncs (the
+    // prefill waits on the encoder, ~0.2 s for large-v3): a caller feeding
+    // audio keeps going. False when cancelled.
+    auto settle = [&]() {
+        if (!cancel) return true;
+        auto next = std::chrono::steady_clock::now();
+        while (!brotensor::idle(device)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (cancel()) {
+                if (cancelled) *cancelled = true;
+                return false;
+            }
+            next = now + std::chrono::milliseconds(2);
+        }
+        return true;
+    };
     encode_audio(window, hidden);
+    if (!settle()) return -1;
 
     // 2. Reset cache for this window, then prefill the prompt.
     cache.reset();
     brotensor::Tensor logits = brotensor::Tensor::empty_on(
         device, 0, 0, brotensor::Dtype::FP32);
     decode_prefill(cache, prompt_ids.data(), prompt_len, hidden, logits);
+    if (!settle()) return -1;
 
     // Captured decode session (CUDA): replay the whole single-token step as
     // one cudaGraphLaunch instead of ~300 individual kernel launches. The

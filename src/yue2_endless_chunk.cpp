@@ -79,15 +79,33 @@ void Yue2Endless::Impl::place_target(Line& l, Yue2EndlessTarget t, bool now) {
     }
     if (now) l.path.clear();
     else l.path.erase(l.path.lower_bound(k), l.path.end());
-    Yue2EndlessEvent e{Yue2EndlessEvent::Kind::Planned};
-    e.chunk = k;
-    e.branch = l.id;
-    e.tag = t.tag;
-    e.sample = static_cast<std::int64_t>(k) * C * kR;
-    e.seconds = static_cast<double>(e.sample) / kSr;
+    // A change that takes a bridge, due now (on the newest sampled chunk or
+    // the next) with no time left for the bridge's work: it starts at the
+    // chunk after instead.
+    if (k <= l.sampled() && k > 0 && l.has_chunk(k - 1) && !t.same_music(l.chunk(k - 1).target) &&
+        (now || target_for(l, k + 1).same_music(t))) {
+        Yue2EndlessTarget probe = t;
+        auto saved = l.path;
+        l.path[k] = probe;
+        l.path[k + 1] = probe;
+        const bool bridge = needs_bridge(l, k, probe);
+        l.path = std::move(saved);
+        if (bridge && !bridge_fits(l)) ++k;
+    }
+    const std::string tag = t.tag;
     l.path[k] = std::move(t);
     // Energy is heard from the audio not yet handed out.
     if (now && l.id == 0) set_energy(static_cast<int>((emitted + kR - 1) / kR), l.path[k].knobs.energy);
+    planned(l, k, tag);
+}
+
+void Yue2Endless::Impl::planned(const Line& l, int k, const std::string& tag) {
+    Yue2EndlessEvent e{Yue2EndlessEvent::Kind::Planned};
+    e.chunk = k;
+    e.branch = l.id;
+    e.tag = tag;
+    e.sample = static_cast<std::int64_t>(k) * C * kR;
+    e.seconds = static_cast<double>(e.sample) / kSr;
     event(e);
 }
 
@@ -167,8 +185,27 @@ bool Yue2Endless::Impl::sample_due(const Line& l) const {
     if (l.failed || finished_sampling(l)) return false;
     if (!opt.paced) return true;
     const int k = l.sampled();
-    const double lead = opt.ahead_seconds + (needs_bridge(l, k, target_for(l, k)) ? opt.bridge_lead_seconds : 0.0);
+    const double lead = sample_lead() + (needs_bridge(l, k, target_for(l, k)) ? opt.bridge_lead_seconds : 0.0);
     return seconds_until(static_cast<std::int64_t>(k) * C * kR) < lead;
+}
+
+// Chunk k is sampled before chunk k-1 plays: k-1's render waits for k's
+// first tokens. So the lead is a chunk, the emit lead, a splice and a render
+// (one per line being built: branches share the device), the listener, and a
+// margin, never less than ahead_seconds.
+double Yue2Endless::Impl::sample_lead() const {
+    const double lines = 1.0 + static_cast<double>(branches.size());
+    const double need = static_cast<double>(C) / Yue2::kFrameRate + opt.emit_lead_seconds +
+                        lines * (est_splice + est_render) + (opt.listen ? est_listen : 0.0) + 1.5;
+    return std::max(opt.ahead_seconds, need);
+}
+
+bool Yue2Endless::Impl::bridge_fits(const Line& l) const {
+    if (!opt.paced) return true;
+    // The bridge's probe renders from the first unrendered chunk: there must
+    // be time for it before that chunk plays.
+    const double left = seconds_until(static_cast<std::int64_t>(l.rendered) * C * kR - kHalo * kR) - opt.emit_lead_seconds;
+    return left > est_bridge * 1.2;
 }
 
 bool Yue2Endless::Impl::can_render(const Line& l) const {
@@ -248,6 +285,9 @@ bool Yue2Endless::Impl::retarget_due(Line& l) {
     if (!retargetable(l, k)) return false;
     const Yue2EndlessTarget& t = target_for(l, k);
     Chunk& c = l.chunk(k);
+    // A change sample() would put off to the next chunk (a bridge with no
+    // time for it) is not worth sampling this one again for.
+    if (needs_bridge(l, k, t) && !bridge_fits(l)) return false;
     if (same_tokens(t, c.target)) {
         // Only what acts after sampling moved (NAR knobs, energy, tag).
         if (!(t.knobs == c.target.knobs) || t.tag != c.target.tag) {
@@ -260,6 +300,11 @@ bool Yue2Endless::Impl::retarget_due(Line& l) {
     }
     work("retarget", k);
     retarget(l, k);
+    // A change announced for the next chunk when this one could not take it.
+    if (l.deferred == k + 1) {
+        planned(l, k, t.tag);
+        l.deferred = -1;
+    }
     return true;
 }
 
@@ -270,12 +315,12 @@ bool Yue2Endless::Impl::sample(Line& l) {
     Yue2EndlessTarget t = target_for(l, k);
     bool use = true;   // fold the path at k (false: a change deferred to the next chunk)
     if (needs_bridge(l, k, t)) {
-        // The bridge's probe renders from the first unrendered chunk: there
-        // must be time for it before that chunk plays, else the change waits
-        // for the next chunk.
-        const double left = seconds_until(static_cast<std::int64_t>(l.rendered) * C * kR - kHalo * kR) -
-                            opt.emit_lead_seconds;
-        if (!opt.paced || left > est_bridge * 1.2) return bridge(l, k, t);
+        // No time for the bridge's work: the change waits for the next chunk.
+        if (bridge_fits(l)) return bridge(l, k, t);
+        if (!l.path.count(k + 1) && l.deferred != k + 1) {
+            planned(l, k + 1, t.tag);
+            l.deferred = k + 1;
+        }
         t = l.chunk(k - 1).target;
         use = false;
     }
@@ -304,7 +349,8 @@ bool Yue2Endless::Impl::sample(Line& l) {
     const Yue2Params p = params_for(t, lyrics, l.seed * 1000 + static_cast<std::uint64_t>(k), true);
     work(l.id ? "branch: splice" : "splice", k);
     const auto t0 = Clock::now();
-    Yue2SpliceResult r = model.splice(p, plan, sp, {}, preemptible(l, k, t));
+    // Preempted when the path's target for k moves (not t: a deferred change is t's old one).
+    Yue2SpliceResult r = model.splice(p, plan, sp, {}, preemptible(l, k, target_for(l, k)));
     end_preemptible();
     if (r.cancelled) return false;
     const int middle = static_cast<int>(r.semantic.size()) - r.middle0;
@@ -356,7 +402,9 @@ void Yue2Endless::Impl::built(Line& l, int k, double seconds) {
     e.frame0 = k * C;
     if (opt.chunk_data) e.latents = std::make_shared<std::vector<float>>(l.lat_at(k * C), l.lat_at((k + 1) * C));
     event(e);
-    if (c.row.latent_norm < 6.5 || c.row.latent_norm > 9.5) {
+    // The opening chunk has no music before it and always runs louder (a
+    // latent norm of 9-10); past it, a norm outside 6.5-9.5 is a break.
+    if (k > 0 && (c.row.latent_norm < 6.5 || c.row.latent_norm > 9.5)) {
         Yue2EndlessEvent w{Yue2EndlessEvent::Kind::BreakWarning};
         w.chunk = k;
         w.branch = l.id;

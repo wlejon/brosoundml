@@ -6,9 +6,11 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace brosoundml {
 
@@ -133,6 +135,25 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
             std::vector<int32_t> nids(neg);
             nids.insert(nids.end(), hist.begin(), hist.end());
             m.ar_prefill(*S.sess, 1, nids, lo, hi);
+        }
+    }
+    // The prefill is queued: poll `cancel` every 2 ms until the device is
+    // done rather than block in the logits' readback (a caller feeding audio
+    // keeps going through a long prefix).
+    if (cancel) {
+        auto next = std::chrono::steady_clock::now();
+        while (!brotensor::idle(m.device())) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (cancel()) {
+                Yue2SpliceResult r;
+                r.cancelled = true;
+                return r;
+            }
+            next = now + std::chrono::milliseconds(2);
         }
     }
     m.ar_logits(*S.sess, S.logits);

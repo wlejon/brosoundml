@@ -89,8 +89,10 @@ public:
 
     // Latents, frame-major [frame][64] (Yue2's on_latents layout), -> the
     // full-decoder waveform, 1920*frames - 64 samples per channel. Decodes in
-    // one pass; long songs want decode_tiled.
-    StereoAudio decode(const float* latents, int frames) const;
+    // one pass; long songs want decode_tiled. `wait`, when set, is called
+    // every 2 ms while the device runs the decode (a host loop feeding audio
+    // keeps going); it changes nothing in the result.
+    StereoAudio decode(const float* latents, int frames, const std::function<void()>& wait = {}) const;
 
     // The same waveform from tiles of `core_frames` with `halo_frames` of
     // context each side (0 = the config defaults; halo must be >=
@@ -108,7 +110,7 @@ public:
     // context each side, exactly. A just-in-time decoder: frames before `end`
     // + halo must already be final; anything can be re-decoded after an edit.
     StereoAudio decode_span(const float* latents, int frames, int start, int end, bool song_end = false,
-                            int halo_frames = 0) const;
+                            int halo_frames = 0, const std::function<void()>& wait = {}) const;
     // 48 kHz stereo -> posterior-mean latents, frame-major [frame][64];
     // *frames_out receives the frame count. Other rates are resampled; a mono
     // input is duplicated to both channels. Needs >= 1920 samples. Encodes in

@@ -122,9 +122,12 @@ struct Yue2EndlessOptions {
     bool paced = true;
     double emit_lead_seconds = 0.75;    // audio handed out ahead of the playhead
     double decode_lead_seconds = 4.0;   // audio decoded ahead of the playhead (energy acts behind it)
-    // A chunk is sampled once its start is this far ahead of the playhead (a
-    // chunk's render waits for the next one's tokens, so this covers a chunk
-    // plus a render); a bridge starts `bridge_lead_seconds` earlier still.
+    // A chunk is sampled once its start is this far ahead of the playhead, or
+    // further when the measured costs ask for it (a chunk's render waits for
+    // the next one's tokens, so the lead covers a chunk, the emit lead, a
+    // splice and a render per line being built, the listener and a margin:
+    // ~15.7 s on a 4090); a bridge starts `bridge_lead_seconds` earlier still.
+    // The less it is, the sooner a target set now is heard.
     double ahead_seconds = 14.0;
     double bridge_lead_seconds = 7.0;
     bool retarget = true;               // a target set now may re-sample the newest chunk (see above)

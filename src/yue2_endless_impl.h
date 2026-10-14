@@ -66,6 +66,7 @@ struct Line {
     Roll roll;
     bool committing = false;
     bool failed = false;
+    int deferred = -1;   // a change sample() put off and announced for this chunk (-1: none)
 
     int sampled() const { return chunk_base + static_cast<int>(chunks.size()); }
     Chunk& chunk(int k) { return chunks[static_cast<std::size_t>(k - chunk_base)]; }
@@ -165,6 +166,9 @@ struct Yue2Endless::Impl {
     Yue2Params params_for(const Yue2EndlessTarget& t, const std::string& lyrics, std::uint64_t seed, bool ar) const;
     void nar_steer(Yue2Params& p, const Yue2Knobs& k, int frames) const;
     bool needs_bridge(const Line& l, int k, const Yue2EndlessTarget& t) const;
+    bool bridge_fits(const Line& l) const;   // paced: a bridge sampled now is rendered before it plays
+    double sample_lead() const;              // seconds ahead of a chunk's start its sampling begins
+    void planned(const Line& l, int k, const std::string& tag);
     bool sample_due(const Line& l) const;
     bool can_render(const Line& l) const;
     bool sample(Line& l);                     // false: preempted / stopping (nothing changed)
@@ -195,7 +199,11 @@ struct Yue2Endless::Impl {
     Line* branch_of(int id);
 
     // yue2_endless_program.cpp
-    void service();
+    // The player's turn: gaps, commands (unless `light`), preemption, audio
+    // out, an urgent decode, stats. Light inside a decode: a command could
+    // re-decode under it.
+    void service(bool light = false);
+    std::function<void()> waiting() { return [this] { service(true); }; }
     void emit();
     bool decode_tile(int max_frames);
     int decodable() const;                    // program frames decodable exactly now

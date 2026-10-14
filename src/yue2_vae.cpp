@@ -23,6 +23,7 @@
 #include <brotensor/safetensors.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -282,7 +284,8 @@ struct Yue2Vae::Impl {
     // ── forward ──
     // Latent frames [left, right) of a frame-major buffer -> (2, dec_len) host,
     // planar.
-    std::vector<float> decode_window(const float* lat, int left, int right, int* L_out) const {
+    std::vector<float> decode_window(const float* lat, int left, int right, int* L_out,
+                                     const std::function<void()>& wait = {}) const {
         const int T = right - left, D = cfg.latent_dim;
         std::vector<float> ncl(static_cast<std::size_t>(D) * T);
         for (int t = 0; t < T; ++t)
@@ -303,6 +306,21 @@ struct Yue2Vae::Impl {
         dec_snake.apply(x, L, x);
         x = dec_out.forward(x, L);
         L = dec_out.out_len(L);
+        if (wait) {
+            // The decode is queued: poll `wait` every 2 ms until the device
+            // is done instead of blocking in the readback (spinning, as a
+            // device sync does; a sleep rounds up to the OS tick).
+            auto next = std::chrono::steady_clock::now();
+            while (!bt::idle(dev)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next) {
+                    wait();
+                    next = now + std::chrono::milliseconds(2);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        }
         std::vector<float> out(static_cast<std::size_t>(cfg.channels) * L);
         to_host(x, out.data(), out.size());
         *L_out = L;
@@ -443,7 +461,7 @@ void Yue2Vae::load(const std::string& dir, bt::Device device, bool decoder_only)
     impl_ = std::move(fresh);
 }
 
-StereoAudio Yue2Vae::decode(const float* latents, int frames) const {
+StereoAudio Yue2Vae::decode(const float* latents, int frames, const std::function<void()>& wait) const {
     if (!loaded()) fail("decode: no model loaded");
     if (!latents || frames <= 0) fail("decode: empty latents");
     for (std::size_t i = 0, n = std::size_t(frames) * impl_->cfg.latent_dim; i < n; ++i)
@@ -451,7 +469,7 @@ StereoAudio Yue2Vae::decode(const float* latents, int frames) const {
     StereoAudio a;
     a.sample_rate = impl_->cfg.sample_rate;
     a.channels = impl_->cfg.channels;
-    a.samples = impl_->decode_window(latents, 0, frames, &a.frames);
+    a.samples = impl_->decode_window(latents, 0, frames, &a.frames, wait);
     return a;
 }
 
@@ -652,7 +670,7 @@ void Yue2VaeStream::reset() {
 }
 
 StereoAudio Yue2Vae::decode_span(const float* latents, int frames, int start, int end, bool song_end,
-                                 int halo) const {
+                                 int halo, const std::function<void()>& wait) const {
     if (!loaded()) fail("decode_span: no model loaded");
     if (!latents || start < 0 || end > frames || start >= end) fail("decode_span: bad span");
     const Impl& m = *impl_;
@@ -663,7 +681,7 @@ StereoAudio Yue2Vae::decode_span(const float* latents, int frames, int start, in
     const int R = m.cfg.downsampling_ratio, C = m.cfg.channels;
     const int left = std::max(0, start - halo), right = std::min(frames, end + halo);
     int L = 0;
-    const std::vector<float> tile = m.decode_window(latents, left, right, &L);
+    const std::vector<float> tile = m.decode_window(latents, left, right, &L, wait);
     const int out0 = start * R, out1 = (song_end && end == frames) ? m.dec_len(frames) : end * R;
     const int crop = (start - left) * R, n = out1 - out0;
     if (crop + n > L) fail("decode_span: window did not cover its core");
