@@ -153,6 +153,13 @@ target_sources(brosoundml PRIVATE
     src/yue2_stream_song.cpp
     src/yue2_edit.cpp
     src/yue2_directions.cpp
+    src/yue2_endless.cpp
+    src/yue2_endless_program.cpp
+    src/yue2_endless_chunk.cpp
+    src/yue2_endless_bridge.cpp
+    src/yue2_endless_lyrics.cpp
+    src/yue2_endless_branch.cpp
+    src/beat.cpp
     src/supertonic.cpp
     src/speaker_encoder.cpp
     src/wake.cpp

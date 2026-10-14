@@ -7,6 +7,7 @@
 #include "host_soundml_internal.h"
 
 #include <brosoundml/yue2.h>
+#include <brosoundml/yue2_stream.h>
 #include <brosoundml/yue2_vae.h>
 
 #include <memory>
@@ -49,6 +50,17 @@ Value yue2Inpaint(Value self, std::span<const Value> a);
 // model.stream(opts) -> YuE2Stream (native_soundml_music_stream.cpp)
 Value yue2Stream(Value self, std::span<const Value> a);
 void installStreamClass();
+// Knobs are flat in JS (energy, texture, percussion, one field per semantic
+// axis); readKnobs leaves fields not given as they are.
+void readKnobs(Value v, brosoundml::Yue2Knobs& k);
+Value makeKnobs(const brosoundml::Yue2Knobs& k);
+
+// model.endless(opts) -> YuE2Endless (native_soundml_music_endless.cpp), its
+// events / stats as JS (native_soundml_music_endless_js.cpp), and
+// bro.music.beat(audio, opts).
+Value yue2Endless(Value self, std::span<const Value> a);
+void installEndlessClass();
+Value musicBeat(Value self, std::span<const Value> a);
 // { energy, texture, percussion, arrangement, density, timbre: { min, max } }: the clamps
 // Yue2Knobs::clamp applies, as a stream's knobRanges and bro.music.knobRanges.
 Value knobRanges();

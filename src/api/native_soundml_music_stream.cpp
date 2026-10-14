@@ -87,6 +87,8 @@ const char* kindName(brosoundml::Yue2StreamEvent::Kind k) {
     return "idle";
 }
 
+}  // namespace
+
 // Knobs are flat in JS: energy, texture, percussion and one field per
 // semantic axis (arrangement, then the style axes).
 void readKnobs(Value v, brosoundml::Yue2Knobs& k) {
@@ -111,6 +113,8 @@ Value makeKnobs(const brosoundml::Yue2Knobs& k) {
         o.set(a.name, static_cast<double>(k.get(a.name)));
     return o.get();
 }
+
+namespace {
 
 // A song: Yue2Params' fields (readParams) + semantic (Int32Array of codec
 // ids: render these instead of sampling) + tag.

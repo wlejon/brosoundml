@@ -20,6 +20,7 @@
 // function (onDone(result, { cancelled, error? }); the call answers an
 // AsyncHandle), and block otherwise.
 #include "soundml_loader.h"
+#include "soundml_music_internal.h"
 
 #include <brosoundml/clap.h>
 
@@ -503,6 +504,8 @@ void installEar(ObjectBuilder& bro) {
     const bool had = ev::isObject(existing.get()) && !ev::isFunction(existing.get());
     ObjectBuilder ear = had ? ObjectBuilder(existing.get()) : ObjectBuilder();
     ear.def("loadClap", 2, loadClap);
+    // The beat phase sensor (bro.music.beat too): spectral flux + a comb.
+    ear.def("beat", 2, music::musicBeat);
     ear.set("ClapModel", g_clapClass.constructor());
     if (!had) bro.set("ear", ear.get());
 }

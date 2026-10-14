@@ -647,6 +647,7 @@ void decorateYue2(ObjectBuilder& b) {
     b.def("semantic", 2, yue2Semantic);
     b.def("synthesize", 3, yue2Synthesize);
     b.def("stream", 1, music::yue2Stream);
+    b.def("endless", 1, music::yue2Endless);
     b.def("splice", 2, music::yue2Splice);
     b.def("inpaint", 6, music::yue2Inpaint);
     b.def("tokenize", 1, [](Value self, std::span<const Value> a) -> Value {
@@ -981,9 +982,11 @@ void installMusic(ObjectBuilder& bro) {
     g_yue2Class.install("YuE2", 0, nullptr, decorateYue2);
     g_yue2VaeClass.install("YuE2Vae", 0, nullptr, decorateYue2Vae);
     music::installStreamClass();
+    music::installEndlessClass();
 
     ObjectBuilder music;
     music.def("init", 0, musicInit);
+    music.def("beat", 2, music::musicBeat);
     music.def("loadYuE2", 2, loadYuE2);
     music.def("loadVae", 2, loadVae);
     music.set("YuE2", g_yue2Class.constructor());
