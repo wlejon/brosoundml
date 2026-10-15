@@ -602,6 +602,16 @@ void decorateYue2(ObjectBuilder& b) {
     b.accessor("frameRate", [](Value, std::span<const Value>) -> Value {
         return ev::fromDouble(brosoundml::Yue2::kFrameRate);
     });
+    // Frees the weights now (a 3B model's VRAM should not wait for a GC);
+    // the model is unusable afterwards. A stream or job still holding it
+    // (busy) refuses: stop it and wait for its onDone first.
+    b.def("dispose", 0, [](Value self, std::span<const Value>) -> Value {
+        auto* w = yue2Of(self);
+        if (!w) return ev::throwTypeError("dispose: not a YuE2");
+        if (w->busy.isBusy()) return ev::throwError("dispose: the model is busy (a job or stream holds it)");
+        w->model.reset();
+        return ev::undefined();
+    });
     b.def("generate", 1, yue2Generate);
     b.def("plan", 1, yue2Plan);
     b.def("semantic", 2, yue2Semantic);
@@ -870,6 +880,13 @@ void decorateYue2Vae(ObjectBuilder& b) {
         const int f = i32At(a, 0, 0);
         if (f <= 0) return ev::throwTypeError("outputLength(frames): frames must be positive");
         return ev::fromDouble(w->vae->output_length(f));
+    });
+    b.def("dispose", 0, [](Value self, std::span<const Value>) -> Value {
+        auto* w = vaeOf(self);
+        if (!w) return ev::throwTypeError("dispose: not a YuE2Vae");
+        if (w->busy.isBusy()) return ev::throwError("dispose: the VAE is busy (a job or stream holds it)");
+        w->vae.reset();
+        return ev::undefined();
     });
     b.def("decode", 2, vaeDecode);
     b.def("encode", 2, vaeEncode);
