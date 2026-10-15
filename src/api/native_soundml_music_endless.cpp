@@ -3,15 +3,13 @@
 // branches.
 //
 // The stream's worker runs on a background thread for its whole life
-// (launchAsyncJob) and claims the model's and the VAE's gates (and the
-// Whisper model's, when one listens for rolled lyrics) until it ends. Audio
+// (launchAsyncJob) and claims the model's and the VAE's gates until it ends. Audio
 // chunks and events cross to the JS thread through a mutex-guarded queue
 // that each tick's poll drains; controls are Yue2Endless's own thread-safe
 // calls. While it runs the job roots the stream object.
 
 #include "soundml_music_endless.h"
 #include "soundml_async.h"
-#include "soundml_stt_internal.h"
 
 #include <atomic>
 #include <deque>
@@ -33,16 +31,14 @@ using Item = std::variant<AudioItem, brosoundml::Yue2EndlessEvent>;
 struct EndlessJob {
     std::shared_ptr<brosoundml::Yue2> model;
     std::shared_ptr<brosoundml::Yue2Vae> vae;
-    std::shared_ptr<brosoundml::Whisper> whisper;
-    ModelGate gate, vaeGate, whisperGate;
-    bool hasWhisper = false;
+    ModelGate gate, vaeGate;
     std::unique_ptr<brosoundml::Yue2Endless> stream;
     brosoundml::Yue2EndlessTarget target;   // JS side: what setTarget merges into
     std::atomic<const std::atomic<bool>*> cancel{nullptr};
     std::atomic<bool> running{true};
     std::mutex mu;
     std::deque<Item> out;
-    ev::Persistent onAudio, onEvent, onDone, modelRef, vaeRef, whisperRef, tokRef, selfRef;
+    ev::Persistent onAudio, onEvent, onDone, modelRef, vaeRef, selfRef;
 };
 
 struct HostEndless {
@@ -187,7 +183,7 @@ void decorateEndless(ObjectBuilder& b) {
 
 void installEndlessClass() { g_endlessClass.install("YuE2Endless", 0, nullptr, decorateEndless); }
 
-// model.endless({ vae, target, path?, whisper?, whisperTokenizer?, onAudio, onEvent?, onDone?, ...options })
+// model.endless({ vae, target, path?, onAudio, onEvent?, onDone?, ...options })
 Value yue2Endless(Value self, std::span<const Value> a) {
     ev::Persistent selfRoot(self);
     HostYue2* w = yue2Of(selfRoot.get());
@@ -204,23 +200,6 @@ Value yue2Endless(Value self, std::span<const Value> a) {
     std::string err;
     if (!readEndlessOptions(opts.get(), o, err)) return ev::throwTypeError("endless(opts): " + err);
 
-    // The listener for rolled lyrics: a Whisper model and its tokenizer.
-    ev::Persistent whVal(ev::getProperty(opts.get(), "whisper"));
-    ev::Persistent tokVal(ev::getProperty(opts.get(), "whisperTokenizer"));
-    HostWhisperModel* wm = nullptr;
-    HostWhisperTokenizer* wt = nullptr;
-    if (!ev::isUndefined(whVal.get()) && !ev::isNull(whVal.get())) {
-        wm = unwrapAs<HostWhisperModel>(g_whisperModelClass, whVal.get());
-        wt = unwrapAs<HostWhisperTokenizer>(g_whisperTokenizerClass, tokVal.get());
-        if (!wm || !wm->model || !wm->model->loaded())
-            return ev::throwTypeError("endless(opts): opts.whisper must be a loaded Whisper model (bro.stt.loadWhisper)");
-        if (!wt || !wt->tok)
-            return ev::throwTypeError("endless(opts): opts.whisper needs opts.whisperTokenizer (bro.stt.loadTokenizer)");
-        const brolm::whisper::Tokenizer* tok = wt->tok.get();
-        o.listen = brosoundml::Yue2Endless::whisper_listener(
-            *wm->model, tok->build_prompt("en", "transcribe", false),
-            [tok](const std::vector<int32_t>& ids) { return tok->decode(ids, true); });
-    }
     job->onAudio = getFunctionOpt(opts.get(), "onAudio");
     job->onEvent = getFunctionOpt(opts.get(), "onEvent");
     job->onDone = getFunctionOpt(opts.get(), "onDone");
@@ -250,24 +229,12 @@ Value yue2Endless(Value self, std::span<const Value> a) {
         w->busy.release();
         return ev::throwError("endless: an operation is already in flight on the VAE");
     }
-    if (wm && !wm->busy.tryClaim()) {
-        w->busy.release();
-        vw->busy.release();
-        return ev::throwError("endless: an operation is already in flight on the Whisper model");
-    }
     job->model = w->model;
     job->vae = vw->vae;
     job->gate = w->busy;
     job->vaeGate = vw->busy;
     job->modelRef = ev::Persistent(selfRoot.get());
     job->vaeRef = ev::Persistent(vaeVal.get());
-    if (wm) {
-        job->whisper = wm->model;
-        job->whisperGate = wm->busy;
-        job->hasWhisper = true;
-        job->whisperRef = ev::Persistent(whVal.get());
-        job->tokRef = ev::Persistent(tokVal.get());
-    }
     const brotensor::Device dev = w->device;
 
     auto host = std::make_unique<HostEndless>();
@@ -285,7 +252,6 @@ Value yue2Endless(Value self, std::span<const Value> a) {
         job->running.store(false);
         job->gate.release();
         job->vaeGate.release();
-        if (job->hasWhisper) job->whisperGate.release();
         pollEndless(*job);
         ev::Persistent self(job->selfRef.get());
         job->selfRef = ev::Persistent();

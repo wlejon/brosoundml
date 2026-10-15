@@ -127,12 +127,21 @@ struct ArSession {
         bt::Tensor ones;                           // (1,1) FP32
         bt::Tensor cos, sin;                       // (B*R, hd/2) FP32
         bt::Tensor x, n, q, k, v, qn, kn, att, g, u, logits, ws;
+        bt::Tensor wq;                             // (R, qd): branch 0's queries at the watched layer
         bt::CudaGraph graph;
         bool captured = false;
         int graph_lo = -1, graph_hi = -1;
         std::vector<int> mask_len;
     };
     std::map<int, Step> steps;                     // by R
+    int last_R = 0;                                // rows of the last decode step
+
+    // Model::ar_watch: one query head of one layer, branch 0. Each step
+    // copies the layer's query rows; the host keeps the head's key rows
+    // (they never change once written) and catches up on the new ones.
+    int watch_layer = -1, watch_head = 0;
+    std::vector<float> watch_k;                    // (watch_rows, hd) FP32
+    int watch_rows = 0;
 };
 
 struct NarChunk {

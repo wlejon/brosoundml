@@ -52,7 +52,7 @@ void Yue2Endless::Impl::open_branch(int id, const Yue2EndlessTarget& t, std::vec
         const Chunk& c = m.chunk(f);
         if (c.roll_sheet != b->roll.sheet) b->roll = Roll{}, b->roll.sheet = c.roll_sheet;
         b->roll.at = c.roll_at;
-        b->roll.moved = c.roll_moved;
+        b->roll.reached = c.roll_reached;
     }
     b->base = t;
     b->base.at = -1;

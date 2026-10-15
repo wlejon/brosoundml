@@ -125,22 +125,18 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
 
     const StageHooks hooks = make_hooks(m, p, Yue2Stage::Semantic, cb);
     S.sess = m.ar_session(S.B, std::min(CONTEXT, longest + kept + 1024), hooks.get(), CONTEXT);
+    const bool watch = sp.watch_layer >= 0 && M > 0;
+    if (watch) m.ar_watch(*S.sess, sp.watch_layer, sp.watch_head);
+    std::vector<std::vector<float>> watched;   // per candidate
+    std::vector<float> wrow;
     std::vector<int32_t> hist;   // the song so far, absolute ids (the repetition penalty's history)
     for (int32_t c : sp.before) hist.push_back(c + CODEC_OFFSET);
-    {
-        std::vector<int32_t> ids(plan.prefix);
-        ids.insert(ids.end(), hist.begin(), hist.end());
-        m.ar_prefill(*S.sess, 0, ids, lo, hi);
-        if (S.use_cfg) {
-            std::vector<int32_t> nids(neg);
-            nids.insert(nids.end(), hist.begin(), hist.end());
-            m.ar_prefill(*S.sess, 1, nids, lo, hi);
-        }
-    }
-    // The prefill is queued: poll `cancel` every 2 ms until the device is
-    // done rather than block in the logits' readback (a caller feeding audio
-    // keeps going through a long prefix).
-    if (cancel) {
+    // A branch's prefill is queued: poll `cancel` every 2 ms until the device
+    // is done rather than block (a caller feeding audio keeps going through a
+    // long prefix). Each branch waits on its own: the next branch's queueing
+    // blocks on the one before it (its uploads wait their turn on the stream).
+    auto settled = [&] {
+        if (!cancel) return true;
         auto next = std::chrono::steady_clock::now();
         while (!brotensor::idle(m.device())) {
             const auto now = std::chrono::steady_clock::now();
@@ -148,12 +144,19 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
                 std::this_thread::yield();
                 continue;
             }
-            if (cancel()) {
-                Yue2SpliceResult r;
-                r.cancelled = true;
-                return r;
-            }
+            if (cancel()) return false;
             next = now + std::chrono::milliseconds(2);
+        }
+        return true;
+    };
+    for (int b = 0; b < S.B; ++b) {
+        std::vector<int32_t> ids(b == 0 ? plan.prefix : neg);
+        ids.insert(ids.end(), hist.begin(), hist.end());
+        m.ar_prefill(*S.sess, b, ids, lo, hi);
+        if (!settled()) {
+            Yue2SpliceResult r;
+            r.cancelled = true;
+            return r;
         }
     }
     m.ar_logits(*S.sess, S.logits);
@@ -188,6 +191,7 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
         const UniformFn u = k == 0 ? stage_uniform(p, stage_u) : make_uniform(p.seed + static_cast<std::uint64_t>(k));
         std::vector<int32_t> h = hist;
         std::vector<int32_t> mid;
+        std::vector<float> seen;
         for (int i = 0; i < M; ++i) {
             if (cancelled()) { res.cancelled = true; return res; }
             const int32_t tok = S.sample(S.row(0), h, A + i, /*forbid_end=*/true, u);
@@ -195,6 +199,10 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
             h.push_back(tok);
             if (cb.on_semantic) cb.on_semantic(tok - CODEC_OFFSET);
             S.step(tok);
+            if (watch) {
+                m.ar_watched(*S.sess, sp.watch_spans, wrow);
+                seen.insert(seen.end(), wrow.begin(), wrow.end());
+            }
             progress();
         }
         // B's opening, teacher-forced: the current row predicts B[0], each
@@ -214,12 +222,14 @@ Yue2SpliceResult Yue2::splice(const Yue2Params& p, const Yue2Plan& plan, const Y
         }
         res.scores.push_back(static_cast<float>(nll));
         res.middles.push_back(mid);
+        if (watch) watched.push_back(std::move(seen));
         if (k == 0 || nll < best) {
             best = nll;
             res.chosen = k;
         }
         held = k;
     }
+    if (watch) res.watched = std::move(watched[static_cast<std::size_t>(res.chosen)]);
     res.semantic = sp.before;
     res.semantic.insert(res.semantic.end(), res.middles[res.chosen].begin(), res.middles[res.chosen].end());
     res.semantic.insert(res.semantic.end(), sp.after.begin(), sp.after.end());

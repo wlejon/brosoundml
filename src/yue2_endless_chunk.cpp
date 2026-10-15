@@ -191,12 +191,14 @@ bool Yue2Endless::Impl::sample_due(const Line& l) const {
 
 // Chunk k is sampled before chunk k-1 plays: k-1's render waits for k's
 // first tokens. So the lead is a chunk, the emit lead, a splice and a render
-// (one per line being built: branches share the device), the listener, and a
-// margin, never less than ahead_seconds.
+// (one per line being built: branches share the device), the program's
+// decode of a chunk, and a margin, never less than ahead_seconds. (Without
+// the decode a splice starts late enough that the program's due decodes
+// land inside it, each a 0.2-0.3 s stretch without a service.)
 double Yue2Endless::Impl::sample_lead() const {
     const double lines = 1.0 + static_cast<double>(branches.size());
     const double need = static_cast<double>(C) / Yue2::kFrameRate + opt.emit_lead_seconds +
-                        lines * (est_splice + est_render) + (opt.listen ? est_listen : 0.0) + 1.5;
+                        lines * (est_splice + est_render) + est_decode + 1.5;
     return std::max(opt.ahead_seconds, need);
 }
 
@@ -263,15 +265,14 @@ void Yue2Endless::Impl::add_chunk(Line& l, Chunk c) {
 
 void Yue2Endless::Impl::retarget(Line& l, int k) {
     Chunk& c = l.chunk(k);
-    const int heard = l.roll.last_heard;
     const bool same_sheet = c.roll_sheet == l.roll.sheet;
     if (!same_sheet) {   // the chunk had started a new sheet: back to the old one
         l.roll = Roll{};
         l.roll.sheet = c.roll_sheet;
     }
+    // The roll before the chunk: what the head read in it is undone with it.
     l.roll.at = c.roll_at;
-    l.roll.moved = c.roll_moved;
-    if (same_sheet) l.roll.last_heard = heard;
+    l.roll.reached = c.roll_reached;
     if (!same_sheet && !c.roll_sheet.empty()) {
         // Rebuilt by the next lyrics_of() from the sheet text.
         l.roll.lines.clear();
@@ -333,12 +334,13 @@ bool Yue2Endless::Impl::sample(Line& l) {
     Roll roll = l.roll;
     Chunk c;
     c.roll_at = l.roll.at;
-    c.roll_moved = l.roll.moved;
+    c.roll_reached = l.roll.reached;
     c.roll_sheet = l.roll.sheet;
     c.row.index = k;
     c.row.branch = l.id;
-    const std::string lyrics = lyrics_of(l, k, t, roll, &c.row.lyric_from, &c.row.lyric_to);
+    const std::string lyrics = lyrics_of(t, roll, &c.row.lyric_from, &c.row.lyric_to);
     const Yue2Plan& plan = plan_for(t, lyrics);
+    const LyricWords words = lyric_words(plan, lyrics, c.row.lyric_from);
     const int mem = change && mode == Yue2ChangeMode::Drop ? opt.change_memory : opt.memory;
     Yue2Splice sp;
     const int T = static_cast<int>(l.tokens.size());
@@ -346,6 +348,7 @@ bool Yue2Endless::Impl::sample(Line& l) {
     sp.middle_frames = C;
     sp.candidates = 1;
     sp.continue_after = false;
+    watch_lyrics(sp, words);
     const Yue2Params p = params_for(t, lyrics, l.seed * 1000 + static_cast<std::uint64_t>(k), true);
     work(l.id ? "branch: splice" : "splice", k);
     const auto t0 = Clock::now();
@@ -368,9 +371,11 @@ bool Yue2Endless::Impl::sample(Line& l) {
     c.row.lyrics = lyrics;
     c.row.knobs = t.knobs;
     c.target = t;
+    read_lyrics(roll, c, words, r.watched, 0);
     l.roll = std::move(roll);
     if (use) fold(l, k);
     add_chunk(l, std::move(c));
+    lyrics_event(l, k, l.roll.reached);
     if (change) {
         Yue2EndlessEvent e{Yue2EndlessEvent::Kind::StyleChange};
         e.chunk = k;
@@ -390,7 +395,6 @@ void Yue2Endless::Impl::built(Line& l, int k, double seconds) {
     c.row.rendered = true;
     c.row.latent_norm = norm_of(l, k * C, (k + 1) * C);
     c.row.inpaint_seconds = seconds;
-    hear(l, k);
     Yue2EndlessEvent e{Yue2EndlessEvent::Kind::Built};
     e.chunk = k;
     e.branch = l.id;

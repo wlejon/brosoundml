@@ -7,6 +7,7 @@
 #include <brotensor/runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 namespace brosoundml::yue2 {
@@ -16,6 +17,65 @@ void Model::ar_step(ArSession& s, int32_t token) const { ar_step_rows(s, &token,
 void Model::ar_truncate(ArSession& s, int b, int len) const {
     if (b < 0 || b >= s.B || len < 1 || len > s.len[b]) model_fail("truncate outside the branch");
     s.len[b] = len;
+    if (b == 0) s.watch_rows = std::min(s.watch_rows, len);   // the rows past it will be rewritten
+}
+
+void Model::ar_watch(ArSession& s, int layer, int head) const {
+    const Config& c = w_->cfg;
+    if (layer < 0 || layer >= c.layers || head < 0 || head >= c.n_q) model_fail("watched head outside the model");
+    s.watch_layer = layer;
+    s.watch_head = head;
+    s.watch_k.clear();
+    s.watch_rows = 0;
+    s.steps.clear();   // the step buffers and graphs gain the query copy
+}
+
+void Model::ar_watched(ArSession& s, const std::vector<std::pair<int, int>>& spans, std::vector<float>& out) const {
+    const ModelWeights& w = *w_;
+    const Config& c = w.cfg;
+    bt::DeviceScope scope(w.dev);
+    if (s.watch_layer < 0) model_fail("ar_watched without ar_watch");
+    const int R = s.last_R;
+    auto it = s.steps.find(R);
+    if (R < 1 || it == s.steps.end() || it->second.wq.rows != R) model_fail("ar_watched before a watched step");
+    const int hd = c.head_dim, kd = c.n_kv * hd, qd = c.n_q * hd;
+    const int kvh = s.watch_head / (c.n_q / c.n_kv);   // GQA: query heads share their KV head in groups
+    const int len = s.len[0];
+    // The key rows written since the last read (a prefill, steps).
+    if (s.watch_rows < len) {
+        std::vector<float> rows;
+        to_host_f32(w, rows_view(s.K[0][s.watch_layer], s.watch_rows, len - s.watch_rows), rows);
+        s.watch_k.resize(static_cast<std::size_t>(len) * hd);
+        for (int r = 0; r < len - s.watch_rows; ++r)
+            std::copy_n(rows.data() + static_cast<std::size_t>(r) * kd + kvh * hd, hd,
+                        s.watch_k.data() + static_cast<std::size_t>(s.watch_rows + r) * hd);
+        s.watch_rows = len;
+    }
+    std::vector<float> q;
+    to_host_f32(w, it->second.wq, q);
+    const std::size_t S = spans.size();
+    out.assign(static_cast<std::size_t>(R) * S, 0.0f);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(hd));
+    std::vector<double> e(static_cast<std::size_t>(len));
+    for (int r = 0; r < R; ++r) {
+        const int n = len - R + r + 1;   // row r sees the keys up to its own
+        const float* qh = q.data() + static_cast<std::size_t>(r) * qd + static_cast<std::size_t>(s.watch_head) * hd;
+        double mx = -1e300;
+        for (int j = 0; j < n; ++j) {
+            const float* kj = s.watch_k.data() + static_cast<std::size_t>(j) * hd;
+            float d = 0;
+            for (int i = 0; i < hd; ++i) d += qh[i] * kj[i];
+            e[j] = d * scale;
+            mx = std::max(mx, e[j]);
+        }
+        double z = 0;
+        for (int j = 0; j < n; ++j) z += (e[j] = std::exp(e[j] - mx));
+        for (std::size_t k = 0; k < S; ++k) {
+            double m = 0;
+            for (int j = std::max(0, spans[k].first); j < std::min(n, spans[k].second); ++j) m += e[j];
+            out[static_cast<std::size_t>(r) * S + k] = static_cast<float>(m / z);
+        }
+    }
 }
 
 void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
@@ -51,6 +111,7 @@ void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
         st.cos = bt::Tensor::zeros_on(w.dev, M, half, bt::Dtype::FP32);
         st.sin = bt::Tensor::zeros_on(w.dev, M, half, bt::Dtype::FP32);
         st.att = bt::Tensor::zeros_on(w.dev, M, qd, w.dt);
+        if (s.watch_layer >= 0) st.wq = bt::Tensor::zeros_on(w.dev, R, qd, w.dt);
     }
     // Stage this step: tokens, cache rows, each branch's key count after the
     // step (the last row's; row r sees len + r + 1 keys), RoPE rows.
@@ -94,6 +155,7 @@ void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
             bt::Tensor qv = reshape_view(st.qn, M, qd), kv = reshape_view(st.kn, M, kd);
             bt::rope_apply(qv, st.cos, st.sin, hd, c.n_q, qv);
             bt::rope_apply(kv, st.cos, st.sin, hd, c.n_kv, kv);
+            if (l == s.watch_layer) bt::copy_d2d(qv, 0, st.wq, 0, R * qd);   // branch 0's rows lead
             for (int b = 0; b < B; ++b) {
                 bt::scatter_rows(rows_view(kv, b * R, R), st.rowsb[b], s.K[b][l]);
                 bt::scatter_rows(rows_view(st.v, b * R, R), st.rowsb[b], s.V[b][l]);
@@ -153,6 +215,7 @@ void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
         st.mask_len[b] = s.len[b] + R;
         s.len[b] += R;
     }
+    s.last_R = R;
 }
 
 }  // namespace brosoundml::yue2

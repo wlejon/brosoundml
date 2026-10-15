@@ -7,7 +7,7 @@
 //   yue2_endless_program.cpp the program: decode just in time, energy, emit, service
 //   yue2_endless_chunk.cpp   targets, plans, sampling a chunk, rendering it
 //   yue2_endless_bridge.cpp  the measured bridge under a score
-//   yue2_endless_lyrics.cpp  rolled lyrics, hearing, the Whisper listener
+//   yue2_endless_lyrics.cpp  rolled lyrics, the lyric head's reading
 //   yue2_endless_branch.cpp  branches: fork, keep pace, commit, discard
 
 #include "brosoundml/yue2_endless.h"
@@ -31,13 +31,29 @@ constexpr int kHalo = 12;     // the VAE's required halo
 constexpr int kSr = 48000;
 constexpr int kBlock = 25;    // the program is decoded a second at a time
 
-// The roll's place in a sheet (endless.js rollAt / rollMoved / lastHeard).
+// The lyric pointer (yue2-research FINDINGS 11): attention head 14.10 points
+// at the lyric word being sung. A line is reached in a chunk when the head
+// pointed into kReachWords of its words, each for kReachFrames frames or
+// more, counting frames whose mass on the window's words is kReachGate or more.
+constexpr int kLyricLayer = 14, kLyricHead = 10;
+constexpr double kReachGate = 0.2, kReachWords = 0.6;
+constexpr int kReachFrames = 2;
+
+// The roll's place in a sheet: the window starts at `at`, after the
+// furthest line reached.
 struct Roll {
     std::string sheet;                     // the sheet it rolls (a change resets it)
     std::vector<std::string> lines;        // its non-empty lines
     std::vector<int> sung;                 // indices of lines that are not [section] tags
-    std::vector<std::vector<std::string>> words;   // each sung line's words
-    int at = 0, moved = 0, last_heard = -1;
+    int at = 0, reached = -1;
+};
+
+// A window's words as columns of a chunk's prompt (lyric_track.py
+// lyric_word_spans): the tokens [a, b) covering each word.
+struct LyricWords {
+    std::vector<std::string> words;
+    std::vector<int> lines;                // sheet line (sung-line index) of each word
+    std::vector<std::pair<int, int>> cols;
 };
 
 // A chunk as the worker holds it: its public row, the target it was made
@@ -46,7 +62,7 @@ struct Roll {
 struct Chunk {
     Yue2EndlessChunk row;
     Yue2EndlessTarget target;
-    int roll_at = 0, roll_moved = 0;       // the roll before this chunk was sampled
+    int roll_at = 0, roll_reached = -1;    // the roll before this chunk was sampled
     std::string roll_sheet;
     bool fresh = false;                    // a bridge's fresh clip (never re-sampled)
 };
@@ -141,7 +157,7 @@ struct Yue2Endless::Impl {
     bool preempt = false;
 
     // ── measured costs (seconds, running means) ──
-    double est_splice = 1.0, est_render = 2.0, est_decode = 0.15, est_listen = 0.4, est_bridge = 7.0;
+    double est_splice = 1.0, est_render = 2.0, est_decode = 0.15, est_bridge = 7.0;
 
     Impl(const Yue2& m, const Yue2Vae& v, Yue2EndlessOptions o, AudioFn a, EventFn e);
 
@@ -186,8 +202,16 @@ struct Yue2Endless::Impl {
     bool bridge(Line& l, int k, const Yue2EndlessTarget& t);
 
     // yue2_endless_lyrics.cpp
-    std::string lyrics_of(Line& l, int k, const Yue2EndlessTarget& t, endless::Roll& roll, int* from, int* to) const;
-    void hear(Line& l, int k);
+    std::string lyrics_of(const Yue2EndlessTarget& t, endless::Roll& roll, int* from, int* to) const;
+    // The window's words as prompt columns of `plan` (empty unless rolled).
+    endless::LyricWords lyric_words(const Yue2Plan& plan, const std::string& lyrics, int from) const;
+    // Watch the lyric head over a splice's M (no-op without words).
+    static void watch_lyrics(Yue2Splice& sp, const endless::LyricWords& w);
+    // Read the head over M rows [row0, row0 + C) of `watched` into the row,
+    // and move the roll past the lines reached.
+    void read_lyrics(endless::Roll& roll, Chunk& c, const endless::LyricWords& w, const std::vector<float>& watched,
+                     int row0) const;
+    void lyrics_event(const Line& l, int k, int reached);
 
     // yue2_endless_branch.cpp
     void open_branch(int id, const Yue2EndlessTarget& t, std::vector<Yue2EndlessTarget> path);

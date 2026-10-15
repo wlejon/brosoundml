@@ -49,10 +49,11 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     Roll roll = l.roll;
     Chunk cb, cf;
     cb.roll_at = cf.roll_at = l.roll.at;
-    cb.roll_moved = cf.roll_moved = l.roll.moved;
+    cb.roll_reached = cf.roll_reached = l.roll.reached;
     cb.roll_sheet = cf.roll_sheet = l.roll.sheet;
-    const std::string lyrics = lyrics_of(l, k, t, roll, &cb.row.lyric_from, &cb.row.lyric_to);
+    const std::string lyrics = lyrics_of(t, roll, &cb.row.lyric_from, &cb.row.lyric_to);
     const Yue2Plan& plan = plan_for(t, lyrics);
+    const LyricWords words = lyric_words(plan, lyrics, cb.row.lyric_from);
     const int T = static_cast<int>(l.tokens.size());
     const std::vector<int32_t> before(l.tokens.begin() + std::max(0, T - opt.memory), l.tokens.end());
     const std::uint64_t S = l.seed * 1000;
@@ -61,6 +62,7 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     Yue2Splice fs;
     fs.middle_frames = C + span;
     fs.candidates = 1;
+    watch_lyrics(fs, words);
     work(l.id ? "branch: bridge fresh" : "bridge: fresh", k + 1);
     Yue2SpliceResult fresh = model.splice(params_for(t, lyrics, S + k + 1, true), plan, fs, {}, preemptible(l, k, t));
     end_preemptible();
@@ -77,6 +79,7 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     bs.after.assign(F.begin(), F.begin() + C);
     bs.candidates = opt.bridge_candidates;
     bs.score_frames = opt.bridge_score_frames;
+    watch_lyrics(bs, words);
     work(l.id ? "branch: bridge splice" : "bridge: splice", k);
     Yue2SpliceResult r = model.splice(params_for(t, lyrics, S + k, true), plan, bs, {}, preemptible(l, k, t));
     end_preemptible();
@@ -164,11 +167,17 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     cf.row.fit_seconds = fit_seconds;
     cf.target = t;
     cf.fresh = true;
+    // The head over the bridge, then over the clip as cut (one window for both).
+    read_lyrics(roll, cb, words, r.watched, 0);
+    const int reached_b = roll.reached;
+    read_lyrics(roll, cf, words, fresh.watched, cut);
     l.roll = std::move(roll);
     fold(l, k + 1);
     est_bridge = 0.7 * est_bridge + 0.3 * since(t0);
     add_chunk(l, std::move(cb));
+    lyrics_event(l, k, reached_b);
     add_chunk(l, std::move(cf));
+    lyrics_event(l, k + 1, l.roll.reached);
     {
         Yue2EndlessEvent e{Yue2EndlessEvent::Kind::StyleChange};
         e.chunk = k;

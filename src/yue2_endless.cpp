@@ -295,7 +295,6 @@ void Yue2Endless::Impl::publish() {
     st.splice_seconds = est_splice;
     st.render_seconds = est_render;
     st.decode_seconds = est_decode;
-    st.listen_seconds = est_listen;
     std::lock_guard<std::mutex> lk(mu);
     snapshot = std::move(st);
 }

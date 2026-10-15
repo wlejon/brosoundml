@@ -2,10 +2,12 @@
 
 // YuE2 endless stream: no songs, one token history in 10 s chunks, steered by
 // targets. Beside Yue2Stream (yue2_stream.h, the song radio), on the same
-// model and VAE. Design and measurements: yue2-research FINDINGS 7-10; the
+// model and VAE. Design and measurements: yue2-research FINDINGS 7-11; the
 // reference implementation is its native/endless.js, which this reproduces
 // token for token from the same seeds (yue2-research/native/endless_stream.js
-// is the check).
+// is the check), except rolled lyrics: those roll by the model's own lyric
+// pointer (FINDINGS 11), checked against lyric_track.py's teacher-forced
+// reading of the same tokens.
 //
 // A chunk (`chunk_frames`, 250 = 10 s) is sampled by Yue2::splice opened by
 // the last `memory` tokens of the history (positions re-based: the model sees
@@ -21,8 +23,8 @@
 //
 // Targets. A target is what chunks are made under: style text, an optional
 // score (ABC: under it the tempo is exact, Q: sets it), a lyric sheet
-// (whole, or rolled: a window of lines moved past the last line the listener
-// heard), and knobs (AR steers act on the chunk's splice, NAR steers on its
+// (whole, or rolled: a window of lines moved past the last line the model
+// sang, read off its own attention as it samples), and knobs (AR steers act on the chunk's splice, NAR steers on its
 // render, energy at decode). set_target() applies from the first chunk whose
 // tokens can still change: the first not sampled, or the newest sampled one
 // while it is only the previous chunk's lookahead and there is time to sample
@@ -73,8 +75,6 @@
 
 namespace brosoundml {
 
-class Whisper;
-
 // YuE2's instrumental sheet (a stream with no lyrics sings none).
 inline constexpr const char* kYue2Instrumental = "[Intro]\n\n[Instrumental]\n\n[Interlude]\n\n[Instrumental]\n";
 
@@ -83,10 +83,15 @@ struct Yue2EndlessTarget {
     std::string score;          // ABC; empty = none (cot off). Under a score the chunks carry it (cot full)
     std::string lyrics;         // the sheet (YuE2's format, [section] lines); empty = instrumental
     // Rolled: each chunk's prefix carries `lyric_window` lines of the sheet
-    // (section tags kept as lines and not counted), starting after the last
-    // line the listener heard in the rendered chunks (a line heard when 60%
-    // of its words are, near the window), one line on when it has not moved
-    // for 3 chunks. Off: the whole sheet in every chunk (it loops on the first
+    // (section tags kept as lines and not counted), starting after the
+    // furthest line the model reached in the chunks before it. Where the
+    // model is in the lyrics is its own: attention head 14.10 (layer 14,
+    // query head 10) points at the lyric word being sung (yue2-research
+    // FINDINGS 11), read for every token as the chunk is sampled; a line is
+    // reached when the head pointed into 60% of its words, each for 2 frames
+    // or more, on frames where its mass on the window's words is 0.2 or more.
+    // It walks through lines the model only hums too, so those count as
+    // passed. Off: the whole sheet in every chunk (it loops on the first
     // verse and chorus). A change of sheet starts the roll again at line 0.
     bool roll = false;
     int lyric_window = 4;
@@ -102,10 +107,6 @@ enum class Yue2ChangeMode {
     Bridge,   // always the measured bridge (needs a score: a target without one drops)
     Plain,    // the style text changes, nothing else (barely moves the music: FINDINGS 7)
 };
-
-// The listener behind rolled lyrics: 16 kHz mono audio -> the text heard.
-// Called on run()'s thread; `cancel` services the stream and must be polled.
-using Yue2Listen = std::function<std::string(const AudioBuffer& audio16k, const CancelCheck& cancel)>;
 
 struct Yue2EndlessOptions {
     int chunk_frames = 250;             // 25..1000
@@ -125,8 +126,8 @@ struct Yue2EndlessOptions {
     // A chunk is sampled once its start is this far ahead of the playhead, or
     // further when the measured costs ask for it (a chunk's render waits for
     // the next one's tokens, so the lead covers a chunk, the emit lead, a
-    // splice and a render per line being built, the listener and a margin:
-    // ~15.7 s on a 4090); a bridge starts `bridge_lead_seconds` earlier still.
+    // splice and a render per line being built, a chunk's decode and a
+    // margin: ~15.8 s on a 4090); a bridge starts `bridge_lead_seconds` earlier still.
     // The less it is, the sooner a target set now is heard.
     double ahead_seconds = 14.0;
     double bridge_lead_seconds = 7.0;
@@ -140,7 +141,6 @@ struct Yue2EndlessOptions {
     Yue2EndlessTarget target;           // the first chunk's (at is ignored)
     std::vector<Yue2EndlessTarget> path;   // initial timed targets
     Yue2Directions directions = Yue2Directions::builtin();
-    Yue2Listen listen;                  // empty = rolled lyrics move one line per 3 chunks
     // Polled on run()'s thread (at least every 10 ms and inside long ops):
     // true = stop().
     CancelCheck cancel;
@@ -156,7 +156,7 @@ struct Yue2EndlessChunk {
     std::string how;                    // "", "drop", "bridge", "fresh", "plain"
     int memory = 0;                     // tokens it was opened by
     bool retargeted = false;            // sampled again for a target that came after it was
-    double splice_seconds = 0, inpaint_seconds = 0, decode_seconds = 0, listen_seconds = 0;
+    double splice_seconds = 0, inpaint_seconds = 0, decode_seconds = 0;
     int nar_window = 0;
     bool probe_render = false;          // rendered by its bridge's probe (kept)
     double latent_norm = 0;             // mean frame norm of its latents (corpus 6.5..9.5)
@@ -168,8 +168,14 @@ struct Yue2EndlessChunk {
     int cut = 0;
     std::string lyrics;                 // the sheet text its prefix carried
     int lyric_from = -1, lyric_to = -1; // rolled: the window [from, to) of sung lines
-    std::string heard;                  // rolled + a listener: what was heard in it
-    std::vector<int> heard_lines;       // sung lines heard (60% of their words)
+    // Rolled: head 14.10's reading of the chunk, taken as it was sampled.
+    // Words are the window's, in prompt order (lower case, runs of [a-z']);
+    // lines are sheet line indices (counting sung lines, as lyric_from).
+    std::vector<std::string> lyric_words;
+    std::vector<int> lyric_word_lines;  // each word's line
+    std::vector<int> pointer;           // per frame: the word the head attends to most
+    std::vector<float> pointer_mass;    // per frame: the head's mass on all the window's words (0..1)
+    std::vector<int> lines_reached;     // lines it reached in this chunk (see Yue2EndlessTarget::roll)
     Yue2Knobs knobs;
     bool rendered = false;
 };
@@ -181,7 +187,8 @@ struct Yue2EndlessEvent {
         Built,        // a chunk is rendered (row; latents with chunk_data), value = its latent norm
         StyleChange,  // a change made at `chunk`: text = how ("drop" / "bridge"), sample = where it is heard
         PhaseFit,     // a bridge's beat fit (row of the fresh clip): value = the cut in frames
-        Heard,        // rolled lyrics: what the listener heard in a rendered chunk (row: heard, heard_lines)
+        Lyrics,       // rolled lyrics: head 14.10's reading of a chunk just sampled (row: lyric_words,
+                      // pointer, pointer_mass, lines_reached); value = the furthest line reached so far
         BreakWarning, // a chunk's latent norm left the corpus range (6.5 .. 9.5): value = the norm
         ChunkStart,   // a chunk's first sample handed out: sample
         Branch,       // a branch opened: branch, chunk = its fork
@@ -225,8 +232,8 @@ struct Yue2EndlessStats {
     std::vector<Yue2StreamStats::Gap> gaps;   // the last 16 gaps of 0.2 s or more without a service
     double worst_gap_seconds = 0;
     std::vector<Yue2StreamStats::Work> work;  // the worker's seconds per kind of work
-    // Measured cost per chunk (seconds, running means): splice, render, decode, listen.
-    double splice_seconds = 0, render_seconds = 0, decode_seconds = 0, listen_seconds = 0;
+    // Measured cost per chunk (seconds, running means): splice, render, decode.
+    double splice_seconds = 0, render_seconds = 0, decode_seconds = 0;
 };
 
 class Yue2Endless {
@@ -263,14 +270,6 @@ public:
 
     Yue2EndlessStats stats() const;
     const Yue2EndlessOptions& options() const;
-
-    // A listener over Whisper (16 kHz mono in, the decoded text out, special
-    // tokens skipped, trimmed): transcribe with `prompt_ids` (build_prompt
-    // ("en", "transcribe", false)), at most `max_new_tokens`, decoded by
-    // `decode`. Both must outlive the stream.
-    static Yue2Listen whisper_listener(const Whisper& whisper, std::vector<int32_t> prompt_ids,
-                                       std::function<std::string(const std::vector<int32_t>&)> decode,
-                                       int max_new_tokens = 120);
 
     // The score's beat in latent frames (25 Hz) from its Q: header ("Q:1/4=90"
     // -> 16.667; "Q:90" as quarters); 0 when it has none.

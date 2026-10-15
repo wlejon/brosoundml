@@ -23,7 +23,7 @@ const char* kindName(Yue2EndlessEvent::Kind k) {
         case K::Built: return "built";
         case K::StyleChange: return "styleChange";
         case K::PhaseFit: return "phaseFit";
-        case K::Heard: return "heard";
+        case K::Lyrics: return "lyrics";
         case K::BreakWarning: return "breakWarning";
         case K::ChunkStart: return "chunkStart";
         case K::Branch: return "branch";
@@ -199,7 +199,6 @@ Value makeChunkRow(const brosoundml::Yue2EndlessChunk& c) {
     o.set("spliceSeconds", c.splice_seconds);
     o.set("inpaintSeconds", c.inpaint_seconds);
     o.set("decodeSeconds", c.decode_seconds);
-    o.set("listenSeconds", c.listen_seconds);
     o.set("narWindow", static_cast<double>(c.nar_window));
     o.set("probeRender", c.probe_render);
     o.set("latentNorm", c.latent_norm);
@@ -224,10 +223,18 @@ Value makeChunkRow(const brosoundml::Yue2EndlessChunk& c) {
         ev::Persistent l(intArray({c.lyric_from, c.lyric_to}));
         o.set("lyricLines", l.get());
     }
-    if (!c.heard.empty() || !c.heard_lines.empty()) {
-        o.set("heardText", c.heard);
-        ev::Persistent h(intArray(c.heard_lines));
-        o.set("heardLines", h.get());
+    if (!c.lyric_words.empty()) {
+        // Head 14.10's reading of the chunk (the lyric pointer).
+        ev::Persistent w(makeStringArray(c.lyric_words));
+        o.set("lyricWords", w.get());
+        ev::Persistent wl(makeInt32Array(c.lyric_word_lines));
+        o.set("lyricWordLines", wl.get());
+        ev::Persistent p(makeInt32Array(c.pointer));
+        o.set("pointer", p.get());
+        ev::Persistent m(makeFloat32Array(c.pointer_mass));
+        o.set("pointerMass", m.get());
+        ev::Persistent r(intArray(c.lines_reached));
+        o.set("linesReached", r.get());
     }
     {
         ev::Persistent k(makeKnobs(c.knobs));
@@ -322,7 +329,6 @@ Value makeEndlessStats(const brosoundml::Yue2EndlessStats& s) {
         co.set("splice", s.splice_seconds);
         co.set("render", s.render_seconds);
         co.set("decode", s.decode_seconds);
-        co.set("listen", s.listen_seconds);
         ev::Persistent c(co.get());
         o.set("costSeconds", c.get());
     }
