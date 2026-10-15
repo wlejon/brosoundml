@@ -5,9 +5,8 @@
 // model and VAE. Design and measurements: yue2-research FINDINGS 7-11; the
 // reference implementation is its native/endless.js, which this reproduces
 // token for token from the same seeds (yue2-research/native/endless_stream.js
-// is the check), except rolled lyrics: those roll by the model's own lyric
-// pointer (FINDINGS 11), checked against lyric_track.py's teacher-forced
-// reading of the same tokens.
+// is the check). The stream is instrumental: every chunk's prompt carries
+// YuE2's instrumental sheet (kYue2Instrumental), and no target sets lyrics.
 //
 // A chunk (`chunk_frames`, 250 = 10 s) is sampled by Yue2::splice opened by
 // the last `memory` tokens of the history (positions re-based: the model sees
@@ -22,10 +21,8 @@
 // seed*1000 + 500 + k (endless.js's scheme).
 //
 // Targets. A target is what chunks are made under: style text, an optional
-// score (ABC: under it the tempo is exact, Q: sets it), a lyric sheet
-// (whole, or rolled: a window of lines moved past the last line the model
-// sang, read off its own attention as it samples), and knobs (AR steers act on the chunk's splice, NAR steers on its
-// render, energy at decode). set_target() applies from the first chunk whose
+// score (ABC: under it the tempo is exact, Q: sets it), and knobs (AR steers
+// act on the chunk's splice, NAR steers on its render, energy at decode). set_target() applies from the first chunk whose
 // tokens can still change: the first not sampled, or the newest sampled one
 // while it is only the previous chunk's lookahead and there is time to sample
 // it again (`retarget`). A path of targets stamped in program seconds applies
@@ -75,26 +72,12 @@
 
 namespace brosoundml {
 
-// YuE2's instrumental sheet (a stream with no lyrics sings none).
+// YuE2's instrumental sheet: the "[Lyrics]" text of every chunk's prompt.
 inline constexpr const char* kYue2Instrumental = "[Intro]\n\n[Instrumental]\n\n[Interlude]\n\n[Instrumental]\n";
 
 struct Yue2EndlessTarget {
     std::string style;          // "[Tags]" text
     std::string score;          // ABC; empty = none (cot off). Under a score the chunks carry it (cot full)
-    std::string lyrics;         // the sheet (YuE2's format, [section] lines); empty = instrumental
-    // Rolled: each chunk's prefix carries `lyric_window` lines of the sheet
-    // (section tags kept as lines and not counted), starting after the
-    // furthest line the model reached in the chunks before it. Where the
-    // model is in the lyrics is its own: attention head 14.10 (layer 14,
-    // query head 10) points at the lyric word being sung (yue2-research
-    // FINDINGS 11), read for every token as the chunk is sampled; a line is
-    // reached when the head pointed into 60% of its words, each for 2 frames
-    // or more, on frames where its mass on the window's words is 0.2 or more.
-    // It walks through lines the model only hums too, so those count as
-    // passed. Off: the whole sheet in every chunk (it loops on the first
-    // verse and chorus). A change of sheet starts the roll again at line 0.
-    bool roll = false;
-    int lyric_window = 4;
     Yue2Knobs knobs;            // clamped
     std::string tag;            // the caller's label, echoed
     double at = -1;             // program seconds (path entries); < 0 = now
@@ -166,16 +149,6 @@ struct Yue2EndlessChunk {
     bool phase_fit = false;
     double period = 0, stream_phase = 0, fresh_phase = 0, fit_seconds = 0;
     int cut = 0;
-    std::string lyrics;                 // the sheet text its prefix carried
-    int lyric_from = -1, lyric_to = -1; // rolled: the window [from, to) of sung lines
-    // Rolled: head 14.10's reading of the chunk, taken as it was sampled.
-    // Words are the window's, in prompt order (lower case, runs of [a-z']);
-    // lines are sheet line indices (counting sung lines, as lyric_from).
-    std::vector<std::string> lyric_words;
-    std::vector<int> lyric_word_lines;  // each word's line
-    std::vector<int> pointer;           // per frame: the word the head attends to most
-    std::vector<float> pointer_mass;    // per frame: the head's mass on all the window's words (0..1)
-    std::vector<int> lines_reached;     // lines it reached in this chunk (see Yue2EndlessTarget::roll)
     Yue2Knobs knobs;
     bool rendered = false;
 };
@@ -187,8 +160,6 @@ struct Yue2EndlessEvent {
         Built,        // a chunk is rendered (row; latents with chunk_data), value = its latent norm
         StyleChange,  // a change made at `chunk`: text = how ("drop" / "bridge"), sample = where it is heard
         PhaseFit,     // a bridge's beat fit (row of the fresh clip): value = the cut in frames
-        Lyrics,       // rolled lyrics: head 14.10's reading of a chunk just sampled (row: lyric_words,
-                      // pointer, pointer_mass, lines_reached); value = the furthest line reached so far
         BreakWarning, // a chunk's latent norm left the corpus range (6.5 .. 9.5): value = the norm
         ChunkStart,   // a chunk's first sample handed out: sample
         Branch,       // a branch opened: branch, chunk = its fork

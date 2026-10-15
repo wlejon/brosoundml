@@ -47,13 +47,6 @@ void Yue2Endless::Impl::open_branch(int id, const Yue2EndlessTarget& t, std::vec
     b->lat_ensure(static_cast<int>(b->tokens.size()));
     b->chunk_base = m.chunk_base;
     for (int k = m.chunk_base; k < f; ++k) b->chunks.push_back(m.chunk(k));
-    b->roll = m.roll;
-    if (m.has_chunk(f)) {   // forked at the main line's newest chunk: the roll before it
-        const Chunk& c = m.chunk(f);
-        if (c.roll_sheet != b->roll.sheet) b->roll = Roll{}, b->roll.sheet = c.roll_sheet;
-        b->roll.at = c.roll_at;
-        b->roll.reached = c.roll_reached;
-    }
     b->base = t;
     b->base.at = -1;
     b->base.knobs = Yue2Knobs::clamp(b->base.knobs, opt.directions);

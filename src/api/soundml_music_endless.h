@@ -9,8 +9,8 @@
 
 namespace brosoundml::api::music {
 
-// { style, score, lyrics, roll, lyricWindow, knobs, tag, at } merged into `t`
-// (fields left out keep their value; score / lyrics null = none).
+// { style, score, knobs, tag, at } merged into `t` (fields left out keep their
+// value; score null = none). lyrics / roll / lyricWindow are an error (removed).
 bool readTarget(Value v, brosoundml::Yue2EndlessTarget& t, std::string& err);
 Value makeTarget(const brosoundml::Yue2EndlessTarget& t);
 // An array of targets (each merged into the one before it, from `from`).

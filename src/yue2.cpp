@@ -104,12 +104,6 @@ std::string Yue2::detokenize(const std::vector<int32_t>& ids) const {
     return utf8_replace(impl_->tok->decode(kept));
 }
 
-std::string Yue2::token_piece(int32_t id) const {
-    if (!impl_->tok) fail("not loaded");
-    if (id < 0 || id >= 151643) return {};
-    return impl_->tok->decode({id});
-}
-
 Yue2Plan Yue2::plan(const Yue2Params& p, const Yue2Callbacks& cb, const CancelCheck& cancel) const {
     if (!loaded()) fail("not loaded");
     return plan_impl(*impl_, p, cb, cancel, stage_uniform(p, std::make_shared<std::size_t>(0))).plan;

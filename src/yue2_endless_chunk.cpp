@@ -28,8 +28,7 @@ double norm_of(const Line& l, int f0, int f1) {
 
 // What a chunk's tokens depend on (the rest, NAR knobs and energy, act later).
 bool same_tokens(const Yue2EndlessTarget& a, const Yue2EndlessTarget& b) {
-    return a.style == b.style && a.score == b.score && a.lyrics == b.lyrics && a.roll == b.roll &&
-           a.lyric_window == b.lyric_window && a.knobs.semantic == b.knobs.semantic;
+    return a.same_music(b) && a.knobs.semantic == b.knobs.semantic;
 }
 
 void mean_in(double& est, double v) { est = 0.7 * est + 0.3 * v; }
@@ -70,7 +69,6 @@ int Yue2Endless::Impl::open_chunk(const Line& l) const {
 
 void Yue2Endless::Impl::place_target(Line& l, Yue2EndlessTarget t, bool now) {
     t.knobs = Yue2Knobs::clamp(t.knobs, opt.directions);
-    t.lyric_window = std::clamp(t.lyric_window, 1, 32);
     const int open = open_chunk(l);
     int k = open;
     if (!now) {
@@ -111,27 +109,26 @@ void Yue2Endless::Impl::planned(const Line& l, int k, const std::string& tag) {
 
 // ─── plans and params ───────────────────────────────────────────────────────
 
-const Yue2Plan& Yue2Endless::Impl::plan_for(const Yue2EndlessTarget& t, const std::string& lyrics) {
-    const std::string key = t.style + '\x1f' + t.score + '\x1f' + lyrics;
+const Yue2Plan& Yue2Endless::Impl::plan_for(const Yue2EndlessTarget& t) {
+    const std::string key = t.style + '\x1f' + t.score;
     auto it = plans.find(key);
     if (it != plans.end()) return it->second;
     Yue2Params p;
     p.style = t.style;
-    p.lyrics = lyrics;
+    p.lyrics = kYue2Instrumental;
     p.abc = t.score;
     p.cot = t.score.empty() ? Yue2Cot::Off : Yue2Cot::Full;
     p.seed = 1;
     work("plan");
     Yue2Plan plan = model.plan(p, {}, servicing());
-    if (plans.size() > 64) plans.clear();   // rolled lyrics make a plan per window
+    if (plans.size() > 64) plans.clear();
     return plans.emplace(key, std::move(plan)).first->second;
 }
 
-Yue2Params Yue2Endless::Impl::params_for(const Yue2EndlessTarget& t, const std::string& lyrics, std::uint64_t seed,
-                                         bool ar) const {
+Yue2Params Yue2Endless::Impl::params_for(const Yue2EndlessTarget& t, std::uint64_t seed, bool ar) const {
     Yue2Params p;
     p.style = t.style;
-    p.lyrics = lyrics;
+    p.lyrics = kYue2Instrumental;
     p.abc = t.score;
     p.cot = t.score.empty() ? Yue2Cot::Off : Yue2Cot::Full;
     p.seed = seed;
@@ -264,19 +261,6 @@ void Yue2Endless::Impl::add_chunk(Line& l, Chunk c) {
 }
 
 void Yue2Endless::Impl::retarget(Line& l, int k) {
-    Chunk& c = l.chunk(k);
-    const bool same_sheet = c.roll_sheet == l.roll.sheet;
-    if (!same_sheet) {   // the chunk had started a new sheet: back to the old one
-        l.roll = Roll{};
-        l.roll.sheet = c.roll_sheet;
-    }
-    // The roll before the chunk: what the head read in it is undone with it.
-    l.roll.at = c.roll_at;
-    l.roll.reached = c.roll_reached;
-    if (!same_sheet && !c.roll_sheet.empty()) {
-        // Rebuilt by the next lyrics_of() from the sheet text.
-        l.roll.lines.clear();
-    }
     l.tokens.resize(static_cast<std::size_t>(k) * C);
     l.chunks.pop_back();
 }
@@ -331,16 +315,10 @@ bool Yue2Endless::Impl::sample(Line& l) {
     if (mode == Yue2ChangeMode::Auto) mode = t.score.empty() ? Yue2ChangeMode::Drop : Yue2ChangeMode::Plain;
     if (mode == Yue2ChangeMode::Bridge) mode = t.score.empty() ? Yue2ChangeMode::Drop : Yue2ChangeMode::Plain;
 
-    Roll roll = l.roll;
     Chunk c;
-    c.roll_at = l.roll.at;
-    c.roll_reached = l.roll.reached;
-    c.roll_sheet = l.roll.sheet;
     c.row.index = k;
     c.row.branch = l.id;
-    const std::string lyrics = lyrics_of(t, roll, &c.row.lyric_from, &c.row.lyric_to);
-    const Yue2Plan& plan = plan_for(t, lyrics);
-    const LyricWords words = lyric_words(plan, lyrics, c.row.lyric_from);
+    const Yue2Plan& plan = plan_for(t);
     const int mem = change && mode == Yue2ChangeMode::Drop ? opt.change_memory : opt.memory;
     Yue2Splice sp;
     const int T = static_cast<int>(l.tokens.size());
@@ -348,8 +326,7 @@ bool Yue2Endless::Impl::sample(Line& l) {
     sp.middle_frames = C;
     sp.candidates = 1;
     sp.continue_after = false;
-    watch_lyrics(sp, words);
-    const Yue2Params p = params_for(t, lyrics, l.seed * 1000 + static_cast<std::uint64_t>(k), true);
+    const Yue2Params p = params_for(t, l.seed * 1000 + static_cast<std::uint64_t>(k), true);
     work(l.id ? "branch: splice" : "splice", k);
     const auto t0 = Clock::now();
     // Preempted when the path's target for k moves (not t: a deferred change is t's old one).
@@ -368,14 +345,10 @@ bool Yue2Endless::Impl::sample(Line& l) {
     c.row.scored = !t.score.empty();
     c.row.change = change;
     c.row.how = change ? (mode == Yue2ChangeMode::Drop ? "drop" : "plain") : "";
-    c.row.lyrics = lyrics;
     c.row.knobs = t.knobs;
     c.target = t;
-    read_lyrics(roll, c, words, r.watched, 0);
-    l.roll = std::move(roll);
     if (use) fold(l, k);
     add_chunk(l, std::move(c));
-    lyrics_event(l, k, l.roll.reached);
     if (change) {
         Yue2EndlessEvent e{Yue2EndlessEvent::Kind::StyleChange};
         e.chunk = k;
@@ -426,12 +399,11 @@ void Yue2Endless::Impl::render(Line& l) {
     if (s0 < l.lat_base) throw std::runtime_error("brosoundml: Yue2Endless: latents trimmed under a render");
     Chunk& c = l.chunk(k);
     const Yue2EndlessTarget t = c.target;
-    const std::string lyrics = c.row.lyrics;
-    const Yue2Plan& plan = plan_for(t, lyrics);
+    const Yue2Plan& plan = plan_for(t);
     std::vector<int32_t> win(l.tokens.begin() + s0, l.tokens.begin() + e1);
     std::vector<float> wl(win.size() * kD, 0.0f);
     std::copy(l.lat_at(s0), l.lat_at(c0), wl.begin());
-    Yue2Params p = params_for(t, lyrics, l.seed * 1000 + 500 + static_cast<std::uint64_t>(k), false);
+    Yue2Params p = params_for(t, l.seed * 1000 + 500 + static_cast<std::uint64_t>(k), false);
     nar_steer(p, t.knobs, static_cast<int>(win.size()));
     work(l.id ? "branch: render" : "render", k);
     const auto t0 = Clock::now();

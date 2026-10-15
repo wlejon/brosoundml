@@ -23,7 +23,6 @@ const char* kindName(Yue2EndlessEvent::Kind k) {
         case K::Built: return "built";
         case K::StyleChange: return "styleChange";
         case K::PhaseFit: return "phaseFit";
-        case K::Lyrics: return "lyrics";
         case K::BreakWarning: return "breakWarning";
         case K::ChunkStart: return "chunkStart";
         case K::Branch: return "branch";
@@ -54,27 +53,25 @@ bool readText(Value o, std::string_view name, std::string& dst, std::string& err
     return true;
 }
 
-Value intArray(const std::vector<int>& v) {
-    return hostArrayOf(v.size(), [&v](size_t i) { return ev::fromDouble(v[i]); });
-}
-
 }  // namespace
 
 bool readTarget(Value v, brosoundml::Yue2EndlessTarget& t, std::string& err) {
     if (!ev::isObject(v)) {
-        err = "a target must be an object ({ style, score, lyrics, roll, knobs, at })";
+        err = "a target must be an object ({ style, score, knobs, tag, at })";
         return false;
     }
     ev::Persistent o(v);
-    if (!readText(o.get(), "style", t.style, err) || !readText(o.get(), "score", t.score, err) ||
-        !readText(o.get(), "lyrics", t.lyrics, err) || !readText(o.get(), "tag", t.tag, err))
-        return false;
-    getBoolOpt(o.get(), "roll", t.roll);
-    getIntOpt(o.get(), "lyricWindow", t.lyric_window);
-    if (t.lyric_window < 1 || t.lyric_window > 32) {
-        err = "lyricWindow must be 1..32";
-        return false;
+    // The stream is instrumental: its lyric options are gone, and setting one is an error.
+    for (const char* gone : {"lyrics", "roll", "lyricWindow"}) {
+        ev::Persistent g(ev::getProperty(o.get(), gone));
+        if (!ev::isUndefined(g.get())) {
+            err = std::string(gone) + " was removed: the endless stream is instrumental and sings no lyrics";
+            return false;
+        }
     }
+    if (!readText(o.get(), "style", t.style, err) || !readText(o.get(), "score", t.score, err) ||
+        !readText(o.get(), "tag", t.tag, err))
+        return false;
     {
         ev::Persistent k(ev::getProperty(o.get(), "knobs"));
         if (ev::isObject(k.get())) readKnobs(k.get(), t.knobs);
@@ -90,9 +87,6 @@ Value makeTarget(const brosoundml::Yue2EndlessTarget& t) {
     o.set("style", t.style);
     if (t.score.empty()) o.set("score", ev::null());
     else o.set("score", t.score);
-    o.set("lyrics", t.lyrics);
-    o.set("roll", t.roll);
-    o.set("lyricWindow", static_cast<double>(t.lyric_window));
     {
         ev::Persistent k(makeKnobs(t.knobs));
         o.set("knobs", k.get());
@@ -217,24 +211,6 @@ Value makeChunkRow(const brosoundml::Yue2EndlessChunk& c) {
         ev::Persistent fp(f.get());
         o.set("phaseFit", fp.get());
         o.set("trim", static_cast<double>(c.cut));
-    }
-    o.set("lyrics", c.lyrics);
-    if (c.lyric_from >= 0) {
-        ev::Persistent l(intArray({c.lyric_from, c.lyric_to}));
-        o.set("lyricLines", l.get());
-    }
-    if (!c.lyric_words.empty()) {
-        // Head 14.10's reading of the chunk (the lyric pointer).
-        ev::Persistent w(makeStringArray(c.lyric_words));
-        o.set("lyricWords", w.get());
-        ev::Persistent wl(makeInt32Array(c.lyric_word_lines));
-        o.set("lyricWordLines", wl.get());
-        ev::Persistent p(makeInt32Array(c.pointer));
-        o.set("pointer", p.get());
-        ev::Persistent m(makeFloat32Array(c.pointer_mass));
-        o.set("pointerMass", m.get());
-        ev::Persistent r(intArray(c.lines_reached));
-        o.set("linesReached", r.get());
     }
     {
         ev::Persistent k(makeKnobs(c.knobs));

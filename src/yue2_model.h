@@ -31,7 +31,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace brosoundml::yue2 {
@@ -131,16 +130,6 @@ public:
     void ar_truncate(ArSession& s, int b, int len) const;
     // Host copy of the logits rows: branches * (hi - lo) floats, branch-major.
     void ar_logits(ArSession& s, std::vector<float>& out) const;
-    // Watch query head `head` of layer `layer` on branch 0 (before the
-    // steps it should see; recaptures the decode graphs). Each step then
-    // copies the layer's query rows (one device copy inside the step), and
-    // ar_watched() reads them: for every row of the last step, the head's
-    // softmax over the row's keys (causal, the full row), summed over each
-    // of `spans` (key columns [a, b)). out = R * spans.size(), row-major.
-    // The cost is one head's dot products on the host per row plus the new
-    // key rows' download.
-    void ar_watch(ArSession& s, int layer, int head) const;
-    void ar_watched(ArSession& s, const std::vector<std::pair<int, int>>& spans, std::vector<float>& out) const;
     int ar_len(const ArSession& s, int b) const;
 
     // ── NAR path ──

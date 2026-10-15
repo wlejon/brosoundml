@@ -13,9 +13,7 @@
 //      other committed (at the first boundary it can make, within 15 s of
 //      the request), the main line's chunks from there carry its tag; then a
 //      target set now is planned where stats said and the chunk is made
-//      under it; no service gap of 0.2 s, contiguous audio, stop() ends it;
-//   4. unpaced, rolled lyrics: the lyric head's reading per chunk (a Lyrics
-//      event after each Sampled), each window after the furthest line reached.
+//      under it; no service gap of 0.2 s, contiguous audio, stop() ends it.
 
 #include "test_yue2_common.h"
 
@@ -182,63 +180,6 @@ void unpaced(const brosoundml::Yue2& y, const brosoundml::Yue2Vae& vae) {
     }
 }
 
-// 4: unpaced, rolled lyrics: a Lyrics event per chunk, right after its
-// Sampled, carrying the lyric head's reading of the window it was sampled
-// under; each next window starts after the furthest line reached.
-void rolled(const brosoundml::Yue2& y, const brosoundml::Yue2Vae& vae) {
-    Yue2EndlessOptions o;
-    o.max_chunks = 4;
-    o.memory = 500;
-    o.seed = 5;
-    o.target = target(kFolk, "folk");
-    o.target.roll = true;
-    o.target.lyric_window = 4;
-    o.target.lyrics =
-        "[Verse]\nThe river runs beneath the bridge\nI walk the road alone tonight\nThe lantern swings above the door\n"
-        "And every window holds a light\n[Chorus]\nCarry me home across the water\nCarry me home before the dawn\n"
-        "The morning finds me singing louder\nThe evening finds the singer gone\n[Verse]\nThe orchard bends beneath the "
-        "snow\nThe kettle hums a quiet tune\nMy brother counts the falling stars\nAnd waits for me beneath the moon\n";
-    Unpaced u;
-    const double t = now_s();
-    run_unpaced(y, vae, o, u);
-    std::printf("rolled: 4 chunks in %.1f s\n", now_s() - t);
-    std::vector<Yue2EndlessEvent> seq;
-    for (const auto& e : u.cap.events)
-        if (e.kind == Kind::Sampled || e.kind == Kind::Lyrics) seq.push_back(e);
-    CHECK(seq.size() == 8, "a Sampled and a Lyrics per chunk (%zu)", seq.size());
-    int reached = -1;
-    for (int k = 0; k < static_cast<int>(seq.size()) / 2; ++k) {
-        const auto& s = seq[2 * k];
-        const auto& l = seq[2 * k + 1];
-        CHECK(s.kind == Kind::Sampled && l.kind == Kind::Lyrics && s.chunk == k && l.chunk == k && l.row,
-              "chunk %d: Sampled then Lyrics", k);
-        if (!l.row) continue;
-        const auto& r = *l.row;
-        const int W = static_cast<int>(r.lyric_words.size());
-        std::printf("rolled: chunk %d window [%d, %d), %d words, lines reached", k, r.lyric_from, r.lyric_to, W);
-        for (int i : r.lines_reached) std::printf(" %d", i);
-        std::printf("\n");
-        CHECK(r.lyric_from == std::min(reached + 1, 11),"chunk %d: the window starts after the furthest line reached "
-              "(%d, reached %d)", k, r.lyric_from, reached);
-        CHECK(r.lyric_to - r.lyric_from == 4 && W >= 4 * 5, "chunk %d: 4 lines, their words (%d)", k, W);
-        CHECK(static_cast<int>(r.lyric_word_lines.size()) == W && static_cast<int>(r.pointer.size()) == kC &&
-                  static_cast<int>(r.pointer_mass.size()) == kC,
-              "chunk %d: a line per word, a pointer and a mass per frame", k);
-        bool ok = true;
-        int on = 0;
-        for (int f = 0; f < kC && f < static_cast<int>(r.pointer.size()); ++f) {
-            ok = ok && r.pointer[f] >= 0 && r.pointer[f] < W && r.pointer_mass[f] >= 0 && r.pointer_mass[f] <= 1.0001f;
-            on += r.pointer_mass[f] >= 0.2f;
-        }
-        for (int i : r.lyric_word_lines) ok = ok && i >= r.lyric_from && i < r.lyric_to;
-        CHECK(ok, "chunk %d: pointers inside the window, masses in [0, 1], word lines inside the window", k);
-        std::printf("rolled: chunk %d: %d of %d frames with mass >= 0.2 on the lyrics\n", k, on, kC);
-        for (int i : r.lines_reached) reached = std::max(reached, i);
-        CHECK(l.value == reached, "chunk %d: the event's value is the furthest line reached (%g, %d)", k, l.value, reached);
-    }
-    CHECK(reached >= 2, "the head reached at least three lines in 40 s (%d)", reached);
-}
-
 // 3: paced, a player on the wall clock.
 void paced(const brosoundml::Yue2& y, const brosoundml::Yue2Vae& vae) {
     Yue2EndlessOptions o;
@@ -386,7 +327,6 @@ int main() {
     vae.load(vdir.string(), brotensor::Device::CUDA, /*decoder_only=*/true);
     std::printf("load %.1f s\n", now_s() - t);
     unpaced(y, vae);
-    rolled(y, vae);
     paced(y, vae);
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

@@ -209,8 +209,7 @@ void Yue2Endless::Impl::service(bool light) {
     // A splice making a chunk whose target just changed stops, to be made again.
     if (!light && sampling && !preempt) {
         const Yue2EndlessTarget& t = target_for(*sampling, sampling_k);
-        if (!t.same_music(sampling_target) || t.lyrics != sampling_target.lyrics || t.roll != sampling_target.roll ||
-            t.knobs.semantic != sampling_target.knobs.semantic || sampling->failed)
+        if (!t.same_music(sampling_target) || t.knobs.semantic != sampling_target.knobs.semantic || sampling->failed)
             preempt = true;
     }
     emit();

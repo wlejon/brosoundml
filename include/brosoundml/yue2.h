@@ -8,7 +8,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace brosoundml {
@@ -238,14 +237,6 @@ struct Yue2Splice {
     int  candidates = 4;               // Ms drawn (1 with no B to score them by, or M = 0)
     int  score_frames = 125;           // B's frames scored (5 s)
     bool continue_after = false;       // sample C after A + M + B until the song ends
-    // Watch one attention head of the AR path while M is sampled: for each
-    // M token fed, its row's softmax mass (the head's full causal row,
-    // conditional branch) on each of `watch_spans`, column ranges [a, b) of
-    // the plan's prefix. Head 14.10 points at the lyric word being sung
-    // (yue2-research FINDINGS 11), so the spans are the lyric words' tokens.
-    // watch_layer < 0 = off. Costs one head's dot products per token.
-    int watch_layer = -1, watch_head = 0;
-    std::vector<std::pair<int, int>> watch_spans;
 };
 
 struct Yue2SpliceResult {
@@ -255,7 +246,6 @@ struct Yue2SpliceResult {
     int chosen = 0;                    // the M kept
     std::vector<float> scores;         // per M: mean NLL of B's scored frames (nats; lower = B follows better)
     std::vector<std::vector<int32_t>> middles;   // every M drawn, by candidate
-    std::vector<float> watched;        // watching: the kept M's rows x watch_spans masses, row-major
     bool truncated = false;            // C hit the token budget without ending
     bool cancelled = false;            // cancel() stopped it (semantic then holds nothing)
 };
@@ -335,9 +325,6 @@ public:
 
     std::vector<int32_t> tokenize(const std::string& text) const;
     std::string detokenize(const std::vector<int32_t>& ids) const;
-    // One token's raw bytes (a piece may be part of a UTF-8 sequence); empty
-    // for special and codec ids. A prefix's pieces concatenate to its text.
-    std::string token_piece(int32_t id) const;
 
     bool loaded() const;
     brotensor::Device device() const;

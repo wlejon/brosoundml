@@ -46,14 +46,8 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     const double P0 = score_beat_frames(t.score);
     const int span = static_cast<int>(std::ceil(P0 - 1e-9));   // one beat: 17 frames at 90 bpm
     const int NL = opt.nar_left, LA = opt.lookahead;
-    Roll roll = l.roll;
     Chunk cb, cf;
-    cb.roll_at = cf.roll_at = l.roll.at;
-    cb.roll_reached = cf.roll_reached = l.roll.reached;
-    cb.roll_sheet = cf.roll_sheet = l.roll.sheet;
-    const std::string lyrics = lyrics_of(t, roll, &cb.row.lyric_from, &cb.row.lyric_to);
-    const Yue2Plan& plan = plan_for(t, lyrics);
-    const LyricWords words = lyric_words(plan, lyrics, cb.row.lyric_from);
+    const Yue2Plan& plan = plan_for(t);
     const int T = static_cast<int>(l.tokens.size());
     const std::vector<int32_t> before(l.tokens.begin() + std::max(0, T - opt.memory), l.tokens.end());
     const std::uint64_t S = l.seed * 1000;
@@ -62,9 +56,8 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     Yue2Splice fs;
     fs.middle_frames = C + span;
     fs.candidates = 1;
-    watch_lyrics(fs, words);
     work(l.id ? "branch: bridge fresh" : "bridge: fresh", k + 1);
-    Yue2SpliceResult fresh = model.splice(params_for(t, lyrics, S + k + 1, true), plan, fs, {}, preemptible(l, k, t));
+    Yue2SpliceResult fresh = model.splice(params_for(t, S + k + 1, true), plan, fs, {}, preemptible(l, k, t));
     end_preemptible();
     if (fresh.cancelled) return false;
     if (static_cast<int>(fresh.semantic.size()) - fresh.middle0 < C + span)
@@ -79,9 +72,8 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     bs.after.assign(F.begin(), F.begin() + C);
     bs.candidates = opt.bridge_candidates;
     bs.score_frames = opt.bridge_score_frames;
-    watch_lyrics(bs, words);
     work(l.id ? "branch: bridge splice" : "bridge: splice", k);
-    Yue2SpliceResult r = model.splice(params_for(t, lyrics, S + k, true), plan, bs, {}, preemptible(l, k, t));
+    Yue2SpliceResult r = model.splice(params_for(t, S + k, true), plan, bs, {}, preemptible(l, k, t));
     end_preemptible();
     if (r.cancelled) return false;
     const std::vector<int32_t> bridge_tok(r.semantic.begin() + r.middle0, r.semantic.begin() + r.middle0 + C);
@@ -96,7 +88,7 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     win.insert(win.end(), F.begin(), F.begin() + LA);
     std::vector<float> wl(win.size() * kD, 0.0f);
     std::copy(l.lat_at(s0), l.lat_at(r1), wl.begin());
-    Yue2Params pp = params_for(t, lyrics, S + 800 + k, false);
+    Yue2Params pp = params_for(t, S + 800 + k, false);
     nar_steer(pp, t.knobs, static_cast<int>(win.size()));
     work(l.id ? "branch: bridge probe" : "bridge: probe", k);
     std::vector<float> pr = model.inpaint(pp, plan, win, std::move(wl), r1 - s0, static_cast<int>(win.size()), {}, servicing());
@@ -112,7 +104,7 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
                                 P0 * 4, false);
     service();
     // The fresh clip's own beat, from a probe render of it.
-    Yue2Params fp = params_for(t, lyrics, S + 900 + k, false);
+    Yue2Params fp = params_for(t, S + 900 + k, false);
     nar_steer(fp, t.knobs, static_cast<int>(F.size()));
     work(l.id ? "branch: fresh probe" : "bridge: fresh probe", k + 1);
     std::vector<float> probe = model.inpaint(fp, plan, F, std::vector<float>(F.size() * kD, 0.0f), 0,
@@ -149,7 +141,6 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     cb.row.memory = static_cast<int>(before.size());
     cb.row.splice_seconds = std::chrono::duration<double>(tb - t1).count();
     cb.row.bridge_scores = r.scores;
-    cb.row.lyrics = lyrics;
     cb.row.knobs = t.knobs;
     cb.target = t;
     cf.row = cb.row;
@@ -167,17 +158,10 @@ bool Yue2Endless::Impl::bridge(Line& l, int k, const Yue2EndlessTarget& t) {
     cf.row.fit_seconds = fit_seconds;
     cf.target = t;
     cf.fresh = true;
-    // The head over the bridge, then over the clip as cut (one window for both).
-    read_lyrics(roll, cb, words, r.watched, 0);
-    const int reached_b = roll.reached;
-    read_lyrics(roll, cf, words, fresh.watched, cut);
-    l.roll = std::move(roll);
     fold(l, k + 1);
     est_bridge = 0.7 * est_bridge + 0.3 * since(t0);
     add_chunk(l, std::move(cb));
-    lyrics_event(l, k, reached_b);
     add_chunk(l, std::move(cf));
-    lyrics_event(l, k + 1, l.roll.reached);
     {
         Yue2EndlessEvent e{Yue2EndlessEvent::Kind::StyleChange};
         e.chunk = k;
