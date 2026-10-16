@@ -24,6 +24,11 @@ broaudio::Engine*& audioEngineSlot() {
     return e;
 }
 
+std::function<broaudio::Engine*()>& audioEngineProvider() {
+    static std::function<broaudio::Engine*()> p;
+    return p;
+}
+
 InferenceScheduler& schedulerSlot() {
     static InferenceScheduler s;
     return s;
@@ -31,11 +36,26 @@ InferenceScheduler& schedulerSlot() {
 
 }  // namespace
 
-broaudio::Engine* audioEngine() { return audioEngineSlot(); }
+broaudio::Engine* audioEngine() {
+    if (!audioEngineSlot() && audioEngineProvider()) audioEngineSlot() = audioEngineProvider()();
+    return audioEngineSlot();
+}
+
+broaudio::Engine* existingAudioEngine() { return audioEngineSlot(); }
+
+bool audioEngineOffered() { return audioEngineSlot() || audioEngineProvider(); }
 
 const InferenceScheduler& inferenceScheduler() { return schedulerSlot(); }
 
-void setAudioEngine(broaudio::Engine* engine) { audioEngineSlot() = engine; }
+void setAudioEngine(broaudio::Engine* engine) {
+    audioEngineSlot() = engine;
+    audioEngineProvider() = nullptr;
+}
+
+void setAudioEngineProvider(std::function<broaudio::Engine*()> provider) {
+    audioEngineSlot() = nullptr;
+    audioEngineProvider() = std::move(provider);
+}
 
 void setInferenceScheduler(InferenceScheduler scheduler) {
     schedulerSlot() = std::move(scheduler);

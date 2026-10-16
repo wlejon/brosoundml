@@ -421,7 +421,7 @@ struct ListenStream {
 
     void teardownInfra() {
         // Producer first, so no more samples enter the ring.
-        broaudio::Engine* audio = audioEngine();
+        broaudio::Engine* audio = existingAudioEngine();
         if (audio && tapId != broaudio::kInvalidMicTapId) {
             audio->removeMicTap(tapId);
         }
@@ -572,7 +572,7 @@ void shutdownListenHost() {
     g_mgr.defaultMic = kInvalidStream;
 }
 
-bool listenHostAudioAvailable() { return audioEngine() != nullptr; }
+bool listenHostAudioAvailable() { return audioEngineOffered(); }
 
 bool listenHostThreaded() {
     const InferenceScheduler& sched = inferenceScheduler();
@@ -580,7 +580,7 @@ bool listenHostThreaded() {
 }
 
 bool listenHostMicCapturing() {
-    broaudio::Engine* audio = audioEngine();
+    broaudio::Engine* audio = existingAudioEngine();
     return audio && audio->isMicCapturing();
 }
 
@@ -678,7 +678,7 @@ void listenStreamSetGesture(StreamId id,
 
 bool listenStreamTapStats(StreamId id, broaudio::MicTapStats& out) {
     ListenStream* s = g_mgr.find(id);
-    broaudio::Engine* audio = audioEngine();
+    broaudio::Engine* audio = existingAudioEngine();
     if (!s || !audio || s->tapId == broaudio::kInvalidMicTapId) return false;
     out = audio->getMicTapStats(s->tapId);
     return true;

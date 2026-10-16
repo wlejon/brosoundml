@@ -60,6 +60,9 @@ void setLogHook(std::function<void(const std::string&)> hook);
 /// outlive every open stream — call shutdownSoundML() before the engine
 /// dies.
 void setAudioEngine(broaudio::Engine* engine);
+/// As setAudioEngine, but asked for only when a live source first needs the
+/// engine, so a host that never listens never opens its audio device.
+void setAudioEngineProvider(std::function<broaudio::Engine*()> provider);
 
 /// Where the listen host's per-stream feed runs. A host with an audio-
 /// inference worker supplies it here: `addPump` registers a closure the

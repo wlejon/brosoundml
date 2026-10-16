@@ -434,8 +434,12 @@ std::string resolvePath(const std::string& path);
 void logInfo(const std::string& line);
 
 // The host's broaudio engine and inference scheduler (api.h setters); null /
-// empty until the host provides them.
+// empty until the host provides them. audioEngine() makes the host's engine
+// if the host offered one through a provider; existingAudioEngine() never
+// does, for the polls that only ask about one already running.
 broaudio::Engine* audioEngine();
+broaudio::Engine* existingAudioEngine();
+bool audioEngineOffered();
 const InferenceScheduler& inferenceScheduler();
 
 // ---------------------------------------------------------------------------
