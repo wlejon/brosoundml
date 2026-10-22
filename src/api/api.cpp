@@ -104,6 +104,7 @@ void shutdownSoundML() {
     cleanupKws();
     cleanupSense();
     cleanupGesture();
+    cleanupVoiceAgent();
     shutdownListenHost();
 }
 

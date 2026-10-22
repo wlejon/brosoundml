@@ -79,7 +79,16 @@ const HostClass::Slots* HostClass::slotsIfAny() const {
 
 bool HostClass::installed() const {
     const Slots* s = slotsIfAny();
-    return s && s->proto;
+    if (!s || !s->proto || !s->realmGlobal) return false;
+    ev::GlobalValue gt = ev::globalValue("globalThis");
+    if (!gt.found || !ev::isObject(gt.value)) return false;
+    ev::Persistent gtP(gt.value);
+    if (s->realmGlobal->get() != gtP.get()) return false;
+    if (s->isGlobal && !s->name.empty() && s->ctor) {
+        Value cur = ev::getProperty(gtP.get(), s->name);
+        if (cur != s->ctor->get()) return false;
+    }
+    return true;
 }
 
 void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
@@ -93,6 +102,15 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
     }
 
     Slots& s = slots();
+    delete s.ctor;
+    delete s.proto;
+    delete s.realmGlobal;
+    s.ctor = nullptr;
+    s.proto = nullptr;
+    s.realmGlobal = nullptr;
+    s.name = name ? name : "";
+    s.isGlobal = global;
+
     ev::Persistent ctor(ev::makeFunction(std::move(ctorBody), arity, name));
     s.ctor = new ev::Persistent(ctor.get());
 
@@ -101,6 +119,13 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
         proto.set("constructor", ctor.get());
         if (decorate) decorate(proto);
         s.proto = new ev::Persistent(proto.get());
+    }
+
+    {
+        ev::GlobalValue gt = ev::globalValue("globalThis");
+        if (gt.found && ev::isObject(gt.value)) {
+            s.realmGlobal = new ev::Persistent(gt.value);
+        }
     }
 
     if (!global) return;
@@ -152,7 +177,8 @@ Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) 
 void HostClass::setStatic(const char* name, Value v) const {
     const Slots* s = slotsIfAny();
     if (!s || !s->ctor) return;
-    s->ctor->set(ev::setProperty(s->ctor->get(), name, v));
+    ev::Persistent vP(v);
+    s->ctor->set(ev::setProperty(s->ctor->get(), name, vP.get()));
 }
 
 Value HostClass::prototype() const {

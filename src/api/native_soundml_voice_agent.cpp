@@ -68,7 +68,7 @@ struct VoiceAgentEventQueue {
 };
 
 struct HostVoiceAgent {
-    std::unique_ptr<VoiceAgent> agent;
+    std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
     std::atomic<std::thread::id> ownerThreadId;
     VoiceAgentEventQueue eventQueue;
 
@@ -85,8 +85,19 @@ struct HostVoiceAgent {
     ev::Persistent tokenizerCb;
     ev::Persistent phonemizerCb;
 
+    std::unique_ptr<VoiceAgent> agent;
+
     HostVoiceAgent();
     ~HostVoiceAgent();
+
+    void clearCallbacks() {
+        for (ev::Persistent* p : {&onStateChangedCb, &onSpeechStartCb, &onSpeechEndCb,
+                                  &onTranscriptCb, &onResponseTextCb, &onAudioOutputCb,
+                                  &onBargeInCb, &textHandlerCb, &sttHandlerCb,
+                                  &ttsHandlerCb, &tokenizerCb, &phonemizerCb}) {
+            *p = ev::Persistent();
+        }
+    }
 
     void queueEvent(VoiceAgentEvent ev);
     void drainEvents();
@@ -110,6 +121,21 @@ void unregisterVoiceAgent(HostVoiceAgent* h) {
     }
 }
 
+bool isVoiceAgentActive(HostVoiceAgent* h) {
+    std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
+    return std::find(g_activeVoiceAgents.begin(), g_activeVoiceAgents.end(), h) != g_activeVoiceAgents.end();
+}
+
+void cancelPendingEvents(VoiceAgentEventQueue& q) {
+    std::vector<VoiceAgentEvent> batch;
+    q.drain(batch);
+    for (auto& ev : batch) {
+        if (ev.promise) {
+            try { ev.promise->set_value(""); } catch (...) {}
+        }
+    }
+}
+
 inline const char* voiceAgentStateToJs(VoiceAgentState s) {
     switch (s) {
         case VoiceAgentState::Idle:      return "idle";
@@ -127,17 +153,21 @@ HostVoiceAgent::HostVoiceAgent() : ownerThreadId(std::this_thread::get_id()) {
 }
 
 HostVoiceAgent::~HostVoiceAgent() {
+    alive->store(false, std::memory_order_release);
     unregisterVoiceAgent(this);
-    std::vector<VoiceAgentEvent> batch;
-    eventQueue.drain(batch);
-    for (auto& ev : batch) {
-        if (ev.promise) {
-            try { ev.promise->set_value(""); } catch (...) {}
-        }
-    }
+    cancelPendingEvents(eventQueue);
+    agent.reset();
+    cancelPendingEvents(eventQueue);
+    clearCallbacks();
 }
 
 void HostVoiceAgent::queueEvent(VoiceAgentEvent ev) {
+    if (!alive->load(std::memory_order_acquire)) {
+        if (ev.promise) {
+            try { ev.promise->set_value(""); } catch (...) {}
+        }
+        return;
+    }
     eventQueue.push(std::move(ev));
     if (std::this_thread::get_id() == ownerThreadId.load(std::memory_order_relaxed)) {
         drainEvents();
@@ -145,60 +175,67 @@ void HostVoiceAgent::queueEvent(VoiceAgentEvent ev) {
 }
 
 void HostVoiceAgent::drainEvents() {
+    auto aliveFlag = alive;
+    if (!aliveFlag || !aliveFlag->load(std::memory_order_acquire)) return;
     auto cur = std::this_thread::get_id();
     auto expected = ownerThreadId.load(std::memory_order_relaxed);
     if (expected != std::thread::id{} && cur != expected) return;
     std::vector<VoiceAgentEvent> batch;
     eventQueue.drain(batch);
     for (auto& ev : batch) {
+        if (!aliveFlag->load(std::memory_order_acquire)) {
+            if (ev.promise) {
+                try { ev.promise->set_value(""); } catch (...) {}
+            }
+            continue;
+        }
         switch (ev.type) {
-            case VoiceAgentEvent::Type::StateChanged:
-                if (ev::isFunction(onStateChangedCb.get())) {
+            case VoiceAgentEvent::Type::StateChanged: {
+                ev::Persistent cb(onStateChangedCb.get());
+                if (ev::isFunction(cb.get())) {
                     ev::Persistent a0(ev::fromUtf8(voiceAgentStateToJs(ev.oldState)));
                     Value a1 = ev::fromUtf8(voiceAgentStateToJs(ev.newState));
-                    callCallback2(onStateChangedCb.get(), a0.get(), a1);
+                    callCallback2(cb.get(), a0.get(), a1);
                 }
                 break;
-            case VoiceAgentEvent::Type::SpeechStart:
-                if (ev::isFunction(onSpeechStartCb.get())) {
-                    callCallback(onSpeechStartCb.get(), {});
-                }
+            }
+            case VoiceAgentEvent::Type::SpeechStart: {
+                ev::Persistent cb(onSpeechStartCb.get());
+                if (ev::isFunction(cb.get())) callCallback(cb.get(), {});
                 break;
-            case VoiceAgentEvent::Type::SpeechEnd:
-                if (ev::isFunction(onSpeechEndCb.get())) {
-                    Value a0 = makeFloat32Array(ev.samples);
-                    callCallback1(onSpeechEndCb.get(), a0);
-                }
+            }
+            case VoiceAgentEvent::Type::SpeechEnd: {
+                ev::Persistent cb(onSpeechEndCb.get());
+                if (ev::isFunction(cb.get())) callCallback1(cb.get(), makeFloat32Array(ev.samples));
                 break;
-            case VoiceAgentEvent::Type::Transcript:
-                if (ev::isFunction(onTranscriptCb.get())) {
-                    Value a0 = ev::fromUtf8(ev.text);
-                    callCallback1(onTranscriptCb.get(), a0);
-                }
+            }
+            case VoiceAgentEvent::Type::Transcript: {
+                ev::Persistent cb(onTranscriptCb.get());
+                if (ev::isFunction(cb.get())) callCallback1(cb.get(), ev::fromUtf8(ev.text));
                 break;
-            case VoiceAgentEvent::Type::ResponseText:
-                if (ev::isFunction(onResponseTextCb.get())) {
-                    Value a0 = ev::fromUtf8(ev.text);
-                    callCallback1(onResponseTextCb.get(), a0);
-                }
+            }
+            case VoiceAgentEvent::Type::ResponseText: {
+                ev::Persistent cb(onResponseTextCb.get());
+                if (ev::isFunction(cb.get())) callCallback1(cb.get(), ev::fromUtf8(ev.text));
                 break;
-            case VoiceAgentEvent::Type::AudioOutput:
-                if (ev::isFunction(onAudioOutputCb.get())) {
-                    Value a0 = makeFloat32Array(ev.samples);
-                    callCallback1(onAudioOutputCb.get(), a0);
-                }
+            }
+            case VoiceAgentEvent::Type::AudioOutput: {
+                ev::Persistent cb(onAudioOutputCb.get());
+                if (ev::isFunction(cb.get())) callCallback1(cb.get(), makeFloat32Array(ev.samples));
                 break;
-            case VoiceAgentEvent::Type::BargeIn:
-                if (ev::isFunction(onBargeInCb.get())) {
-                    callCallback(onBargeInCb.get(), {});
-                }
+            }
+            case VoiceAgentEvent::Type::BargeIn: {
+                ev::Persistent cb(onBargeInCb.get());
+                if (ev::isFunction(cb.get())) callCallback(cb.get(), {});
                 break;
+            }
             case VoiceAgentEvent::Type::SttRequest:
                 if (ev.promise) {
                     std::string result;
-                    if (ev::isFunction(sttHandlerCb.get())) {
+                    ev::Persistent cb(sttHandlerCb.get());
+                    if (ev::isFunction(cb.get())) {
                         Value a0 = makeFloat32Array(ev.samples);
-                        ev::CallResult r = ev::call(sttHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                        ev::CallResult r = ev::call(cb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
                         if (!r.thrown && ev::isString(r.value)) {
                             result = ev::toUtf8(r.value);
                         }
@@ -209,9 +246,10 @@ void HostVoiceAgent::drainEvents() {
             case VoiceAgentEvent::Type::TextRequest:
                 if (ev.promise) {
                     std::string result;
-                    if (ev::isFunction(textHandlerCb.get())) {
+                    ev::Persistent cb(textHandlerCb.get());
+                    if (ev::isFunction(cb.get())) {
                         Value a0 = ev::fromUtf8(ev.text);
-                        ev::CallResult r = ev::call(textHandlerCb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
+                        ev::CallResult r = ev::call(cb.get(), ev::undefined(), std::span<const Value>(&a0, 1));
                         if (!r.thrown && ev::isString(r.value)) {
                             result = ev::toUtf8(r.value);
                         }
@@ -231,9 +269,26 @@ void tickVoiceAgent() {
     }
     const auto curThread = std::this_thread::get_id();
     for (auto* a : agents) {
+        if (!isVoiceAgentActive(a)) continue;
         if (a->ownerThreadId.load(std::memory_order_relaxed) == curThread) {
             a->drainEvents();
         }
+    }
+}
+
+void cleanupVoiceAgent() {
+    std::vector<HostVoiceAgent*> agents;
+    {
+        std::lock_guard<std::mutex> lock(g_voiceAgentRegMtx);
+        agents.swap(g_activeVoiceAgents);
+    }
+    for (auto* a : agents) {
+        if (!a) continue;
+        a->alive->store(false, std::memory_order_release);
+        cancelPendingEvents(a->eventQueue);
+        a->agent.reset();
+        cancelPendingEvents(a->eventQueue);
+        a->clearCallbacks();
     }
 }
 
@@ -914,12 +969,8 @@ void decorateBcResnet(ObjectBuilder& b) {
 }  // namespace
 
 void installVoiceAgent(ObjectBuilder& bro) {
-    if (!g_voiceAgentClass.installed()) {
-        g_voiceAgentClass.install("VoiceAgent", 1, ctorVoiceAgent, decorateVoiceAgent, /*global=*/true);
-    }
-    if (!g_bcResnet2dClass.installed()) {
-        g_bcResnet2dClass.install("BcResnet2d", 1, ctorBcResnet, decorateBcResnet, /*global=*/true);
-    }
+    g_voiceAgentClass.install("VoiceAgent", 1, ctorVoiceAgent, decorateVoiceAgent, /*global=*/true);
+    g_bcResnet2dClass.install("BcResnet2d", 1, ctorBcResnet, decorateBcResnet, /*global=*/true);
 
     // Rooted: bro.set allocates, and a raw Value would be stale after it.
     ObjectBuilder soundml(ev::getProperty(bro.get(), "soundml"));

@@ -71,6 +71,9 @@ public:
     struct Slots {
         ev::Persistent* proto = nullptr;
         ev::Persistent* ctor = nullptr;
+        ev::Persistent* realmGlobal = nullptr;
+        std::string name;
+        bool isGlobal = true;
     };
 
 private:

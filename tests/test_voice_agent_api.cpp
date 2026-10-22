@@ -340,6 +340,55 @@ int main() {
 
     brosoundml::api::shutdownSoundML();
 
+    // ── Test 7: Multi-Realm installSoundML, shutdownSoundML cleanup, and callback GC survival ──
+    std::cout << "\n--- Test 7: Multi-Realm installSoundML and callback GC survival ---" << std::endl;
+    {
+        ev::Realm* r1 = ev::createRealm();
+        {
+            ev::RealmScope s1(r1);
+            brosoundml::api::installSoundML();
+            runEval(R"JS(
+                if (typeof VoiceAgent !== "function") throw new Error("VoiceAgent missing in realm 1");
+                if (typeof BcResnet2d !== "function") throw new Error("BcResnet2d missing in realm 1");
+                globalThis.leakedAgent = bro.createVoiceAgent({
+                    onStateChanged: () => {}
+                });
+            )JS", "Realm 1 VoiceAgent setup");
+            brosoundml::api::shutdownSoundML();
+        }
+        ev::destroyRealm(r1);
+
+        ev::Realm* r2 = ev::createRealm();
+        {
+            ev::RealmScope s2(r2);
+            brosoundml::api::installSoundML();
+            runEval(R"JS(
+                if (typeof VoiceAgent !== "function") throw new Error("VoiceAgent missing in realm 2");
+                if (typeof BcResnet2d !== "function") throw new Error("BcResnet2d missing in realm 2");
+                if (bro.soundml.VoiceAgent !== VoiceAgent) throw new Error("bro.soundml.VoiceAgent mismatch in realm 2");
+                if (bro.soundml.BcResnet2d !== BcResnet2d) throw new Error("bro.soundml.BcResnet2d mismatch in realm 2");
+                const va = bro.createVoiceAgent();
+                if (!(va instanceof VoiceAgent)) throw new Error("createVoiceAgent prototype mismatch in realm 2");
+                if (va.state !== "idle") throw new Error("VoiceAgent methods broken in realm 2");
+
+                // Callback drops last reference to VoiceAgent during event delivery
+                let dropAgent = bro.createVoiceAgent({
+                    onStateChanged: () => {
+                        dropAgent = null;
+                    },
+                    ttsHandler: (text, emitChunk) => {
+                        emitChunk(new Float32Array(160).fill(0.1));
+                    }
+                });
+                dropAgent.speak("trigger state change and drop ref");
+            )JS", "Realm 2 VoiceAgent multi-VM & callback drop survival");
+            ev::collectGarbage();
+            brosoundml::api::tickSoundML();
+            brosoundml::api::shutdownSoundML();
+        }
+        ev::destroyRealm(r2);
+    }
+
     if (g_failures > 0) {
         std::cerr << "\n" << g_failures << " test(s) FAILED!" << std::endl;
         return 1;

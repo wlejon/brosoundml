@@ -220,6 +220,29 @@ int main() {
 
     brosoundml::api::shutdownSoundML();
 
+    // ── Second realm on the same thread ────────────────────────────────────
+    {
+        ev::Realm* realm2 = ev::createRealm();
+        {
+            ev::RealmScope scope(realm2);
+            brosoundml::api::installSoundML();
+            ev::GlobalValue va = ev::globalValue("VoiceAgent");
+            check(va.found && ev::isFunction(va.value), "VoiceAgent installed in second realm");
+            ev::GlobalValue bc = ev::globalValue("BcResnet2d");
+            check(bc.found && ev::isFunction(bc.value), "BcResnet2d installed in second realm");
+            ev::GlobalValue b2 = ev::globalValue("bro");
+            check(b2.found && ev::isObject(b2.value), "bro installed in second realm");
+            if (b2.found && ev::isObject(b2.value)) {
+                ev::Persistent bro2(b2.value);
+                ev::Persistent createFn(ev::getProperty(bro2.get(), "createVoiceAgent"));
+                ev::CallResult res = ev::call(createFn.get(), bro2.get(), {});
+                check(!res.thrown && ev::isObject(res.value), "bro.createVoiceAgent works in second realm");
+            }
+            brosoundml::api::shutdownSoundML();
+        }
+        ev::destroyRealm(realm2);
+    }
+
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed" << std::endl;
         return 1;

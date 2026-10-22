@@ -56,7 +56,6 @@ void finishJob(const std::shared_ptr<AsyncJob>& job) {
 }  // namespace
 
 void installAsyncHandleClass() {
-    if (g_asyncHandleClass.installed()) return;
     g_asyncHandleClass.install("AsyncHandle", 0, nullptr, [](ObjectBuilder& b) {
         b.def("cancel", 0, [](Value self, std::span<const Value>) -> Value {
             if (auto* h = handleOf(self); h && *h) {
@@ -89,7 +88,7 @@ void installAsyncHandleClass() {
 }
 
 Value launchAsyncJob(AsyncWorkFn work, AsyncPollFn poll, AsyncDoneFn done) {
-    installAsyncHandleClass();
+    if (!g_asyncHandleClass.installed()) installAsyncHandleClass();
     auto job = std::make_shared<AsyncJob>();
     job->handle = std::make_shared<HostAsyncHandle>();
     job->work = std::move(work);

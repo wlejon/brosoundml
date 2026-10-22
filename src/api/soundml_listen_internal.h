@@ -43,6 +43,7 @@ void cleanupWake();
 void cleanupKws();
 void cleanupSense();
 void cleanupGesture();
+void cleanupVoiceAgent();
 
 // Shared helpers for the tenants' JS surfaces.
 
