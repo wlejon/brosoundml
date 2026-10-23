@@ -48,6 +48,7 @@ struct QwenAsrEncoder {
 
     // ── mel front-end tables (CPU; built at load, no learned weights) ──
     brotensor::Tensor mel_filters;      // (num_mel_bins, 201) FP32
+    brotensor::Tensor mel_filters_T;    // (201, num_mel_bins) FP32 (pre-transposed)
     brotensor::Tensor hann_window;      // (1, 400) FP32
 
     // ── weights (FP32 on the model device) ──

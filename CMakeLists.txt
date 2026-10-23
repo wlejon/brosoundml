@@ -174,6 +174,7 @@ target_sources(brosoundml PRIVATE
     src/mel.cpp
     src/whisper.cpp
     src/whisper_modules.cpp
+    src/whisper_decoder.cpp
     src/fastconformer.cpp
     src/parakeet.cpp
     src/word_align.cpp

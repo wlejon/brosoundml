@@ -2,6 +2,8 @@
 
 #include "u8path.h"
 
+#include <brotensor/detail/cpu/thread_pool.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -200,23 +202,31 @@ AudioBuffer resample(const AudioBuffer& in, int rate) {
     AudioBuffer out;
     out.sample_rate = rate;
     out.samples.resize(static_cast<std::size_t>(n_out));
-    for (long long j = 0; j < n_out; ++j) {
-        const long long num = j * orig;
-        const long long base = num / next;
-        const double t = static_cast<double>(base) +
-                         static_cast<double>(num - base * next) / static_cast<double>(next);
-        const long long lo = std::max<long long>(0, static_cast<long long>(std::ceil(t - span)));
-        const long long hi = std::min<long long>(n - 1, static_cast<long long>(std::floor(t + span)));
-        double acc = 0.0;
-        for (long long k = lo; k <= hi; ++k) {
-            const double u = static_cast<double>(k) - t;
-            const double arg = 2.0 * cutoff * u;
-            const double sinc = (arg == 0.0) ? 1.0 : std::sin(kPi * arg) / (kPi * arg);
-            const double w = std::cos(kPi * u / (2.0 * span));
-            acc += static_cast<double>(x[k]) * 2.0 * cutoff * sinc * w * w;
+    float* dst = out.samples.data();
+    const int n_out_i = static_cast<int>(n_out);
+    constexpr int kChunk = 1024;
+    const std::size_t n_chunks = static_cast<std::size_t>((n_out_i + kChunk - 1) / kChunk);
+    brotensor::detail::cpu::parallel_for(n_chunks, [&](std::size_t ci) {
+        const int j0 = static_cast<int>(ci) * kChunk;
+        const int j1 = std::min(n_out_i, j0 + kChunk);
+        for (int j = j0; j < j1; ++j) {
+            const long long num = static_cast<long long>(j) * orig;
+            const long long base = num / next;
+            const double t = static_cast<double>(base) +
+                             static_cast<double>(num - base * next) / static_cast<double>(next);
+            const long long lo = std::max<long long>(0, static_cast<long long>(std::ceil(t - span)));
+            const long long hi = std::min<long long>(n - 1, static_cast<long long>(std::floor(t + span)));
+            double acc = 0.0;
+            for (long long k = lo; k <= hi; ++k) {
+                const double u = static_cast<double>(k) - t;
+                const double arg = 2.0 * cutoff * u;
+                const double sinc = (arg == 0.0) ? 1.0 : std::sin(kPi * arg) / (kPi * arg);
+                const double w = std::cos(kPi * u / (2.0 * span));
+                acc += static_cast<double>(x[k]) * 2.0 * cutoff * sinc * w * w;
+            }
+            dst[static_cast<std::size_t>(j)] = static_cast<float>(acc);
         }
-        out.samples[static_cast<std::size_t>(j)] = static_cast<float>(acc);
-    }
+    });
     return out;
 }
 

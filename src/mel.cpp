@@ -1,5 +1,6 @@
 #include "brosoundml/mel.h"
 
+#include <brotensor/detail/cpu/thread_pool.h>
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
@@ -242,13 +243,19 @@ void MelFrontend::compress_and_emit(const std::vector<float>& linear_mel_TM,
 
     if (cfg_.compression == MelCompression::Log) {
         // log(max(mel, eps)) — bit-identical to the previous front-end.
-        for (int t = 0; t < T; ++t) {
-            for (int m = 0; m < M; ++m) {
-                float v = linear_mel_TM[static_cast<std::size_t>(t) * M + m];
-                if (v < kEps) v = kEps;
-                out_host[static_cast<std::size_t>(m) * T + t] = std::log(v);
+        constexpr int kChunk = 64;
+        const std::size_t n_chunks = static_cast<std::size_t>((T + kChunk - 1) / kChunk);
+        bt::detail::cpu::parallel_for(n_chunks, [&](std::size_t ci) {
+            const int t0 = static_cast<int>(ci) * kChunk;
+            const int t1 = std::min(T, t0 + kChunk);
+            for (int t = t0; t < t1; ++t) {
+                for (int m = 0; m < M; ++m) {
+                    float v = linear_mel_TM[static_cast<std::size_t>(t) * M + m];
+                    if (v < kEps) v = kEps;
+                    out_host[static_cast<std::size_t>(m) * T + t] = std::log(v);
+                }
             }
-        }
+        });
     } else {  // PCEN
         const float s     = cfg_.pcen_s;
         const float alpha = cfg_.pcen_alpha;

@@ -71,6 +71,7 @@ struct LogMel {
     brotensor::Device device = brotensor::Device::CPU;
 
     brotensor::Tensor mel_filters;      // (num_mel_bins, n_fft/2 + 1) FP32 (CPU)
+    brotensor::Tensor mel_filters_T;    // (n_fft/2 + 1, num_mel_bins) FP32 (CPU, pre-transposed)
     brotensor::Tensor hann_window;      // (1, win_length) FP32 (CPU)
 
     // Build mel_filters + hann_window from scratch; no safetensors needed.

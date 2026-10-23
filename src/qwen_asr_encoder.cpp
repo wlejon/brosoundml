@@ -3,6 +3,7 @@
 #include "mel_slaney.h"
 #include "qwen_tts_device.h"   // qtd:: device-neutral helpers (model-agnostic)
 
+#include <brotensor/detail/cpu/thread_pool.h>
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
@@ -88,6 +89,17 @@ void load_encoder_impl(QwenAsrEncoder& self, const Source& f, const QwenAsrConfi
                                                 bt::Dtype::FP32);
         std::memcpy(self.mel_filters.host_f32_mut(), fb.data(),
                     fb.size() * sizeof(float));
+        self.mel_filters_T = bt::Tensor::zeros_on(bt::Device::CPU, kNBins, self.num_mel_bins,
+                                                  bt::Dtype::FP32);
+        {
+            float* dst = self.mel_filters_T.host_f32_mut();
+            for (int m = 0; m < self.num_mel_bins; ++m) {
+                for (int k = 0; k < kNBins; ++k) {
+                    dst[static_cast<std::size_t>(k) * self.num_mel_bins + m] =
+                        fb[static_cast<std::size_t>(m) * kNBins + k];
+                }
+            }
+        }
         std::vector<float> hw = melslaney::build_hann_window(kNFft);
         self.hann_window = bt::Tensor::zeros_on(bt::Device::CPU, 1, kNFft,
                                                 bt::Dtype::FP32);
@@ -220,21 +232,29 @@ std::vector<float> QwenAsrEncoder::log_mel(const AudioBuffer& audio,
     {
         const float* sd = spec.host_f32();
         float*       pd = power.host_f32_mut();
-        for (int fr = 0; fr < frames; ++fr) {
-            const float* src = sd + static_cast<std::size_t>(fr) * 2 * kNBins;
-            float*       dst = pd + static_cast<std::size_t>(fr) * kNBins;
-            for (int k = 0; k < kNBins; ++k) {
-                const float re = src[2 * k + 0];
-                const float im = src[2 * k + 1];
-                dst[k] = re * re + im * im;
+        constexpr int kChunk = 128;
+        const std::size_t n_chunks = static_cast<std::size_t>((frames + kChunk - 1) / kChunk);
+        bt::detail::cpu::parallel_for(n_chunks, [&](std::size_t ci) {
+            const int fr0 = static_cast<int>(ci) * kChunk;
+            const int fr1 = std::min(frames, fr0 + kChunk);
+            for (int fr = fr0; fr < fr1; ++fr) {
+                const float* src = sd + static_cast<std::size_t>(fr) * 2 * kNBins;
+                float*       dst = pd + static_cast<std::size_t>(fr) * kNBins;
+                for (int k = 0; k < kNBins; ++k) {
+                    const float re = src[2 * k + 0];
+                    const float im = src[2 * k + 1];
+                    dst[k] = re * re + im * im;
+                }
             }
-        }
+        });
     }
 
     // Mel projection: (frames, 201) @ (201, n_mels) -> frame-major (frames,
     // n_mels), the layout the chunk assembly below wants.
     bt::Tensor mel_ft;
-    {
+    if (mel_filters_T.rows == kNBins && mel_filters_T.cols == num_mel_bins) {
+        bt::matmul(power, mel_filters_T, mel_ft);
+    } else {
         bt::Tensor fb_T = bt::Tensor::zeros_on(bt::Device::CPU, kNBins,
                                                num_mel_bins, bt::Dtype::FP32);
         const float* src = mel_filters.host_f32();
@@ -251,15 +271,27 @@ std::vector<float> QwenAsrEncoder::log_mel(const AudioBuffer& audio,
         static_cast<std::size_t>(frames) * num_mel_bins;
     std::vector<float> out(total);
     const float* md = mel_ft.host_f32();
+    constexpr std::size_t kElemChunk = 4096;
+    const std::size_t n_elem_chunks = (total + kElemChunk - 1) / kElemChunk;
+    bt::detail::cpu::parallel_for(n_elem_chunks, [&](std::size_t ci) {
+        const std::size_t i0 = ci * kElemChunk;
+        const std::size_t i1 = std::min(total, i0 + kElemChunk);
+        for (std::size_t i = i0; i < i1; ++i) {
+            out[i] = std::log10(std::max(md[i], 1e-10f));
+        }
+    });
     float global_max = -1e30f;
     for (std::size_t i = 0; i < total; ++i) {
-        const float lv = std::log10(std::max(md[i], 1e-10f));
-        out[i] = lv;
-        if (lv > global_max) global_max = lv;
+        if (out[i] > global_max) global_max = out[i];
     }
     const float floor_v = global_max - 8.0f;
-    for (std::size_t i = 0; i < total; ++i)
-        out[i] = (std::max(out[i], floor_v) + 4.0f) / 4.0f;
+    bt::detail::cpu::parallel_for(n_elem_chunks, [&](std::size_t ci) {
+        const std::size_t i0 = ci * kElemChunk;
+        const std::size_t i1 = std::min(total, i0 + kElemChunk);
+        for (std::size_t i = i0; i < i1; ++i) {
+            out[i] = (std::max(out[i], floor_v) + 4.0f) * 0.25f;
+        }
+    });
 
     frames_out = frames;
     return out;
