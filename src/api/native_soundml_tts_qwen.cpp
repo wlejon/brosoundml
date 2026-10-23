@@ -69,8 +69,10 @@ void readQwenOpts(Value opts, QwenSynthOpts& o) {
             ev::Persistent lbRoot(lb);
             for (const std::string& key : objectKeys(lbRoot.get())) {
                 Value v = ev::getProperty(lbRoot.get(), key);
-                if (ev::isNumber(v))
-                    s.logit_bias.emplace_back(std::atoi(key.c_str()), static_cast<float>(ev::toDouble(v)));
+                if (ev::isNumber(v)) {
+                    const double d = ev::toDouble(v);
+                    if (std::isfinite(d)) s.logit_bias.emplace_back(std::atoi(key.c_str()), static_cast<float>(d));
+                }
             }
         }
     }

@@ -311,6 +311,8 @@ Value jsSetThreshold(Value self, std::span<const Value> a) {
     if (a.empty() || !ev::isNumber(a[0]))
         return ev::throwTypeError("bro.wake.setThreshold(value): number required");
     const double th = ev::toDouble(a[0]);
+    if (!std::isfinite(th))
+        return ev::throwTypeError("bro.wake.setThreshold(value): finite number required");
     // WakeWord setters are atomic; safe to call while the inference thread feeds.
     WakeTenant* t = findTenant(streamOf(self));
     if (t && t->wake) t->wake->set_threshold(static_cast<float>(th));

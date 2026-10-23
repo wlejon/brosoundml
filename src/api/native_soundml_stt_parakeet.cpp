@@ -105,14 +105,14 @@ bool readSpeechAligner(Value v, SpeechAligner& out, std::string& err) {
     out = SpeechAligner{};
     if (ev::isUndefined(v) || ev::isNull(v)) return true;
     ev::Persistent root(v);
-    Value modelVal = root.get();
+    ev::Persistent modelVal(root.get());
     HostParakeetTokenizer* tok = nullptr;
-    if (!g_parakeetModelClass.isInstance(modelVal)) {
-        if (!ev::isObject(modelVal) || ev::isFunction(modelVal)) {
+    if (!g_parakeetModelClass.isInstance(modelVal.get())) {
+        if (!ev::isObject(modelVal.get()) || ev::isFunction(modelVal.get())) {
             err = "align must be a ParakeetModel or { model, tokenizer? }";
             return false;
         }
-        modelVal = ev::getProperty(root.get(), "model");
+        modelVal.set(ev::getProperty(root.get(), "model"));
         Value tv = ev::getProperty(root.get(), "tokenizer");
         if (g_parakeetTokenizerClass.isInstance(tv)) tok = tokSelf(tv);
         else if (!ev::isUndefined(tv) && !ev::isNull(tv)) {
@@ -120,11 +120,11 @@ bool readSpeechAligner(Value v, SpeechAligner& out, std::string& err) {
             return false;
         }
     }
-    if (!g_parakeetModelClass.isInstance(modelVal)) {
+    if (!g_parakeetModelClass.isInstance(modelVal.get())) {
         err = "align.model must be a ParakeetModel";
         return false;
     }
-    auto* m = modelSelf(modelVal);
+    auto* m = modelSelf(modelVal.get());
     if (!m || !m->model || !m->model->loaded()) {
         err = "the align model is not loaded";
         return false;

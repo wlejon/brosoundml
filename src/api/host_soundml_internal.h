@@ -58,11 +58,14 @@ inline double numAt(std::span<const Value> args, size_t i, double def = 0.0) {
     Value v = args[i];
     if (ev::isObject(v) || ev::isUndefined(v) || ev::isNull(v)) return def;
     double d = ev::toDouble(v);
-    return std::isnan(d) ? def : d;
+    return !std::isfinite(d) ? def : d;
 }
 
 inline int32_t i32At(std::span<const Value> args, size_t i, int32_t def = 0) {
-    return static_cast<int32_t>(static_cast<int64_t>(numAt(args, i, def)));
+    const double d = numAt(args, i, def);
+    if (d >= 2147483647.0) return INT32_MAX;
+    if (d <= -2147483648.0) return INT32_MIN;
+    return static_cast<int32_t>(d);
 }
 
 inline bool boolAt(std::span<const Value> args, size_t i, bool def = false) {
@@ -101,11 +104,14 @@ inline double getPropertyDouble(Value obj, std::string_view name, double def = 0
     Value v = ev::getProperty(obj, name);
     if (ev::isUndefined(v) || ev::isNull(v) || ev::isObject(v)) return def;
     double d = ev::toDouble(v);
-    return std::isnan(d) ? def : d;
+    return !std::isfinite(d) ? def : d;
 }
 
 inline int32_t getPropertyInt(Value obj, std::string_view name, int32_t def = 0) {
-    return static_cast<int32_t>(static_cast<int64_t>(getPropertyDouble(obj, name, def)));
+    const double d = getPropertyDouble(obj, name, def);
+    if (d >= 2147483647.0) return INT32_MAX;
+    if (d <= -2147483648.0) return INT32_MIN;
+    return static_cast<int32_t>(d);
 }
 
 inline bool getPropertyBool(Value obj, std::string_view name, bool def = false) {
@@ -125,19 +131,28 @@ inline std::string getPropertyString(Value obj, std::string_view name, const std
 inline void getIntOpt(Value obj, std::string_view name, int& dst) {
     if (!ev::isObject(obj)) return;
     Value v = ev::getProperty(obj, name);
-    if (ev::isNumber(v)) dst = static_cast<int>(ev::toDouble(v));
+    if (ev::isNumber(v)) {
+        const double d = ev::toDouble(v);
+        if (std::isfinite(d) && d >= -2147483648.0 && d <= 2147483647.0) dst = static_cast<int>(d);
+    }
 }
 
 inline void getFloatOpt(Value obj, std::string_view name, float& dst) {
     if (!ev::isObject(obj)) return;
     Value v = ev::getProperty(obj, name);
-    if (ev::isNumber(v)) dst = static_cast<float>(ev::toDouble(v));
+    if (ev::isNumber(v)) {
+        const double d = ev::toDouble(v);
+        if (std::isfinite(d)) dst = static_cast<float>(d);
+    }
 }
 
 inline void getDoubleOpt(Value obj, std::string_view name, double& dst) {
     if (!ev::isObject(obj)) return;
     Value v = ev::getProperty(obj, name);
-    if (ev::isNumber(v)) dst = ev::toDouble(v);
+    if (ev::isNumber(v)) {
+        const double d = ev::toDouble(v);
+        if (std::isfinite(d)) dst = d;
+    }
 }
 
 inline void getBoolOpt(Value obj, std::string_view name, bool& dst) {
