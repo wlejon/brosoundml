@@ -274,6 +274,13 @@ void installListen(ObjectBuilder& bro) {
                 StreamHandle* h = streamSelf(self);
                 return ev::fromBool(h && listenHostValid(h->id));
             });
+            // Why the host closed the stream (its grant to record was taken
+            // back while it ran), or null.
+            b.accessor("revoked", [](Value self, std::span<const Value>) -> Value {
+                StreamHandle* h = streamSelf(self);
+                const std::string why = h ? listenHostRevoked(h->id) : std::string();
+                return why.empty() ? ev::null() : ev::fromUtf8(why);
+            });
             b.def("retain", 1, jsStreamRetain);
             b.def("audio",  2, jsStreamAudio);
             b.def("frame",  0, jsStreamFrame);

@@ -100,6 +100,11 @@ void listenHostClose(StreamId id);
 
 bool listenHostValid(StreamId id);
 
+// Why a stream was closed by the host taking back the grant its source
+// records under (the microphone, or other applications' audio); "" when it
+// was not. Main thread only.
+std::string listenHostRevoked(StreamId id);
+
 // The id of the shared default-microphone stream (the one the global tenant
 // bindings target), creating it if needed. Stable for the session — the default
 // mic stream is never erased, only its infra cycles with membership. Tenant

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -294,6 +295,11 @@ private:
 
 constexpr std::uint32_t kInvalidPump = 0;
 
+// The host took back the grant the stream's source records under
+// (broaudio/capture_gate.h): the stream closes, and its refusal is kept for
+// ListenStream.revoked. Main thread.
+void revokeStream(StreamId id, const std::string& refusal);
+
 // ── One independent listening pipeline ────────────────────────────────────────
 struct ListenStream {
     StreamId     id = kInvalidStream;
@@ -310,6 +316,7 @@ struct ListenStream {
     std::unique_ptr<broaudio::LoopbackCapture> loopback;                 // loopback source
 #if defined(__linux__)
     std::unique_ptr<LinuxSystemLoopbackCapture> linuxLoopback;
+    std::uint64_t linuxLoopbackHeld = 0;   // its hold under the capture holder
 #endif
 
     // Members (main-thread copies used to build each generation's closure).
@@ -360,6 +367,8 @@ struct ListenStream {
         auto newRing = std::make_shared<PcmRing>(
             static_cast<std::size_t>(rate) * 2u);
         auto ringRef = newRing;
+        const StreamId sid = id;
+        auto onRevoked = [sid](const std::string& refusal) { revokeStream(sid, refusal); };
 
         if (source.kind == ListenSource::Kind::Mic) {
             // One raw tap (no AGC — the PCEN front-end is loudness-robust and
@@ -369,6 +378,7 @@ struct ListenStream {
             tapCfg.targetRate  = rate;
             tapCfg.chunkFrames = 0;
             tapCfg.agc         = false;
+            tapCfg.onRevoked   = onRevoked;
             const broaudio::MicTapId tap = audio->addMicTap(
                 tapCfg,
                 [ringRef](const float* s, int n) { ringRef->write(s, n); });
@@ -395,6 +405,7 @@ struct ListenStream {
                 cfg.pid        = source.pid;
                 cfg.targetRate = rate;
                 cfg.mono       = true;   // channel-select reserved (source.channel)
+                cfg.onRevoked  = onRevoked;
                 auto cap = std::make_unique<broaudio::LoopbackCapture>();
                 if (cap->start(cfg, [ringRef](const float* s, int n) { ringRef->write(s, n); })) {
                     loopback = std::move(cap);
@@ -411,6 +422,7 @@ struct ListenStream {
                                                  (err.empty() ? "audio server connection failed" : err));
                     }
                     linuxLoopback = std::move(cap);
+                    linuxLoopbackHeld = broaudio::holdCapture(what, onRevoked);
                     started = true;
                 } else {
                     throw std::runtime_error("listen host: process-scoped loopback capture is not supported on Linux; use system loopback");
@@ -439,6 +451,7 @@ struct ListenStream {
         tapId = broaudio::kInvalidMicTapId;
         if (loopback) { loopback->stop(); loopback.reset(); }
 #if defined(__linux__)
+        broaudio::releaseCapture(linuxLoopbackHeld);
         if (linuxLoopback) { linuxLoopback->stop(); linuxLoopback.reset(); }
 #endif
         removePumpIfAny();
@@ -573,7 +586,23 @@ struct Manager {
 
 Manager g_mgr;
 
+// Streams closed because their grant was taken back, and why.
+std::map<StreamId, std::string> g_revoked;
+
+void revokeStream(StreamId id, const std::string& refusal) {
+    if (!g_mgr.find(id)) return;
+    std::fprintf(stderr, "[WARN] [listen] stream %u closed: %s\n", static_cast<unsigned>(id), refusal.c_str());
+    g_revoked[id] = refusal;
+    if (id == g_mgr.defaultMic) g_mgr.defaultMic = kInvalidStream;
+    g_mgr.erase(id);
+}
+
 }  // namespace
+
+std::string listenHostRevoked(StreamId id) {
+    auto it = g_revoked.find(id);
+    return it == g_revoked.end() ? std::string() : it->second;
+}
 
 // ─── Host lifecycle ─────────────────────────────────────────────────────────
 
