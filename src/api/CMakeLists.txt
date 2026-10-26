@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
 set(BROSOUNDML_API_SOURCES
-    host_class.cpp
     api.cpp
     soundml_async.cpp
     native_soundml_stt.cpp
