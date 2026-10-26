@@ -5,6 +5,7 @@
 #include "api.h"
 #include "host_soundml_internal.h"
 
+#include <broaudio/capture_gate.h>
 #include <broaudio/engine.h>
 #include <brotensor/runtime.h>
 
@@ -343,6 +344,16 @@ struct ListenStream {
         broaudio::Engine* audio = audioEngine();
         if (!audio) {
             throw std::runtime_error("listen host: audio engine not available");
+        }
+        // Every source is the user's audio (their microphone, or what their
+        // machine plays), so each asks the host's capture gate first. The
+        // Linux PipeWire loopback below opens its own stream, outside
+        // broaudio's capture paths, so the check has to be here as well.
+        const char* what = source.kind == ListenSource::Kind::Mic
+                               ? "bro.listen microphone stream"
+                               : "bro.listen loopback stream";
+        if (std::string refused = broaudio::checkCaptureGate(what); !refused.empty()) {
+            throw std::runtime_error("listen host: " + refused);
         }
         auto newBus = std::make_shared<brosoundml::ListenBus>();   // KWS recipe
         const int rate = newBus->sample_rate();
