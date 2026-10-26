@@ -2,7 +2,11 @@
 #include "host_soundml_internal.h"
 #include "soundml_listen_internal.h"
 
+#include "embed/embed_access.h"
+
 #include <cstdio>
+#include <filesystem>
+#include <system_error>
 #include <utility>
 
 namespace brosoundml::api {
@@ -64,6 +68,44 @@ void setInferenceScheduler(InferenceScheduler scheduler) {
 std::string resolvePath(const std::string& path) {
     auto& r = pathResolver();
     return r ? r(path) : path;
+}
+
+namespace {
+
+std::string gatePath(std::string_view p) {
+    std::filesystem::path fp(std::u8string(p.begin(), p.end()));
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::absolute(fp, ec);
+    if (ec) abs = fp;
+    const std::u8string u = abs.lexically_normal().u8string();
+    return std::string(u.begin(), u.end());
+}
+
+PathRefusal checkOne(ev::AccessKind kind, std::string_view p) {
+    PathRefusal r;
+    if (p.empty()) return r;
+    r.path = gatePath(p);
+    r.message = ev::checkAccess(kind, r.path);
+    return r;
+}
+
+} // namespace
+
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths) {
+    if (!ev::accessGateActive()) return {};
+    for (std::string_view p : paths) {
+        if (PathRefusal r = checkOne(ev::AccessKind::Read, p)) return r;
+    }
+    return {};
+}
+
+PathRefusal checkWriteAccess(std::string_view path) {
+    if (!ev::accessGateActive()) return {};
+    return checkOne(ev::AccessKind::Write, path);
+}
+
+Value throwRefusal(const PathRefusal& refusal) {
+    return ev::throwAccessError(refusal.message, "EACCES", refusal.path);
 }
 
 void logInfo(const std::string& line) {

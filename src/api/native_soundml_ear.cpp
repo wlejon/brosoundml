@@ -68,8 +68,10 @@ std::string defaultClapDir(std::vector<std::string>& tried) {
 // `root` is re-read after every allocating call (embed.h GC contract).
 bool readClip(const ev::Persistent& root, int defaultRate, brosoundml::AudioBuffer& out, std::string& err) {
     if (ev::isString(root.get())) {
+        const std::string path = resolvePath(ev::toUtf8(root.get()));
+        if (PathRefusal r = checkReadAccess({path})) throwRefusal(r);
         try {
-            out = brosoundml::read_wav(resolvePath(ev::toUtf8(root.get())));
+            out = brosoundml::read_wav(path);
         } catch (const std::exception& e) {
             err = e.what();
             return false;
@@ -465,6 +467,7 @@ Value loadClap(Value, std::span<const Value> args) {
     std::size_t optsIndex = 0;
     if (isStringArg(args, 0)) {
         dir = resolvePath(strAt(args, 0));
+        if (PathRefusal r = checkReadAccess({dir})) return throwRefusal(r);
         optsIndex = 1;
     } else if (hasArg(args, 0) && !isObjectArg(args, 0) && !ev::isNull(args[0])) {
         return ev::throwTypeError("loadClap(dir?, opts?): dir must be a path string");

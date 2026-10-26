@@ -45,6 +45,40 @@ void tickSoundMLAsync();
 /// at realm teardown, before the runtime and brotensor go away.
 void shutdownSoundML();
 
+// ---- Access ------------------------------------------------------------------
+//
+// Every native that opens a path the app named asks the host's access gate
+// (embed/embed_access.h, bronze::embed::checkAccess) first, on the calling JS
+// thread, before anything is opened, stat'ed or queued. The gate is handed the
+// path as it will be opened (after the path resolver where the native
+// resolves), absolute and lexically normal, in UTF-8.
+//   AccessKind::Read:
+//     every model-directory loader (a directory covers what is in it):
+//     bro.stt.loadWhisper / loadParakeet / loadQwenAsr / loadQwenAsrStream,
+//     bro.tts.loadKokoro / loadQwen / loadOmniVoice / loadSupertonic /
+//     loadSpeakerEncoder / loadHiggsCodec, bro.diar.loadSortformer and
+//     loadClusterDiarizer (both directories), bro.rave.loadRave,
+//     bro.music.loadYuE2 / loadVae / loadSeparator, bro.ear.loadClap (a dir
+//     given; the default weights location is the library's own);
+//     the file loaders: bro.stt.loadTokenizer (vocabPath, mergesPath,
+//     addedTokensPath), loadParakeetTokenizer, Kokoro.loadVoice,
+//     Supertonic.loadVoiceStyle, OmniVoice.loadPrompt, bro.kws.load and
+//     bro.wake.load / bro.wake.listen (opts.weights, when it will be read),
+//     new BcResnet2d(path | { weights }), VoiceAgent.setVad(path) and
+//     setKokoro(model, voicePath); a WAV path handed as audio
+//     (QwenTts.synthesizeClone's ref, ClapModel.score / embedAudio's clip);
+//     bro.tts.setAssetRoot / setAssets (each path, when set; nothing is kept
+//     when one is refused).
+//   AccessKind::Write: OmniVoice.savePrompt and YuE2Stream.saveSong (the file
+//     written).
+// soundml_listen_host.cpp's live sources ask the capture gate instead.
+//
+// A refusal is thrown from the call as an Error carrying the gate's sentence as
+// its message, code "EACCES" and `path` (the path as the gate was handed it),
+// named "PermissionRevoked" for a grant taken back while the app ran; a loader
+// given opts.onReady throws it too, so nothing is queued. Nothing is read or
+// written.
+
 /// Resolve model / asset paths the way the host's fs module does (app-
 /// relative base paths). Identity when unset.
 void setPathResolver(std::function<std::string(const std::string&)> resolver);

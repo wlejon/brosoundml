@@ -256,7 +256,9 @@ std::unique_ptr<PhonemizerState> buildPhonemizer() {
 // bro.tts.setAssetRoot(path): the brosoundml repo root; clears explicit paths.
 Value setAssetRoot(Value, std::span<const Value> a) {
     if (!isStringArg(a, 0)) return ev::throwTypeError("setAssetRoot(path): path string required");
-    g_assetRoot = resolvePath(strAt(a, 0));
+    const std::string root = resolvePath(strAt(a, 0));
+    if (PathRefusal r = checkReadAccess({root})) return throwRefusal(r);
+    g_assetRoot = root;
     g_lexiconPath.clear();
     g_posPath.clear();
     g_kokoroConfigPath.clear();
@@ -268,16 +270,24 @@ Value setAssetRoot(Value, std::span<const Value> a) {
 Value setAssets(Value, std::span<const Value> a) {
     if (!isObjectArg(a, 0)) return ev::throwTypeError("setAssets(opts): options object required");
     ev::Persistent opts(a[0]);
-    auto take = [&](const char* key, std::string& dst) {
+    // Every path is read and asked about before any is kept: a refused one
+    // leaves the assets as they were.
+    auto read = [&](const char* key) {
         std::string s;
         getStrOpt(opts.get(), key, s);
-        if (!s.empty()) dst = resolvePath(s);
+        return s.empty() ? s : resolvePath(s);
     };
-    take("root", g_assetRoot);
-    take("lexicon", g_lexiconPath);
-    take("posTagger", g_posPath);
-    take("pos", g_posPath);
-    take("kokoroConfig", g_kokoroConfigPath);
+    const std::string root = read("root"), lexicon = read("lexicon"), posTagger = read("posTagger"),
+                      pos = read("pos"), kokoroConfig = read("kokoroConfig");
+    if (PathRefusal r = checkReadAccess({root, lexicon, posTagger, pos, kokoroConfig})) return throwRefusal(r);
+    auto take = [](const std::string& s, std::string& dst) {
+        if (!s.empty()) dst = s;
+    };
+    take(root, g_assetRoot);
+    take(lexicon, g_lexiconPath);
+    take(posTagger, g_posPath);
+    take(pos, g_posPath);
+    take(kokoroConfig, g_kokoroConfigPath);
     g_phonemizer.reset();
     return ev::undefined();
 }

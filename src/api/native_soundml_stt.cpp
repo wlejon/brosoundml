@@ -78,6 +78,7 @@ Value loadTokenizer(Value, std::span<const Value> args) {
     vocab = resolvePath(vocab);
     merges = resolvePath(merges);
     if (!added.empty()) added = resolvePath(added);
+    if (PathRefusal r = checkReadAccess({vocab, merges, added})) return throwRefusal(r);
     return runLoader<HostWhisperTokenizer>("loadTokenizer", opts.get(), g_whisperTokenizerClass,
         [vocab, merges, added] {
             auto t = std::make_unique<HostWhisperTokenizer>();
@@ -114,6 +115,7 @@ Value loadParakeetTokenizer(Value, std::span<const Value> args) {
     if (!isStringArg(args, 0))
         return ev::throwTypeError("loadParakeetTokenizer(tokenizerJsonPath, opts?): path required");
     const std::string path = resolvePath(strAt(args, 0));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     ev::Persistent opts(isObjectArg(args, 1) ? args[1] : ev::undefined());
     return runLoader<HostParakeetTokenizer>("loadParakeetTokenizer", opts.get(), g_parakeetTokenizerClass,
         [path] {

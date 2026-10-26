@@ -409,6 +409,7 @@ void decorateStream(ObjectBuilder& b) {
             return ev::throwTypeError("saveSong(song, path): a song index and a file path required");
         const int song = static_cast<int>(numAt(a, 0, -1));
         const std::string path = strAt(a, 1);
+        if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
         return streamControl(self, "saveSong", [&](StreamJob& j) -> Value {
             j.stream->save_song(song, path);
             return ev::undefined();

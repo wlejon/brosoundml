@@ -67,7 +67,8 @@ inline bool loaderDevice(const char* fn, std::span<const Value> args, std::size_
     return true;
 }
 
-// The one-path form: `fn(modelDir, opts?)`.
+// The one-path form: `fn(modelDir, opts?)`. The model directory is asked
+// about (Read) before anything else; a refusal is thrown from here.
 inline bool modelLoaderArgs(const char* fn, std::span<const Value> args, std::string& dir,
                             brotensor::Device& dev, ev::Persistent& opts, bool* explicitDevice = nullptr) {
     if (!isStringArg(args, 0)) {
@@ -75,6 +76,10 @@ inline bool modelLoaderArgs(const char* fn, std::span<const Value> args, std::st
         return false;
     }
     dir = resolvePath(strAt(args, 0));
+    if (PathRefusal r = checkReadAccess({dir})) {
+        throwRefusal(r);
+        return false;
+    }
     return loaderDevice(fn, args, 1, dev, opts, explicitDevice);
 }
 

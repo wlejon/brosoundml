@@ -302,8 +302,10 @@ Value omniSavePrompt(Value self, std::span<const Value> a) {
     std::string err;
     const int nq = w->model && w->model->loaded() ? w->model->config().lm.num_codebooks : 8;
     if (!promptFromJs(a[0], nq, p, err)) return ev::throwTypeError("savePrompt: " + err);
+    const std::string path = resolvePath(strAt(a, 1));
+    if (PathRefusal r = checkWriteAccess(path)) return throwRefusal(r);
     try {
-        p.save(resolvePath(strAt(a, 1)));
+        p.save(path);
         return ev::undefined();
     } catch (const std::exception& e) {
         return ev::throwError(std::string("savePrompt: ") + e.what());
@@ -314,8 +316,10 @@ Value omniLoadPrompt(Value self, std::span<const Value> a) {
     auto* w = omniSelf(self);
     if (!w) return ev::throwTypeError("loadPrompt: not an OmniVoice");
     if (!isStringArg(a, 0)) return ev::throwTypeError("loadPrompt(path): path string required");
+    const std::string path = resolvePath(strAt(a, 0));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     try {
-        return promptToJs(brosoundml::OmniVoicePrompt::load(resolvePath(strAt(a, 0))));
+        return promptToJs(brosoundml::OmniVoicePrompt::load(path));
     } catch (const std::exception& e) {
         return ev::throwError(std::string("loadPrompt: ") + e.what());
     }

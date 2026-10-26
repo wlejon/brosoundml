@@ -162,11 +162,16 @@ Value qwenSynthesizeClone(Value self, std::span<const Value> a) {
     std::string alignErr;
     if (!alignerReady(o, alignErr)) return ev::throwTypeError("synthesizeClone: " + alignErr);
     if (w->busy.isBusy()) return ev::throwError("synthesizeClone: an operation is already in flight on this model");
+    std::string refPath;
+    if (ev::isString(a[1])) {
+        refPath = resolvePath(ev::toUtf8(a[1]));
+        if (PathRefusal r = checkReadAccess({refPath})) return throwRefusal(r);
+    }
     try {
         const std::string text = strAt(a, 0);
         brosoundml::AudioBuffer ref;
         if (ev::isString(a[1])) {
-            ref = brosoundml::read_wav(resolvePath(ev::toUtf8(a[1])));
+            ref = brosoundml::read_wav(refPath);
         } else {
             std::string err;
             if (!readAudioBuffer(a[1], ref, err, 24000)) return ev::throwTypeError("synthesizeClone: " + err);

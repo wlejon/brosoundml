@@ -70,6 +70,7 @@ Value kokoroLoadVoice(Value self, std::span<const Value> a) {
     if (!isStringArg(a, 0)) return ev::throwTypeError("loadVoice(path, opts?): path string required");
     if (!w->model || !w->model->loaded()) return ev::throwError("loadVoice: model is not loaded");
     const std::string path = resolvePath(strAt(a, 0));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     ev::Persistent opts(isObjectArg(a, 1) ? a[1] : ev::undefined());
     ev::Persistent onReady = getFunctionOpt(opts.get(), "onReady");
     if (!ev::isFunction(onReady.get())) {

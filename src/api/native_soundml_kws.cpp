@@ -232,6 +232,8 @@ Value jsLoad(Value, std::span<const Value> a) {
     std::string weights = getPropertyString(opts.get(), "weights");
     if (weights.empty())
         return ev::throwTypeError("bro.kws.load: opts.weights (PhonemeNet checkpoint path) required");
+    weights = resolvePath(weights);
+    if (PathRefusal r = checkReadAccess({weights})) return throwRefusal(r);
     // init() BEFORE the device probe — the GPU backends only register on the
     // driver probe, so a probe before init() silently lands on CPU.
     brotensor::Device dev;
@@ -253,7 +255,7 @@ Value jsLoad(Value, std::span<const Value> a) {
         {
             brotensor::DeviceScope scope(dev);
             net = std::make_shared<const brosoundml::PhonemeNet>(
-                brosoundml::PhonemeNet::load(resolvePath(weights), dev));
+                brosoundml::PhonemeNet::load(weights, dev));
         }
 
         // Replacing the net invalidates existing tenant spotters — drop them.

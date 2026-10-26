@@ -312,6 +312,7 @@ Value loadClusterDiarizer(Value, std::span<const Value> args) {
         return ev::throwTypeError("loadClusterDiarizer(sortformerDir, speakerEncoderDir, opts?): two paths required");
     const std::string sortformerDir = resolvePath(strAt(args, 0));
     const std::string encoderDir = resolvePath(strAt(args, 1));
+    if (PathRefusal r = checkReadAccess({sortformerDir, encoderDir})) return throwRefusal(r);
     brotensor::Device dev = brotensor::Device::CPU;
     ev::Persistent opts;
     if (!loaderDevice("loadClusterDiarizer", args, 2, dev, opts)) return ev::undefined();

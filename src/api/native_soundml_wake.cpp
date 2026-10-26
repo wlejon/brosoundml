@@ -171,6 +171,7 @@ Value jsLoad(Value, std::span<const Value> a) {
     std::string weights = getPropertyString(opts.get(), "weights");
     if (weights.empty())
         return ev::throwTypeError("bro.wake.load: opts.weights (model path) required");
+    if (PathRefusal r = checkReadAccess({resolvePath(weights)})) return throwRefusal(r);
     // init() BEFORE the device probe: GPU backends register on the driver probe.
     brotensor::Device dev = autoDevice();
     {
@@ -210,6 +211,10 @@ Value jsListen(Value self, std::span<const Value> a) {
         return ev::throwError("bro.wake.listen: audio engine not available");
 
     std::string weights = getPropertyString(opts.get(), "weights");   // optional once loaded
+    // Asked only when they will be read: a loaded net ignores them.
+    if (!g_wake.net && !weights.empty()) {
+        if (PathRefusal r = checkReadAccess({resolvePath(weights)})) return throwRefusal(r);
+    }
 
     // init() BEFORE the device probe.
     brotensor::Device dev = g_wake.net ? g_wake.device : autoDevice();

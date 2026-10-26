@@ -84,6 +84,7 @@ Value loadVoiceStyle(Value self, std::span<const Value> a) {
     if (!isStringArg(a, 0)) return ev::throwTypeError("loadVoiceStyle(path): path string required");
     if (!w->model || !w->model->loaded()) return ev::throwError("loadVoiceStyle: model is not loaded");
     const std::string path = resolvePath(strAt(a, 0));
+    if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
     try {
         return makeStyleVoice(w->model->load_voice_style(path), std::filesystem::path(path).stem().string());
     } catch (const std::exception& e) {

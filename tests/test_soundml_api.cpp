@@ -97,6 +97,8 @@ void expectBrandChecked(const ev::Persistent& obj, const char* cls, const char* 
 
 }  // namespace
 
+void runAccessGateTests();  // test_soundml_api_gate.cpp
+
 int main() {
     // A host (bro, with broaudio) publishes bro.ear before brosoundml installs;
     // loadClap must mount onto that object, keeping what is already on it.
@@ -217,6 +219,8 @@ int main() {
                      [] { return std::vector<ev::Value>{ev::fromDouble(1234)}; },
                      "TypeError", "source must be a string or an object");
     }
+
+    runAccessGateTests();
 
     brosoundml::api::shutdownSoundML();
 

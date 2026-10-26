@@ -726,9 +726,11 @@ void decorateVoiceAgent(ObjectBuilder& b) {
             }
         }
         if (isStringArg(a, 0)) {
+            const std::string path = resolvePath(strAt(a, 0));
+            if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
             try {
                 auto net = std::make_shared<const BcResnet2d>(
-                    BcResnet2d::load(resolvePath(strAt(a, 0)), autoDevice()));
+                    BcResnet2d::load(path, autoDevice()));
                 h->agent->set_vad_model(net);
                 return self;
             } catch (const std::exception& e) {
@@ -804,6 +806,7 @@ void decorateVoiceAgent(ObjectBuilder& b) {
                 if (hv) voice = hv->voice;
             } else if (isStringArg(a, 1)) {
                 std::string vpath = resolvePath(strAt(a, 1));
+                if (PathRefusal r = checkReadAccess({vpath})) return throwRefusal(r);
                 try {
                     voice = kokoro->load_voice(vpath);
                 } catch (const std::exception& e) {
@@ -924,6 +927,7 @@ Value ctorBcResnet(Value, std::span<const Value> a) {
         std::shared_ptr<const BcResnet2d> net;
         if (isStringArg(a, 0)) {
             std::string path = resolvePath(strAt(a, 0));
+            if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
             brotensor::Device dev = autoDevice();
             if (a.size() > 1 && ev::isObject(a[1])) {
                 std::string err;
@@ -937,7 +941,8 @@ Value ctorBcResnet(Value, std::span<const Value> a) {
             if (!parseDeviceOpt(opts, dev, err)) return ev::throwTypeError("BcResnet2d: " + err);
             if (hasProperty(opts, "weights")) {
                 std::string path = resolvePath(getPropertyString(opts, "weights"));
-                net = std::make_shared<const BcResnet2d>(BcResnet2d::load(path, dev));
+                if (PathRefusal r = checkReadAccess({path})) return throwRefusal(r);
+                net =std::make_shared<const BcResnet2d>(BcResnet2d::load(path, dev));
             } else {
                 BcResnet2dConfig cfg;
                 getIntOpt(opts, "nMels", cfg.n_mels);

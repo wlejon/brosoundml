@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <string>
@@ -444,6 +445,23 @@ private:
 // (app-relative base paths). Identity until the host installs a resolver
 // (brosoundml::api::setPathResolver).
 std::string resolvePath(const std::string& path);
+
+// The host's access gate (embed/embed_access.h; api.h, "Access"). A native
+// asks about every path the app handed it, as it will be opened (after
+// resolvePath where the native resolves), on the JS thread before anything is
+// opened, stat'ed or queued: Read for what is read (a directory covers what is
+// in it), Write for what is written. The gate is handed the path absolute and
+// lexically normal, in UTF-8; empty paths are skipped. A set PathRefusal
+// carries the gate's sentence and that path.
+struct PathRefusal {
+    std::string message, path;
+    explicit operator bool() const { return !message.empty(); }
+};
+PathRefusal checkReadAccess(std::initializer_list<std::string_view> paths);
+PathRefusal checkWriteAccess(std::string_view path);
+// The refusal thrown into the running program (Error, code EACCES, path);
+// unwinds like every ev::throw*.
+Value throwRefusal(const PathRefusal& refusal);
 
 // Log line on the host's [INFO] channel (stderr when no host hook).
 void logInfo(const std::string& line);

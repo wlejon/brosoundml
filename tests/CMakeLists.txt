@@ -141,7 +141,9 @@ target_compile_definitions(brosoundml_test_whisper PRIVATE
 
 # Bronze standalone JavaScript API test (weights-free: mounts, TypeErrors)
 if(BROSOUNDML_ENABLE_API)
-    add_executable(brosoundml_test_api test_soundml_api.cpp)
+    # test_soundml_api_gate.cpp: the loaders under a refusing access gate
+    # (embed/embed_access.h), run from test_soundml_api.cpp's main.
+    add_executable(brosoundml_test_api test_soundml_api.cpp test_soundml_api_gate.cpp)
     target_include_directories(brosoundml_test_api PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/api
     )
