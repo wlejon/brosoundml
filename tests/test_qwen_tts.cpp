@@ -569,6 +569,27 @@ static int run() {
                 if (gotL == L) cmpv("trailing", trailing, ref_trailing, 5e-3);
                 cmpv("tts_pad", tts_pad, ref_pad, 5e-3);
 
+                // (2b) language-slot replace: another language's row passed as
+                // lang_vec assembles exactly the prefill that selecting it does,
+                // and under "auto" it takes the think form's language position.
+                {
+                    auto lid = [&](const char* n) { return cfg.talker.codec_language_id.at(n); };
+                    std::vector<float> de_row(static_cast<std::size_t>(talker.hidden));
+                    talker.codec_embed(lid("german"), de_row.data());
+                    std::vector<float> p_de, p_vec, p_auto, tr, pad;
+                    int t1 = 0, t2 = 0, t3 = 0, l = 0;
+                    brosoundml::assemble_talker_prefill(talker, cfg, ids, {}, spk_id, nullptr, nullptr,
+                                                        lid("german"), p_de, t1, tr, l, pad);
+                    brosoundml::assemble_talker_prefill(talker, cfg, ids, {}, spk_id, nullptr, nullptr,
+                                                        lid("english"), p_vec, t2, tr, l, pad,
+                                                        de_row.data());
+                    brosoundml::assemble_talker_prefill(talker, cfg, ids, {}, spk_id, nullptr, nullptr,
+                                                        /*auto*/ -1, p_auto, t3, tr, l, pad,
+                                                        de_row.data());
+                    CHECK(t1 == t2 && p_de == p_vec, tag("language_vector = a language's row reproduces selecting it"));
+                    CHECK(t3 == t1 && p_auto == p_de, tag("language_vector under auto uses the think form"));
+                }
+
                 // (3) AR loop with the upstream codebook-0 logits policy.
                 std::vector<int32_t> pos3(static_cast<std::size_t>(3) * gotT);
                 for (int a = 0; a < 3; ++a)

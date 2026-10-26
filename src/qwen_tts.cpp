@@ -744,12 +744,24 @@ AudioBuffer QwenTts::synth_core(QwenTtsGenState& gen,
         spk_steer = sampling.voice_steer.data();
     }
 
+    // Optional language-slot REPLACE (accent): a caller-supplied row in place of
+    // the language token's codec_embedding row.
+    const float* lang_vec = nullptr;
+    if (!sampling.language_vector.empty()) {
+        if (static_cast<int>(sampling.language_vector.size()) != impl_->talker.hidden) {
+            fail("QwenTts::synth_core",
+                 "language_vector must be " + std::to_string(impl_->talker.hidden) +
+                 " floats (got " + std::to_string(sampling.language_vector.size()) + ")");
+        }
+        lang_vec = sampling.language_vector.data();
+    }
+
     // Assemble the prefill embedding stream + trailing-text embeddings.
     std::vector<float> prefill, trailing, tts_pad;
     int T = 0, L = 0;
     assemble_talker_prefill(impl_->talker, cfg, input_ids, instruct_ids, spk_id_eff,
                             spk_embed_eff, spk_steer, language_id, prefill, T, trailing,
-                            L, tts_pad);
+                            L, tts_pad, lang_vec);
 
     // Prefill M-RoPE positions: plain 0..T-1 on all three axes (the Talker's
     // get_rope_index is cumsum of an all-ones mask), rope_delta 0.
@@ -897,6 +909,15 @@ std::vector<std::string> QwenTts::languages() const {
     for (const auto& kv : impl_->config.talker.codec_language_id)
         if (kv.first.find("dialect") == std::string::npos) out.push_back(kv.first);
     return out;
+}
+
+std::vector<float> QwenTts::language_embedding(const std::string& language) const {
+    const auto& ids = impl_->config.talker.codec_language_id;
+    auto it = ids.find(language);
+    if (it == ids.end()) fail("QwenTts::language_embedding", "unknown language '" + language + "'");
+    std::vector<float> row(static_cast<std::size_t>(impl_->talker.hidden));
+    impl_->talker.codec_embed(it->second, row.data());
+    return row;
 }
 
 std::string QwenTts::speaker_dialect(const std::string& speaker) const {

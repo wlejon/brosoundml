@@ -134,6 +134,9 @@ int generate_codes(const QwenTtsTalker& talker, const QwenTtsCodePredictor& cp,
 //                    slot (VoiceDesign) there is nothing to steer and it is
 //                    ignored.
 //   `language_id`  — the codec language token (>=0), or -1 for "auto".
+//   `lang_vec`     — optional hidden-width row that REPLACES the language row
+//                    (QwenTtsSampling::language_vector); with language_id -1 the
+//                    think form is used so the row has a position. nullptr = none.
 //
 // Writes the prefill (T*hidden row-major), the per-frame trailing-text hidden
 // (L*hidden), and the tts_pad embedding (hidden). The prefill positions are a
@@ -148,6 +151,7 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const float* spk_steer, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
-                             std::vector<float>& tts_pad);
+                             std::vector<float>& tts_pad,
+                             const float* lang_vec = nullptr);
 
 }  // namespace brosoundml

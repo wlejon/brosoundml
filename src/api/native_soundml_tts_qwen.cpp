@@ -82,6 +82,7 @@ void readQwenOpts(Value opts, QwenSynthOpts& o) {
     };
     readVec("voiceSteer", s.voice_steer);
     readVec("speakerVector", s.speaker_vector);
+    readVec("languageVector", s.language_vector);
     readVec("xvector", o.xvector);
 }
 
@@ -502,6 +503,19 @@ void decorateQwenTts(ObjectBuilder& b) {
         if (!w) return ev::throwTypeError("languages: not a QwenTts");
         if (!w->model || !w->model->loaded()) return ev::throwError("languages: model is not loaded");
         return makeStringArray(w->model->languages());
+    });
+    // qwen.languageEmbedding(name) -> Float32Array(hidden): the language's codec row,
+    // the point opts.languageVector replaces (blend rows for a continuous accent).
+    b.def("languageEmbedding", 1, [](Value self, std::span<const Value> a) -> Value {
+        auto* w = qwenSelf(self);
+        if (!w) return ev::throwTypeError("languageEmbedding: not a QwenTts");
+        if (!isStringArg(a, 0)) return ev::throwTypeError("languageEmbedding(name): name string required");
+        if (!w->model || !w->model->loaded()) return ev::throwError("languageEmbedding: model is not loaded");
+        try {
+            return makeFloat32Array(w->model->language_embedding(strAt(a, 0)));
+        } catch (const std::exception& e) {
+            return ev::throwError(std::string("languageEmbedding: ") + e.what());
+        }
     });
     b.def("speakerDialect", 1, [](Value self, std::span<const Value> a) -> Value {
         auto* w = qwenSelf(self);

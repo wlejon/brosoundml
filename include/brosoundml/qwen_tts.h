@@ -252,6 +252,16 @@ struct QwenTtsSampling {
     // Talker only trained on its preset rows this is off-distribution, but the
     // slot is dimensionally identical, so it renders.
     std::vector<float> speaker_vector;
+
+    // ── Language-slot REPLACE (accent) ──────────────────────────────────────
+    // When non-empty, this vector REPLACES the language row of the prefill (the
+    // codec_embedding row of the language token between think_bos and think_eos)
+    // with a caller-supplied point. Must be exactly the Talker hidden width. With
+    // English text, another language's row speaks the English words with that
+    // language's accent, so a point between rows (language_embedding) is a
+    // continuous accent. With "auto" (no language row) the think form is used and
+    // this vector fills its language position. Empty = the selected language's row.
+    std::vector<float> language_vector;
 };
 
 // Streaming sink: receives `n` finalized 24 kHz mono samples as the codec decodes
@@ -507,6 +517,11 @@ public:
     // excluding the dialect tags, which are reached via their dialect speaker).
     // "auto" is always valid (no language tag) but is not included here.
     std::vector<std::string> languages() const;
+
+    // A language's codec_embedding row (Talker hidden width floats): the point
+    // QwenTtsSampling::language_vector replaces. Any codec_language_id key,
+    // dialect tags included. Throws on an unknown name.
+    std::vector<float> language_embedding(const std::string& language) const;
 
     // The dialect tag for a preset speaker ("sichuan_dialect" / "beijing_dialect"),
     // or "" if the speaker is not a dialect voice / is unknown. Lets a UI badge

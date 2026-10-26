@@ -287,7 +287,8 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
                              const float* spk_steer, int language_id,
                              std::vector<float>& prefill, int& T,
                              std::vector<float>& trailing, int& L,
-                             std::vector<float>& tts_pad) {
+                             std::vector<float>& tts_pad,
+                             const float* lang_vec) {
     const int H = talker.hidden;
     const QwenTtsTalkerConfig& tk = cfg.talker;
 
@@ -305,11 +306,16 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
     tts_pad.assign(tts_pad_e.begin(), tts_pad_e.end());
 
     // codec prefix tokens: think tag (+ language) [+ speaker] + pad + bos.
+    // A language_vector replaces the language row, so it needs the think form even
+    // under "auto": a pad placeholder holds the position and is overridden below.
     std::vector<int> codec_input;
-    if (language_id < 0) {
+    int lang_pos = -1;
+    if (language_id < 0 && !lang_vec) {
         codec_input = {tk.codec_nothink_id, tk.codec_think_bos_id, tk.codec_think_eos_id};
     } else {
-        codec_input = {tk.codec_think_id, tk.codec_think_bos_id, language_id, tk.codec_think_eos_id};
+        codec_input = {tk.codec_think_id, tk.codec_think_bos_id,
+                       language_id >= 0 ? language_id : tk.codec_pad_id, tk.codec_think_eos_id};
+        if (lang_vec) lang_pos = 2;
     }
     // The speaker sits between the think tag and the pad/bos. CustomVoice uses a
     // preset speaker token (looked up in codec_embedding); the Base zero-shot
@@ -358,7 +364,8 @@ void assemble_talker_prefill(const QwenTtsTalker& talker,
         float* dst = prefill.data() + static_cast<std::size_t>(I + 3 + i) * H;
         const float* txt = (i < C - 2) ? tts_pad_e.data() : tts_bos.data();
         const float* codec = spk_embed;             // raw x-vector at spk_pos
-        if (i != spk_pos) { codec_row(codec_input[i], ce); codec = ce.data(); }
+        if (i == lang_pos) codec = lang_vec;        // caller's language row (accent)
+        else if (i != spk_pos) { codec_row(codec_input[i], ce); codec = ce.data(); }
         for (int d = 0; d < H; ++d) dst[d] = txt[d] + codec[d];
         // Voice-slot steering: an additive direction on the speaker row (emotion /
         // masc-fem), applied once whether the row came from a token or an x-vector.
