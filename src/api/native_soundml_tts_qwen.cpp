@@ -24,8 +24,7 @@ HostSpeakerEncoder* encSelf(Value self) {
 const char* variantName(brosoundml::QwenTtsVariant v) {
     switch (v) {
         case brosoundml::QwenTtsVariant::Base: return "base";
-        // The names the QuickJS binding published and the weights layout /
-        // download script use ("0.6B-customvoice", --variant voicedesign).
+        // The names the weights layout / download script use ("0.6B-customvoice", --variant voicedesign).
         case brosoundml::QwenTtsVariant::CustomVoice: return "customvoice";
         case brosoundml::QwenTtsVariant::VoiceDesign: return "voicedesign";
     }
