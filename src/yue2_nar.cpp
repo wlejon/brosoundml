@@ -86,12 +86,8 @@ void velocity(const ModelWeights& w, NarChunk& c, const bt::Tensor& xin, const s
     // CUDA graph per input buffer (the state and the midpoint) replays the
     // ~600 launches of an evaluation as one. An evaluation that captures
     // activations to the host runs eagerly.
-    static const bool no_graph = [] {
-        const char* v = std::getenv("BROSOUNDML_YUE2_NO_GRAPH");
-        return v && *v && *v != '0';
-    }();
     const int slot = xin.data == c.xpad.data ? 0 : 1;
-    if (!no_graph && !capture && bt::graph_capture_available(w.dev)) {
+    if (!capture && bt::graph_capture_available(w.dev)) {
         if (c.graphed[slot]) {
             c.graph[slot].launch();
         } else {

@@ -124,12 +124,8 @@ void Model::ar_step_rows(ArSession& s, const int32_t* tokens, int R) const {
         dlin(lm, qlm, st.n, st.logits, &st.ws);
     };
 
-    static const bool no_graph = [] {
-        const char* v = std::getenv("BROSOUNDML_YUE2_NO_GRAPH");
-        return v && *v && *v != '0';
-    }();
     const bool hooks_eager = s.hooks && (s.hooks->any_capture() || s.hooks->any_per_position());
-    const bool graph = !no_graph && !hooks_eager && bt::graph_capture_available(w.dev);
+    const bool graph = !hooks_eager && bt::graph_capture_available(w.dev);
     if (!graph) {
         body();
     } else if (!st.captured || st.graph_lo != s.lo || st.graph_hi != s.hi) {

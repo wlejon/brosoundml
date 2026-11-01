@@ -424,9 +424,7 @@ void QwenTtsCodePredictor::predict_dev(CpFramePtr& fs,
     // both policies). Stream capture records without executing, so the warm-up
     // run produces frame 0's codes and advances the counter by 15; each replay
     // then advances 15 more, matching the CPU eager path frame for frame.
-    // BROSOUNDML_QWEN_NO_GRAPH forces the eager path (A/B + escape hatch).
-    static const bool no_graph = std::getenv("BROSOUNDML_QWEN_NO_GRAPH") != nullptr;
-    const bool use_graph = bt::graph_capture_available(dev) && !no_graph;
+    const bool use_graph = bt::graph_capture_available(dev);
     if (use_graph) {
         CpProf::graph() = true;
         // Drop a captured graph whose baked policy/params differ from this call.

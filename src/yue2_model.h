@@ -169,7 +169,7 @@ public:
     // services real-time work from `cancel` keeps doing so through a long
     // evaluation instead of waiting it out in the next sync. On CUDA an evaluation replays
     // as a graph (one per chunk and state buffer, captured at its first use)
-    // unless it is in capture_evals; BROSOUNDML_YUE2_NO_GRAPH=1 runs all eager.
+    // unless it is in capture_evals.
     // `known` (known_frames * 64, may be null): inpainting of the first
     // known_frames frames: before every velocity evaluation at time t they are
     // set to the flow interpolant t * noise + (1 - t) * known (each op rounded
