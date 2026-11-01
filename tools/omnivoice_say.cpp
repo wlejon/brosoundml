@@ -104,16 +104,11 @@ int main(int argc, char** argv) {
 
     try {
         brotensor::init();
-        // The best GPU is the default; the CPU fallback is taken only when no
-        // GPU backend is present and no --device was given, and it is never
-        // silent.
-        brotensor::Device dev = brosoundml_tool::best_gpu();
-        if (!device_arg.empty()) {
-            std::string err;
-            if (!brosoundml_tool::resolve_device(device_arg, dev, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        } else if (!dev.is_gpu()) {
-            std::fprintf(stderr, "warning: no GPU backend is available — running on CPU (slow); pass --device cpu to run there deliberately\n");
-        }
+        // The best GPU is the default; the CPU runs only when --device cpu
+        // asks for it.
+        brotensor::Device dev = brotensor::Device::CPU;
+        std::string err;
+        if (!brosoundml_tool::resolve_device(device_arg, dev, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         if (bf16 && dev == brotensor::Device::CPU) { std::fprintf(stderr, "--bf16 needs a GPU device\n"); return 2; }
 
         brosoundml::OmniVoice ov;

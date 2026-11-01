@@ -6,10 +6,9 @@
 // a Metal build) instead of hard-coding Device::CUDA. Call brotensor::init() first —
 // availability is only known after the driver probes.
 //
-//   auto  default_device(): the best GPU, else CPU (BROTENSOR_DEFAULT_DEVICE
-//         overrides, as everywhere in brotensor)
+//   auto  the same as gpu (the default)
 //   gpu   the best GPU (the default device when it is one, else CUDA >
-//         Metal > Vulkan); an error when there is none
+//         Metal > Vulkan); the tool exits with an error when there is none
 //   cuda  CUDA when present, else the best GPU — `--device cuda` has always
 //         meant "use the GPU", and keeps meaning it on a Vulkan or Metal
 //         build
@@ -19,6 +18,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace brosoundml_tool {
@@ -27,15 +28,16 @@ namespace brosoundml_tool {
 inline constexpr const char* kDeviceChoices = "auto|cpu|gpu|cuda|vulkan|vk|metal";
 
 // The best registered GPU backend: brotensor's default device when it is a
-// GPU, else CUDA > Metal > Vulkan, or Device::CPU when the build or the machine
-// has none.
+// GPU, else CUDA > Metal > Vulkan. A build or machine with none ends the tool
+// with an error (only --device cpu runs on the CPU).
 inline brotensor::Device best_gpu() {
     if (brotensor::default_device().is_gpu()) return brotensor::default_device();
     for (brotensor::Device d : {brotensor::Device::CUDA, brotensor::Device::Metal,
                                 brotensor::Device::VULKAN}) {
         if (brotensor::is_available(d)) return d;
     }
-    return brotensor::Device::CPU;
+    std::fprintf(stderr, "no GPU backend is available (--device cpu runs on the CPU)\n");
+    std::exit(1);
 }
 
 inline const char* device_name(brotensor::Device d) {
@@ -56,16 +58,13 @@ inline bool resolve_device(const std::string& arg, brotensor::Device& out, std::
         err = std::string("--device ") + arg + ": no " + what + " backend is available";
         return false;
     };
-    if (arg.empty() || arg == "auto") { out = brotensor::default_device(); return true; }
     if (arg == "cpu")                 { out = Device::CPU; return true; }
     if (arg == "vulkan" || arg == "vk") return require(Device::VULKAN, "Vulkan");
     if (arg == "metal")                return require(Device::Metal, "Metal");
-    if (arg == "gpu" || arg == "cuda") {
+    if (arg.empty() || arg == "auto" || arg == "gpu" || arg == "cuda") {
         if (arg == "cuda" && brotensor::is_available(Device::CUDA)) { out = Device::CUDA; return true; }
         out = best_gpu();
-        if (out.is_gpu()) return true;
-        err = std::string("--device ") + arg + ": no GPU backend is available";
-        return false;
+        return true;
     }
     err = "unknown --device '" + arg + "' (want " + kDeviceChoices + ")";
     return false;
