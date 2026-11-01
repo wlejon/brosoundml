@@ -237,28 +237,86 @@ static void test_no_nan_on_noise(bt::Device dev, const char* dev_name) {
 // CPU path remains the reference; outputs feed the same checkpoints/centroid
 // files, so the two devices must agree to FP32 STFT noise — not just be
 // individually self-consistent.
+//
+// What FP32 noise is: the GPU's STFT is an FP32 radix-2 FFT per frame, whose
+// error is absolute, about eps * log2(n_fft) of the frame's energy, while the
+// CPU's engine is accurate well below that. So the linear mel energies agree
+// to a small fraction of the loudest band everywhere, and the log and PCEN
+// outputs (which both turn a band's relative error into an absolute one)
+// agree only where a band stands above that floor. The bands this signal
+// leaves near silence (the top ones, past its 1760 Hz tone's leakage) hold
+// little more than rounding, and their log or PCEN value is that rounding.
 static void test_cross_device_parity(bt::Device dev, const char* dev_name) {
-    for (int pcen = 0; pcen <= 1; ++pcen) {
-        MelConfig cfg;
-        cfg.compression = pcen ? brosoundml::MelCompression::PCEN
-                               : brosoundml::MelCompression::Log;
+    MelConfig cfg;
+    const auto sig = make_test_signal(2 * cfg.sample_rate, cfg.sample_rate);
+    const int n = static_cast<int>(sig.size());
+
+    // Linear energies, from the log outputs (log(max(E, 1e-10)) inverted).
+    cfg.compression = brosoundml::MelCompression::Log;
+    std::vector<float> log_a, log_b;
+    {
         MelFrontend ref(cfg, bt::Device::CPU);
         MelFrontend alt(cfg, dev);
-        const auto sig = make_test_signal(2 * cfg.sample_rate, cfg.sample_rate);
         bt::Tensor a, b;
-        ref.compute_offline(sig.data(), static_cast<int>(sig.size()), a);
-        alt.compute_offline(sig.data(), static_cast<int>(sig.size()), b);
+        ref.compute_offline(sig.data(), n, a);
+        alt.compute_offline(sig.data(), n, b);
         CHECK(a.rows == b.rows && a.cols == b.cols,
-              tag(pcen ? "parity PCEN: shape matches CPU"
-                       : "parity Log: shape matches CPU", dev_name).c_str());
-        const float d = max_abs_diff(a.to_host_vector(), b.to_host_vector());
-        std::fprintf(stderr, "[%s] cross-device %s max-abs-diff vs CPU: %g\n",
-                     dev_name, pcen ? "PCEN" : "Log", d);
-        CHECK(d < 2e-3f,
-              tag(pcen ? "parity PCEN: matches CPU within FP32 noise"
-                       : "parity Log: matches CPU within FP32 noise",
-                  dev_name).c_str());
+              tag("parity Log: shape matches CPU", dev_name).c_str());
+        log_a = a.to_host_vector();
+        log_b = b.to_host_vector();
     }
+    const std::size_t count = std::min(log_a.size(), log_b.size());
+    double peak = 0.0;
+    for (std::size_t i = 0; i < count; ++i) peak = std::max(peak, std::exp((double)log_a[i]));
+    double lin_diff = 0.0;
+    for (std::size_t i = 0; i < count; ++i) {
+        lin_diff = std::max(lin_diff, std::abs(std::exp((double)log_a[i]) -
+                                               std::exp((double)log_b[i])));
+    }
+    std::fprintf(stderr, "[%s] cross-device linear mel max-abs-diff vs CPU: %g (peak %g)\n",
+                 dev_name, lin_diff, peak);
+    CHECK(lin_diff <= 1e-6 * peak,
+          tag("parity linear mel: matches CPU within FP32 FFT noise", dev_name).c_str());
+
+    // Bands at least 1e-4 of the peak: the FFT's rounding is under a
+    // thousandth of each.
+    std::vector<uint8_t> above(count, 0);
+    std::size_t n_above = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (std::exp((double)log_a[i]) >= 1e-4 * peak) {
+            above[i] = 1;
+            ++n_above;
+        }
+    }
+    std::fprintf(stderr, "[%s] cross-device: %zu of %zu bands above the FP32 floor\n",
+                 dev_name, n_above, count);
+    CHECK(n_above * 2 > count,
+          tag("parity: most bands stand above the FP32 floor", dev_name).c_str());
+
+    auto masked_diff = [&](const std::vector<float>& a, const std::vector<float>& b) {
+        float m = 0.0f;
+        for (std::size_t i = 0; i < std::min({a.size(), b.size(), count}); ++i) {
+            if (above[i]) m = std::max(m, std::abs(a[i] - b[i]));
+        }
+        return m;
+    };
+    const float d_log = masked_diff(log_a, log_b);
+    std::fprintf(stderr, "[%s] cross-device Log max-abs-diff vs CPU (bands above the floor): %g\n",
+                 dev_name, d_log);
+    CHECK(d_log < 2e-3f, tag("parity Log: matches CPU within FP32 noise", dev_name).c_str());
+
+    cfg.compression = brosoundml::MelCompression::PCEN;
+    MelFrontend ref(cfg, bt::Device::CPU);
+    MelFrontend alt(cfg, dev);
+    bt::Tensor a, b;
+    ref.compute_offline(sig.data(), n, a);
+    alt.compute_offline(sig.data(), n, b);
+    CHECK(a.rows == b.rows && a.cols == b.cols,
+          tag("parity PCEN: shape matches CPU", dev_name).c_str());
+    const float d_pcen = masked_diff(a.to_host_vector(), b.to_host_vector());
+    std::fprintf(stderr, "[%s] cross-device PCEN max-abs-diff vs CPU (bands above the floor): %g\n",
+                 dev_name, d_pcen);
+    CHECK(d_pcen < 2e-3f, tag("parity PCEN: matches CPU within FP32 noise", dev_name).c_str());
 }
 
 // ─── Device runner ────────────────────────────────────────────────────────
