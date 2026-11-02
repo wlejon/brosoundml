@@ -136,10 +136,12 @@ target_sources(brosoundml PRIVATE
     src/omnivoice.cpp
     src/omnivoice_lm.cpp
     src/omnivoice_prompt.cpp
+    src/omnivoice_prompt_audio.cpp
     src/qwen_asr.cpp
     src/qwen_asr_encoder.cpp
     src/qwen_asr_decoder.cpp
     src/rave.cpp
+    src/rave_weights.cpp
     src/yue2_vae.cpp
     src/yue2.cpp
     src/yue2_generate.cpp
@@ -164,10 +166,13 @@ target_sources(brosoundml PRIVATE
     src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp
+    src/wake_data_manifest.cpp
     src/phoneme_data.cpp
     src/bc_resnet2d.cpp
+    src/bc_resnet2d_train.cpp
     src/voice_agent.cpp
     src/phoneme_model.cpp
+    src/phoneme_model_train.cpp
     src/phoneme_spotter.cpp
     src/gesture_spotter.cpp
     src/listen_bus.cpp
