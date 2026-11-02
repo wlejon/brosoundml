@@ -70,7 +70,6 @@ bt::Tensor read_tensor(Reader& r, const std::string& want, int rows, int cols,
 }
 
 }  // namespace
-}  // namespace
 
 // ─── Public surface ───────────────────────────────────────────────────────────
 

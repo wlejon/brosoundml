@@ -58,7 +58,6 @@ struct BcResnet2dTrainState {
     }
 };
 
-namespace {
 namespace detail_bc2d {
 
 [[noreturn]] inline void fail(const std::string& where, const std::string& msg) {

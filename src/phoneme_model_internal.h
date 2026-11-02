@@ -56,7 +56,6 @@ struct PhonemeNetTrainState {
     }
 };
 
-namespace {
 namespace detail_pm {
 
 [[noreturn]] inline void fail(const std::string& where, const std::string& msg) {

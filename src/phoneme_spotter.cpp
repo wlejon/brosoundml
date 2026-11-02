@@ -34,7 +34,9 @@ namespace {
 
 }  // namespace
 
+} // namespace brosoundml
 #include "phoneme_spotter_matcher.h"
+namespace brosoundml {
 
 namespace {
 using detail::kNegInf;

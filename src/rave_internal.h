@@ -27,7 +27,6 @@ namespace sf = brotensor::safetensors;
 namespace j  = brotensor::json;
 namespace fs = std::filesystem;
 
-namespace {
 namespace detail_rave {
 
 [[noreturn]] inline void fail(const std::string& msg) {
