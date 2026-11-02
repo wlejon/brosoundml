@@ -160,6 +160,7 @@ target_sources(brosoundml PRIVATE
     src/yue2_endless_branch.cpp
     src/beat.cpp
     src/supertonic.cpp
+    src/supertonic_weights.cpp
     src/speaker_encoder.cpp
     src/wake.cpp
     src/wake_data.cpp
